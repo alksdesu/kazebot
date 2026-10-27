@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 import config_layout
+from real_paths import real_path
 
 from .descriptor import PlatformDescriptor
 from .registry import (
@@ -90,8 +91,8 @@ def _moved_to(raw: str, workspace: Path | None) -> str:
     """
     if workspace is None:
         return Path(raw).expanduser().as_posix()
-    root = Path(workspace).resolve()
-    resolved = workspace_path(raw, root).resolve()
+    root = real_path(workspace)
+    resolved = real_path(workspace_path(raw, root))
     logical = config_layout.workspace_logical_path(root, resolved)
     return logical if logical is not None else resolved.as_posix()
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event
 import config_layout
+from real_paths import real_path
 from ..config import CLONOTH_WORKSPACE
 from adapters._shared import capability
 from ..live_config import live
@@ -334,7 +335,7 @@ def _workspace_file(raw_path: str) -> tuple[Path, str] | None:
     if not raw:
         return None
     try:
-        resolved = local_source.workspace_path(raw, CLONOTH_WORKSPACE).resolve()
+        resolved = real_path(local_source.workspace_path(raw, CLONOTH_WORKSPACE))
     except Exception:
         return None
     logical = config_layout.workspace_logical_path(Path(CLONOTH_WORKSPACE), resolved)

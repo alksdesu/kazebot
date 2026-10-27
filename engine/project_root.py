@@ -12,6 +12,7 @@ from typing import Any
 
 import config_layout
 from clonoth_runtime import get_str, load_runtime_config
+from real_paths import real_path
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def _directory_or_reason(raw: Any) -> tuple[Path | None, str]:
         candidate = Path(str(raw).strip())
         if not candidate.is_absolute():
             return None, "not an absolute path"
-        resolved = candidate.resolve()
+        resolved = real_path(candidate)
         if resolved.is_dir():
             return resolved, ""
         return None, "not a directory" if resolved.exists() else "no such directory"
@@ -103,7 +104,7 @@ def isolation_error(task_input: Mapping[str, Any] | None) -> str:
 def _resolved(path: Path | str) -> Path:
     candidate = Path(path)
     try:
-        return candidate.resolve()
+        return real_path(candidate)
     except (OSError, RuntimeError):
         return candidate.absolute()
 

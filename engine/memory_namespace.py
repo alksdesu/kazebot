@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from real_paths import real_path
+
 CONVERSATION_PREFIX = "conv_"
 SUBJECT_PREFIX = "user_"
 # 内部任务点名要读写哪个目录时用的会话键前缀；conv_/user_ 目录名本身就能当键，用不着它。
@@ -204,7 +206,7 @@ def memory_root(workspace_root: Path | str) -> Path:
 
 def _resolves_inside(root: Path, directory: Path) -> bool:
     # 名字合规还不够：namespace 目录若是指向别处的链接，读写就跟着出了 data/memory。
-    return directory.resolve().parent == root.resolve()
+    return real_path(directory).parent == real_path(root)
 
 
 def memory_dir(workspace_root: Path | str, namespace: Any = "") -> Path:

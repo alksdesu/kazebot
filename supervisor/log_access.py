@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from real_paths import real_path
+
 # 单次最多回多少行、多少字节。cleanup.log 已经 277KB 并且还在长。
 MAX_LINES = 2000
 MAX_BYTES = 512 * 1024
@@ -86,8 +88,8 @@ class LogReader:
         if not name or "/" in name or "\\" in name or not name.endswith(".log"):
             return None
         try:
-            root = self.log_dir.resolve(strict=True)
-            path = (root / name).resolve(strict=True)
+            root = real_path(self.log_dir, strict=True)
+            path = real_path(root / name, strict=True)
         except OSError:
             return None
         if root not in path.parents or not path.is_file():

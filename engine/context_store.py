@@ -20,6 +20,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from real_paths import real_path
+
 
 _BASE_DIR = Path("data") / "node_contexts"
 
@@ -33,8 +35,8 @@ def _base_dir(workspace_root: Path) -> Path:
 
 
 def _resolve_ref(workspace_root: Path, context_ref: str) -> Path:
-    p = (workspace_root / str(context_ref or "")).resolve()
-    base = _base_dir(workspace_root).resolve()
+    p = real_path(workspace_root / str(context_ref or ""))
+    base = real_path(_base_dir(workspace_root))
     try:
         p.relative_to(base)
     except ValueError as e:

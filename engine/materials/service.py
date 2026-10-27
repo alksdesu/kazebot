@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from real_paths import real_path
+
 from .process import cancel_workers, release_owner, run_worker
 from .storage import MAX_FILE_BYTES, MaterialError, MaterialStore, bounded_text, dump, identity, new_id, require_row, value
 
@@ -74,8 +76,8 @@ class MaterialService:
         return self._work("capabilities")
 
     def _attachment(self, raw: str) -> Path:
-        root = (self.workspace / "data" / "attachments").resolve()
-        path = (self.workspace / raw).resolve()
+        root = real_path(self.workspace / "data" / "attachments")
+        path = real_path(self.workspace / raw)
         if root not in path.parents or not path.is_file():
             raise MaterialError("只能注册已上传到附件目录的文件。", "invalid_path", 403)
         if path.stat().st_size > MAX_FILE_BYTES:
@@ -426,7 +428,7 @@ class MaterialService:
         if not isinstance(image_paths, list) or len(image_paths) > 16:
             raise MaterialError("参考图列表不合法。")
         scope, owner, bot = identity(actor)
-        output_root = (self.workspace / "data" / "attachments" / roots[tool]).resolve()
+        output_root = real_path(self.workspace / "data" / "attachments" / roots[tool])
         versions = []
         for item in attachments:
             if not isinstance(item, dict):
@@ -451,8 +453,8 @@ class MaterialService:
             artifact_id = str(body.get("artifact_id") or "")
             if not base_version:
                 for reference in image_paths:
-                    reference_path = (self.workspace / str(reference)).resolve()
-                    base = next((version for version in prior_versions if (self.store.root / version["blob"]).resolve() == reference_path), None)
+                    reference_path = real_path(self.workspace / str(reference))
+                    base = next((version for version in prior_versions if real_path(self.store.root / version["blob"]) == reference_path), None)
                     if base is not None:
                         base_version, artifact_id = base["id"], base["artifact_id"]
                         break
@@ -499,11 +501,11 @@ class MaterialService:
         if not prepared["base_version"]:
             with self.store.lock:
                 rows = self.store.db.execute("SELECT data FROM objects WHERE kind='version' AND scope=? AND bot_scope=? AND owner=? ORDER BY created DESC", (scope, bot, owner)).fetchall()
-            paths = {(self.workspace / str(path)).resolve() for path in references}
+            paths = {real_path(self.workspace / str(path)) for path in references}
             for raw in rows:
                 version = json.loads(raw[0])
                 generated = version.get("metadata", {}).get("generated_path")
-                if (self.store.root / version["blob"]).resolve() in paths or generated and (self.workspace / generated).resolve() in paths:
+                if real_path(self.store.root / version["blob"]) in paths or generated and real_path(self.workspace / generated) in paths:
                     prepared["base_version"], prepared["artifact_id"] = version["id"], version["artifact_id"]
                     break
         if prepared["artifact_id"]:

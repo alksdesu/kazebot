@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import config_layout
+from real_paths import real_path
 
 from ..attachments import build_multimodal_content, payload_attachments
 from ..conversation_store import MessageType
@@ -388,7 +389,7 @@ def _select_attachments(
                 p = workspace_root / p
             # 只读工作区里的文件，和 screen_model_attachment_paths 放行的范围一致：受信链接后面的也算。
             try:
-                resolved = p.resolve()
+                resolved = real_path(p)
             except (OSError, RuntimeError):
                 continue
             if config_layout.workspace_logical_path(workspace_root, resolved) is None:

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from config_layout import is_dir_link
+from real_paths import real_path
 
 from .store import Sticker, StickerStore
 
@@ -34,8 +35,6 @@ _TEMP_SUFFIX = ".tmp"
 _SUFFIX = re.compile(r"^\.[a-z0-9]{1,8}$")
 _EXT_BY_FMT = {"png": ".png", "gif": ".gif", "jpeg": ".jpg", "webp": ".webp", "bmp": ".bmp"}
 _REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
-_EXTENDED_PREFIX = "\\\\?\\"
-_EXTENDED_UNC_PREFIX = _EXTENDED_PREFIX + "UNC\\"
 
 
 def sticker_root(workspace_root: Path | str) -> Path:
@@ -78,7 +77,7 @@ def pure_relative(raw: Any) -> str:
 def media_roots(workspace_root: Path | str) -> tuple[Path, ...]:
     """图片只许落在这两个目录。库文件、打标锁和历史备份都在上一层，落点歪一步就会碰到它们。"""
     root = sticker_root(workspace_root)
-    return tuple(_real_path(root / name) for name in MEDIA_DIRS)
+    return tuple(real_path(root / name) for name in MEDIA_DIRS)
 
 
 def sticker_file(
@@ -93,7 +92,7 @@ def sticker_file(
         return None
     try:
         bases = media_roots(workspace_root) if roots is None else tuple(roots)
-        target = _real_path(Path(workspace_root) / rel)
+        target = real_path(Path(workspace_root) / rel)
     except (OSError, RuntimeError, ValueError):
         return None
     return target if any(base in target.parents for base in bases) else None
@@ -167,25 +166,6 @@ def sweep_stale(
     if removed:
         logger.info("表情包库清掉 %d 个崩溃留下的临时文件", len(removed))
     return removed
-
-
-def _real_path(path: Path) -> Path:
-    """resolve 跟着软链走到头，再去掉扩展长度前缀，同一位置只给一种写法。
-
-    途经的目录或文件正被别的进程建出来、删掉时，CPython 在 Windows 上会把这个前缀留在 resolve 的结果里。
-    """
-    resolved = path.resolve()
-    drive = resolved.drive
-    if path.drive.startswith(_EXTENDED_PREFIX) or not drive.startswith(_EXTENDED_PREFIX):
-        return resolved
-    if drive.startswith(_EXTENDED_UNC_PREFIX):
-        plain = "\\\\" + drive[len(_EXTENDED_UNC_PREFIX):]
-    elif len(drive) == len(_EXTENDED_PREFIX) + 2 and drive.endswith(":"):
-        plain = drive[len(_EXTENDED_PREFIX):]
-    else:
-        # 卷 GUID 这类没有盘符的路径离了前缀就不能用，原样给回。
-        return resolved
-    return Path(plain + str(resolved)[len(drive):])
 
 
 def _replace(source: Path, target: Path) -> None:

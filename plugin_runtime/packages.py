@@ -16,6 +16,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Collection
 
+from real_paths import real_path
+
 logger = logging.getLogger(__name__)
 
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
@@ -46,7 +48,7 @@ def is_link(path: Path) -> bool:
 
 
 def checked_directory(path: Path, boundary: Path) -> Path:
-    if not path.resolve().is_relative_to(boundary.resolve()):
+    if not real_path(path).is_relative_to(real_path(boundary)):
         raise ValueError("插件版本目录超出插件目录")
     cursor = path
     while cursor != boundary:

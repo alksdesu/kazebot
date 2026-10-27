@@ -25,6 +25,7 @@ from clonoth_runtime import load_workspace_env
 from engine.attachments import blocked_file_reject_reason
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
+from real_paths import real_path
 
 from . import async_dispatches, continuation, provisioning, share_groups
 from .config_store import ConfigStore
@@ -564,8 +565,8 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         safe_key = conversation_key.replace(":", "_").replace("/", "_").replace("..", "_")
-        att_root = (st.workspace_root / "data" / "attachments").resolve()
-        att_dir = (att_root / safe_key).resolve()
+        att_root = real_path(st.workspace_root / "data" / "attachments")
+        att_dir = real_path(att_root / safe_key)
         # 反斜杠在 Windows 上仍是路径分隔符，safe_key 的字符替换挡不住穿越，靠 resolve 兜底。
         if att_dir != att_root and att_root not in att_dir.parents:
             raise HTTPException(status_code=400, detail="Invalid conversation_key")
@@ -610,8 +611,8 @@ def create_app(
                 headers={**(exc.headers or {}), **_FILE_SECURITY_HEADERS},
             ) from exc
         st: SupervisorState = app.state.state
-        root = (st.workspace_root / "data" / "attachments").resolve()
-        target = (st.workspace_root / rel).resolve()
+        root = real_path(st.workspace_root / "data" / "attachments")
+        target = real_path(st.workspace_root / rel)
         # resolve 之后再比：'..'、绝对路径和符号链接都会在这一步现形。
         if root not in target.parents or not target.is_file():
             raise HTTPException(status_code=404, detail="Not found", headers=dict(_FILE_SECURITY_HEADERS))

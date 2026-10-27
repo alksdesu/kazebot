@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import IO, Iterable
 
 import config_layout
+from real_paths import real_path
 from toolbox._common import safe_subprocess_env
 
 log = logging.getLogger(__name__)
@@ -157,7 +158,7 @@ def run_git(
 def _resolved(path: Path | str) -> Path:
     candidate = Path(path)
     try:
-        return candidate.resolve()
+        return real_path(candidate)
     except (OSError, RuntimeError):
         return candidate.absolute()
 

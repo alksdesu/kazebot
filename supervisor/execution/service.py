@@ -19,6 +19,7 @@ import config_layout
 from clonoth_runtime import get_int, load_yaml_dict
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.tool_outputs import excerpt_text
+from real_paths import real_path
 from supervisor.feature_auth import FeatureActor
 from supervisor.types import TaskKind
 from .inputs import fetch_url, read_document
@@ -126,8 +127,8 @@ class ExecutionService:
         for item in draft.inputs:
             if item.kind != "file":
                 continue
-            path = (self.root / item.value).resolve()
-            attachment_root = (self.root / "data/attachments").resolve()
+            path = real_path(self.root / item.value)
+            attachment_root = real_path(self.root / "data/attachments")
             if not path.exists() and self._prior_snapshot(item.value, prior_inputs):
                 continue
             if attachment_root not in path.parents or not path.is_file():
@@ -193,9 +194,9 @@ class ExecutionService:
         return prior
 
     def _input_path(self, item: dict) -> Path:
-        path = (self.root / item.get("snapshot_path", item["value"])).resolve()
+        path = real_path(self.root / item.get("snapshot_path", item["value"]))
         directory = self.root / ("data/execution/inputs" if item.get("snapshot_path") else "data/attachments")
-        if directory.resolve() not in path.parents or not path.is_file():
+        if real_path(directory) not in path.parents or not path.is_file():
             raise ValueError("计划输入已丢失，请重新上传资料")
         if path.stat().st_size > self.max_bytes or hashlib.sha256(path.read_bytes()).hexdigest() != item.get("sha256"):
             raise ValueError("计划输入已在预览后改变，请重新生成并确认计划")
@@ -205,13 +206,13 @@ class ExecutionService:
         items = [item.model_dump() for item in draft.inputs]
         for item in items:
             if item["kind"] == "file":
-                source = (self.root / item["value"]).resolve()
+                source = real_path(self.root / item["value"])
                 if not source.exists():
                     prior = self._prior_snapshot(item["value"], prior_inputs)
                     if prior:
                         item.update(sha256=prior["sha256"], snapshot_path=prior["snapshot_path"])
                         continue
-                if (self.root / "data/attachments").resolve() not in source.parents:
+                if real_path(self.root / "data/attachments") not in source.parents:
                     raise PermissionError("无效附件路径")
                 with source.open("rb") as stream:
                     data = stream.read(self.max_bytes + 1)
@@ -629,8 +630,8 @@ class ExecutionService:
         artifact = next((item for item in plan["artifacts"] if item["id"] == artifact_id), None)
         if artifact is None:
             raise KeyError("产物不存在")
-        path = (self.root / artifact["path"]).resolve()
-        if (self.root / "data/execution/artifacts").resolve() not in path.parents:
+        path = real_path(self.root / artifact["path"])
+        if real_path(self.root / "data/execution/artifacts") not in path.parents:
             raise PermissionError("无效产物路径")
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != artifact["sha256"]:
             raise ConflictError("产物内容已变化或丢失，请核对后重新生成")

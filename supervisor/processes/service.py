@@ -31,6 +31,7 @@ from engine.project_root import (
     task_project_root,
 )
 from engine.tool_outputs import MAX_PATTERN_CHARS, session_dir_name, tool_output_limits
+from real_paths import real_path
 from toolbox._common import safe_subprocess_env
 
 from . import osproc
@@ -156,7 +157,7 @@ def _clean_name(name: Any, command: str) -> str:
 
 def _is_under(path: Path, root: Path) -> bool:
     try:
-        path.resolve().relative_to(root)
+        real_path(path).relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
     return True
@@ -491,7 +492,7 @@ class ProcessService:
     def stop_under_root(self, root: Path | str, *, reason: str = REASON_ROOT_CLEANUP, wait_sec: float = 10.0) -> int:
         """停掉工作目录在 root 之下的全部进程，等它们停完再返回（清理目录之前调）。会阻塞，不要在 supervisor 的锁里调。"""
         try:
-            target = Path(root).resolve()
+            target = real_path(root)
         except (OSError, RuntimeError):
             return 0
         with self._lock:

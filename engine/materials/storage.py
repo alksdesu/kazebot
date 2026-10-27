@@ -19,6 +19,7 @@ from engine.conversation_migration import (
     sqlite_rekey_transaction,
     sqlite_tables,
 )
+from real_paths import real_path
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
@@ -226,7 +227,7 @@ class MaterialStore:
         return path.relative_to(self.root).as_posix(), digest
 
     def path(self, relative: str, digest: str = "") -> Path:
-        path = (self.root / relative).resolve()
+        path = real_path(self.root / relative)
         if self.root not in path.parents or not path.is_file():
             raise MaterialError("资料文件不存在。", "file_missing", 404)
         if digest and hashlib.sha256(path.read_bytes()).hexdigest() != digest:

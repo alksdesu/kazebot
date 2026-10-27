@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import config_layout
+from real_paths import real_path
 from toolbox._common import request_guard
 from toolbox.context import project_root_of
 
@@ -49,7 +50,7 @@ def _locate(root: Path, path: str) -> _Located | None:
     if not candidate.is_absolute():
         candidate = root / candidate
     try:
-        resolved = candidate.resolve()
+        resolved = real_path(candidate)
     except (OSError, RuntimeError):
         return None
     logical = config_layout.workspace_logical_path(root, resolved)

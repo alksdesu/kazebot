@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import sqlite3
 import time
@@ -15,6 +14,7 @@ from typing import Any, Iterator
 
 from clonoth_runtime import get_int, load_runtime_config
 from file_lock import exclusive_lock
+from real_paths import real_path
 
 
 MAX_PAGE_CHARS = 20_000
@@ -22,17 +22,6 @@ MAX_RECORD_CHARS = 12_000
 MAX_RESULTS = 50
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 _ARCHIVE_ID = re.compile(r"[a-f0-9]{64}\Z")
-
-
-def _resolved(path: Path) -> Path:
-    value = str(path.resolve())
-    if os.name == "nt":
-        # Windows may keep the extended prefix while SQLite holds a shared-memory file open.
-        if value.startswith("\\\\?\\UNC\\"):
-            value = "\\\\" + value[8:]
-        elif value.startswith("\\\\?\\"):
-            value = value[4:]
-    return Path(value)
 
 
 def _json(value: Any) -> str:
@@ -95,7 +84,7 @@ def _search_text(record: dict[str, Any]) -> str:
 
 class ContextArchiveStore:
     def __init__(self, workspace_root: Path):
-        self.workspace_root = _resolved(Path(workspace_root))
+        self.workspace_root = real_path(workspace_root)
         self.path = self.workspace_root / "data" / "context_archive.sqlite3"
         self._initialization_lock = self.path.with_name(f".{self.path.name}.init.lock")
 
@@ -114,7 +103,8 @@ class ContextArchiveStore:
             self.path.parent, self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"),
             self._initialization_lock,
         ):
-            if not _resolved(path).is_relative_to(self.workspace_root):
+            # SQLite creates and deletes -wal and -shm as connections open and close.
+            if not real_path(path).is_relative_to(self.workspace_root):
                 raise ValueError("Context archive path escapes workspace")
 
     @staticmethod

@@ -17,6 +17,7 @@ import yaml
 from . import packages
 
 import config_layout
+from real_paths import real_path
 
 logger = logging.getLogger(__name__)
 
@@ -188,9 +189,9 @@ class PluginStore:
         self.settings_path = config_layout.plugins_path(self.root)
 
     def _check_paths(self) -> None:
-        config = config_layout.config_dir(self.root).resolve()
+        config = real_path(config_layout.config_dir(self.root))
         for path in (self.directory, self.settings_path):
-            if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()) or not path.resolve().is_relative_to(config):
+            if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()) or not real_path(path).is_relative_to(config):
                 raise ValueError("插件目录或配置文件不能通过链接指向其他位置")
 
     def _settings(self) -> dict[str, Any]:
@@ -215,7 +216,7 @@ class PluginStore:
             for path in sorted(directory.glob("*.py")):
                 if path.name.startswith("_") or path.name.endswith(".disabled.py") or not path.is_file():
                     continue
-                if source == "custom" and (path.is_symlink() or not path.resolve().is_relative_to(self.directory.resolve())):
+                if source == "custom" and (path.is_symlink() or not real_path(path).is_relative_to(real_path(self.directory))):
                     continue
                 try:
                     plugin_id = validate_id(path.stem)

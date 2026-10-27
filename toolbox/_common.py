@@ -497,16 +497,6 @@ def display_namer(root: Path, project_root: Path) -> Callable[[str], str]:
     return name
 
 
-def resolve_under_root(root: Path, rel_path: str) -> Path:
-    """Resolve *rel_path* under *root*, raising if it escapes."""
-    p = (root / rel_path).resolve()
-    try:
-        p.relative_to(root)
-    except ValueError:
-        raise ValueError("path escapes workspace root")
-    return p
-
-
 def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
     """Load extra_roots from policy.yaml for defense in depth path checks."""
     data = load_policy_config(workspace_root)

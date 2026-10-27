@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_int, load_runtime_config
+from real_paths import real_path
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,7 @@ class ToolOutputStore:
 
     def session_dir(self, session_id: str) -> Path:
         directory = self.root / session_dir_name(session_id)
-        if not directory.resolve().is_relative_to(self.root.resolve()):
+        if not real_path(directory).is_relative_to(real_path(self.root)):
             raise ValueError("tool output directory escapes data/tool_outputs")
         return directory
 

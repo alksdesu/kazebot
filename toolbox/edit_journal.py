@@ -24,6 +24,7 @@ from typing import Any
 from clonoth_runtime import get_int, load_runtime_config
 from engine.tool_outputs import session_dir_name
 from file_lock import exclusive_lock
+from real_paths import real_path
 
 from . import file_state
 from .file_state import _path_key
@@ -68,7 +69,7 @@ def journal_root(workspace_root: Path | str) -> Path:
 def inside_journal(workspace_root: Path | str, path: Path | str) -> bool:
     """path 落在编辑日志目录里（软链也按指向的位置算）。"""
     try:
-        return Path(path).resolve().is_relative_to(journal_root(workspace_root).resolve())
+        return real_path(path).is_relative_to(real_path(journal_root(workspace_root)))
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -388,7 +389,7 @@ class EditJournal:
         return retention_days_of(load_runtime_config(self.workspace_root))
 
     def _inside(self, directory: Path) -> Path:
-        if not directory.resolve().is_relative_to(self.root.resolve()):
+        if not real_path(directory).is_relative_to(real_path(self.root)):
             raise ValueError("edit journal directory escapes data/edit_journal")
         return directory
 

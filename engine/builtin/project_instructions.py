@@ -18,6 +18,7 @@ import config_layout
 from clonoth_runtime import classify_path, load_policy_config, parse_bool, parse_extra_roots
 from engine.inference.loop_state import build_tool_context
 from engine.tool_step import tool_outcome
+from real_paths import real_path
 from toolbox.context import project_root_of
 
 from .result import hook_result
@@ -193,7 +194,7 @@ def touched_paths(name: str, arguments: Any, result: Any) -> list[tuple[str, boo
 
 
 def _file_key(path: Path) -> str:
-    return os.path.normcase(str(path.resolve()))
+    return os.path.normcase(str(real_path(path)))
 
 
 @dataclass(frozen=True)

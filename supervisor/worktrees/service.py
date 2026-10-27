@@ -25,6 +25,7 @@ from engine.project_root import (
     PROJECT_ROOT_KEY,
     WORKTREE_KEY,
 )
+from real_paths import real_path
 from toolbox import edit_journal, file_state
 from toolbox._common import ORIGIN_ROOT_ENV, ORIGIN_VENV_ENV
 from toolbox.text_files import replace_bytes
@@ -107,7 +108,7 @@ def _utcnow() -> datetime:
 def _resolved(path: Path | str) -> Path:
     candidate = Path(path)
     try:
-        return candidate.resolve()
+        return real_path(candidate)
     except (OSError, RuntimeError):
         return candidate.absolute()
 

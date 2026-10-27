@@ -231,6 +231,6 @@ class TestTheContract:
         ]
         assert offenders == []
 
-    def test_the_only_first_party_import_is_the_config_layout(self) -> None:
+    def test_the_only_first_party_imports_are_the_config_layout_and_real_paths(self) -> None:
         """放开仓库自己的模块之后，这条钉住实际放进来的是哪几个，别顺手再拖进半个引擎。"""
-        assert {name.split(".")[0] for _filename, name in _non_stdlib_imports()} == {"config_layout"}
+        assert {name.split(".")[0] for _filename, name in _non_stdlib_imports()} == {"config_layout", "real_paths"}

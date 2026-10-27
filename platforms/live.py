@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import config_layout
+from real_paths import real_path
 
 from .descriptor import STATE_LIVE, PlatformDescriptor
 from .registry import platform_state_path
@@ -86,7 +87,10 @@ def same_file(reported: Any, path: Path) -> bool:
     """bot 报的配置路径和这边算出来的是不是同一个文件。两边写法可能不同，按真实路径比。"""
     if not isinstance(reported, str) or not reported.strip():
         return False
-    return os.path.normcase(os.path.realpath(reported)) == os.path.normcase(os.path.realpath(path))
+    try:
+        return os.path.normcase(str(real_path(reported))) == os.path.normcase(str(real_path(path)))
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)

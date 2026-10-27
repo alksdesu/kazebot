@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import config_layout
+from real_paths import real_path
 
 
 _logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ def resolve_attachment_file(workspace_root: Path, rel_path: str) -> Path | None:
     if not is_allowed_attachment_path(rel_path):
         return None
     try:
-        resolved = (Path(workspace_root) / rel_path).resolve()
+        resolved = real_path(Path(workspace_root) / rel_path)
     except (OSError, RuntimeError):
         return None
     logical = config_layout.workspace_logical_path(workspace_root, resolved)

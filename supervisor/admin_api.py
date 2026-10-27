@@ -20,6 +20,7 @@ import config_layout
 from clonoth_runtime import check_runtime_text
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import node_file
+from real_paths import real_path
 
 from . import config_files
 from .config_store import check_models_text
@@ -202,8 +203,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         返回不解析软链的写法：共享组的 config/ 是软链，显示给人看的路径和 policy 认的名字都按工作区里的走。
         """
         name = rel_path if not suffix or rel_path.endswith(suffix) else rel_path + suffix
-        base = base_dir.resolve()
-        resolved = (base_dir / name).resolve()
+        base = real_path(base_dir)
+        resolved = real_path(base_dir / name)
         # 按字符串前缀比会放过 nodes-evil/ 这种同名开头的兄弟目录。
         if resolved == base or not resolved.is_relative_to(base):
             raise HTTPException(status_code=400, detail="Invalid path")

@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import ntpath
-import os
 import sys
 import zipfile
 from pathlib import Path
@@ -17,9 +15,12 @@ from typing import Callable
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+for _p in (str(_ROOT), str(_TESTS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+from _midway import change_midway, windows_only
 from stickers import backup as sb
 from stickers import collect as sc
 from stickers import files as sf
@@ -95,23 +96,6 @@ def test_a_shared_library_behind_a_link_still_counts_as_inside(tmp_path: Path) -
 _MIDWAY_REL = "data/stickers/pending/a.png"
 
 
-def _change_midway(monkeypatch: pytest.MonkeyPatch, watched: Path, change: Callable[[], None]) -> list[Path]:
-    """头一回向系统要 watched 的最终路径之后，像另一个进程那样动一下磁盘。返回的列表记着动过没有。"""
-    lookup = ntpath._getfinalpathname
-    fired: list[Path] = []
-
-    def hooked(path):
-        try:
-            return lookup(path)
-        finally:
-            if not fired and path == str(watched):
-                fired.append(watched)
-                change()
-
-    monkeypatch.setattr(ntpath, "_getfinalpathname", hooked)
-    return fired
-
-
 def _pending_folder_appears(root: Path) -> tuple[Path, Callable[[], None]]:
     stickers = sf.sticker_root(root)
     stickers.mkdir(parents=True)
@@ -130,13 +114,13 @@ def _image_vanishes(root: Path) -> tuple[Path, Callable[[], None]]:
     return image, image.unlink
 
 
-@pytest.mark.skipif(os.name != "nt", reason="只有 Windows 上的 resolve 会因为磁盘中途变了换一种写法")
+@windows_only
 @pytest.mark.parametrize("scene", [_pending_folder_appears, _sticker_root_appears, _image_vanishes])
 def test_a_folder_or_image_changing_midway_still_resolves_inside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scene: Callable[[Path], tuple[Path, Callable[[], None]]],
 ) -> None:
     # 几个进程头一回同时往待审目录写图、输家删掉自己那份时，磁盘就是这样在解析途中被别人动了。
-    fired = _change_midway(monkeypatch, *scene(tmp_path))
+    fired = change_midway(monkeypatch, *scene(tmp_path))
 
     found = sf.sticker_file(tmp_path, _MIDWAY_REL)
 

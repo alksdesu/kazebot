@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from real_paths import real_path
 from stickers.collect import accept_pending, drop_sticker_file
 from stickers.files import LIBRARY_DIR, PENDING_DIR, place, sticker_file, store_path, suffix_for
 from stickers.filter import read_shape
@@ -222,8 +223,8 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
         accept = bool(body.get("accept")) if isinstance(body, dict) else False
         if not raw:
             raise HTTPException(status_code=400, detail="要给一个目录")
-        source = (workspace_root / raw).resolve()
-        if workspace_root.resolve() not in source.parents or not source.is_dir():
+        source = real_path(workspace_root / raw)
+        if real_path(workspace_root) not in source.parents or not source.is_dir():
             raise HTTPException(status_code=400, detail="目录必须在工作区内")
 
         store = library_store(workspace_root)

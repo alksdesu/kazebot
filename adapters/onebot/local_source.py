@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import unquote
 
+from real_paths import real_path
+
 logger = logging.getLogger(__name__)
 
 FILE_SCHEME = "file://"
@@ -68,7 +70,7 @@ def resolve_inbound_source(source: str, *, roots: Iterable[Path | str]) -> Path:
         # 相对路径和 file://别的主机 都不是这台机器上能确认的位置；只看 root，Windows 上 /a/b 也算有根。
         if not path.root:
             raise LocalSourceError(LOCAL_DENIED)
-        resolved = path.resolve()
+        resolved = real_path(path)
         exists = resolved.is_file()
     except LocalSourceError:
         raise
@@ -78,7 +80,7 @@ def resolve_inbound_source(source: str, *, roots: Iterable[Path | str]) -> Path:
         raise LocalSourceError(LOCAL_UNAVAILABLE)
     for root in roots:
         try:
-            if resolved.is_relative_to(Path(root).resolve()):
+            if resolved.is_relative_to(real_path(root)):
                 return resolved
         except (OSError, RuntimeError, ValueError):
             continue

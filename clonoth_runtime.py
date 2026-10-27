@@ -16,6 +16,7 @@ import yaml
 from dotenv import load_dotenv
 
 import config_layout
+from real_paths import real_path
 from workspace import pin_workspace_env, resolve_workspace_root, workspace_env_root
 
 if TYPE_CHECKING:
@@ -909,8 +910,7 @@ def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
         if not isinstance(item, str) or not item.strip():
             continue
         p = Path(item)
-        p = p.resolve() if p.is_absolute() else (workspace_root / p).resolve()
-        out.append(p)
+        out.append(real_path(p if p.is_absolute() else workspace_root / p))
     return out
 
 
@@ -919,7 +919,7 @@ def _inside_root(path: Path, root: Path | None) -> Path | None:
     if root is None:
         return None
     try:
-        return path.relative_to(root.resolve())
+        return path.relative_to(real_path(root))
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -962,12 +962,12 @@ def classify_path(
     base = workspace_root if project_root is None else project_root
     try:
         raw = Path(path_str)
-        p = raw.resolve() if raw.is_absolute() else (base / path_str).resolve()
+        p = real_path(raw if raw.is_absolute() else base / path_str)
     except Exception as e:
         return None, f"invalid path: {e}", False
 
     # Ensure roots are resolved for reliable comparison
-    extras = [r.resolve() for r in extra_roots]
+    extras = [real_path(r) for r in extra_roots]
 
     # 本任务的隔离副本：按原仓库里同一位置判，策略规则照常匹配
     if project_origin is not None:

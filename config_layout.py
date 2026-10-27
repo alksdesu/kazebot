@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from file_lock import exclusive_lock
+from real_paths import real_path
 from toolbox.text_files import encode_as, newline_of
 
 _log = logging.getLogger(__name__)
@@ -206,7 +207,7 @@ def drawtools_example(name: str) -> Path:
 def _contained(path: Path, base: Path) -> bool:
     """path 顺着软链走到头还在 base 里。目录里被人放了个指向别处的软链，读出来的就是目录外的文件。"""
     try:
-        path.resolve().relative_to(base.resolve())
+        real_path(path).relative_to(real_path(base))
     except (OSError, ValueError):
         return False
     return True
@@ -340,7 +341,7 @@ def config_share_group(workspace_root: Path | str) -> str | None:
     if shared is None or not is_dir_link(link):
         return None
     try:
-        relative = link.resolve(strict=True).relative_to(shared.resolve())
+        relative = real_path(link, strict=True).relative_to(real_path(shared))
     except (OSError, RuntimeError, ValueError):
         return None
     parts = relative.parts
@@ -369,7 +370,7 @@ def workspace_logical_path(workspace_root: Path | str, resolved: Path) -> str | 
     """解析到底的 resolved 在工作区里叫什么：工作区里的写相对路径，经受信链接通到外面的按链接名写，都不是返回 None。"""
     root = Path(workspace_root)
     try:
-        return resolved.relative_to(root.resolve()).as_posix()
+        return resolved.relative_to(real_path(root)).as_posix()
     except (OSError, ValueError):
         pass
     for name, expected in trusted_links(root):
@@ -377,8 +378,8 @@ def workspace_logical_path(workspace_root: Path | str, resolved: Path) -> str | 
         if not is_dir_link(link):
             continue
         try:
-            target = link.resolve(strict=True)
-            if target != expected.resolve():
+            target = real_path(link, strict=True)
+            if target != real_path(expected):
                 continue
             relative = resolved.relative_to(target)
         except (OSError, RuntimeError, ValueError):
