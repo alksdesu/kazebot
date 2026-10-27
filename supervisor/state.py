@@ -1316,14 +1316,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         - fresh：强制创建新 child session，旧的不删除（等 TTL 过期清理）
         - fork：创建新 child session，调用方需额外做 ConversationStore.fork()
 
+        别的取值抛 ValueError。accumulate 沿用的会话此刻能不能派由调用方先用 session_reuse 判。
+
         Returns:
             (child_session_id, is_new) — is_new 表示是否新建了 session
         """
-        map_key = (parent_session_id, node_id, context_key)
-
         if context_mode == "accumulate":
-            existing_cid = self.child_session_map.get(map_key)
-            if existing_cid and not self._is_child_session_expired(existing_cid):
+            existing_cid = self._reusable_child_session_locked(parent_session_id, node_id, context_key)
+            if existing_cid:
                 # 复用现有 child session，更新 last_active_at
                 self._session_store.update_last_active(existing_cid)
                 return existing_cid, False
@@ -1338,12 +1338,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             # fork 与 fresh 类似：总是新建
             return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
-        else:
-            # 未知模式，按 accumulate 处理
-            logger.warning("unknown context_mode '%s', falling back to accumulate", context_mode)
-            return self.get_or_create_child_session(
-                parent_session_id, node_id, context_key, "accumulate",
-            )
+        # 委派路由先按 parse_context_mode 拒掉写错的；按 accumulate 兜底会把别的任务正在用的会话交出去
+        raise ValueError(f"unknown context_mode: {context_mode!r}")
+
+    def _reusable_child_session_locked(self, parent_session_id: str, node_id: str, context_key: str) -> str:
+        """accumulate 会沿用的那个子会话，只查不建；还没有或已失效给空串。"""
+        existing_cid = self.child_session_map.get((parent_session_id, node_id, context_key))
+        if existing_cid and not self._is_child_session_expired(existing_cid):
+            return existing_cid
+        return ""
 
     def _create_child_session(
         self, parent_session_id: str, node_id: str, context_key: str, context_mode: str,

@@ -1,6 +1,6 @@
 """continue_from：核对委派时带的句柄，找出能接着做的那个子 agent 会话。
 
-句柄要指向调用方会话家族里一个还留着的子会话；目标节点、同步还是异步都得和当初一致，且此刻没有任务在用它。
+句柄要指向调用方会话家族里一个还留着的子会话；目标节点、同步还是异步都得和当初一致，此刻没有任务在用它，也不是调用方上级在写的会话。
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from engine.child_session_retention import retention_hold
 from engine.dispatch_handle import DispatchHandle, parse_handle
 
-from . import child_retention
+from . import child_retention, session_reuse
 from .types import Task
 
 if TYPE_CHECKING:
@@ -30,14 +30,17 @@ _REFUSALS = {
     "handle_mismatch": "continue_from 的句柄对不上：里面的任务不是在这个子会话里跑的，要照抄委派结果里给的句柄。",
     "not_in_family": "continue_from 指向的子会话不属于当前这段对话，不能接着做。",
     "target_mismatch": "continue_from 指向的子 agent 是 {node}，要接着它做就得委派给同一个节点。",
-    "busy": "continue_from 指向的子 agent 此刻还有任务在跑，等它结束后再接着派。",
     "mode_wait_required": "这个子 agent 当初是同步委派（wait=true）的，接着做也要带 wait=true。",
     "mode_async_required": "这个子 agent 当初是异步委派的，接着做也要异步派（去掉 wait=true）。",
 }
 
 
 def refusal(reason: str, **details: Any) -> dict[str, Any]:
-    message = _REFUSALS.get(reason, _REFUSALS["not_continuable"])
+    # busy、lineage 和 accumulate 撞会话是同一件事，原因由 session_reuse 统一给
+    message = (
+        session_reuse.refusal_message(reason, continuing=True)
+        or _REFUSALS.get(reason, _REFUSALS["not_continuable"])
+    )
     if details:
         message = message.format(**details)
     return {"ok": False, "reason": reason, "message": message}
@@ -129,8 +132,9 @@ def resolve_locked(
         return refusal("mode_wait_required")
     if kind == child_retention.KIND_AGENT and wait:
         return refusal("mode_async_required")
-    if child_retention.session_busy_locked(state, session_id):
-        return refusal("busy")
+    conflict = session_reuse.conflict_locked(state, session_id, session_reuse.lineage_sessions_locked(state, caller))
+    if conflict:
+        return refusal(conflict)
 
     context_mode = str(
         (entry.get("context_mode") if kind == child_retention.KIND_CHILD else "")

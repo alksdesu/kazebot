@@ -20,7 +20,7 @@ from typing import Any
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
-from . import async_dispatches, auto_continue, child_retention, continuation
+from . import async_dispatches, auto_continue, child_retention, continuation, session_reuse
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
@@ -38,6 +38,8 @@ from engine.dispatch_batch import (
     batch_item_attachments,
     batch_item_continue_from,
     batch_item_timeout,
+    context_mode_refusal,
+    parse_context_mode,
 )
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
@@ -1444,14 +1446,11 @@ class TaskRouterMixin:
         except Exception:
             return False
 
-    def _resolve_dispatch_context_mode(self, node_id: str, raw_mode: Any) -> str:
-        """解析 dispatch 的有效 context_mode。
-
-        [AutoC 2026-07-09] 显式传参优先；未传时按 target 节点 persistent 推导默认。
-        """
-        _m = str(raw_mode or "").strip()
-        if _m:
-            return _m
+    def _resolve_dispatch_context_mode(self, node_id: str, raw_mode: Any) -> str | None:
+        """解析 dispatch 的有效 context_mode：写了的照写的，没写按 target 节点 persistent 推导；写错的给 None。"""
+        written = parse_context_mode(raw_mode)
+        if written is None or written:
+            return written
         return "accumulate" if self._node_is_persistent(node_id) else "fresh"
 
     def _dispatch_batch_refusal_locked(
@@ -1646,6 +1645,27 @@ class TaskRouterMixin:
                             )
                             created_child_ids.append(refused.task_id)
                             continue
+                    _item_refusal = ""
+                    if _continued:
+                        # 接着的是那个子会话自己的历史：模式沿用它当初的，context_key 不再参与找会话
+                        _batch_ctx_mode = str(_continued.get("context_mode") or "fresh").strip()
+                        _batch_ctx_key = None
+                    else:
+                        _batch_ctx_mode = self._resolve_dispatch_context_mode(item_target, item.get("context_mode"))
+                        _batch_ctx_key = str(item.get("context_key") or "").strip() or None
+                        if _batch_ctx_mode is None:
+                            _item_refusal = context_mode_refusal(item.get("context_mode"))
+                        elif _batch_ctx_mode == "accumulate":
+                            _item_refusal = session_reuse.child_refusal_locked(
+                                self, task, task.session_id, item_target, _batch_ctx_key or "",
+                            )
+                    if _item_refusal:
+                        refused = self._create_refused_batch_child_locked(
+                            task, item, target=item_target, batch_id=batch_id, index=idx,
+                            delivery_key=delivery_key, error=_item_refusal,
+                        )
+                        created_child_ids.append(refused.task_id)
+                        continue
                     _plan = worktrees.plan_child_locked(
                         caller=task,
                         request=item,
@@ -1658,11 +1678,6 @@ class TaskRouterMixin:
                         )
                         created_child_ids.append(refused.task_id)
                         continue
-                    _batch_ctx_mode = str(_continued.get("context_mode") or "").strip() or self._resolve_dispatch_context_mode(
-                        item_target, item.get("context_mode")
-                    )
-                    # 接着的是那个子会话自己的历史，context_key 不再参与找会话
-                    _batch_ctx_key = None if _continued else (str(item.get("context_key") or "").strip() or None)
                     _batch_input: dict[str, Any] = {
                         "instruction": str(item.get("instruction") or "").strip(),
                     }
@@ -1770,6 +1785,20 @@ class TaskRouterMixin:
             # under compact_target_session_id. Purpose: compactor bookkeeping and
             # result application stay attached to the durable parent session.
             _dispatch_session_id = compact_target_session_id or task.session_id
+            if _ctx_mode is None:
+                _single_refusal = context_mode_refusal(dispatch_input.get("context_mode"))
+            elif _ctx_mode == "accumulate":
+                _single_refusal = session_reuse.child_refusal_locked(
+                    self, task, _dispatch_session_id, target, _ctx_key or "",
+                )
+            else:
+                _single_refusal = ""
+            if _single_refusal:
+                log.warning("dispatch of task %s refused: %s", task.task_id[:12], _single_refusal)
+                # 只改判这次完成的结果，外层接着按失败路由
+                self._apply_failure_locked(task, _single_refusal)
+                self._event_task_snapshot("task_completed", task, component="supervisor")
+                return
             _child_sid, _is_new = self.get_or_create_child_session(
                 _dispatch_session_id, target, _ctx_key or "", _ctx_mode,
             )

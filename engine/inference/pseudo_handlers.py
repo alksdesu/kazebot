@@ -22,6 +22,7 @@ from ..dispatch_batch import (
     AWAIT_ALL,
     AWAIT_MODES,
     CONTINUE_FROM_KEY,
+    INBOUND_REFUSAL_STATUSES,
     ISOLATION_KEY,
     ISOLATION_WORKTREE,
     ITEM_TIMEOUT_KEY,
@@ -31,6 +32,8 @@ from ..dispatch_batch import (
     REPO_KEY,
     AwaitRequest,
     DispatchTimeouts,
+    context_mode_refusal,
+    parse_context_mode,
     parse_timeout_sec,
 )
 from ..dispatch_handle import format_handle, parse_handle
@@ -674,16 +677,9 @@ async def _resolve_dispatch_request(
     # Purpose: 让 persistent 字段真正驱动默认行为，语义与 node.persistent 一致。
     _raw_ctx_mode = args.get("context_mode")
     to_self = target == ls.node.id
-    if _raw_ctx_mode is not None and str(_raw_ctx_mode).strip():
-        ctx_mode = str(_raw_ctx_mode).strip()
-    elif to_self:
-        # 委派给自己是拆成几份各做各的，持久节点也不沿用会话
-        ctx_mode = "fresh"
-    else:
-        ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
-    context_key = str(args.get("context_key") or "").strip()
     raw_continue = str(args.get(CONTINUE_FROM_KEY) or "").strip()
-    if to_self and not raw_continue and ctx_mode not in OWN_SESSION_MODES:
+    written_mode = parse_context_mode(_raw_ctx_mode)
+    if to_self and not raw_continue and written_mode not in ("", *OWN_SESSION_MODES):
         # 子会话按（祖先会话，目标节点，context_key）找：沿用会话的话，同时派出的几份、以及它们再派出的会落进同一个会话
         return None, (
             f"没有派出：委派给自己时 context_mode 只能是 fresh 或 fork，收到的是 "
@@ -691,6 +687,17 @@ async def _resolve_dispatch_request(
             "沿用会话的话，同时派出的几份、以及它们再派出的，都会落进同一个会话。"
             "要接着之前派出的那一份，用 continue_from 带上它的句柄。"
         )
+    # 接着之前的子 agent 时模式沿用它当初的，写错了也用不上
+    if written_mode is None and not raw_continue:
+        return None, context_mode_refusal(_raw_ctx_mode)
+    if written_mode:
+        ctx_mode = written_mode
+    elif to_self:
+        # 委派给自己是拆成几份各做各的，持久节点也不沿用会话
+        ctx_mode = "fresh"
+    else:
+        ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
+    context_key = str(args.get("context_key") or "").strip()
     isolation, repo, refusal = _isolation_request(ls, target, args)
     if refusal:
         return None, refusal
@@ -831,7 +838,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         else:
             dispatch_result = {
                 "success": False,
-                "error": f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
+                "error": _inbound_refusal(_dispatch_resp)
+                or f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
             }
     except Exception as e:
         dispatch_result = {"success": False, "error": str(e)}
@@ -843,6 +851,17 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         dispatch_result["refused_attachments"] = [item.as_dict() for item in refused_attachments]
     _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(dispatch_result, ensure_ascii=False))
     return None
+
+
+def _inbound_refusal(response: Any) -> str:
+    """supervisor 拒收这次异步委派时给模型看的原因；别的失败给空串。"""
+    if getattr(response, "status_code", None) not in INBOUND_REFUSAL_STATUSES:
+        return ""
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return ""
+    return detail.strip() if isinstance(detail, str) else ""
 
 
 def _runtime_session_id(ls: _LoopState) -> str:
@@ -1008,7 +1027,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
                 )))
                 continue
             continued_sessions.add(continued)
-        # fresh / fork 每项各开一个子会话；其余模式同一目标同一 context_key 共用一个，同时跑会写乱它
+        # fresh / fork 每项各开一个子会话；accumulate 同一目标同一 context_key 共用一个，同时跑会写乱它
         elif request.context_mode not in OWN_SESSION_MODES:
             shared = (request.target, request.context_key)
             if shared in shared_contexts:

@@ -27,7 +27,7 @@ from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 from real_paths import real_path
 
-from . import async_dispatches, continuation, provisioning, share_groups
+from . import async_dispatches, continuation, provisioning, session_reuse, share_groups
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
@@ -631,21 +631,26 @@ def create_app(
         # adapter、engine、cli、tui 四个调用方本来就都带令牌。
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
-
         # [2026-05-28] 异步 dispatch 统一走 inbound：透传新增的 dispatch 字段到 payload。
         # 为什么：model_dump() 已包含这些字段，但 record_inbound_message_event 依赖
         #   payload dict 来传递给 _create_entry_task_for_inbound_locked。
         # 怎么改：无需额外处理，Pydantic model_dump 已包含新字段。
         # 目的：确保 dispatch_origin/dispatch_context_mode/dispatch_fork_from_session
         #   能通过 event payload 传递到 task 创建逻辑。
-        evt = st.eventlog.append(
-            session_id=session_id,
-            component="shell",
-            type_="inbound_message",
-            payload=msg.model_dump(),
-        )
-        created = st.record_inbound_message_event(evt)
+        payload = msg.model_dump()
+        # 判能不能收和建任务在同一把锁里：两个委派同时到，只有一个能落进同一个会话
+        with st._lock:
+            refused = session_reuse.inbound_refusal_locked(st, payload)
+            if refused is not None:
+                raise HTTPException(status_code=refused.status, detail=refused.message)
+            session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
+            evt = st.eventlog.append(
+                session_id=session_id,
+                component="shell",
+                type_="inbound_message",
+                payload=payload,
+            )
+            created = st.record_inbound_message_event(evt)
         inbound_seq = int(evt.get("seq", 0) or 0)
         return InboundMessageOut(
             session_id=session_id, inbound_seq=inbound_seq, accepted=True,

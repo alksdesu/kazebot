@@ -1,6 +1,7 @@
 """委派两端共用的约束：engine 组同步批次、等异步委派，supervisor 建子任务、挂起和恢复调用方都按这里来。"""
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -22,8 +23,13 @@ ISOLATION_KEY = "isolation"
 ISOLATION_WORKTREE = "worktree"
 # 要隔离的仓库：绝对路径，不写就是工作区所在的仓库
 REPO_KEY = "repo"
-# 每次各开一个子会话的上下文模式；其余取值（写错的也算）supervisor 都按 accumulate 沿用同一个子会话
+# 每次各开一个子会话的上下文模式；accumulate 沿用同一个子会话，那个会话在用或是发起方上级在写的就不派
 OWN_SESSION_MODES = ("fresh", "fork")
+CONTEXT_MODES = (*OWN_SESSION_MODES, "accumulate")
+# supervisor 拒收异步委派的入站：要沿用的会话不能派是 409，context_mode 写错是 422，detail 是给模型看的原因
+INBOUND_CONFLICT_STATUS = 409
+INBOUND_BAD_MODE_STATUS = 422
+INBOUND_REFUSAL_STATUSES = (INBOUND_CONFLICT_STATUS, INBOUND_BAD_MODE_STATUS)
 
 # dispatch 动作的 dispatch_input 带这个键：不派新的子任务，挂起调用方等这些异步委派
 AWAIT_KEY = "await_dispatches"
@@ -136,6 +142,29 @@ def await_request(action: Any) -> AwaitRequest | None:
         mode=mode if mode in AWAIT_MODES else AWAIT_ALL,
         timeout_sec=parse_timeout_sec(raw.get("timeout_sec")),
         call_id=str(raw.get("call_id") or "").strip(),
+    )
+
+
+def parse_context_mode(raw: Any) -> str | None:
+    """委派写的 context_mode：没写（缺省、null、空串）给空串，是 CONTEXT_MODES 之一给它本身，其余（大小写不对的也算）给 None。"""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return None
+    mode = raw.strip()
+    if not mode:
+        return ""
+    return mode if mode in CONTEXT_MODES else None
+
+
+def context_mode_refusal(raw: Any) -> str:
+    """context_mode 写错时的拒绝原因，engine 当场拒和 supervisor 复核用同一句。"""
+    quoted = json.dumps(raw, ensure_ascii=False, default=str)
+    if len(quoted) > 40:
+        quoted = quoted[:40] + "...<truncated>"
+    return (
+        f"没有派出：context_mode 只能是 {'、'.join(CONTEXT_MODES)} 之一，收到的是 {quoted}；"
+        "不填就按目标节点是否持久自动选（持久节点 accumulate，其余 fresh）。"
     )
 
 

@@ -16,6 +16,7 @@ from toolbox.tool_names import DISPATCH_TOOL_PREFIX
 from ..dispatch_batch import (
     AWAIT_ALL,
     AWAIT_ANY,
+    CONTEXT_MODES,
     ISOLATION_KEY,
     ISOLATION_WORKTREE,
     MAX_AWAIT_HANDLES,
@@ -157,7 +158,8 @@ def _dispatch_delegate_parameters(
         context_mode_description = (
             "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；"
             "fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；"
-            "accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。"
+            "accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）；"
+            "这份上下文此刻还有任务在跑、或是派你出来的上级在写的，委派会被拒。"
             "不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。"
         )
         if allow_wait:
@@ -171,7 +173,7 @@ def _dispatch_delegate_parameters(
         },
         "context_mode": {
             "type": "string",
-            "enum": list(OWN_SESSION_MODES) if to_self else [*OWN_SESSION_MODES, "accumulate"],
+            "enum": list(OWN_SESSION_MODES) if to_self else list(CONTEXT_MODES),
             "description": context_mode_description,
         },
         "context_key": {
