@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from adapters._shared.feature_failures import user_failure
 from clonoth_sdk.command_text import parse_duration_seconds
 
 COMMANDS = frozenset({"提醒", "提醒列表", "提醒完成", "提醒延后", "提醒取消"})
 CONTROL_COMMANDS = frozenset({"提醒列表", "提醒取消"})
+_SERVICE_FAILED = "提醒服务暂时出错，请稍后再试。"
 
 
 def _reply_action(text: str) -> dict | None:
@@ -62,7 +64,7 @@ async def handle(client: Any, actor: dict, text: str, reply_ref: str = "") -> di
             item = await client.request_feature("POST", "/v1/reminders/reply-actions", body={"message_id": reply_ref, **natural}, actor=actor)
             return {"text": render(item)}
         except Exception as exc:
-            return {"text": f"提醒操作未完成：{_error_detail(exc)}"}
+            return {"text": f"提醒操作未完成：{user_failure(exc, _SERVICE_FAILED)}"}
     parts = text.strip().lstrip("/").split(maxsplit=1)
     if not parts or parts[0] not in COMMANDS:
         return None
@@ -94,16 +96,4 @@ async def handle(client: Any, actor: dict, text: str, reply_ref: str = "") -> di
         item = await client.request_feature("POST", f"/v1/reminders/{reminder_id}/{action}", body=body, actor=actor)
         return {"text": render(item)}
     except Exception as exc:
-        return {"text": f"提醒操作未完成：{_error_detail(exc)}"}
-
-
-def _error_detail(error: Exception) -> str:
-    response = getattr(error, "response", None)
-    if response is not None:
-        try:
-            detail = response.json().get("detail")
-            if isinstance(detail, str):
-                return detail
-        except (ValueError, AttributeError):
-            pass
-    return str(error)
+        return {"text": f"提醒操作未完成：{user_failure(exc, _SERVICE_FAILED)}"}

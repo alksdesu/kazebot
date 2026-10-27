@@ -19,6 +19,7 @@ from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 from adapters._shared import community_commands
 from adapters._shared.burst_store import BurstStore
 from adapters._shared.conversation_coordinator import BurstItem, ConversationCoordinator
+from adapters._shared.feature_failures import user_failure
 from adapters._shared.send_guard import SendError
 from adapters._shared.trigger_policy import EXPLICIT_SIGNALS
 
@@ -401,15 +402,7 @@ class FeatureGateway:
                     resume(actor["scope"])
             return result
         except Exception as error:
-            response = getattr(error, "response", None)
-            if response is not None:
-                try:
-                    detail = response.json().get("detail")
-                    return {"text": str(detail or "操作未完成，请重试。"), "attachments": [], "control": False}
-                except Exception:
-                    pass
-            logger.warning("feature command failed", exc_info=True)
-            return {"text": "操作未完成，请检查功能服务后重试。", "attachments": []}
+            return {"text": user_failure(error, "操作未完成，请检查功能服务后重试。"), "attachments": [], "control": False}
 
     def blocked(self, metadata, *, direct=None):
         return self.coordinator.quiet_blocks(metadata.get("policy", {}), direct=metadata.get("direct", False) if direct is None else direct)

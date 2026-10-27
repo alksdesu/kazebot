@@ -6,8 +6,11 @@ import re
 from typing import Any
 from urllib.parse import quote
 
+from adapters._shared.feature_failures import user_failure
+
 COMMANDS = frozenset({"资料"})
 CONTROL_COMMANDS: frozenset[str] = frozenset()
+_SERVICE_FAILED = "资料服务暂时出错，请稍后再试。"
 
 
 async def record_message(
@@ -114,4 +117,4 @@ async def handle(client: Any, actor: dict, text: str, reply_ref: str = "") -> di
             return result(f"校对结果已保存，修订 {revised['revision']}，状态 {revised['status']}。")
         return result("命令参数不完整。发送 /资料 查看用法。")
     except Exception as exc:
-        return result(f"资料操作未完成：{str(exc)[:350]}")
+        return result(f"资料操作未完成：{user_failure(exc, _SERVICE_FAILED)}")
