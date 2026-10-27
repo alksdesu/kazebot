@@ -24,6 +24,7 @@ import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
+import { filterEntryNodes } from '../../utils/entryNodes';
 import { describeEnvRef, envRefNames } from '../../utils/envRef';
 import { literalModelsOnly, mergeModelChoices, modelsFromProviders } from '../../utils/modelChoices';
 import { connectionDotClass } from '../../utils/systemStatus';
@@ -44,12 +45,11 @@ interface SessionModelEdit {
 
 function getSwitchableNodes(allNodes: NodeDef[]): NodeDef[] {
   // [2026-06-01] Reuse the modal's root-node filtering in embedded form.
-  // Why: users should see the same practical node list as before. How: hide system
-  // and command-review nodes, then prefer nodes that are not delegated children.
+  // Why: users should see the same practical node list as before. How: hide system,
+  // template, example, internal and command-review nodes, then prefer nodes that are
+  // not delegated children.
   // Purpose: the compact picker stays useful without listing internal workers first.
-  const aiNodes = allNodes.filter(n =>
-    n.type === 'ai' && !n.id.startsWith('system.') && !n.id.startsWith('bootstrap.cmd'),
-  );
+  const aiNodes = filterEntryNodes(allNodes).filter(n => !n.id.startsWith('bootstrap.cmd'));
   const delegated = new Set<string>();
   for (const n of allNodes) {
     for (const t of (n.delegate_targets || [])) {
@@ -204,7 +204,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     if (useSettingsStore.getState().availableNodes.length === 0) {
       const request = requests.begin('nodes');
       getNodes(adminToken)
-        .then(nodes => { if (request.isCurrent()) setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))); })
+        .then(nodes => { if (request.isCurrent()) setAvailableNodes(filterEntryNodes(nodes)); })
         .catch(() => {});
     }
   }, [requests, adminToken, setAvailableNodes]);

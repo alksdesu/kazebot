@@ -278,6 +278,24 @@ tool_access:
     assert rows["read_tool_output"]["gated"] == "" and rows["read_tool_output"]["automatic"]
 
 
+@pytest.mark.parametrize("node_id", ["_w.lead.template", "w.lead.example"])
+def test_a_template_reports_the_merge_tool_a_copy_of_it_would_get(client, workspace: Path, node_id: str) -> None:
+    # 模板、示例按 id 找不到，这一页照样解析它那份文件：照着它复制出去的节点拿到的就是这里报的
+    _write_node(workspace, "w.coder", _ISOLATABLE_CODER)
+    _write_node(workspace, node_id, """
+type: ai
+delegate_targets: [w.coder]
+tool_access:
+  mode: allowlist
+  allow: [read_file]
+""")
+
+    rows = _rows(client, node_id)
+
+    assert rows["read_file"]["gated"] == ""
+    assert "w.coder" in rows["merge_worktree"]["automatic"]
+
+
 def test_the_merge_tool_does_not_follow_the_checkbox(client, workspace: Path) -> None:
     _write_node(workspace, "w.coder", _ISOLATABLE_CODER)
     _write_node(workspace, "w.wide", "id: w.wide\ntype: ai\ntool_access: all\n")

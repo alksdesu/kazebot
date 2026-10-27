@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor.admin_api as admin_api  # noqa: E402
+from engine.node import internal_node, load_node  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -120,6 +121,35 @@ def test_sample_and_template_files_are_flagged_inactive(client) -> None:
 
     assert rows["qq.orchestrator"]["active"] is True
     assert rows["qq.orchestrator.example"]["active"] is False
+
+
+def test_the_flag_follows_the_runtime_rule_in_any_case(client, workspace: Path) -> None:
+    # Windows、macOS 上改了大小写的名字照样打开示例文件，运行期一样不当节点
+    (workspace / "config" / "nodes" / "scout.EXAMPLE.yaml").write_text("type: ai\n", encoding="utf-8")
+    (workspace / "config" / "nodes" / "_draft.yaml").write_text("type: ai\n", encoding="utf-8")
+    (workspace / "config" / "nodes" / "helper_example.yaml").write_text("type: ai\n", encoding="utf-8")
+
+    rows = _nodes(client)
+
+    assert rows["scout.EXAMPLE"]["active"] is False
+    assert rows["_draft"]["active"] is False
+    assert rows["helper_example"]["active"] is True
+    for node_id, row in rows.items():
+        assert row["active"] is (load_node(workspace, node_id) is not None), node_id
+
+
+@pytest.mark.parametrize("written, internal", [
+    ("true", True), ('"yes"', True), ('"no"', False), ("false", False), (None, False),
+], ids=["true", "yes", "no", "false", "unset"])
+def test_the_list_says_which_nodes_are_internal(client, workspace: Path, written: str | None, internal: bool) -> None:
+    # 网页的入口和切换列表按它过滤，和 switch_node 枚举、终端界面是同一个判定
+    body = "type: ai\n" if written is None else f"type: ai\ninternal: {written}\n"
+    (workspace / "config" / "nodes" / "chat.intent.yaml").write_text(body, encoding="utf-8")
+
+    row = _nodes(client)["chat.intent"]
+
+    assert row["internal"] is internal
+    assert internal_node(load_node(workspace, "chat.intent")) is internal
 
 
 def test_an_id_field_that_disagrees_with_the_filename_is_reported(client) -> None:

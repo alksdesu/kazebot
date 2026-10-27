@@ -242,6 +242,16 @@ def test_disallowed_tool_and_other_owner_are_rejected(state, actor):
         state.execution.get(FeatureActor(scope=actor.scope, owner="bob", bot_scope=actor.bot_scope), plan["id"])
 
 
+def test_an_origin_node_that_cannot_load_is_named_instead_of_blamed_on_tool_access(state, actor, monkeypatch):
+    # 说成「无权使用工具」的话，人会去翻授权列表，翻不出问题
+    (state.workspace_root / "config/nodes" / "_entry.template.yaml").write_text("type: ai\ntool_access: all\n", encoding="utf-8")
+    monkeypatch.setattr(state, "_default_entry_node", lambda: "_entry.template")
+    draft = PlanDraft(goal="read", steps=[{"id": "read", "title": "读", "kind": "tool", "operation": "read_file", "arguments": {"path": "a.txt"}}])
+
+    with pytest.raises(PermissionError, match="发起节点用不了：_entry.template 是模板或示例"):
+        state.execution.create(actor, draft)
+
+
 def test_restart_recovers_completed_attempt_from_eventlog(state, actor):
     plan = state.execution.create(actor, PlanDraft(goal="summarize"))
     state.execution.confirm(actor, plan["id"], 1)

@@ -1095,6 +1095,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "session_id": route_sid,
                 "target_node_id": target or default_node,
                 "is_override": bool(target),
+                "default_node_id": default_node,
             }
 
     def get_session_provider_override(self, session_id: str) -> dict[str, Any] | None:

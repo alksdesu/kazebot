@@ -236,6 +236,8 @@ export interface AdminNode extends NodeDef {
   skills?: unknown;
   /** false = 模板或示例文件，不会被派发到。 */
   active?: boolean;
+  /** true = 回给程序看的判定值，不接用户对话；入口和切换列表不列它。旧后端没有这一项。 */
+  internal?: boolean;
   /** yaml 里写的 id，且和文件名不一致。engine 认文件名，这个字段改了不换节点。 */
   declared_id?: string;
   source?: OverlaySource;

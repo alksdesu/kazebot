@@ -19,7 +19,15 @@ from pydantic import BaseModel
 import config_layout
 from clonoth_runtime import check_runtime_text
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
-from engine.node import node_file
+from engine.node import (
+    declares_internal,
+    example_base_name,
+    example_node_name,
+    node_file,
+    template_node_name,
+    template_node_reason,
+    template_reference_warnings,
+)
 from real_paths import real_path
 
 from . import config_files
@@ -288,6 +296,14 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         """节点目录和绘图配置里混着 Markdown 片段，只有 YAML 那几份要校验。"""
         return _yaml_mapping if path.suffix in {".yaml", ".yml"} else None
 
+    def _node_yaml(content: str) -> list[str]:
+        """节点定义只认一个映射；委派清单、旧 id 里点名模板或示例的不会生效，随保存结果提醒。"""
+        return template_reference_warnings(config_files.parse_mapping(content))
+
+    def _node_file_check_for(path: Path) -> Callable[[str], list[str]] | None:
+        """节点目录里只有 .yaml 是节点定义，.yml 只查是不是映射，Markdown 片段不查。"""
+        return _node_yaml if path.suffix == ".yaml" else _yaml_check_for(path)
+
     def _mcp_check(content: str) -> list[str]:
         clients = config_files.parse_mapping(content).get("clients")
         if clients is not None and not isinstance(clients, (dict, list)):
@@ -363,7 +379,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 res.append({
                     "id": nid,
                     # 模板和示例不会被派发到，列出来只是为了能编辑，别混进要配置的节点里。
-                    "active": not (nid.startswith("_") or ".example" in nid),
+                    "active": not template_node_name(nid),
+                    # 回给程序看的判定值，网页的入口和切换列表跟 switch_node 枚举一样不列它。
+                    "internal": declares_internal(data),
                     # yaml 里写的 id。和文件名不一致时它是个摆设，改了也不会换节点。
                     "declared_id": declared if declared and declared != nid else "",
                     "name": data.get("name", ""),
@@ -409,10 +427,14 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/nodes/{node_id}/raw")
     def update_node_raw(node_id: str, payload: RawContent) -> dict[str, Any]:
         target, default = _node_targets(node_id)
-        return _write_overlay(target, default, payload.content, payload.base_hash, check=_yaml_mapping)
+        return _write_overlay(target, default, payload.content, payload.base_hash, check=_node_yaml)
 
     @router.post("/nodes")
     def create_node(payload: NodeCreate) -> dict[str, Any]:
+        # 模板和示例的名字运行期按 id 找不到，建出来的文件永远不会被加载。
+        template_reason = template_node_reason(workspace_root, payload.id)
+        if template_reason:
+            raise HTTPException(status_code=400, detail=template_reason)
         p = _safe_path(config_layout.nodes_dir(workspace_root), payload.id, ".yaml")
         if p.exists():
             raise HTTPException(status_code=409, detail="Node already exists")
@@ -423,7 +445,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 status_code=409,
                 detail=f"{payload.id} 已经指向 {_rel(taken_by)}，新建的文件不会被加载",
             )
-        return _create_text(p, payload.content, check=_yaml_mapping)
+        return _create_text(p, payload.content, check=_node_yaml)
 
     @router.delete("/nodes/{node_id}")
     def delete_node(node_id: str) -> dict[str, Any]:
@@ -472,9 +494,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         res: list[dict[str, Any]] = []
         for name in sorted({*own, *defaults}):
             f = own.get(name) or defaults[name]
-            stem = f.stem
-            is_example = ".example" in name or stem.endswith("_example")
-            base_name = name.replace(".example.yaml", ".yaml").replace(".example.yml", ".yml").replace(".example.md", ".md")
+            is_example = example_node_name(f.stem)
+            base_name = f"{example_base_name(f.stem)}{f.suffix}"
             stat = f.stat()
             overrides = name in own and name in defaults
             res.append({
@@ -499,7 +520,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/node-files/{filename}/raw")
     def update_node_file_raw(filename: str, payload: RawContent) -> dict[str, Any]:
         own, default = _node_file_targets(filename)
-        return _write_overlay(own, default, payload.content, payload.base_hash, check=_yaml_check_for(own))
+        return _write_overlay(own, default, payload.content, payload.base_hash, check=_node_file_check_for(own))
 
     @router.delete("/node-files/{filename}")
     def delete_node_file(filename: str) -> dict[str, Any]:
@@ -872,13 +893,14 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             gated = set()
 
         from engine.inference.pseudo_tools import edit_mode_satisfied, isolatable_node, plan_delegation
-        from engine.node import load_node
+        from engine.node import load_node, load_node_file
         from engine.tool_outputs import READ_TOOL_OUTPUT
         from engine.worktree_report import MERGE_TOOL
 
         def _merge_tool_offer() -> tuple[str, str]:
             """合回工具给不给，和推理循环同一个 plan_delegation 判：(给的时候的说明, 不给的理由)。"""
-            node = load_node(workspace_root, node_id)
+            # 解析上面找到的那份文件：模板和示例按 id 找不到，它们配的工具照样要报
+            node = load_node_file(workspace_root, path)
             if node is None:
                 return "", ""
             targets = [

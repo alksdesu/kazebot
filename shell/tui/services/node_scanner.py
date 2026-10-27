@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from engine.node import internal_node, load_node, node_files
+from engine.node import entry_node_problem, load_node, node_files
 
 
 @dataclass
@@ -18,15 +18,15 @@ class NodeInfo:
 
 
 def scan_nodes(workspace_root: Path) -> list[NodeInfo]:
-    """列出能派发到的节点，和 engine 加载节点同一套规则：系统节点优先，模板和示例不算，委派目标用现在的 id。"""
+    """列出能当入口的节点，和 engine 的 switch_node 枚举同一套规则：系统目录优先，模板、示例和不接对话的不算，委派目标用现在的 id。"""
     result: list[NodeInfo] = []
     seen_ids: set[str] = set()
     for path in node_files(workspace_root):
         node = load_node(workspace_root, path.stem)
         if node is None or node.id in seen_ids:
             continue
-        # internal 节点回的是给程序看的判定值，选它当入口只会收到 "no|群友之间在对话" 这种话
-        if internal_node(node):
+        # 不接对话的不列：internal 节点选它当入口只会收到 "no|群友之间在对话" 这种话，系统节点没人委派会个个算成根节点
+        if entry_node_problem(node):
             continue
         seen_ids.add(node.id)
         result.append(NodeInfo(

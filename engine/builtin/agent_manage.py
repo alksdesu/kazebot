@@ -16,7 +16,7 @@ import yaml
 import config_layout
 from clonoth_runtime import SwitchValueError, switch_arg
 from engine.memory_namespace import InvalidMemoryNamespace, memory_book_error, memory_dir
-from engine.node import node_file
+from engine.node import node_file, template_node_file, template_node_name
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
 
@@ -100,6 +100,11 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         return _err("template is required")
     if not _NODE_ID_RE.fullmatch(name):
         return _err(f"invalid node id: {name!r} — only [A-Za-z0-9][A-Za-z0-9_.\\-]{{0,63}} allowed")
+    if template_node_name(name):
+        return _err(
+            f"invalid node id: {name!r} — names starting with _ or containing .example are templates "
+            "and examples, which are never loaded as nodes"
+        )
     try:
         persistent = switch_arg(args, "persistent", True)
     except SwitchValueError as exc:
@@ -130,8 +135,9 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if taken_by is not None:
         return _err(f"node id already taken: {name} resolves to {config_layout.logical_path(workspace_root, taken_by)}")
 
-    # Step 2: 查找模板 yaml。模板名是模型给的参数，只认节点目录里能按 id 找到的文件。
-    tmpl_path = node_file(workspace_root, template)
+    # Step 2: 查找模板 yaml。模板名是模型给的参数，只认节点目录里能按 id 找到的文件；
+    # _ 开头、带 .example 的模板和示例运行期不当节点，但本来就是给这里当底稿的。
+    tmpl_path = node_file(workspace_root, template) or template_node_file(workspace_root, template)
     if tmpl_path is None:
         return _err(
             f"template not found: {template} (checked engine/system_nodes/, config/nodes/ and defaults/nodes/)"

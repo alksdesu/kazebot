@@ -42,7 +42,7 @@ from .inference.message_model import apply_reasoning_content
 from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
-from .node import Node, internal_node, load_node, node_file, node_files
+from .node import Node, entry_node_problem, load_node, missing_node_reason, node_file, node_files
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
@@ -314,11 +314,11 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
     seen_ids: set[str] = set()
     for path in node_files(workspace_root):
         n = load_node(workspace_root, path.stem)
-        if n is None or n.type != "ai" or n.id in seen_ids:
+        if n is None or n.id in seen_ids:
             continue
-        # internal 节点不进枚举：它们回的是给程序看的判定值，被 AI switch 过去
-        # 就会有人在群里收到一句 "no|群友之间在对话"。
-        if internal_node(n):
+        # 不接对话的不进枚举：internal 节点被 AI switch 过去，就会有人在群里收到一句
+        # "no|群友之间在对话"；系统节点没人委派，不挡的话个个都算根节点。
+        if entry_node_problem(n):
             continue
         seen_ids.add(n.id)
         all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
@@ -1137,7 +1137,7 @@ async def _run_node_task(
 
     node = load_node(ws_root, node_id)
     if node is None:
-        return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
+        return {"action": "fail", "node_id": node_id, "error": missing_node_reason(ws_root, node_id)}
     isolation_problem = isolation_error(input_data)
     if isolation_problem:
         logger.warning("task %s refused: %s", task_id, isolation_problem)
@@ -1550,11 +1550,12 @@ async def _run_tool_task(
     kctx._context_archive_session_id = str(input_data.get("_context_archive_session_id") or session_id)
     _origin_node = load_node(ws_root, _origin_node_id) if _origin_node_id else None
     if _origin_node is None or not tool_allowed(_origin_node, tool_name, registry.get_spec(tool_name)):
-        _why = (
-            f"发起节点 {_origin_node_id!r} 不存在或未指定"
-            if _origin_node is None
-            else f"工具 {tool_name} 不在节点 {_origin_node_id} 的授权列表内"
-        )
+        if _origin_node is not None:
+            _why = f"工具 {tool_name} 不在节点 {_origin_node_id} 的授权列表内"
+        elif _origin_node_id:
+            _why = f"发起节点用不了：{missing_node_reason(ws_root, _origin_node_id)}"
+        else:
+            _why = "没有指定发起节点"
         logger.warning("tool task refused: %s (task=%s)", _why, task_id)
         return {"action": "error", "node_id": tool_name, "summary": f"拒绝执行：{_why}"}
     # node_id 留给审批记录写工具名；search_replace、edit_mode 这些节点开关和记忆去向照发起节点算

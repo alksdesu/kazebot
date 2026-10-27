@@ -67,6 +67,18 @@ describe('remaining Settings optimizations', () => {
     expect(parseNodeList(selfDelegating).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
   });
 
+  it('leaves templates, examples and internal nodes out and ignores what a template delegates to', () => {
+    // Templates and examples are never loaded; an internal node answers the program, not the user.
+    const withTemplates: AdminNode[] = [
+      ...nodeList,
+      { id: '_persistent_agent.template', type: 'ai', name: 'Template', active: false },
+      { id: 'qq.orchestrator.example', type: 'ai', name: 'Example', active: false, delegate_targets: ['bootstrap.coder'] },
+      { id: 'chat.intent', type: 'ai', name: 'Intent', internal: true },
+    ];
+
+    expect(parseNodeList(withTemplates).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
+  });
+
   it('renders Client entry-node selection before approval rules and selects the configured node', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

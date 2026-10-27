@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -71,9 +72,13 @@ class Node:
 
 
 _NODE_SUFFIX = ".yaml"
+_NODE_TYPES = frozenset({"ai", "tool"})
+# Windows、macOS 的文件系统不分大小写，改了大小写的 id 照样打开示例文件，判定也不能分
+_EXAMPLE_MARK = re.compile(re.escape(".example"), re.IGNORECASE)
 # 按旧 id 找节点要把几个节点目录都过一遍，解析出的别名按 (文件, 修改时间) 缓存
 _ALIAS_CACHE: dict[str, tuple[tuple[int, int, int], tuple[str, ...]]] = {}
 _WARNED_ALIAS_CONFLICTS: set[tuple[str, ...]] = set()
+_WARNED_TEMPLATE_TARGETS: set[tuple[str, str]] = set()
 
 
 def _node_dirs(workspace_root: Path) -> tuple[Path, ...]:
@@ -83,6 +88,21 @@ def _node_dirs(workspace_root: Path) -> tuple[Path, ...]:
 def _is_node_name(name: str) -> bool:
     # id 直接拼成文件名：带分隔符、盘符或 .. 就能把节点目录外的 yaml 当节点加载
     return bool(name) and name not in {".", ".."} and not any(ch in name for ch in "/\\:\0")
+
+
+def example_node_name(name: str) -> bool:
+    """示例文件的名字（不带后缀）：带 .example 的是照着改的参考，运行期不当节点用。"""
+    return _EXAMPLE_MARK.search(name) is not None
+
+
+def example_base_name(name: str) -> str:
+    """示例去掉 .example 之后的名字，即照着它建正式文件该叫的名字；不是示例的原样返回。"""
+    return _EXAMPLE_MARK.sub("", name)
+
+
+def template_node_name(name: str) -> bool:
+    """模板或示例的名字（不带 .yaml）：_ 开头的是模板，带 .example 的是示例，运行期都不按 id 当节点。"""
+    return name.startswith("_") or example_node_name(name)
 
 
 def _exact_node_file(workspace_root: Path, name: str) -> Path | None:
@@ -125,7 +145,7 @@ def node_files(workspace_root: Path) -> list[Path]:
             continue
         for path in sorted(nodes_dir.glob(f"*{_NODE_SUFFIX}")):
             # 模板和示例不会被派发到；被排在前面的同名文件顶掉的那份永远加载不到
-            if path.name.startswith("_") or ".example" in path.name:
+            if template_node_name(path.stem):
                 continue
             if _exact_node_file(workspace_root, path.stem) == path:
                 files.append(path)
@@ -156,11 +176,50 @@ def _effective_aliases(workspace_root: Path, path: Path, declared: Iterable[str]
 
 
 def node_file(workspace_root: Path, node_id: str) -> Path | None:
-    """节点 id 对应的文件：先按文件名找，找不到再看哪个节点把它声明成了旧 id。"""
+    """节点 id 对应的文件：先按文件名找，找不到再看哪个节点把它声明成了旧 id。模板和示例的名字一律找不到。"""
     name = (node_id or "").strip()
-    if not _is_node_name(name):
+    if not _is_node_name(name) or template_node_name(name):
         return None
     return _exact_node_file(workspace_root, name) or _alias_owner(workspace_root, name)
+
+
+def template_node_file(workspace_root: Path, node_id: str) -> Path | None:
+    """模板或示例的文件，给拿它当底稿复制的地方用；名字不是模板或示例的返回 None，按 id 找节点用 node_file。"""
+    name = (node_id or "").strip()
+    if not _is_node_name(name) or not template_node_name(name):
+        return None
+    return _exact_node_file(workspace_root, name)
+
+
+def template_node_reason(workspace_root: Path, node_id: str) -> str:
+    """点名的是模板或示例时说清楚它不当节点用；不是的给空串。"""
+    name = (node_id or "").strip()
+    if not _is_node_name(name) or not template_node_name(name):
+        return ""
+    path = _exact_node_file(workspace_root, name)
+    if path is None:
+        return f"{name} 是模板或示例的名字，不当节点用：节点名不能以 _ 开头，也不能带 .example"
+    return (
+        f"{name} 是模板或示例（{config_layout.logical_path(workspace_root, path)}），不当节点用；"
+        f"要用就复制到 {config_layout.NODES_DIR}/ 下，换一个不以 _ 开头、不带 .example 的名字"
+    )
+
+
+def missing_node_reason(workspace_root: Path, node_id: str) -> str:
+    """load_node 拿不到节点时给人看的原因：点名的是模板或示例、文件在但不是能用的节点定义，还是根本没有这个节点。"""
+    name = (node_id or "").strip()
+    reason = template_node_reason(workspace_root, name)
+    if reason:
+        return reason
+    path = node_file(workspace_root, name)
+    if path is None:
+        return f"节点未找到：{name}"
+    where = config_layout.logical_path(workspace_root, path)
+    data = load_yaml_dict(path)
+    problem = "YAML 读不出来，或者顶层不是 key: value 的映射" if data is None else _definition_problem(data)
+    if not problem:
+        return f"节点 {name}（{where}）这次没读成，文件可能正被改写，稍后再试"
+    return f"节点 {name}（{where}）不是能用的节点定义：{problem}"
 
 
 def canonical_node_id(workspace_root: Path, node_id: str) -> str:
@@ -179,20 +238,79 @@ def known_node_ids(workspace_root: Path, node_id: str) -> tuple[str, ...]:
     return (path.stem, *_effective_aliases(workspace_root, path, _declared_aliases(path)))
 
 
+def _node_type(data: dict[str, Any]) -> str:
+    return str(data.get("type") or "ai").strip().lower()
+
+
+def _definition_problem(data: dict[str, Any]) -> str:
+    """节点定义为什么用不了，能用时给空串。kind 默认 node、type 默认 ai，都允许省略。"""
+    kind = str(data.get("kind") or "node").strip()
+    if kind != "node":
+        return f"kind 写的是 {kind}，节点只认 node"
+    node_type = _node_type(data)
+    if node_type not in _NODE_TYPES:
+        return f"type 写的是 {node_type}，只认 ai、tool"
+    return ""
+
+
+def _listed_targets(raw: Any) -> list[str]:
+    """delegate_targets 里写的名字：去掉空项和重复，顺序不变。"""
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(item.strip() for item in raw if isinstance(item, str) and item.strip()))
+
+
+def _delegate_targets(workspace_root: Path, node_path: Path, raw: Any) -> list[str]:
+    """统一换成现在的 id，派发工具名、白名单、子会话键都按它算；模板和示例剔掉，还不存在的节点照留。"""
+    targets: list[str] = []
+    for name in _listed_targets(raw):
+        if template_node_name(name):
+            _warn_template_target(node_path, name)
+        else:
+            targets.append(canonical_node_id(workspace_root, name))
+    return list(dict.fromkeys(targets))
+
+
+def _warn_template_target(node_path: Path, name: str) -> None:
+    key = (str(node_path), name)
+    if key in _WARNED_TEMPLATE_TARGETS:
+        return
+    _WARNED_TEMPLATE_TARGETS.add(key)
+    logger.warning(
+        "%s lists %s in delegate_targets; templates and examples are never dispatched to, so it is left out",
+        node_path.name, name,
+    )
+
+
+def template_reference_warnings(data: dict[str, Any]) -> list[str]:
+    """节点定义里点名模板或示例的地方，控制台保存时随结果提醒：委派清单里的会被剔掉，旧 id 不会生效。"""
+    warnings = [
+        f"delegate_targets 里的 {name} 是模板或示例，不会派发过去"
+        for name in _listed_targets(data.get("delegate_targets"))
+        if template_node_name(name)
+    ]
+    warnings.extend(
+        f"aliases 里的 {name} 是模板或示例的名字，按它找不到这个节点"
+        for name in _parse_aliases(data, stem="")
+        if template_node_name(name)
+    )
+    return warnings
+
+
 def load_node(workspace_root: Path, node_id: str) -> Node | None:
     node_path = node_file(workspace_root, node_id)
     if node_path is None:
         return None
+    return load_node_file(workspace_root, node_path)
+
+
+def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
+    """按一份节点文件解析出节点，不管它能不能按 id 找到：控制台给模板、示例报实际工具时也要解析它们。"""
     data = load_yaml_dict(node_path)
-    if not isinstance(data, dict):
+    if data is None or _definition_problem(data):
         return None
     nid = node_path.stem
-    # kind 默认 "node"，允许省略
-    if str(data.get("kind") or "node").strip() != "node":
-        return None
-    node_type = str(data.get("type") or "ai").strip().lower()
-    if node_type not in {"ai", "tool"}:
-        return None
+    node_type = _node_type(data)
 
     # prompt：字符串→字符串模式，列表→block 列表模式
     raw_prompt = data.get("prompt")
@@ -285,11 +403,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     raw_po = data.get("provider_options")
     provider_options = dict(raw_po) if isinstance(raw_po, dict) else {}
 
-    # delegate_targets：统一换成现在的 id，派发工具名、白名单、子会话键都按它算
-    dt_raw = data.get("delegate_targets")
-    delegate_targets: list[str] = list(dict.fromkeys(
-        canonical_node_id(workspace_root, x) for x in dt_raw if isinstance(x, str) and x.strip()
-    )) if isinstance(dt_raw, list) else []
+    delegate_targets = _delegate_targets(workspace_root, node_path, data.get("delegate_targets"))
 
     # 决定 dispatch 默认的 context_mode；手写成 "false"、no 的也算关，和控制台的读法一致
     persistent = bool(parse_bool(data.get("persistent"), False))
@@ -328,5 +442,21 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
 
 
 def internal_node(node: Node) -> bool:
-    """internal 节点回的是给程序看的判定值，switch_node 枚举和终端界面的入口列表都不列它；手写的 "no"、"false" 也算关。"""
-    return bool(parse_bool((node.extra or {}).get("internal"), False))
+    """internal 节点回的是给程序看的判定值，switch_node 枚举、终端界面和网页的入口列表都不列它；手写的 "no"、"false" 也算关。"""
+    return declares_internal(node.extra or {})
+
+
+def declares_internal(data: dict[str, Any]) -> bool:
+    """节点定义里 internal 开关的读法。控制台列节点时手上只有 YAML，照这一条判，和 internal_node 是同一个结论。"""
+    return bool(parse_bool(data.get("internal"), False))
+
+
+def entry_node_problem(node: Node) -> str:
+    """这个节点接不接用户对话（当会话入口、被 switch_node 切过去）：接就给空串，不接给原因。网页按同样三条筛。"""
+    if node.type != "ai":
+        return f"{node.id} 是工具节点，不接对话"
+    if node.id.startswith("system."):
+        return f"{node.id} 是系统节点，只跑引擎自己发起的后台任务，不接对话"
+    if internal_node(node):
+        return f"{node.id} 是 internal 节点，回的是给程序看的判定值，不接对话"
+    return ""

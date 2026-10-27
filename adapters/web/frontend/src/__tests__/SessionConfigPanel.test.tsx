@@ -11,7 +11,7 @@ import { useChatStore, type ConnectionStatus } from '../store/chatStore';
 import { useSettingsStore } from '../store/settingsStore';
 import type { NodeDef } from '../types';
 
-type TestNodeDef = NodeDef & { base_url?: string };
+type TestNodeDef = NodeDef & { base_url?: string; active?: boolean; internal?: boolean };
 
 const activeNode: TestNodeDef = {
   id: 'ereuna_main',
@@ -163,5 +163,26 @@ describe('SessionConfigPanel compact session UX', () => {
 
     expect(screen.getByRole('option', { name: 'Coder' })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: 'Reviewer' })).not.toBeInTheDocument();
+  });
+
+  it('never offers a template, an example or an internal node as a switch target', () => {
+    // The switch endpoint refuses templates, and an internal node answers the program, not the user.
+    seedStores(null, 'open');
+    const hidden: TestNodeDef[] = [
+      { id: '_persistent_agent.template', type: 'ai', name: 'Template', active: false },
+      { id: 'qq.orchestrator.example', type: 'ai', name: 'Example', active: false },
+      { id: 'chat.intent', type: 'ai', name: 'Intent', internal: true },
+    ];
+    useSettingsStore.setState({
+      availableNodes: [activeNode, ...hidden, { id: 'bootstrap.coder', type: 'ai', name: 'Coder' }],
+    });
+    stubSupervisorFetch({});
+
+    render(<SessionConfigPanel sessionId="session-1" />);
+
+    expect(screen.getByRole('option', { name: 'Coder' })).toBeInTheDocument();
+    for (const name of ['Template', 'Example', 'Intent']) {
+      expect(screen.queryByRole('option', { name })).not.toBeInTheDocument();
+    }
   });
 });

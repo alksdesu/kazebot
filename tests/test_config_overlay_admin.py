@@ -324,6 +324,32 @@ class TestCreateAgentNeverTouchesTheBundledDefaults:
         assert "defaults/nodes/helper.yaml" in result["error"]
 
 
+class TestCreateAgentAndTemplates:
+    def test_a_bundled_template_is_still_a_source_to_copy_from(self, ws: Path, code_root: Path) -> None:
+        # 模板运行期按 id 找不到，可它本来就是给 create_agent 当底稿的。
+        _write(
+            config_layout.default_nodes_dir() / "_persistent_agent.template.yaml",
+            yaml.safe_dump({"id": "my_persistent_agent", "type": "ai", "delegate_targets": []}),
+        )
+
+        result = asyncio.run(create_agent({"name": "helper", "template": "_persistent_agent.template"}, _Ctx(ws)))
+
+        assert result["ok"] is True, result
+        node = node_mod.load_node(ws, "helper")
+        assert node is not None and node.persistent is True
+
+    @pytest.mark.parametrize("name", ["helper.example", "helper.EXAMPLE"])
+    def test_a_new_name_shaped_like_an_example_is_refused(self, ws: Path, code_root: Path, name: str) -> None:
+        # 建出来的文件按 id 永远找不到，委派清单里加上它也会被剔掉。
+        _write(config_layout.default_nodes_dir() / "tmpl.yaml", yaml.safe_dump({"id": "tmpl", "type": "ai"}))
+
+        result = asyncio.run(create_agent({"name": name, "template": "tmpl"}, _Ctx(ws)))
+
+        assert result["ok"] is False
+        assert ".example" in result["error"]
+        assert not (config_layout.nodes_dir(ws) / f"{name}.yaml").exists()
+
+
 # ---------------------------------------------------------------------------
 #  控制台写的是哪一份
 # ---------------------------------------------------------------------------
@@ -477,6 +503,39 @@ class TestTheNodesEndpoint:
 
         assert response.status_code == 200, response.text
         assert (config_layout.nodes_dir(ws) / "scout.yaml").is_file()
+        assert "warnings" not in response.json()
+
+    @pytest.mark.parametrize("node_id", ["_draft", "scout.example", "scout.EXAMPLE"])
+    def test_creating_a_node_under_a_template_name_is_refused(
+        self, admin, ws: Path, code_root: Path, node_id: str,
+    ) -> None:
+        # 模板和示例的名字运行期按 id 找不到，建出来的文件永远不会被加载。
+        response = admin("POST", "/nodes", json={"id": node_id, "content": "type: ai\n"})
+
+        assert response.status_code == 400
+        assert f"{node_id} 是模板或示例" in response.json()["detail"]
+        assert not (config_layout.nodes_dir(ws) / f"{node_id}.yaml").exists()
+
+    def test_saving_a_node_that_names_a_template_warns(self, admin, ws: Path, code_root: Path) -> None:
+        _write(config_layout.default_nodes_dir() / "beta.yaml", "id: beta\ntype: ai\n")
+
+        response = admin("PUT", "/nodes/beta/raw", json={
+            "content": "id: beta\ntype: ai\ndelegate_targets: [alpha, beta.example]\naliases: [beta.v1, _beta]\n",
+        })
+
+        assert response.status_code == 200, response.text
+        assert response.json()["warnings"] == [
+            "delegate_targets 里的 beta.example 是模板或示例，不会派发过去",
+            "aliases 里的 _beta 是模板或示例的名字，按它找不到这个节点",
+        ]
+
+    def test_creating_a_node_that_names_a_template_warns_too(self, admin, ws: Path, code_root: Path) -> None:
+        response = admin("POST", "/nodes", json={
+            "id": "scout", "content": "type: ai\ndelegate_targets: [qq.orchestrator.example]\n",
+        })
+
+        assert response.status_code == 200, response.text
+        assert response.json()["warnings"] == ["delegate_targets 里的 qq.orchestrator.example 是模板或示例，不会派发过去"]
 
     def test_deleting_a_custom_node_removes_it_for_good(self, admin, ws: Path, code_root: Path) -> None:
         own = _write(config_layout.nodes_dir(ws) / "own.yaml", "id: own\n")
@@ -569,6 +628,41 @@ class TestTheNodeFilesEndpoint:
     def test_only_node_and_fragment_suffixes_are_editable(self, admin, ws: Path, code_root: Path, name: str) -> None:
         assert admin("GET", f"/node-files/{name}/raw").status_code == 400
         assert admin("PUT", f"/node-files/{name}/raw", json={"content": "x"}).status_code == 400
+
+    def test_the_example_label_and_base_name_follow_the_runtime_rule(self, admin, ws: Path, code_root: Path) -> None:
+        for name in ("qq.orchestrator.example.yaml", "alpha.EXAMPLE.yaml", "beta_example.yaml"):
+            _write(config_layout.default_nodes_dir() / name, "type: ai\n")
+        for name in ("_persona.example.md", "_shared.md"):
+            _write(config_layout.default_nodes_dir() / name, "text")
+
+        rows = {row["name"]: row for row in admin("GET", "/node-files").json()}
+
+        assert {name: (row["is_example"], row["base_name"]) for name, row in rows.items()} == {
+            "qq.orchestrator.example.yaml": (True, "qq.orchestrator.yaml"),
+            "alpha.EXAMPLE.yaml": (True, "alpha.yaml"),
+            "beta_example.yaml": (False, "beta_example.yaml"),
+            "_persona.example.md": (True, "_persona.md"),
+            "_shared.md": (False, "_shared.md"),
+        }
+        # 标成示例的运行期按 id 找不到，没标的照样当节点加载
+        assert node_mod.load_node(ws, "alpha.EXAMPLE") is None
+        assert node_mod.load_node(ws, "beta_example") is not None
+
+    def test_saving_a_node_file_that_names_a_template_warns(self, admin, ws: Path, code_root: Path) -> None:
+        response = admin("PUT", "/node-files/scout.yaml/raw", json={"content": "type: ai\ndelegate_targets: [_draft]\n"})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["warnings"] == ["delegate_targets 里的 _draft 是模板或示例，不会派发过去"]
+
+    @pytest.mark.parametrize("name", ["notes.yml", "_notes.md"])
+    def test_files_that_are_not_node_definitions_get_no_node_warnings(
+        self, admin, ws: Path, code_root: Path, name: str,
+    ) -> None:
+        # 节点只认 .yaml：.yml 只查是不是映射，Markdown 片段不查
+        response = admin("PUT", f"/node-files/{name}/raw", json={"content": "delegate_targets: [_draft]\n"})
+
+        assert response.status_code == 200, response.text
+        assert "warnings" not in response.json()
 
 
 class TestTheRuntimeEndpoint:

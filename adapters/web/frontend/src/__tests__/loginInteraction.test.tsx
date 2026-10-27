@@ -209,6 +209,24 @@ describe('入口节点加载归属', () => {
     expect(mocks.setEntryNodeId).toHaveBeenCalledWith('entry.node');
   });
 
+  it('模板、示例和 internal 节点不进入口列表，存着的模板入口换成第一个能用的', async () => {
+    // 新装实例的节点表里模板排在最前：不滤掉的话首次登录的入口就是它，发出的消息全会失败。
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = '_persistent_agent.template';
+    localStorage.removeItem('fixture-node');
+    const entry = { id: 'qq.orchestrator', type: 'ai', active: true, internal: false };
+    mocks.getNodes.mockResolvedValue([
+      { id: '_persistent_agent.template', type: 'ai', active: false },
+      { id: 'qq.orchestrator.example', type: 'ai', active: false },
+      { id: 'chat.intent', type: 'ai', active: true, internal: true },
+      entry,
+    ]);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setAvailableNodes).toHaveBeenCalledWith([entry]);
+    expect(mocks.setEntryNodeId).toHaveBeenCalledWith('qq.orchestrator');
+  });
+
   it('成功空列表清理旧选择，网络失败不抹掉选择', async () => {
     const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
     mocks.state.adminToken = 'fixture-token';

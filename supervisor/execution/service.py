@@ -119,7 +119,7 @@ class ExecutionService:
         }
 
     def _validate(self, actor: FeatureActor, draft: PlanDraft, node_id: str, prior_inputs: list[dict] | None = None) -> None:
-        from engine.node import load_node
+        from engine.node import load_node, missing_node_reason
         from engine.inference.pseudo_tools import tool_allowed
 
         source = self.state.tasks.get(actor.task_id) if actor.task_id else None
@@ -142,9 +142,11 @@ class ExecutionService:
         tool_steps = [step for step in draft.steps if step.kind == "tool"]
         if tool_steps:
             node = load_node(self.root, node_id)
+            if node is None:
+                raise PermissionError(f"发起节点用不了：{missing_node_reason(self.root, node_id)}")
             specs = self._available_tool_specs()
             for step in tool_steps:
-                if node is None or step.operation not in specs or not tool_allowed(node, step.operation, specs[step.operation]):
+                if step.operation not in specs or not tool_allowed(node, step.operation, specs[step.operation]):
                     raise PermissionError(f"发起节点无权使用工具：{step.operation}")
 
     def _available_tool_specs(self) -> dict[str, dict]:

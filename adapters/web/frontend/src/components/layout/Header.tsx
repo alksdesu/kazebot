@@ -4,6 +4,7 @@ import { getActiveNode, getAppConfig, getNodes, getSessionProviderOverride } fro
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
+import { filterEntryNodes } from '../../utils/entryNodes';
 import { describeEnvRef } from '../../utils/envRef';
 import { Icon, Modal } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
@@ -68,7 +69,7 @@ export const Header = ({ title, sessionId, isGenerating, isCancelling = false, o
     if (availableNodes.length > 0 || !adminToken) return;
     const request = requests.begin('nodes');
     getNodes(adminToken).then(nodes => {
-      if (request.isCurrent()) setAvailableNodes(nodes.filter(node => node.type === 'ai' && !node.id.startsWith('system.')));
+      if (request.isCurrent()) setAvailableNodes(filterEntryNodes(nodes));
     }).catch(() => {});
     return () => { requests.drop('nodes'); };
   }, [requests, adminToken, availableNodes.length, setAvailableNodes]);

@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 import config_layout
 from clonoth_runtime import load_workspace_env
 from engine.attachments import blocked_file_reject_reason
+from engine.node import entry_node_problem, load_node, missing_node_reason
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 from real_paths import real_path
@@ -1574,7 +1575,18 @@ def create_app(
         """AI 或外部调用：设置/清除 session 级入口节点覆盖。"""
         st: SupervisorState = app.state.state
         target = str(body.get("target_node_id") or "").strip()
-        return st.switch_session_node(session_id, target)
+        if target:
+            # 切过去之后这个会话的每条消息都由它接：模板、找不到的、不接对话的不当场拒，之后每条都会失败
+            node = load_node(st.workspace_root, target)
+            problem = missing_node_reason(st.workspace_root, target) if node is None else entry_node_problem(node)
+            if problem:
+                raise HTTPException(status_code=400, detail=problem)
+            target = node.id
+        result = st.switch_session_node(session_id, target)
+        if not result.get("ok"):
+            # engine 只看状态码，回 200 加 ok:false 会被当成切换成功、就此结束本轮
+            raise HTTPException(status_code=404, detail=result.get("error") or "session not found")
+        return result
 
     @app.get("/v1/sessions/{session_id}/active_node")
     async def session_active_node(session_id: str) -> dict[str, Any]:

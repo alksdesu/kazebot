@@ -1,33 +1,31 @@
 // 客户端设置：只存 localStorage 的前端偏好，不碰后端配置。
 import { useEffect, useState } from 'react';
 
-import { getConfig, getNodes } from '../../../api/supervisorClient';
+import { type AdminNode, getConfig, getNodes } from '../../../api/supervisorClient';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { type TitleGenerationMode, useClientPrefsStore } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
+import { isEntryNode } from '../../../utils/entryNodes';
 import { Block, Field, PageShell, Select } from './settingsControls';
 
-export function parseNodeList(nodes: NodeDef[]): NodeDef[] {
+export function parseNodeList(nodes: AdminNode[]): AdminNode[] {
   // [2026-06-02] Parse real Supervisor nodes into selectable entry nodes.
   // Why: the Client page must not show system nodes or delegated child workers as
   // default conversation entries. How: collect every delegate_targets reference, then
-  // keep only AI nodes whose id is not system.* and is not referenced as a delegate.
+  // keep only entry nodes (AI, not system.*, not a template, example or internal node)
+  // that are not referenced as a delegate.
   // Purpose: the first Client setting presents the actual root entry-point choices.
   const delegated = new Set<string>();
   for (const n of nodes) {
-    if (n.delegate_targets) {
-      for (const t of n.delegate_targets) {
-        // A node that delegates to itself (a coder handing parts to sub-coders) still has no upstream.
-        if (t !== n.id) delegated.add(t);
-      }
+    // Templates and examples are never loaded, so what they delegate to is not anyone's child.
+    if (n.active === false || !n.delegate_targets) continue;
+    for (const t of n.delegate_targets) {
+      // A node that delegates to itself (a coder handing parts to sub-coders) still has no upstream.
+      if (t !== n.id) delegated.add(t);
     }
   }
-  return nodes.filter(n =>
-    n.type === 'ai' &&
-    !n.id.startsWith('system.') &&
-    !delegated.has(n.id)
-  );
+  return nodes.filter(n => isEntryNode(n) && !delegated.has(n.id));
 }
 
 function configuredEntryNodeId(config: Awaited<ReturnType<typeof getConfig>> | null, storedEntryNodeId: string): string {
