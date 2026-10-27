@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import logging
 import sys
 import threading
 import time
@@ -1435,6 +1437,49 @@ def test_listing_clients_on_a_broken_file_says_why_and_shows_the_ones_in_use(ws:
     assert result["data"]["config_error"].startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
     assert result["data"]["result"].startswith(f"{config_layout.MCP_FILE} 用不了")
     assert [client["id"] for client in result["data"]["clients"]] == ["fs"]
+
+
+_BROKEN_ON_A_TOKEN = [
+    pytest.param(
+        "clients:\n  fs:\n    env:\n      API_TOKEN: sk-SECRET-mcp: x\n",
+        "YAML 解析失败：第 4 行第 31 列：mapping values are not allowed here",
+        id="broken-line",
+    ),
+    # 写错的 !!int 原来让 PyYAML 抛 ValueError，McpConfigError 接不住，读配置的地方全跟着炸。
+    pytest.param(
+        "clients:\n  fs:\n    env:\n      API_TOKEN: !!int sk-SECRET-mcp\n",
+        "YAML 解析失败：第 4 行第 18 列：值不是合法的 int",
+        id="bad-value",
+    ),
+]
+
+
+@pytest.mark.parametrize("broken,reason", _BROKEN_ON_A_TOKEN)
+def test_the_reason_handed_to_the_model_names_the_place_but_not_the_line(
+    ws: Path, caplog: pytest.LogCaptureFixture, broken: str, reason: str,
+) -> None:
+    # 客户端的 env、headers 里写着令牌；列客户端的结果和拒绝改写的原因都交给模型，也进日志。
+    mcp_runtime.list_clients(ws)
+    with caplog.at_level(logging.WARNING, logger=mcp_runtime.__name__):
+        _break_config(ws, broken)
+        listed = asyncio.run(list_mcp_clients({}, _ApprovingCtx(ws)))
+        saved = asyncio.run(create_or_update_mcp_client({**_SPEC, "id": "web"}, _RecordingCtx(ws)))
+
+    assert listed["data"]["config_error"] == f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的：{reason}"
+    assert saved["ok"] is False and reason in saved["error"]
+    for text in (json.dumps(listed, ensure_ascii=False), json.dumps(saved, ensure_ascii=False), caplog.text):
+        assert "sk-SECRET" not in text
+
+
+@pytest.mark.parametrize("broken,reason", _BROKEN_ON_A_TOKEN)
+def test_the_editor_check_leaves_no_content_on_the_exception_chain(broken: str, reason: str) -> None:
+    # 控制台原文编辑器拿它判能不能存，接口层再包一层往上抛。
+    with pytest.raises(mcp_runtime.McpConfigError) as caught:
+        mcp_runtime.check_mcp_text(broken)
+
+    assert str(caught.value) == reason
+    for link in (caught.value.__cause__, caught.value.__context__):
+        assert link is not None and "sk-SECRET" not in str(link)
 
 
 # --- share_sessions 配置 ---

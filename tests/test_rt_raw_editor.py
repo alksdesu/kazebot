@@ -120,6 +120,33 @@ class TestRefusals:
         assert response.status_code == 200, response.text
 
 
+_SECRET = "sk-SECRET-raw"
+
+# 端点、一份坏在密钥那一行的内容、拒绝原因该是什么。
+_REFUSED_WITH_A_SECRET = [
+    ("/config/raw", f"openai:\n  api_key: {_SECRET}: x\n", "YAML 解析失败：第 2 行第 25 列：mapping values are not allowed here"),
+    ("/config/raw", f"openai:\n  api_key: [{_SECRET}]\n", "字段不合法：openai.api_key：Input should be a valid string"),
+    ("/config/raw", f"openai:\n  api_key: !!int {_SECRET}\n", "YAML 解析失败：第 2 行第 12 列：值不是合法的 int"),
+    ("/policy/raw", f"read_file:\n  default: auto\n  token: {_SECRET}: x\n", "YAML 解析失败：第 3 行第 23 列：mapping values are not allowed here"),
+    ("/runtime/raw", f"engine:\n  token: {_SECRET}: x\n", "YAML 解析失败：第 2 行第 23 列：mapping values are not allowed here"),
+    ("/schedules/raw", f"schedules:\n  - id: a\n    command: run --token {_SECRET}: x\n", "YAML 解析失败：第 3 行第 39 列：mapping values are not allowed here"),
+    ("/mcp-clients/raw", f"clients:\n  fs:\n    env:\n      API_TOKEN: {_SECRET}: x\n", "YAML 解析失败：第 4 行第 31 列：mapping values are not allowed here"),
+    ("/nodes/scout/raw", f"type: ai\napi_key: {_SECRET}: x\n", "YAML 解析失败：第 2 行第 23 列：mapping values are not allowed here"),
+    ("/drawtools/settings/raw", f"api:\n  api_key: {_SECRET}: x\n", "YAML 解析失败：第 2 行第 25 列：mapping values are not allowed here"),
+]
+
+
+class TestARefusalDoesNotQuoteTheContent:
+    @pytest.mark.parametrize(("url", "content", "reason"), _REFUSED_WITH_A_SECRET)
+    def test_the_reason_names_the_place_but_not_the_line(self, admin, url: str, content: str, reason: str) -> None:
+        # 拒绝原因原样显示在控制台里，写坏的那一行多半就是密钥本身；pydantic 的原文还带着字段原值。
+        response = admin("PUT", url, json={"content": content})
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == reason
+        assert _SECRET not in response.text
+
+
 class TestReminders:
     def test_a_policy_key_nobody_reads_is_saved_with_a_reminder(self, admin, ws: Path) -> None:
         response = admin("PUT", "/policy/raw", json={"content": "version: 1\nread_flie:\n  default: auto\n"})

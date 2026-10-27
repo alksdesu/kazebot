@@ -28,12 +28,16 @@ from platforms.descriptor import PlatformDescriptor
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
-from supervisor.log_access import LogReader, redact
+from supervisor.log_access import MIN_SECRET_CHARS, SENSITIVE_KEY, LogReader, assigned_values, redact
 from supervisor.platform_api import platform_health
 from toolbox import mcp_runtime
 
 # 平台没声明自己的排查提示时用的说法。
 _CONNECTION_HINT = "检查平台账号登录和适配进程的连接配置"
+_YAML_SUFFIXES = frozenset({".yaml", ".yml"})
+# 写坏的那一行上，值前面常多出 YAML 不许打头的记号，后面常多出冒号或收尾的括号。
+_YAML_LEADING_NOISE = "*&!%@`[{|>"
+_YAML_TRAILING_NOISE = ":]}"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -70,13 +74,47 @@ class OperationsService:
         self.reports = self.root / "data" / "diagnostics"
         self._probe_lock = asyncio.Lock()
 
+    def _secret_bearing_files(self) -> list[Path]:
+        """可能写着明文密钥的 YAML：policy 当密钥文件护着的那几份，各平台的配置文件，本实例自己的节点定义（节点能单配 api_key）。
+
+        搬家后旧位置那几份还留着给退回旧版本用，里面可能是没轮换掉的旧密钥，一并抹。config/secrets.env 不在这里，下面按共享密钥收。
+        """
+        files = [
+            self.root / name for name in config_layout.secret_bearing_names()
+            if Path(name).suffix in _YAML_SUFFIXES
+        ]
+        for platform in all_platforms():
+            path = platform_config_path(platform, self.root)
+            if path is not None and path not in files:
+                files.append(path)
+        nodes = config_layout.nodes_dir(self.root)
+        if nodes.is_dir():
+            files.extend(path for path in sorted(nodes.iterdir()) if path.suffix in _YAML_SUFFIXES)
+        return files
+
+    @staticmethod
+    def _values_on_broken_lines(text: str) -> set[str]:
+        """解析不了的文件按行认「敏感键名: 值」收值。文件写坏的时候，正是密钥可能已经随报错进了日志的时候。"""
+        found: set[str] = set()
+        for value in assigned_values(text):
+            resolved = resolve_env_ref(value)
+            if resolved != value:
+                found.add(resolved)
+                continue
+            found.add(value)
+            # 写坏之前那一版多半就是剥掉这些记号剩下的那段：进程用过的、日志里留下的都是它。
+            core = value.lstrip(_YAML_LEADING_NOISE).rstrip(_YAML_TRAILING_NOISE)
+            if len(core) >= MIN_SECRET_CHARS:
+                found.add(core)
+        return found
+
     def _configured_secrets(self) -> tuple[str, ...]:
         values: set[str] = set()
 
         def collect(item: Any, sensitive: bool = False) -> None:
             if isinstance(item, dict):
                 for key, value in item.items():
-                    collect(value, sensitive or bool(re.search(r"token|secret|password|api.?key|authorization", str(key), re.I)))
+                    collect(value, sensitive or bool(SENSITIVE_KEY.search(str(key))))
             elif isinstance(item, list):
                 for value in item:
                     collect(value, sensitive)
@@ -85,24 +123,15 @@ class OperationsService:
                 if resolved:
                     values.add(resolved)
 
-        # 搬家后旧位置那几份还留着给退回旧版本用，里面可能是没轮换掉的旧密钥，一并抹。
-        config_files = [
-            config_layout.models_path(self.root),
-            config_layout.platform_secrets_path(self.root),
-            config_layout.mcp_path(self.root),
-            config_layout.drawtools_file(self.root, "settings.yaml"),
-            self.root / config_layout.LEGACY_MODELS_FILE,
-            self.root / config_layout.LEGACY_MCP_FILE,
-        ]
-        for platform in all_platforms():
-            path = platform_config_path(platform, self.root)
-            if path is not None and path not in config_files:
-                config_files.append(path)
-        for path in config_files:
+        for path in self._secret_bearing_files():
             try:
-                collect(yaml.safe_load(path.read_text(encoding="utf-8")))
-            except (OSError, yaml.YAMLError):
+                raw = path.read_bytes()
+            except OSError:
                 continue
+            try:
+                collect(config_layout.load_yaml_text(raw.decode("utf-8")))
+            except (UnicodeDecodeError, yaml.YAMLError):
+                values.update(self._values_on_broken_lines(raw.decode("utf-8", errors="replace")))
         # 平台声明的密钥不一定叫 token/secret，按声明再收一遍；被密钥文件盖住的那个 env 值也收。
         # 自动生成的密钥文件不收：代码从不打印它们，里面也可能只是模式标记，抹掉反而丢排障线索。
         platform_secrets = load_platform_secrets(self.root)
@@ -123,8 +152,7 @@ class OperationsService:
     def _clean(self, value: Any, secrets: tuple[str, ...] = ()) -> Any:
         if isinstance(value, dict):
             return {
-                self._clean(str(key), secrets): ("[已隐藏]" if re.search(r"token|secret|password|api.?key|authorization", str(key), re.I)
-                      else self._clean(item, secrets))
+                self._clean(str(key), secrets): ("[已隐藏]" if SENSITIVE_KEY.search(str(key)) else self._clean(item, secrets))
                 for key, item in value.items()
             }
         if isinstance(value, list):

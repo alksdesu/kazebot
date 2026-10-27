@@ -351,6 +351,28 @@ class TestCorruptFileNeverOpensOrClosesTheGate:
 
         assert "ParserError" in live.state_payload()["parse_error"]
 
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("napcat_token: [sk-SECRET-token\n", "ParserError: 第 2 行第 1 列："),
+            ("allowed_groups:\n  - sk-SECRET-group: x: y\n", "ScannerError: 第 2 行第 23 列：mapping values are not allowed here"),
+            ("napcat_token: !!int sk-SECRET-token\n", "ConstructorError: 第 1 行第 15 列：值不是合法的 int"),
+            ("napcat_token: *sk-SECRET-alias\n", "ComposerError: 第 1 行第 15 列：found undefined alias '***'"),
+        ],
+    )
+    def test_the_parse_error_names_the_place_but_not_the_line(
+        self, live: Any, caplog: pytest.LogCaptureFixture, text: str, expected: str,
+    ) -> None:
+        # 状态会公布到控制台，日志也会被导出去：出错那一行多半就是令牌或白名单号码
+        with caplog.at_level(logging.WARNING):
+            _write_yaml_text(live, text)
+            error = live.state_payload()["parse_error"]
+
+        assert error.startswith(expected)
+        assert "sk-SECRET" not in error
+        assert "qq.yaml is unusable" in caplog.text
+        assert "sk-SECRET" not in caplog.text
+
     def test_an_empty_file_is_a_valid_empty_document(self, live: Any) -> None:
         live.config_path().parent.mkdir(parents=True, exist_ok=True)
         live.config_path().write_text("", encoding="utf-8")

@@ -8,8 +8,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 import config_layout
 from clonoth_runtime import (
     TASK_REAP_INTERVAL_SECONDS,
@@ -858,11 +856,14 @@ class DreamHandler:
         books: list[str] = []
         for path in sorted(mem_dir.glob("*.yaml")):
             try:
-                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                data = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
                 entries = data.get("entries") if isinstance(data, dict) else None
                 count = len(entries) if isinstance(entries, list) else 0
             except Exception as exc:
-                log.warning("[scheduler] dream book list skipped %s: %s", path.name, exc)
+                # 只报位置和问题：出错那一行是用户的原话。
+                log.warning(
+                    "[scheduler] dream book list skipped %s: %s", path.name, config_layout.config_error_text(exc),
+                )
                 continue
             books.append(f"{path.stem}({count})")
         return ", ".join(books) if books else "(no books found)"
@@ -961,9 +962,11 @@ class DreamHandler:
         result: list[dict[str, Any]] = []
         for yaml_path in sorted(mem_dir.glob("*.yaml")):
             try:
-                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                data = config_layout.load_yaml_text(yaml_path.read_text(encoding="utf-8"))
             except Exception as exc:
-                log.warning("[scheduler] dream topology skipped %s: %s", yaml_path.name, exc)
+                log.warning(
+                    "[scheduler] dream topology skipped %s: %s", yaml_path.name, config_layout.config_error_text(exc),
+                )
                 continue
             if not isinstance(data, dict):
                 continue

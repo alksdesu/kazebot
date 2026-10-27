@@ -579,7 +579,7 @@ def load_memory_catalog(
     for yaml_path in sorted(mem_dir.glob("*.yaml")):
         try:
             text = yaml_path.read_text(encoding="utf-8")
-            data = yaml.safe_load(text)
+            data = config_layout.load_yaml_text(text)
             if not isinstance(data, dict):
                 continue
             book = str(data.get("book") or yaml_path.stem).strip()
@@ -646,10 +646,16 @@ def load_memory_catalog(
                     "created_at": created_at,
                     "last_hit_at": last_hit_at,
                 })
-        except Exception as load_error:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as load_error:
             # 一个 YAML 语法错误原来会让整本记忆凭空消失，零日志零告警 —— 手工编辑
             # 记忆本时打错一个冒号，那一整本就此不再被注入，而且无从察觉。
             # 用 warning 而非 error：编辑期间每轮 prompt build 都会经过这里。
+            # 只报位置和问题：出错那一行是用户的原话。
+            logger.warning(
+                "memory book %s skipped, unreadable: %s", yaml_path.name, config_layout.config_error_text(load_error),
+            )
+            continue
+        except Exception as load_error:
             logger.warning("memory book %s skipped, unreadable: %s", yaml_path.name, load_error)
             continue
 
@@ -1670,9 +1676,9 @@ _BOOK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
 
 
 class MemoryBookUnreadable(ValueError):
-    """记忆本在盘上，却读不出一份 {book, entries}。"""
+    """记忆本在盘上，却读不出一份 {book, entries}。reason 只有位置和问题，不带文件内容。"""
 
-    def __init__(self, path: Path, reason: Any) -> None:
+    def __init__(self, path: Path, reason: str) -> None:
         super().__init__(f"memory book {path.parent.name}/{path.name} is unreadable: {reason}")
         self.path = path
         self.reason = reason
@@ -1688,11 +1694,12 @@ def _load_book(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {"book": path.stem, "entries": []}
     except (OSError, UnicodeDecodeError) as exc:
-        raise MemoryBookUnreadable(path, exc) from exc
+        raise MemoryBookUnreadable(path, config_layout.config_error_text(exc)) from exc
     try:
-        data = yaml.safe_load(text)
-    except Exception as exc:
-        raise MemoryBookUnreadable(path, exc) from exc
+        data = config_layout.load_yaml_text(text)
+    except yaml.YAMLError as exc:
+        # 原因会交给模型、写进日志和控制台：只给位置和问题，出错那一行是用户的原话。
+        raise MemoryBookUnreadable(path, config_layout.yaml_error_text(exc)) from exc
     if data is None:
         return {"book": path.stem, "entries": []}
     if not isinstance(data, dict):

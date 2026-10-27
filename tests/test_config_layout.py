@@ -452,6 +452,12 @@ class TestSplittingOutPlatformSecrets:
 
         assert config_layout.split_platform_secrets(text) == (text, None)
 
+    def test_a_value_that_cannot_be_constructed_is_handed_back_as_is(self) -> None:
+        # 写错的日期以前漏出 ValueError，旧布局的工作区启动时整个搬家就崩了。
+        text = "platforms:\n  qq:\n    access_token: t\nnote: 2026-02-30\n"
+
+        assert config_layout.split_platform_secrets(text) == (text, None)
+
     def test_a_document_that_no_longer_reparses_falls_back_to_re_serializing(self) -> None:
         # 同一个顶层键写了两遍：按行摘掉第一段之后，剩下的原文和摘之前少一段对不上。
         text = (
@@ -465,6 +471,184 @@ class TestSplittingOutPlatformSecrets:
         assert section == {"qq": {"access_token": "second"}}
         assert yaml.safe_load(remaining) == {"other": 1}
         assert "platforms" not in remaining
+
+
+# 读坏的那一行多半就是密钥本身：报错只给位置和问题，原文、原值、抄自文件的别名和 tag 一概不带。
+_SECRET = "sk-SECRET123"
+
+_BROKEN_YAML = [
+    pytest.param(f"version: 1\napi_key: {_SECRET}: x\n", 2, "mapping values are not allowed here", id="colon-in-value"),
+    pytest.param(f"version: 1\nopenai:\n\tapi_key: {_SECRET}\n", 3, "cannot start any token", id="tab-indent"),
+    pytest.param(f'version: 1\napi_key: "{_SECRET}\n', 3, "found unexpected end of stream", id="unclosed-quote"),
+    pytest.param(f"api_key: *{_SECRET}\n", 1, "found undefined alias '***'", id="undefined-alias"),
+    pytest.param(f"api_key: !{_SECRET} x\n", 1, "could not determine a constructor for the tag '***'", id="unknown-tag"),
+    pytest.param(f"api_key: !<{_SECRET}> x\n", 1, "could not determine a constructor for the tag '***'", id="verbatim-tag"),
+    pytest.param(f"a: &{_SECRET} 1\nb: &{_SECRET} 2\n", 2, "found duplicate anchor '***'", id="duplicate-anchor"),
+    pytest.param(f"api_key: !{_SECRET}!x y\n", 1, "found undefined tag handle '***'", id="undefined-tag-handle"),
+    pytest.param(f"api_key: !!int {_SECRET}\n", 1, "值不是合法的 int", id="explicit-int"),
+    pytest.param(f"api_key: !!float {_SECRET}\n", 1, "值不是合法的 float", id="explicit-float"),
+    pytest.param(f"api_key: !!bool {_SECRET}\n", 1, "值不是合法的 bool", id="explicit-bool"),
+    pytest.param(f"api_key: !!timestamp {_SECRET}\n", 1, "值不是合法的 timestamp", id="explicit-timestamp"),
+]
+
+
+class TestParsingAConfigWithoutItsContent:
+    @pytest.mark.parametrize("text, line, problem", _BROKEN_YAML)
+    def test_the_reason_names_the_place_and_the_problem_only(self, text: str, line: int, problem: str) -> None:
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text(text)
+
+        reason = config_layout.yaml_error_text(caught.value)
+        assert reason.startswith(f"第 {line} 行第 ")
+        assert problem in reason
+        assert _SECRET not in reason
+
+    @pytest.mark.parametrize("text, line, problem", _BROKEN_YAML)
+    def test_nothing_raised_carries_the_content(self, text: str, line: int, problem: str) -> None:
+        # str() 进日志，异常链进 traceback：哪一处带着原文都会被打出来。
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text(text)
+
+        exc = caught.value
+        assert _SECRET not in str(exc)
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        for mark in (getattr(exc, "problem_mark", None), getattr(exc, "context_mark", None)):
+            assert mark is None or mark.buffer is None
+
+    def test_the_class_stays_the_one_pyyaml_raised(self) -> None:
+        # 平台文件的 parse_error 照旧带类名，读的人靠它分辨是哪一步出的错。
+        with pytest.raises(yaml.parser.ParserError):
+            config_layout.load_yaml_text("a: 1\nb: [1, 2\nc: 3\n")
+        with pytest.raises(yaml.scanner.ScannerError):
+            config_layout.load_yaml_text("a: 'open\n")
+
+    def test_the_context_keeps_its_own_position_when_it_is_elsewhere(self) -> None:
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text('version: 1\napi_key: "never closed\n')
+
+        assert config_layout.yaml_error_text(caught.value) == (
+            "第 3 行第 1 列：found unexpected end of stream（while scanning a quoted scalar，第 2 行第 10 列）"
+        )
+
+    def test_single_characters_and_token_names_stay_readable(self) -> None:
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text("a: 1\nb: [1, 2\nc: 3\n")
+
+        reason = config_layout.yaml_error_text(caught.value)
+        assert "expected ',' or ']', but got ':'" in reason
+        assert "'***'" not in reason
+
+    @pytest.mark.parametrize("text", [
+        "note: 2026-02-30\n",
+        "when: 2026-13-45\n",
+        "count: 0x_\n",
+    ], ids=["day-out-of-range", "month-out-of-range", "bad-hex"])
+    def test_an_implicit_value_that_cannot_be_built_is_a_yaml_error_with_its_place(self, text: str) -> None:
+        # PyYAML 自己抛的是 ValueError：只接 YAMLError 的读法会直接崩。
+        with pytest.raises(yaml.constructor.ConstructorError) as caught:
+            config_layout.load_yaml_text(text)
+
+        reason = config_layout.yaml_error_text(caught.value)
+        assert reason.startswith("第 1 行第 ")
+        assert text.split(": ", 1)[1].strip() not in reason
+
+    def test_an_illegal_character_reports_where_it_sits(self) -> None:
+        with pytest.raises(yaml.reader.ReaderError) as caught:
+            config_layout.load_yaml_text(f"api_key: sk\x07{_SECRET}\n")
+
+        reason = config_layout.yaml_error_text(caught.value)
+        assert reason == "第 12 个字符：unacceptable character #x0007: special characters are not allowed"
+
+    def test_nesting_past_the_recursion_limit_is_a_yaml_error(self) -> None:
+        with pytest.raises(config_layout.YamlNestingTooDeep) as caught:
+            config_layout.load_yaml_text("[" * 5000 + "]" * 5000)
+
+        assert isinstance(caught.value, yaml.YAMLError)
+        assert config_layout.yaml_error_text(caught.value) == "嵌套太深"
+
+    def test_good_text_parses_as_safe_load_would(self) -> None:
+        text = "version: 1\nlist: [a, b]\nwhen: 2026-02-28\nflag: true\n"
+
+        assert config_layout.load_yaml_text(text) == yaml.safe_load(text)
+
+    def test_several_documents_parse_one_by_one(self) -> None:
+        assert config_layout.load_yaml_documents("a: 1\n---\nb: 2\n") == [{"a": 1}, {"b": 2}]
+
+    def test_a_broken_later_document_reports_its_own_line(self) -> None:
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_documents(f"a: 1\n---\nb: 2\napi_key: {_SECRET}: x\n")
+
+        reason = config_layout.yaml_error_text(caught.value)
+        assert reason.startswith("第 4 行第 ")
+        assert _SECRET not in reason
+        assert caught.value.__context__ is None
+
+    def test_a_loader_subclass_keeps_the_same_guarantees(self) -> None:
+        class _Strict(config_layout.ConfigLoader):
+            pass
+
+        with pytest.raises(yaml.constructor.ConstructorError) as caught:
+            config_layout.load_yaml_text(f"api_key: !!int {_SECRET}\n", loader=_Strict)
+
+        assert _SECRET not in str(caught.value)
+
+    def test_position_text_drops_the_column_when_there_is_none(self) -> None:
+        assert config_layout.position_text(3, 5) == "第 3 行第 5 列"
+        assert config_layout.position_text(3) == "第 3 行"
+
+
+class TestConfigErrorText:
+    def test_a_yaml_error_reads_as_its_place_and_problem(self) -> None:
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text(f"api_key: {_SECRET}: x\n")
+
+        assert config_layout.config_error_text(caught.value) == config_layout.yaml_error_text(caught.value)
+
+    def test_undecodable_bytes_name_the_byte_position(self) -> None:
+        with pytest.raises(UnicodeDecodeError) as caught:
+            b"api_key: \xff\xfe".decode("utf-8")
+
+        assert config_layout.config_error_text(caught.value) == "不是 UTF-8 编码（第 10 个字节）"
+
+    def test_an_os_error_reads_as_its_description(self) -> None:
+        assert config_layout.config_error_text(PermissionError(13, "Permission denied", "x.yaml")) == "Permission denied"
+
+    def test_anything_else_is_named_by_its_class_only(self) -> None:
+        # 别的异常说不准消息里有没有值，只报类名。
+        assert config_layout.config_error_text(ValueError(f"invalid literal: {_SECRET}")) == "ValueError"
+
+    def test_a_too_deep_document_reads_the_same_as_the_yaml_error(self) -> None:
+        assert config_layout.config_error_text(RecursionError()) == "嵌套太深"
+
+
+class TestValidationErrorText:
+    def test_each_error_names_its_field_and_never_the_value(self) -> None:
+        from pydantic import BaseModel, ValidationError
+
+        class _Channel(BaseModel):
+            api_key: str
+            port: int
+
+        class _Config(BaseModel):
+            openai: _Channel
+            fallbacks: list[_Channel] = []
+
+        with pytest.raises(ValidationError) as caught:
+            _Config.model_validate({
+                "openai": {"api_key": [_SECRET], "port": 1},
+                "fallbacks": [{"api_key": "k", "port": f"{_SECRET}-port"}],
+            })
+
+        assert _SECRET in str(caught.value)
+        text = config_layout.validation_error_text(caught.value)
+        assert "openai.api_key：" in text
+        assert "fallbacks[0].port：" in text
+        assert "；" in text
+        assert _SECRET not in text
+
+    def test_something_without_errors_is_named_by_its_class(self) -> None:
+        assert config_layout.validation_error_text(ValueError(_SECRET)) == "ValueError"
 
 
 @pytest.mark.usefixtures("no_legacy_tools")
@@ -545,6 +729,15 @@ class TestTheOneTimeMigration:
         assert yaml.safe_load(config_layout.models_path(ws).read_text(encoding="utf-8")) == {"version": 1}
         secrets = yaml.safe_load(config_layout.platform_secrets_path(ws).read_text(encoding="utf-8"))
         assert secrets == {"qq": {"access_token": "t"}}
+
+    def test_a_legacy_file_with_a_value_that_cannot_be_built_still_moves(self, ws: Path, code_root: Path) -> None:
+        # 摘 platforms 段要先解析一遍：写错的日期以前从这里漏出 ValueError，旧布局的工作区直接起不来。
+        text = "version: 1\nnote: 2026-02-30\nplatforms:\n  qq:\n    access_token: t\n"
+        self._legacy(ws, models=text)
+
+        config_layout.ensure_layout(ws)
+
+        assert config_layout.models_path(ws).read_text(encoding="utf-8") == text
 
     @_POSIX_ONLY
     def test_both_moved_secret_files_are_owner_only(self, ws: Path, code_root: Path) -> None:

@@ -416,6 +416,20 @@ class TestWriteFile:
         assert result["data"]["syntaxCheck"]["ok"] is False
         assert (tmp_path / name).read_bytes() == content.encode("utf-8")
 
+    def test_a_yaml_value_that_cannot_be_built_is_reported_not_raised(self, ctx: _Ctx, tmp_path: Path) -> None:
+        # 检查在写盘之后跑：值构造失败要报成未通过，抛出去的话工具报错，人会以为这次没写上
+        content = "port: !!int sk-SECRET-port\nwhen: 2024-13-45\n"
+
+        result = write(ctx, "bad.yaml", content)
+
+        assert result["ok"] is True
+        assert "语法检查未通过（YAML）：第 1 行第 7 列：值不是合法的 int" in result["data"]["result"]
+        assert result["data"]["syntaxCheck"] == {
+            "language": "yaml", "ok": False, "line": 1, "column": 7, "message": "值不是合法的 int",
+        }
+        assert "sk-SECRET" not in json.dumps(result, ensure_ascii=False)
+        assert (tmp_path / "bad.yaml").read_bytes() == content.encode("utf-8")
+
     def test_a_valid_python_file_passes_the_check(self, ctx: _Ctx, tmp_path: Path) -> None:
         result = write(ctx, "ok.py", "x = 1\n")
 

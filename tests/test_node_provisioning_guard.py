@@ -193,6 +193,24 @@ async def test_a_template_outside_the_node_folders_is_never_read(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_a_broken_template_is_reported_by_place_not_by_its_line(tmp_path: Path) -> None:
+    # 节点能单配 api_key，模板坏的那一行可能就是它；原因原样交给模型。
+    _seed(tmp_path)
+    (tmp_path / "config" / "nodes" / "tmpl.yaml").write_text(
+        "id: tmpl\ntype: ai\napi_key: sk-SECRET-template: x\n", encoding="utf-8",
+    )
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl"}, ctx)
+
+    assert result["ok"] is False
+    assert result["error"] == "failed to parse template: 第 3 行第 28 列：mapping values are not allowed here"
+    assert "sk-SECRET" not in result["data"]["result"]
+    assert ctx.requested == []
+    assert not (tmp_path / "config" / "nodes" / "helper.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_the_caller_named_by_its_old_id_is_updated_in_the_file_that_defines_it(tmp_path: Path) -> None:
     _seed(tmp_path)
     boss = _write(tmp_path, "config/nodes", "boss.v2", {"id": "boss.v2", "type": "ai", "aliases": ["boss"]})

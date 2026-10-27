@@ -24,16 +24,22 @@ _TOKEN_PATTERNS = (
     re.compile(r"\b(xox[baprs]-[A-Za-z0-9\-]{10,})"),
 )
 
+# 认得出是密钥的键名。日志按「键名=值」打码，诊断导出按配置里的键名收值、藏字段，用的是这同一张表。
+SENSITIVE_KEY_NAMES = r"api.?key|token|secret|password|passwd|authorization|bearer"
+SENSITIVE_KEY = re.compile(SENSITIVE_KEY_NAMES, re.IGNORECASE)
+
+# 短于这个长度的值不当密钥：诊断导出拿收到的值按子串替换，太短的会把不相干的字也抹掉。
+MIN_SECRET_CHARS = 6
+
 # 键值对写法。键名认得出就不管值长什么样 —— 中转站的 key 可以是任意串。
 _ASSIGN_PATTERN = re.compile(
-    r"((?:api[_-]?key|apikey|token|secret|password|passwd|authorization|bearer)"
-    r"\s*[=:]\s*)(['\"]?)([^\s'\",;)]{6,})",
+    rf"((?:{SENSITIVE_KEY_NAMES})\s*[=:]\s*)(['\"]?)([^\s'\",;)]{{{MIN_SECRET_CHARS},}})",
     re.IGNORECASE,
 )
 
 # URL 里带的密钥，Gemini 那套 ?key= 就是这么传的。
 _QUERY_PATTERN = re.compile(
-    r"([?&](?:key|api[_-]?key|access[_-]?token)=)([^\s&'\"]{6,})",
+    rf"([?&](?:key|api[_-]?key|access[_-]?token)=)([^\s&'\"]{{{MIN_SECRET_CHARS},}})",
     re.IGNORECASE,
 )
 
@@ -54,6 +60,11 @@ def redact(text: str) -> str:
     text = _ASSIGN_PATTERN.sub(lambda m: m.group(1) + m.group(2) + _mask(m.group(3)), text)
     text = _QUERY_PATTERN.sub(lambda m: m.group(1) + _mask(m.group(2)), text)
     return text
+
+
+def assigned_values(text: str) -> list[str]:
+    """按「敏感键名=值」认出来的值，按出现顺序。redact 按键名打码的就是这些。"""
+    return [match.group(3) for match in _ASSIGN_PATTERN.finditer(text)]
 
 
 @dataclass(frozen=True)

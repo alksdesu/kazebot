@@ -8,17 +8,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import yaml
+import config_layout
 
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 
 
-class _Loader(yaml.SafeLoader):
+class _Loader(config_layout.ConfigLoader):
     # 表必须先于 add_implicit_resolver 建好：它发现子类自己没有这张表，会从父类整份
     # 复制一份带 on/off 的，把这里摘掉的布尔别名又带回来。
     yaml_implicit_resolvers = {
         ch: [(tag, pattern) for tag, pattern in pairs if tag != _BOOL_TAG]
-        for ch, pairs in yaml.SafeLoader.yaml_implicit_resolvers.items()
+        for ch, pairs in config_layout.ConfigLoader.yaml_implicit_resolvers.items()
     }
 
 
@@ -30,5 +30,5 @@ _Loader.add_implicit_resolver(
 
 
 def load_yaml(text: str) -> Any:
-    """解析一份手写 yaml。语法错误照常抛 yaml.YAMLError，由调用方决定怎么兜。"""
-    return yaml.load(text, Loader=_Loader)
+    """解析一份手写 yaml。解析不了抛 yaml.YAMLError，消息里只有位置和问题，由调用方决定怎么兜。"""
+    return config_layout.load_yaml_text(text, loader=_Loader)

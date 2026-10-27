@@ -1,6 +1,6 @@
 """工具子进程那侧的共享密钥。
 
-工具只吃标准库、导不了 config_layout，tools/_channel.py 是那边唯一的一份 dotenv 解析：
+工具子进程读 dotenv 不经 config_layout，tools/_channel.py 是那边唯一的一份 dotenv 解析：
 config/secrets.env 垫底，本实例 .env 盖在上面。搜索工具和绘图工具都从这两层取密钥。
 """
 from __future__ import annotations

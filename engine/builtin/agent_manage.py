@@ -146,9 +146,10 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # Step 3: 解析模板 yaml
     try:
         tmpl_text = tmpl_path.read_text(encoding="utf-8")
-        tmpl_data = yaml.safe_load(tmpl_text)
+        tmpl_data = config_layout.load_yaml_text(tmpl_text)
     except Exception as e:
-        return _err(f"failed to parse template: {e}")
+        # 节点文件里可能写着 api_key：交给模型的原因只带位置和问题。
+        return _err(f"failed to parse template: {config_layout.config_error_text(e)}")
     if not isinstance(tmpl_data, dict):
         return _err("template is not a valid YAML dict")
 

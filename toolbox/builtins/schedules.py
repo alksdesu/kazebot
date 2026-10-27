@@ -130,7 +130,7 @@ def _resolve_schedule_conversation_key(args: dict[str, Any], ctx: ToolContext, s
 
 async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a scheduled task."""
-    from supervisor.scheduler import load_schedules, update_schedules
+    from supervisor.scheduler import ScheduleFileUnreadable, read_schedules, update_schedules
 
     sid = str(args.get("id") or "").strip()
     if not sid:
@@ -174,7 +174,11 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     is_admin = _platform_admin_can_manage_schedules(ctx)
     origin = _originating_conversation_key(ctx)
     creator = _creator_id(ctx)
-    existing = {str(s.get("id") or "").strip(): s for s in load_schedules(ctx.workspace_root)}
+    # 读不懂就停：当成没有定时任务的话，归属和额度都按空表判，写的时候照样被拒。
+    try:
+        existing = {str(s.get("id") or "").strip(): s for s in read_schedules(ctx.workspace_root)}
+    except ScheduleFileUnreadable as exc:
+        return _err(exc)
     if not is_admin and origin:
         if not creator:
             return _err(_UNVERIFIED_SENDER)
@@ -257,12 +261,14 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         update_schedules(ctx.workspace_root, upsert)
     except _ScheduleOwnedByOther:
         return _err(f"schedule {sid} belongs to someone else")
+    except ScheduleFileUnreadable as exc:
+        return _err(exc)
     return _ok(f"Schedule {'updated' if replaced else 'created'}: {sid}", schedule=entry, replaced=replaced)
 
 
 async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List all scheduled tasks."""
-    from supervisor.scheduler import load_schedules
+    from supervisor.scheduler import ScheduleFileUnreadable, read_schedules
 
     # 条目含 type:script 的 command 与全部会话的 conversation_key，是读 data/schedules.yaml
     # 的等价物；与 create/delete 走同一鉴权，避免三个函数策略不一致。
@@ -271,13 +277,17 @@ async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
-    schedules = load_schedules(ctx.workspace_root)
+    # 读不懂就照实说：当成没有定时任务的话，模型会告诉人一条都没有
+    try:
+        schedules = read_schedules(ctx.workspace_root)
+    except ScheduleFileUnreadable as exc:
+        return _err(exc)
     return _ok(f"{len(schedules)} schedules", schedules=schedules)
 
 
 async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Delete a scheduled task."""
-    from supervisor.scheduler import load_schedules, update_schedules
+    from supervisor.scheduler import ScheduleFileUnreadable, read_schedules, update_schedules
 
     sid = str(args.get("id") or "").strip()
     if not sid:
@@ -292,7 +302,11 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
-    schedules = load_schedules(ctx.workspace_root)
+    # 读不懂就停：当成没有定时任务的话，报出来的是「找不到」，人会以为它已经被删了。
+    try:
+        schedules = read_schedules(ctx.workspace_root)
+    except ScheduleFileUnreadable as exc:
+        return _err(exc)
     target = next((s for s in schedules if str(s.get("id") or "").strip() == sid), None)
     if target is None:
         return _err(f"schedule not found: {sid}")
@@ -314,4 +328,6 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         update_schedules(ctx.workspace_root, remove)
     except _ScheduleOwnedByOther:
         return _err(f"schedule {sid} belongs to someone else")
+    except ScheduleFileUnreadable as exc:
+        return _err(exc)
     return _ok(f"Schedule deleted: {sid}", deleted=True, id=sid)

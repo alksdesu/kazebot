@@ -181,13 +181,13 @@ _unreadable_stamps: dict[Path, tuple[int, int, int] | None] = {}
 _unreadable_lock = threading.Lock()
 
 
-def _report_unreadable(path: Path, error: Exception) -> None:
+def _report_unreadable(path: Path, reason: str) -> None:
     stamp = config_layout.file_stamp(path)
     with _unreadable_lock:
         if path in _unreadable_stamps and _unreadable_stamps[path] == stamp:
             return
         _unreadable_stamps[path] = stamp
-    _log.warning("实例清单 %s 读不懂，按没有别的实例算，修好之前拦不住双登：%s", path, error)
+    _log.warning("实例清单 %s 读不懂，按没有别的实例算，修好之前拦不住双登：%s", path, reason)
 
 
 def _read(path: Path, *, mode: _ReadMode = "tolerant") -> list[dict[str, Any]]:
@@ -197,12 +197,12 @@ def _read(path: Path, *, mode: _ReadMode = "tolerant") -> list[dict[str, Any]]:
     拿空表写回去，别的实例就全从清单里消失了。strict 连单条写坏了也抛，给逐条信任清单的导航接口用。
     """
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except (OSError, UnicodeError, yaml.YAMLError) as error:
         if mode == "tolerant":
-            _report_unreadable(path, error)
+            _report_unreadable(path, config_layout.config_error_text(error))
             return []
         raise InstanceDirectoryError("实例目录暂时不可用") from error
     rows = raw.get("instances") if isinstance(raw, dict) else raw
@@ -210,7 +210,7 @@ def _read(path: Path, *, mode: _ReadMode = "tolerant") -> list[dict[str, Any]]:
         rows = []
     if not isinstance(rows, list):
         if mode == "tolerant":
-            _report_unreadable(path, InstanceDirectoryError("实例目录格式无效"))
+            _report_unreadable(path, "实例目录格式无效")
             return []
         raise InstanceDirectoryError("实例目录格式无效")
     strict = mode == "strict"
@@ -253,11 +253,11 @@ def _account_report(workspace: Path) -> dict[str, str] | None:
     """实例自己上报的平台和账号。没有、读不懂、缺字段都是 None，回去用清单里记的。"""
     path = config_layout.instance_account_path(workspace)
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError, yaml.YAMLError) as error:
-        _log.debug("跳过读不懂的账号上报 %s：%s", path, error)
+        _log.debug("跳过读不懂的账号上报 %s：%s", path, config_layout.config_error_text(error))
         return None
     if not isinstance(raw, dict):
         return None

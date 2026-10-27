@@ -227,6 +227,24 @@ describe('入口节点加载归属', () => {
     expect(mocks.setEntryNodeId).toHaveBeenCalledWith('qq.orchestrator');
   });
 
+  it('节点文件用不了的不进入口列表，存着的这种入口换成第一个能用的', async () => {
+    // engine 加载不了它，发出的消息全会失败。节点表里的 type 是生效的值：没写 type 的报成 ai，
+    // 和 engine 的 entry_node_problem 判法一致，所以省略 type 的节点照样能当入口。
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = 'qq.skill';
+    localStorage.removeItem('fixture-node');
+    const untyped = { id: 'qq.untyped', type: 'ai', active: true, internal: false, problem: '' };
+    mocks.getNodes.mockResolvedValue([
+      { id: 'qq.broken', type: '', active: true, internal: false, problem: 'YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here' },
+      { id: 'qq.skill', type: 'ai', active: true, internal: false, problem: 'kind 写的是 skill，节点只认 node' },
+      untyped,
+    ]);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setAvailableNodes).toHaveBeenCalledWith([untyped]);
+    expect(mocks.setEntryNodeId).toHaveBeenCalledWith('qq.untyped');
+  });
+
   it('成功空列表清理旧选择，网络失败不抹掉选择', async () => {
     const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
     mocks.state.adminToken = 'fixture-token';

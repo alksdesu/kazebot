@@ -28,7 +28,7 @@ import config_layout  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from _lock_holder import LockHolder  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
-from supervisor.config_store import ConfigStore, ConfigUnreadable  # noqa: E402
+from supervisor.config_store import ConfigStore, ConfigUnreadable, check_models_text  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
@@ -342,6 +342,64 @@ class TestBrokenBeforeItWasEverRead:
 
         assert store.load_error.startswith("config/models.yaml 用不了，继续用上一份能用的配置：")
         assert store.get_openai_secret().model == "m-alpha"
+
+
+_SECRET = "sk-SECRET-store"
+_BROKEN_ON_THE_KEY = f"version: 1\nprovider: openai\nopenai:\n  base_url: https://api.example.com/v1\n  api_key: {_SECRET}: x\n"
+_KEY_AS_A_LIST = f"version: 1\nprovider: openai\nopenai:\n  api_key: [{_SECRET}]\n"
+_BAD_DATE = f"version: 1\nprovider: openai\nstarted: 2024-13-45\nopenai:\n  api_key: {_SECRET}\n"
+
+
+class TestTheReasonNamesThePlaceButNotTheLine:
+    """原因进日志、控制台诊断、诊断导出和改渠道被拒的提示：坏在密钥那一行时，只能有位置和问题。"""
+
+    @pytest.mark.parametrize("broken,reason", [
+        (_BROKEN_ON_THE_KEY, "YAML 解析失败：第 5 行第 27 列：mapping values are not allowed here"),
+        (_KEY_AS_A_LIST, "字段不合法：openai.api_key：Input should be a valid string"),
+        (_BAD_DATE, "YAML 解析失败：第 3 行第 10 列：值不是合法的 timestamp"),
+    ], ids=["broken-line", "pydantic", "bad-value"])
+    def test_the_load_error_the_log_and_the_refusal(
+        self, store: ConfigStore, models: Path, caplog: pytest.LogCaptureFixture, broken: str, reason: str,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="supervisor.config_store"):
+            models.write_text(broken, encoding="utf-8")
+            error = store.load_error
+
+        # 文件名只出现一次：原来里外各拼一遍。
+        assert error == f"config/models.yaml 用不了，继续用上一份能用的配置：{reason}"
+        assert reason in caplog.text
+        with pytest.raises(ConfigUnreadable) as caught:
+            store.upsert_provider("alpha", model="m", wire="openai")
+        assert reason in str(caught.value)
+        for text in (error, caplog.text, str(caught.value)):
+            assert _SECRET not in text and "input_value" not in text
+
+    def test_a_value_that_cannot_be_built_does_not_stop_the_store_from_starting(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 非法日期原来让 safe_load 抛 ValueError：ConfigStore 构造失败，Supervisor 起不来。
+        path = _write(tmp_path / "config" / "models.yaml", _BAD_DATE)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.config_store"):
+            store = ConfigStore(path=path, workspace_root=tmp_path)
+
+        assert store.load_error.startswith("config/models.yaml 用不了，现在用的是内置默认：")
+        assert store.load_error.endswith("：YAML 解析失败：第 3 行第 10 列：值不是合法的 timestamp")
+        assert store.get_openai_secret().model == "gpt-4o-mini"
+        assert path.read_text(encoding="utf-8") == _BAD_DATE
+        assert _SECRET not in caplog.text
+
+    @pytest.mark.parametrize("broken", [_BROKEN_ON_THE_KEY, _KEY_AS_A_LIST, _BAD_DATE], ids=["broken-line", "pydantic", "bad-value"])
+    def test_the_raw_editor_check_leaves_nothing_on_the_exception_chain(self, broken: str) -> None:
+        # uvicorn 的 500 和 log.exception 会把 __cause__、__context__ 一起打出来。
+        with pytest.raises(ValueError) as caught:
+            check_models_text(broken)
+
+        chain = [caught.value, caught.value.__cause__, caught.value.__context__]
+        assert not any(_SECRET in str(link) for link in chain if link is not None)
+        for link in chain[1:]:
+            if isinstance(link, yaml.MarkedYAMLError):
+                assert link.problem_mark.buffer is None
 
 
 class TestTheApiReportsABrokenFileAsFourHundred:

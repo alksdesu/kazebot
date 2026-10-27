@@ -21,9 +21,11 @@ from clonoth_runtime import check_runtime_text
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import (
     declares_internal,
+    effective_node_type,
     example_base_name,
     example_node_name,
     node_file,
+    read_node_definition,
     template_node_name,
     template_node_reason,
     template_reference_warnings,
@@ -222,15 +224,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def _rel(path: Path) -> str:
         return config_layout.logical_path(workspace_root, path)
 
-    def _read_yaml(p: Path) -> dict[str, Any]:
-        if not p.exists():
-            return {}
-        try:
-            data = yaml.safe_load(p.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
     def _read_text(p: Path, **extra: Any) -> dict[str, Any]:
         """文件内容连同指纹：编辑器保存时带回指纹，写入方据此认出中途被别处改过。"""
         if not p.is_file():
@@ -366,7 +359,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 if nid in seen_ids:
                     continue
                 seen_ids.add(nid)
-                data = _read_yaml(f)
+                definition, problem = read_node_definition(f)
+                data = definition or {}
                 ta_raw = data.get("tool_access", {})
                 if isinstance(ta_raw, str):
                     ta_raw = {"mode": ta_raw}
@@ -383,14 +377,19 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     # yaml 里写的 id。和文件名不一致时它是个摆设，改了也不会换节点。
                     "declared_id": declared if declared and declared != nid else "",
                     "name": data.get("name", ""),
-                    "type": data.get("type", ""),
+                    # 实际按哪种节点跑：没写 type 的是 ai，和 engine 判入口用的是同一个值。
+                    "type": effective_node_type(data) if definition is not None else "",
                     "model": data.get("model", ""),
+                    # 节点文件里写的渠道，没写是空串（跟随全局活跃渠道）。
+                    "provider": str(data.get("provider") or "").strip(),
                     "tool_access": ta_raw,
                     "skills": data.get("skills", {}),
                     "description": data.get("description", ""),
                     "delegate_targets": list(data.get("delegate_targets") or []),
                     "source": source,
                     "same_as_default": source == "override" and _same_as_default(f),
+                    # 不空时 engine 加载它只会落空。只有位置和问题，不带原文。
+                    "problem": problem,
                 })
         return res
 
@@ -845,7 +844,10 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         if not path.exists():
             raise HTTPException(status_code=404, detail="Node not found")
 
-        data = _read_yaml(path)
+        data, problem = read_node_definition(path)
+        if data is None or problem:
+            # 说成「一个工具都没给」的话，人会去改授权，其实该修的是这份文件。
+            raise HTTPException(status_code=409, detail=f"{_rel(path)} 不是能用的节点定义：{problem}")
         ta = data.get("tool_access", {})
         if isinstance(ta, str):
             ta = {"mode": ta}

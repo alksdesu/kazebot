@@ -61,8 +61,7 @@ class TestLoadingSettings:
             common.load_settings()
 
         message = str(caught.value)
-        assert "settings.yaml 读不了" in message
-        assert "（第 3 行第 14 列）" in message
+        assert "settings.yaml 读不了：第 3 行第 14 列：" in message
         assert "nai-secret-key" not in message
 
     @pytest.mark.parametrize("params", ["5", "[cute]", "''"])

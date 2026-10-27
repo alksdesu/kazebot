@@ -544,8 +544,7 @@ class TestAnUnreadableModelsFile:
         resolved = channel.resolve_image_channel("image_gpt", root=root)
 
         assert not resolved.usable
-        assert resolved.error.startswith("config/models.yaml 读不了")
-        assert "（第 5 行第 11 列）" in resolved.error
+        assert resolved.error.startswith("config/models.yaml 读不了：第 5 行第 11 列：")
         assert "sk-secret-in-a-bad-line" not in resolved.error
         assert (resolved.api_key, resolved.base_url) == ("", "")
 
@@ -601,9 +600,12 @@ class TestAnUnreadableModelsFile:
 
     @pytest.mark.parametrize("raw,said", [
         (b"- just\n- a list\n", "顶层不是映射"),
-        # PyYAML 拿它造日期时抛的 ValueError，消息里带着这个值
-        (b"when: 2026-13-45\n", "ValueError"),
+        # PyYAML 拿它造日期时抛的 ValueError，消息里带着这个值；换成只报位置和是哪种值
+        (b"when: 2026-13-45\n", "第 1 行第 7 列：值不是合法的 timestamp"),
         (b"\xff\xfeabc: 1\n", "不是 UTF-8 编码"),
+        # 别名、tag 照抄文件里写的，密码以 * 或 ! 开头又没加引号时抄出来的就是密码
+        (b"api_key: *Pa55-2026-13-45\n", "found undefined alias '***'"),
+        (b"api_key: !Pass-2026-13-45 x\n", "could not determine a constructor for the tag '***'"),
     ])
     def test_an_odd_file_is_unreadable_without_being_quoted(self, tmp_path: Path, raw: bytes, said: str) -> None:
         path = tmp_path / "odd.yaml"
@@ -615,6 +617,28 @@ class TestAnUnreadableModelsFile:
         assert document.problem.startswith("odd.yaml 读不了")
         assert said in document.problem
         assert "2026-13-45" not in document.problem
+
+    @pytest.mark.parametrize("text", [
+        "openai:\n  api_key: [sk-secret-a\n  base_url: https://gw.example.com/v1\n",
+        "openai:\n  api_key: sk-secret-b: x\n",
+        'openai:\n  api_key: "sk-secret-c\n',
+        "when: 2026-02-30\n",
+        "api_key: *sk-secret-d\n",
+    ])
+    def test_the_reason_is_word_for_word_the_main_process_one(self, tmp_path: Path, text: str) -> None:
+        # 屏蔽只有 config_layout 那一份：工具侧报的原因和主进程一字不差，没有第二套写法会漏。
+        import config_layout
+        import yaml
+
+        path = tmp_path / "same.yaml"
+        path.write_text(text, encoding="utf-8")
+        with pytest.raises(yaml.YAMLError) as caught:
+            config_layout.load_yaml_text(text)
+
+        document = channel.read_yaml_document(path, label="same.yaml", keep_last_good=False)
+
+        assert document.problem == f"same.yaml 读不了：{config_layout.yaml_error_text(caught.value)}"
+        assert "sk-secret" not in document.problem
 
     @pytest.mark.parametrize("raw", [b"", b"# only a comment\n"])
     def test_an_empty_file_is_an_empty_table(self, tmp_path: Path, raw: bytes) -> None:

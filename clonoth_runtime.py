@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -204,9 +204,9 @@ def _misplaced_sections(data: Mapping[str, Any], shape: Mapping[str, Any], prefi
 def parse_runtime_text(text: str, shape: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """runtime 原文解析成映射，抛 RuntimeConfigError 说明哪里不对。shape 是该有哪些段，不给就按代码里的默认值。"""
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise RuntimeConfigError(f"YAML 解析失败：{exc}") from exc
+        raise RuntimeConfigError(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     if data is None:
         return {}
     if not isinstance(data, dict):
@@ -741,66 +741,130 @@ def novelai_available(workspace_root: Path) -> bool:
     return novelai_status(workspace_root).available
 
 
-class _ModelsConfigUnusable(ValueError):
-    """config/models.yaml 这一版读不了、解析不了，或者顶层不是映射。"""
+class _ConfigUnusable(ValueError):
+    """这一版配置文件读不了、解析不了，或者内容用不了。消息只有原因，不带文件内容。"""
 
 
 @dataclass(frozen=True)
-class _ModelsConfigVersion:
-    """config/models.yaml 按某一版文件读出来的样子。这一版用不了时 data 留着上一份能用的，没有就是空的。"""
+class _ConfigVersion:
+    """一份配置文件按某一版读出来的样子。
+
+    这一版用不了时 data 留着上一份能用的、error 写着为什么；adopted 是这个进程有没有读成过一份。
+    """
 
     stamp: tuple[int, int, int] | None
     data: dict[str, Any]
+    adopted: bool
+    error: str = ""
 
 
-_MODELS_CONFIG: dict[str, _ModelsConfigVersion] = {}
-_MODELS_CONFIG_LOCK = threading.Lock()
+class _LastGoodConfig:
+    """按 file_stamp 缓存一份 YAML 配置，交出去的都是副本。
+
+    新的那一版用不了时记一次日志、沿用这个进程上一份读成的；一份都没读成过就交出 fallback。
+    文件不在时，keep_when_missing 决定沿用上一份还是交出 fallback。
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        parse: Callable[[Path], dict[str, Any] | None],
+        fallback: Callable[[], dict[str, Any]],
+        keep_when_missing: bool,
+        kept_note: str,
+        fallback_note: str,
+    ) -> None:
+        self._label = label
+        self._parse = parse
+        self._fallback = fallback
+        self._keep_when_missing = keep_when_missing
+        self._kept_note = kept_note
+        self._fallback_note = fallback_note
+        self._versions: dict[str, _ConfigVersion] = {}
+        self._lock = threading.Lock()
+
+    def fresh(self) -> _LastGoodConfig:
+        """设置一样、一份都还没读过的缓存。"""
+        return _LastGoodConfig(
+            label=self._label,
+            parse=self._parse,
+            fallback=self._fallback,
+            keep_when_missing=self._keep_when_missing,
+            kept_note=self._kept_note,
+            fallback_note=self._fallback_note,
+        )
+
+    def load(self, path: Path) -> dict[str, Any]:
+        return copy.deepcopy(self.version(path).data)
+
+    def version(self, path: Path) -> _ConfigVersion:
+        stamp = config_layout.file_stamp(path)
+        key = str(path)
+        with self._lock:
+            cached = self._versions.get(key)
+            if cached is not None and cached.stamp == stamp:
+                return cached
+            version = self._next_version_locked(path, stamp, cached)
+            self._versions[key] = version
+            return version
+
+    def _next_version_locked(
+        self, path: Path, stamp: tuple[int, int, int] | None, cached: _ConfigVersion | None,
+    ) -> _ConfigVersion:
+        kept = cached if cached is not None and cached.adopted else None
+        try:
+            data = None if stamp is None else self._parse(path)
+        except _ConfigUnusable as exc:
+            version = self._fallen_back(stamp, kept, str(exc))
+            _log.warning("%s 用不了，%s：%s", self._label, self._note(version), version.error)
+            return version
+        if data is not None:
+            return _ConfigVersion(stamp, data, adopted=True)
+        if not self._keep_when_missing or kept is None:
+            return _ConfigVersion(None, self._fallback(), adopted=False)
+        _log.warning("%s 不见了，%s", self._label, self._kept_note)
+        return _ConfigVersion(None, kept.data, adopted=True, error="文件不在")
+
+    def _fallen_back(
+        self, stamp: tuple[int, int, int] | None, kept: _ConfigVersion | None, error: str,
+    ) -> _ConfigVersion:
+        if kept is not None:
+            return _ConfigVersion(stamp, kept.data, adopted=True, error=error)
+        return _ConfigVersion(stamp, self._fallback(), adopted=False, error=error)
+
+    def _note(self, version: _ConfigVersion) -> str:
+        return self._kept_note if version.adopted else self._fallback_note
 
 
 def _parse_models_config(path: Path) -> dict[str, Any] | None:
-    """这一版文件的内容，空的按空配置算，文件这会儿不在了是 None。读不了、解析不了、顶层不是映射抛 _ModelsConfigUnusable。"""
+    """这一版文件的内容，空的按空配置算，文件这会儿不在了是 None。读不了、解析不了、顶层不是映射抛 _ConfigUnusable。"""
     try:
         text = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError) as exc:
-        raise _ModelsConfigUnusable(f"读不了：{exc}") from exc
+        raise _ConfigUnusable(f"读不了：{exc}") from exc
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise _ModelsConfigUnusable(f"YAML 解析失败：{exc}") from exc
+        raise _ConfigUnusable(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise _ModelsConfigUnusable("顶层必须是映射（key: value）")
+        raise _ConfigUnusable("顶层必须是映射（key: value）")
     return data
 
 
-def _models_config_version(path: Path) -> _ModelsConfigVersion:
-    """按 file_stamp 认出改动。新的那一版用不了时记一次日志、沿用上一份读成的，一份都没读成过就按空配置算。"""
-    stamp = config_layout.file_stamp(path)
-    key = str(path)
-    with _MODELS_CONFIG_LOCK:
-        cached = _MODELS_CONFIG.get(key)
-        if cached is not None and cached.stamp == stamp:
-            return cached
-        try:
-            data = None if stamp is None else _parse_models_config(path)
-        except _ModelsConfigUnusable as exc:
-            kept = cached.data if cached is not None else {}
-            if kept:
-                _log.warning("%s 用不了，沿用上一份能用的：%s", config_layout.MODELS_FILE, exc)
-            else:
-                _log.warning(
-                    "%s 用不了，按空配置算，点名渠道、系统槽位和备选链在修好之前都不生效：%s",
-                    config_layout.MODELS_FILE, exc,
-                )
-            version = _ModelsConfigVersion(stamp, kept)
-        else:
-            # 文件不在是没配渠道，不是写坏，不沿用上一份。
-            version = _ModelsConfigVersion(None, {}) if data is None else _ModelsConfigVersion(stamp, data)
-        _MODELS_CONFIG[key] = version
-        return version
+# 文件不在是没配渠道，不是写坏，不沿用上一份。
+_MODELS_CONFIG = _LastGoodConfig(
+    label=config_layout.MODELS_FILE,
+    parse=_parse_models_config,
+    fallback=dict,
+    keep_when_missing=False,
+    kept_note="沿用上一份能用的",
+    fallback_note="按空配置算，点名渠道、系统槽位和备选链在修好之前都不生效",
+)
 
 
 def load_models_config(workspace_root: Path | str) -> dict[str, Any]:
@@ -808,7 +872,7 @@ def load_models_config(workspace_root: Path | str) -> dict[str, Any]:
 
     运行中写坏时沿用这个进程上一份读成的：Supervisor 给主渠道的那份也停在上一份，点名渠道、系统槽位和备选链才不会单独没了。
     """
-    return copy.deepcopy(_models_config_version(config_layout.models_path(workspace_root)).data)
+    return _MODELS_CONFIG.load(config_layout.models_path(workspace_root))
 
 
 # 每份平台密钥文件最近告警过的那一版：同一版坏文件只告警一次。
@@ -824,12 +888,12 @@ def load_platform_secrets(workspace_root: Path | str) -> dict[str, Any]:
     path = config_layout.platform_secrets_path(workspace_root)
     stamp = config_layout.file_stamp(path)
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, NotADirectoryError):
         return {}
     except Exception as exc:
-        # 只报异常类型：YAML 的报错会附上出错那一行原文，那一行可能正是令牌
-        _warn_platform_secrets_unreadable(path, stamp, type(exc).__name__)
+        # 只报位置和问题：出错那一行多半就是令牌本身
+        _warn_platform_secrets_unreadable(path, stamp, config_layout.config_error_text(exc))
         return {}
     if data is None:
         return {}
@@ -1112,9 +1176,52 @@ def resolve_system_model(
     )
 
 
+def _parse_policy_config(path: Path) -> dict[str, Any] | None:
+    """这一版 policy.yaml 解析并校验成运行期用的那份，文件这会儿不在了是 None，用不了抛 _ConfigUnusable。
+
+    收不收哪一版和 Supervisor 的 PolicyEngine 是同一套：空文件、顶层不是映射、结构不对都算用不了。
+    """
+    # 放在函数里导入：supervisor.policy 顶上就导入了本模块。
+    from supervisor.policy import parse_policy_text
+
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _ConfigUnusable(f"不是 UTF-8 文本：{exc}") from exc
+    except OSError as exc:
+        raise _ConfigUnusable(f"读不了：{exc}") from exc
+    try:
+        return parse_policy_text(text)
+    except ValueError as exc:
+        raise _ConfigUnusable(str(exc)) from exc
+
+
+def _default_policy_config() -> dict[str, Any]:
+    from supervisor.policy import default_policy
+
+    return default_policy()
+
+
+# 写坏、被删都沿用上一份，和 PolicyEngine 一样：两边认的 extra_roots 不能一边还在、一边没了。
+_POLICY_CONFIG = _LastGoodConfig(
+    label=config_layout.POLICY_FILE,
+    parse=_parse_policy_config,
+    fallback=_default_policy_config,
+    keep_when_missing=True,
+    kept_note="文件工具和项目说明沿用上一份能用的 extra_roots",
+    fallback_note="文件工具和项目说明按内置默认策略的 extra_roots 算",
+)
+
+
 def load_policy_config(workspace_root: Path) -> dict[str, Any]:
-    data = load_yaml_dict(config_layout.policy_path(workspace_root))
-    return data if isinstance(data, dict) else {}
+    """policy.yaml 里 engine 和工具要用的那份（extra_roots），给调用方一份自己的副本。
+
+    哪一版能用、用不了时生效哪份都跟 Supervisor 的 PolicyEngine 一致：运行中写坏或被删沿用这个进程上一份读成的，
+    一份都没读成过就是内置默认策略。
+    """
+    return _POLICY_CONFIG.load(config_layout.policy_path(workspace_root))
 
 
 def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:

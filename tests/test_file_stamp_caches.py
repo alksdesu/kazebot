@@ -7,6 +7,7 @@ Windows 的系统时钟约 15 毫秒跳一次，连着保存两次本来就会�
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -144,6 +145,153 @@ class TestThePolicyEngine:
 
         assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.deny
         assert calls == [1]
+
+
+_POLICY_ROOTS = "version: 1\nextra_roots: ['{root}']\nread_file:\n  default: auto\n  rules: []\n"
+
+
+@pytest.fixture
+def engine_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(clonoth_runtime, "_POLICY_CONFIG", clonoth_runtime._POLICY_CONFIG.fresh())
+
+
+def _policy_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == clonoth_runtime._log.name and config_layout.POLICY_FILE in record.getMessage()
+    ]
+
+
+@pytest.mark.usefixtures("engine_policy")
+class TestTheEngineCopyOfThePolicy:
+    """engine 和工具读 policy.yaml 是为了 extra_roots：收哪一版、坏了用哪份都得和 PolicyEngine 一样。
+
+    以前读坏就按空算：写坏期间审批还认 extra_roots，文件工具却把那里当成外部路径，多要一次审批，项目说明也找不过去。
+    """
+
+    def _seed(self, workspace: Path, root: str = "/srv/shared") -> Path:
+        return _write(config_layout.policy_path(workspace), _POLICY_ROOTS.format(root=root))
+
+    def test_a_broken_rewrite_keeps_the_last_extra_roots(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = self._seed(tmp_path)
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/shared"]
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _rewrite(path, "version: 1\nextra_roots: [/srv/sk-SECRET-root\n")
+            for _ in range(3):
+                data = clonoth_runtime.load_policy_config(tmp_path)
+
+        assert data["extra_roots"] == ["/srv/shared"]
+        [warning] = _policy_warnings(caplog)
+        assert "沿用上一份能用的 extra_roots" in warning
+        assert "YAML 解析失败：第 " in warning
+        assert "sk-SECRET-root" not in warning
+
+    def test_a_file_the_policy_engine_rejects_is_rejected_here_too(self, tmp_path: Path) -> None:
+        # 解析得了、结构不对：PolicyEngine 整份不收，这里照收的话两边的 extra_roots 就分家了。
+        path = self._seed(tmp_path)
+        engine = PolicyEngine(workspace_root=tmp_path, policy_path=path)
+        clonoth_runtime.load_policy_config(tmp_path)
+
+        _rewrite(path, "version: 1\nextra_roots: ['/srv/elsewhere']\nread_file:\n  default: maybe\n  rules: []\n")
+        ours = clonoth_runtime.load_policy_config(tmp_path)
+
+        assert "用不了" in engine.load_error
+        assert ours["extra_roots"] == ["/srv/shared"]
+        assert clonoth_runtime.parse_extra_roots(tmp_path, ours["extra_roots"]) == engine.extra_roots()
+
+    def test_a_file_broken_from_the_start_is_the_built_in_default(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from supervisor.policy import default_policy
+
+        _write(config_layout.policy_path(tmp_path), "extra_roots: [oops\n")
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            data = clonoth_runtime.load_policy_config(tmp_path)
+
+        assert data["extra_roots"] == default_policy()["extra_roots"]
+        [warning] = _policy_warnings(caplog)
+        assert "按内置默认策略的 extra_roots 算" in warning
+        assert "上一份" not in warning
+
+    def test_an_empty_file_counts_as_unusable_like_in_the_policy_engine(self, tmp_path: Path) -> None:
+        path = self._seed(tmp_path)
+        clonoth_runtime.load_policy_config(tmp_path)
+
+        _rewrite(path, "")
+
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/shared"]
+
+    def test_a_deleted_file_keeps_the_last_extra_roots(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = self._seed(tmp_path)
+        clonoth_runtime.load_policy_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            path.unlink()
+            first = clonoth_runtime.load_policy_config(tmp_path)
+            second = clonoth_runtime.load_policy_config(tmp_path)
+
+        assert first["extra_roots"] == second["extra_roots"] == ["/srv/shared"]
+        [warning] = _policy_warnings(caplog)
+        assert "不见了" in warning
+
+    def test_a_file_that_was_never_there_is_the_built_in_default_quietly(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Supervisor 首启时照内置默认建出这份文件，engine 这边就按同一份算，不用为此告警。
+        from supervisor.policy import default_policy
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            data = clonoth_runtime.load_policy_config(tmp_path)
+
+        assert data == default_policy()
+        assert _policy_warnings(caplog) == []
+
+    def test_fixing_the_file_takes_effect_again(self, tmp_path: Path) -> None:
+        path = self._seed(tmp_path)
+        clonoth_runtime.load_policy_config(tmp_path)
+        _rewrite(path, "extra_roots: [oops\n")
+        clonoth_runtime.load_policy_config(tmp_path)
+
+        _rewrite(path, _POLICY_ROOTS.format(root="/srv/moved"))
+
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/moved"]
+
+    def test_callers_get_their_own_copy(self, tmp_path: Path) -> None:
+        self._seed(tmp_path)
+        clonoth_runtime.load_policy_config(tmp_path)["extra_roots"].append("/tampered")
+
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/shared"]
+
+    def test_an_untouched_file_is_not_reparsed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import supervisor.policy as policy_module
+
+        path = self._seed(tmp_path, "/srv/aaaaaa")
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/aaaaaa"]
+        counted, calls = _counting(policy_module.parse_policy_text)
+        monkeypatch.setattr(policy_module, "parse_policy_text", counted)
+
+        # 文件工具每解析一个路径都要问一次，指纹没变就不该再解析一次 yaml。
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/aaaaaa"]
+        assert calls == [0]
+
+        _same_tick_replace(path, _POLICY_ROOTS.format(root="/srv/bbbbbb"))
+
+        assert clonoth_runtime.load_policy_config(tmp_path)["extra_roots"] == ["/srv/bbbbbb"]
+        assert calls == [1]
+
+    def test_the_file_tools_keep_the_extra_root_inside_while_the_file_is_broken(self, tmp_path: Path) -> None:
+        from toolbox._common import resolve_and_classify
+
+        workspace = tmp_path / "ws"
+        extra = tmp_path / "shared"
+        extra.mkdir()
+        path = self._seed(workspace, extra.as_posix())
+        assert resolve_and_classify(workspace, str(extra / "notes.txt"))[1] is False
+
+        _rewrite(path, "version: 1\nextra_roots: [oops\n")
+
+        assert resolve_and_classify(workspace, str(extra / "notes.txt"))[1] is False
 
 
 def _counting(target: Any) -> tuple[Any, list[int]]:

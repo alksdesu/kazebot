@@ -75,6 +75,11 @@ def load_schedules(workspace_root: Path) -> list[dict[str, Any]]:
         return []
 
 
+def read_schedules(workspace_root: Path) -> list[dict[str, Any]]:
+    """读完要接着改这份文件的调用方用：读不懂抛 ScheduleFileUnreadable，不当成没有定时任务。"""
+    return _read_schedule_file(schedules_path(workspace_root))
+
+
 def save_schedules(workspace_root: Path, schedules: list[dict[str, Any]]) -> None:
     path = schedules_path(workspace_root)
     with config_layout.locked(path):
@@ -96,9 +101,9 @@ def schedules_lock(workspace_root: Path) -> contextlib.AbstractContextManager[No
 def check_schedules_text(text: str) -> list[str]:
     """控制台原文编辑器保存前的校验：结构不对抛 ValueError，调度时会被跳过的条目和永远不会触发的 cron 只提醒。"""
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise ValueError(f"YAML 解析失败：{exc}") from exc
+        raise ValueError(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     warnings: list[str] = []
     seen: set[str] = set()
     for index, item in enumerate(_schedule_entries(data, "data/schedules.yaml"), 1):
@@ -166,11 +171,22 @@ def _schedule_entries(data: Any, where: str) -> list[Any]:
     return items
 
 
+class ScheduleFileUnreadable(ValueError):
+    """定时任务文件在盘上却读不懂。消息只有位置和问题：条目里写着要发的话和要跑的命令，原文不能进日志、交给模型。"""
+
+
 def _read_schedule_file(path: Path) -> list[dict[str, Any]]:
-    """文件在但读不懂就抛：读坏当成空表再写回去，全部定时任务就没了。"""
+    """文件在但读不懂就抛 ScheduleFileUnreadable：读坏当成空表再写回去，全部定时任务就没了。"""
     if not path.exists():
         return []
-    items = _schedule_entries(yaml.safe_load(path.read_text(encoding="utf-8")), str(path))
+    try:
+        document = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ScheduleFileUnreadable(f"{path} 读不懂：{config_layout.config_error_text(exc)}") from exc
+    try:
+        items = _schedule_entries(document, str(path))
+    except ValueError as exc:
+        raise ScheduleFileUnreadable(str(exc)) from exc
     return [item for item in items if isinstance(item, dict)]
 
 

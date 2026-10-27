@@ -210,6 +210,23 @@ def test_unknown_node_is_a_404(client) -> None:
     assert resp.status_code == 404
 
 
+@pytest.mark.parametrize(("body", "problem"), [
+    ("type: ai\napi_key: sk-SECRET-node: x\ntool_access: all\n", "YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here"),
+    ("type: robot\ntool_access: all\n", "type 写的是 robot，只认 ai、tool"),
+])
+def test_a_node_file_that_is_not_a_usable_definition_is_a_409_with_the_reason(
+    client, workspace: Path, body: str, problem: str,
+) -> None:
+    # 按空表算会报成「一个工具都没给」，人会去改授权；该修的是这份文件。
+    _write_node(workspace, "qq.intent", body)
+
+    resp = client("GET", f"{_BASE}/qq.intent/effective-tools", headers=_AUTH)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == f"config/nodes/qq.intent.yaml 不是能用的节点定义：{problem}"
+    assert "sk-SECRET" not in resp.text
+
+
 def test_refuses_to_step_out_of_the_nodes_directory(client, workspace: Path) -> None:
     (workspace / "config" / "secrets.yaml").write_text("tool_access: all\n", encoding="utf-8")
 

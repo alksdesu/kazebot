@@ -21,7 +21,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, Tag } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
-import { errorMessage } from '../../../api/request';
+import { errorMessage, hasStatus } from '../../../api/request';
 
 type Mode = 'none' | 'all' | 'allowlist';
 
@@ -199,6 +199,8 @@ const NodeRow = ({ node, tools, onSaved }: {
   const [deadNames, setDeadNames] = useState<string[]>([]);
   // 没问到实际给不给时下面一个「不可用」都不标，看着就像勾了的都能用
   const [effectiveError, setEffectiveError] = useState('');
+  // 409：列出来之后节点文件被改坏了，engine 加载不了它，勾什么都不生效
+  const [fileUnusable, setFileUnusable] = useState(false);
 
   useEffect(() => {
     setMode(saved.mode);
@@ -216,6 +218,7 @@ const NodeRow = ({ node, tools, onSaved }: {
         setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
         setDeadNames(data.dead_names || []);
         setEffectiveError('');
+        setFileUnusable(false);
       })
       .catch((caught) => {
         if (!request.isCurrent()) return;
@@ -223,6 +226,7 @@ const NodeRow = ({ node, tools, onSaved }: {
         setEffective({});
         setDeadNames([]);
         setEffectiveError(errorMessage(caught));
+        setFileUnusable(hasStatus(caught, 409));
       });
     return () => { requests.drop('effective'); };
   }, [requests, open, adminToken, node.id, saved]);
@@ -320,6 +324,10 @@ const NodeRow = ({ node, tools, onSaved }: {
             <span className="text-xs text-[var(--duties-secondary)]">{MODE_HINT[mode]}</span>
           </div>
 
+          {fileUnusable && (
+            <ErrorText>这个节点文件现在用不了，engine 加载不了它，这里勾什么都不生效，先修好节点文件：{effectiveError}</ErrorText>
+          )}
+
           {mode !== 'none' && (
             <>
               <div className="mb-2 flex items-center gap-2">
@@ -352,7 +360,7 @@ const NodeRow = ({ node, tools, onSaved }: {
                 <span className="text-[var(--duties-text)]">{enabledCount} 个可调用</span>
                 {filtered && `，当前筛出 ${candidates.length} 个`}
               </p>
-              {effectiveError && (
+              {effectiveError && !fileUnusable && (
                 <ErrorText>没问到每个工具实际给不给，下面的勾选只是节点文件里写的，标不出哪些勾了也用不了：{effectiveError}</ErrorText>
               )}
               <EffectiveNotes dead={deadNames} mode={mode} rows={Object.values(effective)} />
@@ -398,6 +406,7 @@ const NodeRow = ({ node, tools, onSaved }: {
 export const NodeGrantsSection = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [nodes, setNodes] = useState<AdminNode[]>([]);
+  const [unusableNodes, setUnusableNodes] = useState<AdminNode[]>([]);
   const [tools, setTools] = useState<string[]>([]);
   const [loadError, setLoadError] = useState('');
   const requests = useRequestGuard();
@@ -413,7 +422,10 @@ export const NodeGrantsSection = () => {
       ]);
       if (!request.isCurrent()) return;
       // 模板和示例文件派发不到，摆在授权页里只会让人配一份永远不生效的权限。
-      setNodes(nodeList.filter((node) => node.active !== false));
+      const dispatchable = nodeList.filter((node) => node.active !== false);
+      // 读不出来的节点文件 engine 加载不了，按空表摆成行就成了「一个工具都没给」：单独说出来，不混进能配的里。
+      setNodes(dispatchable.filter((node) => !node.problem));
+      setUnusableNodes(dispatchable.filter((node) => node.problem));
       setTools(toolNames);
       setLoadError('');
     } catch (caught) {
@@ -430,12 +442,18 @@ export const NodeGrantsSection = () => {
       title="节点授权"
     >
       <DefaultsNotice nodes={nodes} />
-      {nodes.length === 0 ? !loadError && <Empty>正在读取…</Empty> : (
+      {nodes.length === 0 && unusableNodes.length === 0 ? !loadError && <Empty>正在读取…</Empty> : nodes.length > 0 && (
         <List>
           {nodes.map((node) => (
             <NodeRow key={node.id} node={node} onSaved={() => void load()} tools={tools} />
           ))}
         </List>
+      )}
+      {unusableNodes.length > 0 && (
+        <ErrorText>
+          这些节点文件现在用不了，engine 加载不了它们，修好之前在这里配不了：
+          {unusableNodes.map((node) => `${node.id}（${node.problem}）`).join('；')}
+        </ErrorText>
       )}
       {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       <Footnote>

@@ -128,6 +128,45 @@ class TestABrokenPolicyFile:
         assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.deny
         assert engine.load_error == ""
 
+    def test_a_value_that_cannot_be_built_keeps_the_last_policy_and_judging_goes_on(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # !!bool 后面跟的不是布尔时 PyYAML 抛 KeyError：以前越过只接 ValueError 的重读，之后每一次判定都抛异常。
+        engine = _policy(tmp_path, _PERMISSIVE)
+        assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.auto
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.policy"):
+            _rewrite(tmp_path, _PERMISSIVE + "approval_grant:\n  permanent_for_admins: !!bool sk-SECRET-policy\n")
+            level = engine.evaluate_read_file(path="notes.txt").safety_level
+
+        assert level == SafetyLevel.auto
+        error = engine.load_error
+        assert error.startswith("config/policy.yaml 用不了，沿用上一份能用的策略")
+        assert "值不是合法的 bool" in error
+        assert "sk-secret-policy" not in error.lower()
+        assert "sk-secret-policy" not in caplog.text.lower()
+
+    def test_the_reason_names_the_place_but_not_the_line(self, tmp_path: Path) -> None:
+        # 坏的那一行可能就是路径或密钥：load_error 进诊断、进控制台状态栏。
+        engine = _policy(tmp_path, _PERMISSIVE)
+
+        _rewrite(tmp_path, _PERMISSIVE + "extra_roots: [/srv/sk-SECRET-root\n")
+
+        error = engine.load_error
+        assert "YAML 解析失败：第 " in error
+        assert "sk-SECRET-root" not in error
+
+    def test_the_raw_editor_check_names_the_place_but_not_the_line(self) -> None:
+        from supervisor.policy import check_policy_text
+
+        with pytest.raises(ValueError) as caught:
+            check_policy_text("version: 1\nextra_roots:\n  - /srv/sk-SECRET-root: x: y\n")
+
+        assert "YAML 解析失败：第 3 行第 " in str(caught.value)
+        assert "sk-SECRET-root" not in str(caught.value)
+        assert "sk-SECRET-root" not in repr(caught.value.__cause__)
+        assert "sk-SECRET-root" not in repr(caught.value.__context__)
+
     def test_a_file_broken_at_startup_falls_back_to_the_built_in_default(self, tmp_path: Path) -> None:
         engine = _policy(tmp_path, "- not a mapping\n")
 

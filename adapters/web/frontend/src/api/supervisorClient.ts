@@ -243,6 +243,8 @@ export interface AdminNode extends NodeDef {
   source?: OverlaySource;
   /** 改过却和仓库默认一字不差：什么也没改，只会挡住以后默认的更新。 */
   same_as_default?: boolean;
+  /** 非空 = 节点文件读不出来，或读出来不是能用的节点定义，engine 加载不了它；只有位置和问题，不带原文。 */
+  problem?: string;
 }
 
 export type ToolSource = 'builtin' | 'plugin' | 'external';

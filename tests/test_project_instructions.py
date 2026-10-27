@@ -329,6 +329,20 @@ class TestWhereToLook:
         expected = [(extra / "AGENTS.md").resolve().as_posix(), (extra / "lib" / "CLAUDE.md").resolve().as_posix()]
         assert [item.display for item in candidates] == expected
 
+    def test_a_policy_broken_while_running_keeps_its_extra_roots(self, tmp_path: Path) -> None:
+        # 和 Supervisor 一样沿用上一份：读坏就按空算的话，写坏期间 extra_roots 里的说明文件一份都找不到。
+        workspace = tmp_path / "ws"
+        extra = tmp_path / "code"
+        policy = seed(workspace / "config" / "policy.yaml", yaml.safe_dump({"version": 1, "extra_roots": [str(extra)]}))
+        seed(extra / "AGENTS.md", "code root")
+        touched = [(str(extra / "lib" / "mod.py"), True)]
+        assert discover(workspace, touched, set())[1]
+
+        seed(policy, "version: 1\nextra_roots: [oops\n")
+        _direct, candidates = discover(workspace, touched, set())
+
+        assert [item.display for item in candidates] == [(extra / "AGENTS.md").resolve().as_posix()]
+
     def test_an_untrusted_outside_path_finds_nothing(self, tmp_path: Path) -> None:
         workspace = tmp_path / "ws"
         workspace.mkdir()

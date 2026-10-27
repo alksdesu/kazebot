@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -403,6 +404,43 @@ class TestTheNodesEndpoint:
         row = next(row for row in admin("GET", "/nodes").json() if row["id"] == "alpha")
 
         assert row["same_as_default"] is False
+
+    def test_a_node_file_that_cannot_be_read_says_why_instead_of_looking_empty(
+        self, admin, ws: Path, code_root: Path,
+    ) -> None:
+        # 读不了的文件原来按空表算，列表里成了一个什么工具都不给的节点；原因只带位置，节点能单配 api_key。
+        _write(config_layout.nodes_dir(ws) / "broken.yaml", "type: ai\napi_key: sk-SECRET-node: x\n")
+        _write(config_layout.nodes_dir(ws) / "robot.yaml", "type: robot\nname: 机器人\n")
+        _write(config_layout.nodes_dir(ws) / "fine.yaml", "type: ai\nname: 正常\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert rows["broken"]["problem"] == "YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here"
+        assert rows["broken"]["type"] == ""
+        assert rows["robot"]["problem"] == "type 写的是 robot，只认 ai、tool"
+        assert rows["robot"]["name"] == "机器人"
+        assert rows["fine"]["problem"] == ""
+        assert "sk-SECRET" not in json.dumps(rows, ensure_ascii=False)
+
+    def test_the_type_is_the_one_the_engine_runs_it_as(self, admin, ws: Path, code_root: Path) -> None:
+        # 没写 type 的按 ai 跑，网页入口列表和 engine 判入口用的是同一个值，这种节点也会进入口列表。
+        _write(config_layout.nodes_dir(ws) / "plain.yaml", "name: 没写类型\n")
+        _write(config_layout.nodes_dir(ws) / "shouty.yaml", "type: AI\n")
+        _write(config_layout.nodes_dir(ws) / "worker.yaml", "type: tool\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert (rows["plain"]["type"], rows["shouty"]["type"], rows["worker"]["type"]) == ("ai", "ai", "tool")
+
+    def test_every_row_says_which_channel_its_file_names(self, admin, ws: Path, code_root: Path) -> None:
+        # 渠道页和模型页按这个字段认节点自己点名的渠道，不用再回头去读节点原文。
+        _write(config_layout.nodes_dir(ws) / "relayed.yaml", "type: ai\nprovider: relay-b\n")
+        _write(config_layout.nodes_dir(ws) / "follower.yaml", "type: ai\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert rows["relayed"]["provider"] == "relay-b"
+        assert rows["follower"]["provider"] == ""
 
     def test_reading_a_node_returns_the_file_that_is_actually_loaded(self, admin, ws: Path, code_root: Path) -> None:
         self._seed(ws, code_root)

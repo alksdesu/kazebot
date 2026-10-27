@@ -53,7 +53,10 @@ const parseOrNull = (raw: string): Record<string, unknown> | null => {
 
 interface NodeChoice {
   id: string;
+  /** 节点文件里写的渠道，没写是空串。 */
   provider: string;
+  /** 非空 = 节点文件用不了，engine 加载不了它。 */
+  problem: string;
 }
 
 export const ModelsPage = () => {
@@ -95,8 +98,12 @@ const ModelsPageEditor = () => {
       void getNodes(token)
         .then((list) => {
           setNodes(
-            list.map((item: any) => ({ id: String(item.id), provider: String(item.provider || '') }))
-              .filter((item: NodeChoice) => item.id),
+            list.map((item): NodeChoice => ({
+              id: String(item.id || ''),
+              provider: String(item.provider || ''),
+              problem: String(item.problem || ''),
+            }))
+              .filter((item) => item.id),
           );
           setNodesError('');
         })
@@ -134,12 +141,10 @@ const ModelsPageEditor = () => {
   const activeWire = wireOf(activeProvider, channels);
   const doc = useMemo(() => (raw ? parseOrNull(raw) : null), [raw]);
 
+  const scopeNode = scope === GLOBAL ? undefined : nodes.find((item) => item.id === scope);
   // 节点没写 provider 就跟随全局活跃渠道，和 engine 的解析顺序一致。
-  const scopeProvider = useMemo(() => {
-    if (scope === GLOBAL) return '';
-    const hit = nodes.find((item) => item.id === scope);
-    return hit?.provider || shownFromValue(readYamlPath(doc, ['provider'])) || activeProvider;
-  }, [scope, nodes, doc, activeProvider]);
+  const scopeProvider = scope === GLOBAL ? '' : (scopeNode?.provider || activeProvider);
+  const scopeProblem = scopeNode?.problem || '';
 
   const selected = scope === GLOBAL
     ? (provider || activeWire)
@@ -148,7 +153,7 @@ const ModelsPageEditor = () => {
 
   const scopeChoices: ReadonlyArray<readonly [string, string]> = [
     [GLOBAL, '全局'],
-    ...nodes.map((item) => [item.id, item.id] as const),
+    ...nodes.map((item) => [item.id, item.problem ? `${item.id}（用不了）` : item.id] as const),
   ];
   const providerChoices: ReadonlyArray<readonly [string, string]> = providerNames.map(
     (name) => [name, name === activeWire ? `${name} ·在用` : name] as const,
@@ -167,7 +172,7 @@ const ModelsPageEditor = () => {
   const confirmDiscard = useUnsavedChanges(dirty, '模型参数还有未保存修改，确定切换或重置吗？');
 
   const save = async () => {
-    if (!token || !raw || busy || loading) return;
+    if (!token || !raw || busy || loading || scopeProblem) return;
     setBusy(true);
     try {
       // 只写改过的键，合并到现读的这一版上：别处改的其他键留着，读和写之间又被改了才报冲突。
@@ -201,10 +206,12 @@ const ModelsPageEditor = () => {
               <p className="mb-1.5 text-xs text-[var(--duties-secondary)]">渠道</p>
               <Segmented label="参数格式" disabled={busy} choices={providerChoices} onPick={value => { if (value !== selected && confirmDiscard()) { setEdits({}); setProvider(value); } }} value={selected} />
             </>
+          ) : scopeProblem ? (
+            <ErrorText>这个节点文件现在用不了，engine 加载不了它，修好之前这里改不了它的参数，先去「设置 → 节点文件」修好：{scopeProblem}</ErrorText>
           ) : (
             <Facts>
               这个节点走 <code>{scopeProvider}</code>，请求格式 <code>{selected}</code>
-              {scopeProvider ? '' : '（它自己没指定渠道，跟随全局在用的那个）'}。
+              {scopeNode?.provider ? '' : '（它自己没指定渠道，跟随全局在用的那个）'}。
             </Facts>
           )}
           {providersError && <ErrorText>渠道表没读到，这里认的「在用」渠道是猜的，不一定是 bot 正在用的那家：{providersError}</ErrorText>}
@@ -217,7 +224,7 @@ const ModelsPageEditor = () => {
           <Empty>这个渠道没有可调参数。</Empty>
         ) : (
           <Panel>
-            <fieldset disabled={busy || !raw} className="min-w-0 space-y-3">
+            <fieldset disabled={busy || !raw || Boolean(scopeProblem)} className="min-w-0 space-y-3">
             {visible.map((spec) => (
               <OptionRow
                 key={spec.key}

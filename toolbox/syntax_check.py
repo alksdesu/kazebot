@@ -90,7 +90,7 @@ class SyntaxReport:
 def _position(line: int | None, column: int | None) -> str:
     if line is None:
         return ""
-    return f"第 {line} 行第 {column} 列：" if column else f"第 {line} 行："
+    return f"{config_layout.position_text(line, column)}："
 
 
 def _is_jsonc(path: Path) -> bool:
@@ -135,18 +135,11 @@ def _check_json(path: Path, source: str) -> SyntaxReport:
 def _check_yaml(path: Path, source: str) -> SyntaxReport:
     try:
         # 多文档的 yaml（--- 分隔）用 safe_load 会报「expected a single document」
-        for _document in yaml.safe_load_all(source):
-            pass
-    except yaml.MarkedYAMLError as exc:
-        mark = exc.problem_mark or exc.context_mark
-        message = "; ".join(part for part in (exc.context, exc.problem) if part) or type(exc).__name__
-        if mark is None:
-            return SyntaxReport("yaml", False, message=message)
-        return SyntaxReport("yaml", False, mark.line + 1, mark.column + 1, message)
+        config_layout.load_yaml_documents(source)
     except yaml.YAMLError as exc:
-        return SyntaxReport("yaml", False, message=type(exc).__name__)
-    except RecursionError:
-        return SyntaxReport("yaml", False, message="嵌套太深")
+        # 文件已经写下去了，这里只能报结论；值写错（坏日期、!!int abc）也按未通过报，不能让异常冒出去。
+        parts = config_layout.yaml_error_parts(exc)
+        return SyntaxReport("yaml", False, parts.line, parts.column, parts.message)
     return SyntaxReport("yaml", True)
 
 

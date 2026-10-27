@@ -16,6 +16,7 @@ import {
   type RawText,
   type EffectiveTool,
 } from '../api/supervisorClient';
+import { ApiError } from '../api/request';
 import { NodeGrantsSection } from '../components/settings/pages/NodeGrantsSection';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -211,6 +212,43 @@ describe('勾了不等于能用', () => {
     expect(await item.findByText(/「服务端策略」那一页管不到它们/)).toBeTruthy();
     const cell = item.getByText('clonoth_debug').closest('div') as HTMLElement;
     expect(within(cell).getByText('策略外')).toBeTruthy();
+  });
+});
+
+describe('节点文件用不了', () => {
+  // 原来读不了的文件按空表算，授权页里成了一个「不给工具」的节点，人会去改授权，其实该修的是文件。
+  const PROBLEM = 'YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here';
+
+  it('读不出来的节点不摆成能配的行，单独列出来并带上原因', async () => {
+    vi.mocked(getNodes).mockResolvedValue([ORCHESTRATOR, { id: 'qq.broken', type: '', tool_access: { mode: 'none' }, problem: PROBLEM }]);
+    render(<NodeGrantsSection />);
+    await screen.findByRole('heading', { name: 'qq.orchestrator' });
+
+    expect(screen.queryByRole('heading', { name: 'qq.broken' })).toBeNull();
+    const note = screen.getByText(/这些节点文件现在用不了/);
+    expect(note).toHaveTextContent(`qq.broken（${PROBLEM}）`);
+    expect(note).toHaveClass('text-[var(--duties-danger)]');
+  });
+
+  it('一个能配的都没有时不一直摆着「正在读取」', async () => {
+    vi.mocked(getNodes).mockResolvedValue([{ id: 'qq.broken', type: '', problem: PROBLEM }]);
+    render(<NodeGrantsSection />);
+
+    expect(await screen.findByText(/这些节点文件现在用不了/)).toHaveTextContent('qq.broken');
+    expect(screen.queryByText('正在读取…')).toBeNull();
+  });
+
+  it('列出来之后文件才坏的，展开时报服务端给的原因，不说成没问到', async () => {
+    const detail = `config/nodes/qq.orchestrator.yaml 不是能用的节点定义：${PROBLEM}`;
+    vi.mocked(getEffectiveTools).mockRejectedValue(new ApiError(409, detail));
+    render(<NodeGrantsSection />);
+    const item = within(await expand('qq.orchestrator'));
+
+    const note = await item.findByText(/这个节点文件现在用不了/);
+    expect(note).toHaveTextContent(detail);
+    expect(note).toHaveClass('text-[var(--duties-danger)]');
+    expect(item.queryByText(/没问到每个工具实际给不给/)).toBeNull();
+    expect(item.queryByText('不可用')).toBeNull();
   });
 });
 

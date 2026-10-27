@@ -7,6 +7,7 @@ system:dream 上，save_memory/delete_memory 根本够不着目标会话的目�
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,6 +141,27 @@ class TestNamespaceScan:
         )
 
         assert payload["total_entries"] == 0
+
+    def test_a_broken_book_is_skipped_naming_the_place_but_not_the_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 每晚整理都扫到它；出错那一行是聊天里的原话，日志会被导出、贴进工单。
+        namespace = conversation_namespace(_GROUP_KEY)
+        _write_memory(tmp_path, namespace, "习惯", [_entry("m1", ["a"])])
+        (tmp_path / "data" / "memory" / namespace / "私密.yaml").write_text(
+            "book: 私密\nentries:\n- id: m2\n  content: 她的密码是-hunter2-secret: x\n", encoding="utf-8",
+        )
+        reason = "第 4 行第 32 列：mapping values are not allowed here"
+
+        with caplog.at_level(logging.WARNING, logger="engine.builtin.dream"):
+            books = DreamHandler()._build_book_list(tmp_path, namespace)
+            payload = json.loads(DreamHandler()._build_keyword_topology_json(tmp_path, namespace))
+
+        assert books == "习惯(1)"
+        assert payload["total_entries"] == 1
+        assert f"dream book list skipped 私密.yaml: {reason}" in caplog.text
+        assert f"dream topology skipped 私密.yaml: {reason}" in caplog.text
+        assert "hunter2" not in caplog.text
 
     def _write_cache(self, tmp_path: Path, payload: dict) -> None:
         cache = tmp_path / "data" / "memory" / ".hit_cache.json"

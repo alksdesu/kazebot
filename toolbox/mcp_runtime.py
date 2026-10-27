@@ -150,9 +150,10 @@ def _parse_config(data: Any) -> dict[str, Any]:
 
 def _parse_mcp_text(text: str) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise McpConfigError(f"YAML 解析失败：{exc}") from exc
+        # 客户端的 env 和 headers 里写着令牌，原因只带位置和问题：它会进日志、控制台和 list_mcp_clients 的结果。
+        raise McpConfigError(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     return _parse_config(data)
 
 

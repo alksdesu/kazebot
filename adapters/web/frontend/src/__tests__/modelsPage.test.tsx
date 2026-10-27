@@ -265,6 +265,46 @@ describe('渠道表、节点表没读到', () => {
   });
 });
 
+describe('节点点名的渠道和用不了的节点文件', () => {
+  it('节点走哪家按节点表里的 provider 认，不回头去读节点原文', async () => {
+    // 两边出自同一份文件；这里故意让它们不一致，钉住认的是节点表那一边。
+    vi.mocked(getNodes).mockResolvedValue([{ id: 'qq.vision', type: 'ai', provider: '' }] as any);
+
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'qq.vision' }));
+
+    expect(await screen.findByText('思考档位')).toBeTruthy();
+    expect(screen.queryByText('思考模式')).toBeNull();
+    expect(screen.getByText(/它自己没指定渠道，跟随全局在用的那个/)).toBeInTheDocument();
+  });
+
+  it('自己点名了渠道的节点不说跟随全局', async () => {
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'qq.vision' }));
+
+    expect(await screen.findByText('思考模式')).toBeTruthy();
+    expect(screen.queryByText(/跟随全局在用的那个/)).toBeNull();
+  });
+
+  it('用不了的节点在作用域里标出来，选中时说出原因，参数改不了', async () => {
+    const problem = 'YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here';
+    vi.mocked(getNodes).mockResolvedValue([...NODES, { id: 'broken', type: '', provider: '', problem }] as any);
+    vi.mocked(getNodeRaw).mockImplementation(async (_token: string, id: string) => (
+      id === 'broken' ? { content: 'type: ai\napi_key: x: y\n', hash: 'broken-1' } : { content: NODE_YAML, hash: 'node-1' }
+    ));
+
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'broken（用不了）' }));
+
+    expect(await screen.findByText(
+      `这个节点文件现在用不了，engine 加载不了它，修好之前这里改不了它的参数，先去「设置 → 节点文件」修好：${problem}`,
+    )).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: '高' })).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'qq.vision' })).toBeInTheDocument();
+    expect(updateNodeRaw).not.toHaveBeenCalled();
+  });
+});
+
 describe('设置页外壳里的模型页', () => {
   beforeEach(() => {
     platformConsoleStore('qq').setState({ live: null, loading: false, draft: {} });

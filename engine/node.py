@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+import yaml
+
 import config_layout
-from clonoth_runtime import load_yaml_dict, load_runtime_config, parse_bool, resolve_env_ref
+from clonoth_runtime import load_runtime_config, parse_bool, resolve_env_ref
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +134,9 @@ def _declared_aliases(path: Path) -> tuple[str, ...]:
     cached = _ALIAS_CACHE.get(key)
     if cached is not None and cached[0] == stamp:
         return cached[1]
-    aliases = _parse_aliases(load_yaml_dict(path) or {}, path.stem)
+    # kind、type 写错的定义也认它的旧 id：按旧 id 找过来，报的才是「不是能用的节点定义」而不是「找不到」。
+    data, _problem = read_node_definition(path)
+    aliases = _parse_aliases(data or {}, path.stem)
     _ALIAS_CACHE[key] = (stamp, aliases)
     return aliases
 
@@ -215,8 +219,7 @@ def missing_node_reason(workspace_root: Path, node_id: str) -> str:
     if path is None:
         return f"节点未找到：{name}"
     where = config_layout.logical_path(workspace_root, path)
-    data = load_yaml_dict(path)
-    problem = "YAML 读不出来，或者顶层不是 key: value 的映射" if data is None else _definition_problem(data)
+    _data, problem = read_node_definition(path)
     if not problem:
         return f"节点 {name}（{where}）这次没读成，文件可能正被改写，稍后再试"
     return f"节点 {name}（{where}）不是能用的节点定义：{problem}"
@@ -238,7 +241,8 @@ def known_node_ids(workspace_root: Path, node_id: str) -> tuple[str, ...]:
     return (path.stem, *_effective_aliases(workspace_root, path, _declared_aliases(path)))
 
 
-def _node_type(data: dict[str, Any]) -> str:
+def effective_node_type(data: dict[str, Any]) -> str:
+    """节点定义实际按哪种节点跑：type 没写是 ai，大小写不论。"""
     return str(data.get("type") or "ai").strip().lower()
 
 
@@ -247,10 +251,33 @@ def _definition_problem(data: dict[str, Any]) -> str:
     kind = str(data.get("kind") or "node").strip()
     if kind != "node":
         return f"kind 写的是 {kind}，节点只认 node"
-    node_type = _node_type(data)
+    node_type = effective_node_type(data)
     if node_type not in _NODE_TYPES:
         return f"type 写的是 {node_type}，只认 ai、tool"
     return ""
+
+
+def read_node_definition(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """读一份节点文件，返回 (定义, 用不了的原因)。能用时原因是空串。
+
+    读不出来、顶层不是映射时定义是 None；读出来了却不是能用的节点定义（kind、type 写错）时定义照给，原因不空。
+    原因只有位置和问题，不带原文：节点能单配 api_key，原因会进日志、控制台和交给模型的结果。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "文件不见了，可能刚被删掉或改名"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"读不了：{config_layout.config_error_text(exc)}"
+    try:
+        data = config_layout.load_yaml_text(text)
+    except yaml.YAMLError as exc:
+        return None, f"YAML 读不出来：{config_layout.yaml_error_text(exc)}"
+    if data is None:
+        return None, "文件是空的"
+    if not isinstance(data, dict):
+        return None, "顶层不是 key: value 的映射"
+    return data, _definition_problem(data)
 
 
 def _listed_targets(raw: Any) -> list[str]:
@@ -306,11 +333,11 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
 
 def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
     """按一份节点文件解析出节点，不管它能不能按 id 找到：控制台给模板、示例报实际工具时也要解析它们。"""
-    data = load_yaml_dict(node_path)
-    if data is None or _definition_problem(data):
+    data, problem = read_node_definition(node_path)
+    if data is None or problem:
         return None
     nid = node_path.stem
-    node_type = _node_type(data)
+    node_type = effective_node_type(data)
 
     # prompt：字符串→字符串模式，列表→block 列表模式
     raw_prompt = data.get("prompt")

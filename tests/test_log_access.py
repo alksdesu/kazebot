@@ -13,7 +13,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from supervisor.log_access import MAX_LINES, LogReader, redact  # noqa: E402
+from supervisor.log_access import MAX_LINES, SENSITIVE_KEY, LogReader, assigned_values, redact  # noqa: E402
 
 
 class TestRedaction:
@@ -41,6 +41,36 @@ class TestRedaction:
     def test_key_value_shapes_are_masked(self, line: str) -> None:
         # 中转站的 key 没有固定前缀，只能靠键名认。
         assert "relay-abcdefghij" not in redact(line)
+
+    @pytest.mark.parametrize(("line", "value"), [
+        ("apikey=relay-abcdefghij", "relay-abcdefghij"),
+        ("api-key: relay-abcdefghij", "relay-abcdefghij"),
+        ("X-Api-Key: relay-abcdefghij", "relay-abcdefghij"),
+        ("secret = relay-abcdefghij", "relay-abcdefghij"),
+        ("client_secret: 'relay-abcdefghij'", "relay-abcdefghij"),
+        ("passwd=relay-abcdefghij", "relay-abcdefghij"),
+        ("bearer: relay-abcdefghij", "relay-abcdefghij"),
+        ("access_token=relay-abcdefghij", "relay-abcdefghij"),
+        ("BOT_TOKEN: relay-abcdefghij", "relay-abcdefghij"),
+        ("Bearer relay-abcdefghij", "relay-abcdefghij"),
+        ("Basic cmVsYXk6YWJjZGVmZ2hpag==", "cmVsYXk6YWJjZGVmZ2hpag=="),
+    ])
+    def test_every_key_name_it_has_always_known_is_masked(self, line: str, value: str) -> None:
+        # 键名表和诊断导出共用之后，日志这边认得的一个都不能少。
+        assert value not in redact(line)
+
+    def test_the_values_it_reports_are_the_ones_it_masks(self) -> None:
+        text = "api_key: relay-abcdefghij\ntoken=short\nurl=https://relay.example\npassword: 'pw-0123456789'\n"
+
+        values = assigned_values(text)
+
+        assert values == ["relay-abcdefghij", "pw-0123456789"]
+        assert not any(value in redact(text) for value in values)
+
+    @pytest.mark.parametrize("key", ["api_key", "apiKey", "bot_token", "client_secret", "password", "passwd", "Authorization", "bearer"])
+    def test_the_shared_key_table_knows_the_names_the_log_masks(self, key: str) -> None:
+        assert SENSITIVE_KEY.search(key)
+        assert "relay-abcdefghij" not in redact(f"{key}: relay-abcdefghij")
 
     def test_keys_in_query_strings_are_masked(self) -> None:
         # Gemini 原生接口就是这么传 key 的。

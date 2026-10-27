@@ -130,6 +130,20 @@ class TestSelfReportedAccounts:
 
         assert _accounts(koki)["koki"] == _OLD_ACCOUNT
 
+    def test_an_unreadable_report_is_skipped_without_its_text(
+        self, koki: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config_layout.instance_account_path(koki).write_text(
+            "id: koki\nplatform: qq\naccount: qq-SECRET-account: x\n", encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="supervisor.instances"):
+            accounts = _accounts(koki)
+
+        assert accounts["koki"] == _OLD_ACCOUNT
+        assert "第 3 行第 27 列：mapping values are not allowed here" in caplog.text
+        assert "qq-SECRET" not in caplog.text
+
     def test_a_double_login_is_caught_through_the_report(self, koki: Path, code_root: Path) -> None:
         _report(code_root, "rong", _NEW_ACCOUNT)
 
@@ -235,6 +249,33 @@ class TestABrokenRosterIsNeverOverwritten:
     def test_a_caller_that_needs_the_truth_gets_an_error(self, koki: Path, broken: Path) -> None:
         with pytest.raises(InstanceDirectoryError):
             load_instances(koki, required=True)
+
+    def test_the_warning_names_the_place_but_not_the_line(
+        self, koki: Path, data_root: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 清单里记着各实例登的号，日志会被导出、贴进工单。
+        (data_root / "instances.yaml").write_text(
+            "instances:\n  - id: koki\n    account: qq-SECRET-account: x\n", encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.instances"):
+            assert load_instances(koki) == []
+
+        assert "第 3 行第 31 列：mapping values are not allowed here" in caplog.text
+        assert "qq-SECRET" not in caplog.text
+
+    def test_the_error_a_writer_gets_carries_no_line_on_its_chain(self, koki: Path, data_root: Path) -> None:
+        # 开实例、删实例再包一层 raise ... from 往上抛，漏到 500 时整条链都会打进日志。
+        (data_root / "instances.yaml").write_text(
+            "instances:\n  - id: koki\n    account: qq-SECRET-account: x\n", encoding="utf-8",
+        )
+
+        with pytest.raises(InstanceDirectoryError) as caught:
+            load_instances(koki, required=True)
+
+        assert str(caught.value) == "实例目录暂时不可用"
+        for link in (caught.value.__cause__, caught.value.__context__):
+            assert link is not None and "qq-SECRET" not in str(link)
 
     def test_an_empty_roster_is_no_instances_yet_not_an_error(self, koki: Path, data_root: Path) -> None:
         (data_root / "instances.yaml").write_text("", encoding="utf-8")

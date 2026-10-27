@@ -201,9 +201,10 @@ class PluginStore:
         except FileNotFoundError:
             return {"version": 1, "plugins": {}}
         try:
-            doc = yaml.safe_load(raw)
+            doc = config_layout.load_yaml_text(raw)
         except yaml.YAMLError as exc:
-            raise ValueError(f"插件配置无法读取：{exc}") from exc
+            # 插件设置里写着各家的密钥，原因只带位置和问题，控制台和状态文件都会转出去。
+            raise ValueError(f"插件配置无法读取：{config_layout.yaml_error_text(exc)}") from exc
         if not isinstance(doc, dict) or doc.get("version", 1) != 1 or not isinstance(doc.get("plugins"), dict):
             raise ValueError("插件配置必须包含 version: 1 和 plugins 字典")
         return doc

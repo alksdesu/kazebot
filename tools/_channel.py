@@ -1,6 +1,6 @@
 """工具子进程共用的渠道、平台密钥、开关参数解析和 YAML 配置读取。
 
-工具是独立子进程、只吃标准库，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍。
+工具是独立子进程，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍；YAML 的解析和报错按需借仓库根下的 config_layout。
 密钥只能从 .env 和 config/secrets.env 读（平台令牌只认 .env）：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -21,7 +22,7 @@ _log = logging.getLogger(__name__)
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
 # 和 Engine 的 _OPENAI_COMPATIBLE_PROVIDERS 同一族（测试比对两份）：同一个兼容网关的根下同时挂着 chat/completions、responses 和 images。
 OPENAI_FAMILY = frozenset({"openai", "openai-responses"})
-# 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE、SHARED_SECRETS_FILE 同值：这里只吃标准库，导不了它。
+# 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE、SHARED_SECRETS_FILE 同值：config_layout 到解析 YAML 时才按需导入，模块加载时还用不上它。
 _MODELS_FILE = ("config", "models.yaml")
 _PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
 _SHARED_SECRETS_FILE = ("config", "secrets.env")
@@ -156,15 +157,32 @@ def dotenv_values(root: Path | None = None) -> dict[str, str]:
     return {**shared, **instance}
 
 
-def _yaml_error_text(exc: BaseException) -> str:
-    """YAML 解析失败的原因，只取 context、problem 和出错位置：异常的字符串形式会附上出错那一行原文，那一行可能正是密钥。"""
-    reason = "; ".join(
-        str(part).strip() for part in (getattr(exc, "context", None), getattr(exc, "problem", None)) if part
-    ) or type(exc).__name__
-    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
-    if mark is None:
-        return reason
-    return f"{reason}（第 {mark.line + 1} 行第 {mark.column + 1} 列）"
+def _config_layout():
+    """仓库根下的 config_layout：YAML 的解析和报错和主进程用同一份，抄自文件的内容进不了原因。
+
+    按路径加载时仓库根已经在 sys.path 上；工具子进程的 sys.path 里只有脚本自己那一级，导不到再把仓库根补进去。
+    """
+    try:
+        import config_layout
+    except ImportError:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import config_layout
+    return config_layout
+
+
+def _import_failure(exc: ImportError) -> str:
+    if exc.name == "yaml":
+        return "没装 PyYAML"
+    return f"导入不了 {exc.name or 'config_layout'}"
+
+
+def _failure_reason(exc: BaseException) -> str:
+    try:
+        return _config_layout().config_error_text(exc)
+    except ImportError as missing:
+        return _import_failure(missing)
 
 
 def _file_stamp(path: Path) -> tuple[int, int, int] | None:
@@ -177,28 +195,19 @@ def _file_stamp(path: Path) -> tuple[int, int, int] | None:
 
 
 def _parse_yaml_file(path: Path) -> tuple[dict, str, bool]:
-    """(内容, 读不了的原因, 文件不存在)。空文件按空表算。"""
+    """(内容, 读不了的原因, 文件不存在)。空文件按空表算。原因只有位置和问题，不带文件内容。"""
     try:
         text = path.read_text(encoding="utf-8")
     except (FileNotFoundError, NotADirectoryError):
         return {}, "", True
-    except UnicodeDecodeError as exc:
-        return {}, f"不是 UTF-8 编码（第 {exc.start + 1} 个字节）", False
-    except OSError as exc:
-        return {}, exc.strerror or type(exc).__name__, False
+    except (OSError, UnicodeDecodeError) as exc:
+        return {}, _failure_reason(exc), False
     try:
-        import yaml  # type: ignore
-    except ImportError:
-        return {}, "没装 PyYAML", False
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        return {}, _yaml_error_text(exc), False
-    except RecursionError:
-        return {}, "嵌套太深", False
+        data = _config_layout().load_yaml_text(text)
+    except ImportError as exc:
+        return {}, _import_failure(exc), False
     except Exception as exc:
-        # 构造日期这类值出错抛的是 ValueError，消息里带着那个值
-        return {}, type(exc).__name__, False
+        return {}, _failure_reason(exc), False
     if data is None:
         return {}, "", False
     if not isinstance(data, dict):
@@ -500,7 +509,6 @@ def _wire_module():
         return _wire
     except ImportError:
         pass
-    import sys
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)

@@ -552,14 +552,24 @@ def _unknown_policy_keys(data: dict[str, Any]) -> list[str]:
 
 
 def load_policy_text(text: str) -> dict[str, Any]:
-    """policy 原文解析成映射。解析不了、顶层不是映射（空文件也算）都抛 ValueError。"""
+    """policy 原文解析成映射。解析不了、顶层不是映射（空文件也算）都抛 ValueError，原因只有位置和问题。"""
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise ValueError(f"YAML 解析失败：{exc}") from exc
+        raise ValueError(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     if not isinstance(data, dict):
         raise ValueError("policy 顶层必须是映射（key: value）")
     return data
+
+
+def parse_policy_text(text: str) -> dict[str, Any]:
+    """policy 原文解析并校验成运行期用的那份，用不了抛 ValueError。PolicyEngine 收不收哪一版，用的就是这两步。"""
+    return _validate_policy_dict(load_policy_text(text))
+
+
+def default_policy() -> dict[str, Any]:
+    """内置默认策略校验后的样子：一份 policy.yaml 都没读成过时，PolicyEngine 用的就是它。"""
+    return _validate_policy_dict(_default_policy_dict())
 
 
 def _unknown_keys_note(unknown: list[str]) -> str:
@@ -611,7 +621,7 @@ class PolicyEngine:
         self._lock = threading.RLock()
 
         # 第一次读文件就读坏时，生效的是这份内置默认。
-        self._cfg: dict[str, Any] = _validate_policy_dict(_default_policy_dict())
+        self._cfg: dict[str, Any] = default_policy()
 
         self._extra_roots: list[Path] = []
 

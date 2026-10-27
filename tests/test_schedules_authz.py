@@ -618,3 +618,64 @@ async def test_an_unverified_sender_cannot_delete_a_schedule_that_has_no_creator
     assert result["ok"] is False
     assert "cannot be verified" in result["error"]
     assert _ids(workspace) == ["nightly_backup"]
+
+
+# 读坏的那一行可能就是 script 的命令和里面的令牌。
+_BROKEN_SCHEDULES = "schedules:\n  - id: nightly_backup\n    command: bash backup.sh --token hunter2: x\n"
+
+
+def _broken_workspace(tmp_path: Path) -> Path:
+    path = tmp_path / "data" / "schedules.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_BROKEN_SCHEDULES, encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool, args", [
+    pytest.param(create_schedule, {"id": "mine", "cron": "0 9 * * *", "text": "hi"}, id="create"),
+    pytest.param(delete_schedule, {"id": "nightly_backup"}, id="delete"),
+    pytest.param(list_schedules, {}, id="list"),
+])
+async def test_an_unreadable_file_is_reported_by_place_and_left_alone(tmp_path: Path, tool: Any, args: dict[str, Any]) -> None:
+    # 以前原样的 YAMLError 连着那一行交给模型；删的时候还会当成没有定时任务，报成「找不到」，列的时候报成一条都没有。
+    workspace = _broken_workspace(tmp_path)
+
+    result = await tool(args, _Ctx(workspace, platform_auth=_ADMIN))
+
+    assert result["ok"] is False
+    assert "读不懂：第 3 行第 " in result["error"]
+    assert "hunter2" not in result["error"]
+    assert "not found" not in result["error"]
+    assert (workspace / "data" / "schedules.yaml").read_text(encoding="utf-8") == _BROKEN_SCHEDULES
+
+
+def test_a_tool_that_lets_the_error_escape_leaves_no_text_in_the_logged_traceback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # registry 接住工具抛出的异常会连 traceback 记一条日志、把消息交给模型：异常链上任何一环带着原文都会被打出来。
+    import asyncio
+    import logging
+
+    from supervisor.scheduler import update_schedules
+    from toolbox.registry import ToolRegistry
+
+    workspace = _broken_workspace(tmp_path)
+    registry = ToolRegistry(workspace_root=workspace, tools_dir=workspace / "tools", load_external=False)
+
+    async def careless(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+        update_schedules(ctx.workspace_root, lambda items: items)
+        return {"ok": True}
+
+    registry.register_builtin_tool("careless_schedule_edit", "", {"type": "object", "properties": {}}, careless)
+
+    with caplog.at_level(logging.ERROR, logger="toolbox.registry"):
+        result = asyncio.run(registry.execute(
+            name="careless_schedule_edit", arguments={}, ctx=_Ctx(workspace, platform_auth=_ADMIN),
+        ))
+
+    assert result["ok"] is False
+    assert "读不懂：第 3 行第 " in result["error"]
+    assert "hunter2" not in result["error"]
+    assert any(record.exc_info for record in caplog.records)
+    assert "hunter2" not in caplog.text

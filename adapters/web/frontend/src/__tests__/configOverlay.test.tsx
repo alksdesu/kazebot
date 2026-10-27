@@ -422,6 +422,20 @@ describe('节点的来源与删除', () => {
     await waitFor(() => expect(button('删除选中节点')).toBeEnabled());
     expect(screen.queryByRole('button', { name: '恢复默认选中节点' })).toBeNull();
   });
+
+  it('节点文件用不了的那一个用红字写出原因，能用的不写', async () => {
+    // 原来读不了的文件按空表算，列表里看着就是一个没名字、没类型的普通节点。
+    const problem = 'YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here';
+    vi.mocked(api.getNodes).mockResolvedValue([
+      ...NODES,
+      node('chat.broken', { source: 'custom', type: '', name: '', problem }),
+    ]);
+    await ready();
+
+    const line = within(nodeRow('chat.broken')).getByText(`节点文件用不了，选中后在右栏修好：${problem}`);
+    expect(line).toHaveClass('text-[var(--duties-danger)]');
+    expect(within(nodeRow('chat.mine')).queryByText(/节点文件用不了/)).toBeNull();
+  });
 });
 
 const tool = (name: string, over: Partial<AdminTool> = {}): AdminTool => ({

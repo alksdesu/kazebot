@@ -152,6 +152,10 @@ export const AgentsSettingsPage = () => {
                   文件里写着 id: {node.declared_id}，但节点认的是文件名，改那一行不会换节点
                 </p>
               )}
+              {node.problem && (
+                // engine 加载不了这份文件，派发、切过去都会落空。
+                <p className="mt-1 text-xs text-[var(--duties-danger)]">节点文件用不了，选中后在右栏修好：{node.problem}</p>
+              )}
               <p className="mt-1 text-xs text-[var(--duties-secondary)]">{node.name || '未命名'} · {node.type || '未知类型'} · {describeEnvRef(node.model || '') || '未设置模型'}</p>
               {node.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{node.description}</p>}
             </button>

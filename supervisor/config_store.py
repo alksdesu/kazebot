@@ -54,26 +54,42 @@ def _tristate(value: Any) -> bool | None:
 
 
 def _parse_models_text(text: str) -> dict[str, Any]:
-    """models.yaml 原文解析成 dict。空的按空配置算；解析不了、顶层不是映射抛 ConfigUnreadable。"""
+    """models.yaml 原文解析成 dict。空的按空配置算；解析不了、顶层不是映射抛 ConfigUnreadable，原因只有位置和问题。"""
     if not text.strip():
         return dict(_EMPTY_CONFIG)
     try:
-        data = yaml.safe_load(text)
+        data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
-        raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 解析失败：{exc}") from exc
+        raise ConfigUnreadable(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     if data is None:
         return dict(_EMPTY_CONFIG)
     if not isinstance(data, dict):
-        raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 顶层必须是映射（key: value）")
+        raise ConfigUnreadable("顶层必须是映射（key: value）")
     return data
+
+
+def _invalid_fields(exc: ValidationError) -> str:
+    """pydantic 的原文带着字段原值（api_key 写成列表时就是那把密钥），只留字段路径和问题。"""
+    return f"字段不合法：{config_layout.validation_error_text(exc)}"
+
+
+def _validation_failure(data: dict[str, Any]) -> str:
+    """data 当模型配置校验不过的原因，过了是空串。
+
+    调用方拿着原因在 except 块外抛：异常链上不挂那个带着原值的 ValidationError。
+    """
+    try:
+        AppConfigSecret.model_validate(data)
+    except ValidationError as exc:
+        return _invalid_fields(exc)
+    return ""
 
 
 def check_models_text(text: str) -> list[str]:
     """原文编辑器保存前的校验，和运行期读文件是同一套：这里不过的，存下去运行期也读不进去。"""
-    try:
-        AppConfigSecret.model_validate(_parse_models_text(text))
-    except ValidationError as exc:
-        raise ValueError(f"{config_layout.MODELS_FILE} 字段不合法：{exc}") from exc
+    reason = _validation_failure(_parse_models_text(text))
+    if reason:
+        raise ValueError(reason)
     return []
 
 
@@ -126,7 +142,7 @@ class ConfigStore:
         except FileNotFoundError:
             return dict(_EMPTY_CONFIG)
         except (OSError, UnicodeDecodeError) as exc:
-            raise ConfigUnreadable(f"读不了 {config_layout.MODELS_FILE}：{exc}") from exc
+            raise ConfigUnreadable(f"读不了：{exc}") from exc
         return _parse_models_text(text)
 
     def _load_locked(self) -> None:
@@ -135,17 +151,21 @@ class ConfigStore:
         try:
             data = self._read_file()
             config = AppConfigSecret.model_validate(data)
-        except (ConfigUnreadable, ValidationError) as exc:
-            if stamp != self._stamp or not self._error:
-                _log.warning("%s 用不了，%s：%s", config_layout.MODELS_FILE, self._fallback_note_locked(), exc)
+        except ConfigUnreadable as exc:
+            error = str(exc)
+        except ValidationError as exc:
+            error = _invalid_fields(exc)
+        else:
+            self._raw = data
+            self._config = config
             self._stamp = stamp
-            self._error = str(exc)
+            self._error = ""
+            self._adopted = True
             return
-        self._raw = data
-        self._config = config
+        if stamp != self._stamp or not self._error:
+            _log.warning("%s 用不了，%s：%s", config_layout.MODELS_FILE, self._fallback_note_locked(), error)
         self._stamp = stamp
-        self._error = ""
-        self._adopted = True
+        self._error = error
 
     def _fallback_note_locked(self) -> str:
         """文件用不了时手上那份是什么。只看已经装好的 _config，不能经过 _current：它会回头调 _load_locked。"""
@@ -214,16 +234,15 @@ class ConfigStore:
         with self._lock, config_layout.locked(self.path):
             self._load_locked()
             if self._error:
-                raise ConfigUnreadable(f"{self._error}。先在原文编辑器里修好再改")
+                raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 用不了：{self._error}。先在原文编辑器里修好再改")
             data = copy.deepcopy(self._raw)
             yield data
             # 没改动就不写：写一次就把手写的注释和排版洗掉一次，组里别的实例也会跟着重读。
             if data == self._raw:
                 return
-            try:
-                AppConfigSecret.model_validate(data)
-            except ValidationError as exc:
-                raise ValueError(f"改完的配置不合法，没有写入：{exc}") from exc
+            reason = _validation_failure(data)
+            if reason:
+                raise ValueError(f"改完的配置不合法，没有写入：{reason}")
             config_layout.write_locked(
                 self.path, self._dump(data), mode=config_layout.private_mode_for(self._root, self.path),
             )

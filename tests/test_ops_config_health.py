@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,3 +117,20 @@ def test_a_missing_or_healthy_mcp_file_adds_no_check(tmp_path: Path, text: str |
     report = asyncio.run(service(tmp_path).diagnose())
 
     assert "MCP 配置文件" not in _names(report)
+
+
+def test_a_key_on_the_broken_line_of_models_yaml_is_hidden_in_the_export(tmp_path: Path) -> None:
+    # 文件写坏时整份跳过的话，旧日志里按值记下的那把密钥（没有键名可认）就原样进了导出。
+    models = config_layout.models_path(tmp_path)
+    models.parent.mkdir(parents=True, exist_ok=True)
+    models.write_text("openai:\n  api_key: relay-SECRET-value: x\n", encoding="utf-8")
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "supervisor.log").write_text(
+        "[config] config/models.yaml 字段不合法：input_value=['relay-SECRET-value']\n", encoding="utf-8",
+    )
+
+    report = asyncio.run(service(tmp_path).diagnose(include_logs=True))
+
+    assert "input_value=" in report["logs"]["supervisor.log"]
+    assert "relay-SECRET-value" not in json.dumps(report, ensure_ascii=False)

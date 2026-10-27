@@ -5,6 +5,7 @@ config/ 装这个 bot 怎么运作的全部配置，能整份和别的实例共�
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import yaml
 
@@ -584,6 +585,215 @@ def file_stamp(path: Path) -> tuple[int, int, int] | None:
     return info.st_mtime_ns, info.st_size, info.st_ino
 
 
+# ---------------------------------------------------------------------------
+#  YAML 配置的解析和报错
+# ---------------------------------------------------------------------------
+
+_YAML_CORE_TAG = "tag:yaml.org,2002:"
+# 值构造失败时 PyYAML 直接抛 Python 异常，消息里就是写错的那个值，也没有位置。
+_CONSTRUCT_FAILURES = (ValueError, TypeError, KeyError, AttributeError, OverflowError)
+# repr() 写出来的字符串，单引号或双引号包着，里面可能有转义。
+_QUOTED_SPAN = re.compile(r"""'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*\"""")
+# PyYAML 报错里引用的记号名（<scalar>、<block mapping start>），不是文件内容。
+_TOKEN_NAME = re.compile(r"<[a-z ]+>")
+_MASKED_SPAN = "'***'"
+_NESTING_TOO_DEEP = "嵌套太深"
+
+
+class ConfigLoader(yaml.SafeLoader):
+    """SafeLoader 的子类：值构造不出来时抛带位置的 ConstructorError，消息里只写是哪种值，不写那个值。
+
+    按 YAML 1.1 认出来的日期、整数、布尔，或者 !!int 这类显式 tag，构造失败都走这里。
+    """
+
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        try:
+            return super().construct_object(node, deep=deep)
+        except _CONSTRUCT_FAILURES:
+            failure = yaml.constructor.ConstructorError(None, None, self._construct_problem(node.tag), node.start_mark)
+        # 在 except 块外抛：异常链上不挂那个带着原值的 Python 异常。
+        raise failure
+
+    @classmethod
+    def _construct_problem(cls, tag: str | None) -> str:
+        """只点出是哪种值。tag 名只在是注册过构造器的那几个时才写，用户自己写的 tag 可能就是密码。"""
+        name = str(tag or "").removeprefix(_YAML_CORE_TAG)
+        if f"{_YAML_CORE_TAG}{name}" in cls.yaml_constructors:
+            return f"值不是合法的 {name}"
+        return "值构造不出来"
+
+
+class YamlNestingTooDeep(yaml.YAMLError):
+    """嵌套层数超过了解释器的递归上限。PyYAML 自己抛的是 RecursionError，接住它的地方多半只认 YAMLError。"""
+
+    def __init__(self) -> None:
+        super().__init__(_NESTING_TOO_DEEP)
+
+
+@dataclass(frozen=True)
+class YamlErrorParts:
+    """一次 YAML 解析失败报给人看的部分：行列从 1 数，没有位置时是 None；message 不带文件内容。"""
+
+    line: int | None
+    column: int | None
+    message: str
+
+    @property
+    def text(self) -> str:
+        if self.line is None:
+            return self.message
+        return f"{position_text(self.line, self.column)}：{self.message}"
+
+
+def position_text(line: int, column: int | None = None) -> str:
+    """「第 L 行第 C 列」，列号没有时只写行。行列都从 1 数。"""
+    return f"第 {line} 行第 {column} 列" if column else f"第 {line} 行"
+
+
+def _masked_span(match: re.Match[str]) -> str:
+    span = match.group(0)
+    try:
+        value = ast.literal_eval(span)
+    except (ValueError, SyntaxError):
+        return _MASKED_SPAN
+    if isinstance(value, str) and (len(value) <= 1 or _TOKEN_NAME.fullmatch(value)):
+        return span
+    return _MASKED_SPAN
+
+
+def _mask_quoted(text: str | None) -> str | None:
+    """报错说明里引号括起来的内容换成 '***'：别名、锚点名、tag 都是照抄文件里写的，密码以 * 或 ! 开头时抄出来的就是密码。
+
+    单个字符（找到的 tab、冒号）和 PyYAML 的记号名照留，排障要靠它们。
+    """
+    if not text:
+        return text
+    return _QUOTED_SPAN.sub(_masked_span, text)
+
+
+def _bare_mark(mark: yaml.Mark | None) -> yaml.Mark | None:
+    """只留位置的 mark：原来那份带着整份原文，str() 时会把出错那一行打出来。"""
+    if mark is None:
+        return None
+    return yaml.Mark(mark.name, mark.index, mark.line, mark.column, None, None)
+
+
+def _without_source(exc: yaml.YAMLError) -> yaml.YAMLError:
+    """同一个类的一份干净副本：说明过一遍屏蔽，mark 不带原文。"""
+    if isinstance(exc, yaml.MarkedYAMLError):
+        return type(exc)(
+            _mask_quoted(exc.context), _bare_mark(exc.context_mark),
+            _mask_quoted(exc.problem), _bare_mark(exc.problem_mark),
+            _mask_quoted(exc.note),
+        )
+    if isinstance(exc, yaml.reader.ReaderError):
+        # 读字节时它是在 UnicodeDecodeError 的 except 里抛的，原对象的 __context__ 上挂着整段原始字节
+        return yaml.reader.ReaderError(exc.name, exc.position, exc.character, exc.encoding, exc.reason)
+    if isinstance(exc, YamlNestingTooDeep):
+        return exc
+    return yaml.YAMLError(type(exc).__name__)
+
+
+def _parse_without_source(parse: Callable[[], Any]) -> Any:
+    try:
+        return parse()
+    except yaml.YAMLError as exc:
+        failure = _without_source(exc)
+    except RecursionError:
+        failure = YamlNestingTooDeep()
+    # 在 except 块外抛：__cause__、__context__ 都不挂原来那个带着原文的异常。
+    raise failure
+
+
+def load_yaml_text(text: str, *, loader: type[ConfigLoader] = ConfigLoader) -> Any:
+    """解析一份配置原文。解析不了抛 yaml.YAMLError：还是 PyYAML 原来那个类，消息里只有位置和问题，异常链上也不挂原文。
+
+    值构造失败（写错的日期、!!int 后面跟的不是数）和嵌套太深也抛 yaml.YAMLError，不会漏出别的异常。
+    """
+    return _parse_without_source(lambda: yaml.load(text, Loader=loader))
+
+
+def load_yaml_documents(text: str, *, loader: type[ConfigLoader] = ConfigLoader) -> list[Any]:
+    """按 --- 分开的多份文档逐份解析，失败时和 load_yaml_text 一样只报位置和问题。"""
+    return _parse_without_source(lambda: list(yaml.load_all(text, Loader=loader)))
+
+
+def yaml_error_parts(exc: BaseException) -> YamlErrorParts:
+    """解析失败的位置和问题。问题照 PyYAML 的原话，引号里抄自文件的内容换成 '***'，出错那一行原文不带。"""
+    if isinstance(exc, yaml.MarkedYAMLError):
+        problem = _mask_quoted(exc.problem) or ""
+        context = _mask_quoted(exc.context) or ""
+        mark = exc.problem_mark or exc.context_mark
+        if problem and context:
+            where = ""
+            context_mark = exc.context_mark
+            if context_mark is not None and mark is not context_mark and (
+                context_mark.line, context_mark.column,
+            ) != (mark.line, mark.column):
+                where = f"，{position_text(context_mark.line + 1, context_mark.column + 1)}"
+            message = f"{problem}（{context}{where}）"
+        else:
+            message = problem or context or type(exc).__name__
+        if mark is None:
+            return YamlErrorParts(None, None, message)
+        return YamlErrorParts(mark.line + 1, mark.column + 1, message)
+    if isinstance(exc, yaml.reader.ReaderError):
+        character = exc.character
+        if isinstance(character, int):
+            detail = f"unacceptable character #x{character:04x}: {exc.reason}"
+        elif isinstance(character, bytes) and character:
+            detail = f"undecodable byte #x{character[0]:02x}: {exc.reason}"
+        else:
+            detail = str(exc.reason)
+        return YamlErrorParts(None, None, f"第 {exc.position + 1} 个字符：{detail}")
+    if isinstance(exc, (YamlNestingTooDeep, RecursionError)):
+        return YamlErrorParts(None, None, _NESTING_TOO_DEEP)
+    return YamlErrorParts(None, None, type(exc).__name__)
+
+
+def yaml_error_text(exc: BaseException) -> str:
+    """一行写清解析失败在哪、什么问题：「第 L 行第 C 列：problem（context，第 L2 行第 C2 列）」。不带文件内容。"""
+    return yaml_error_parts(exc).text
+
+
+def config_error_text(exc: BaseException) -> str:
+    """读一份配置失败的原因，读文件、解码、解析在一个 except 里接住时用。只有位置和问题，不带文件内容。"""
+    if isinstance(exc, (yaml.YAMLError, RecursionError)):
+        return yaml_error_text(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return f"不是 UTF-8 编码（第 {exc.start + 1} 个字节）"
+    if isinstance(exc, OSError):
+        return exc.strerror or type(exc).__name__
+    return type(exc).__name__
+
+
+def _field_path(loc: Iterable[Any]) -> str:
+    path = ""
+    for part in loc:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += f".{part}" if path else str(part)
+    return path
+
+
+def validation_error_text(exc: BaseException) -> str:
+    """pydantic 校验失败的原因：每条写成「字段路径：msg」，用「；」接，不带字段原值。
+
+    按鸭子类型调 errors()，这里不导入 pydantic。
+    """
+    try:
+        errors = exc.errors(include_input=False, include_url=False, include_context=False)
+    except (AttributeError, TypeError):
+        return type(exc).__name__
+    lines: list[str] = []
+    for error in errors:
+        where = _field_path(error.get("loc") or ())
+        message = str(error.get("msg") or error.get("type") or "").strip()
+        lines.append(f"{where}：{message}" if where else message)
+    return "；".join(line for line in lines if line) or type(exc).__name__
+
+
 def lock_path(path: Path) -> Path:
     """改 path 这份文件的人一律拿的锁文件。root 侧脚本用 flock 改清单时锁的也是它，两边的名字不能各写各的。"""
     # .env 这类本来就以点开头的，不再叠一个点。
@@ -841,7 +1051,7 @@ def split_platform_secrets(text: str) -> tuple[str, dict[str, Any] | None]:
     按行摘，其余的注释和换行不动；摘完解析出来和摘之前少了这一段对不上时，退回整份重新序列化。
     """
     try:
-        data = yaml.safe_load(text)
+        data = load_yaml_text(text)
     except yaml.YAMLError:
         return text, None
     if not isinstance(data, dict) or LEGACY_PLATFORMS_KEY not in data:
@@ -865,7 +1075,7 @@ def split_platform_secrets(text: str) -> tuple[str, dict[str, Any] | None]:
             end += 1
         remaining = "".join(lines[:start] + lines[end:])
         try:
-            if (yaml.safe_load(remaining) or {}) == data:
+            if (load_yaml_text(remaining) or {}) == data:
                 return remaining, section
         except yaml.YAMLError:
             pass
@@ -875,7 +1085,7 @@ def split_platform_secrets(text: str) -> tuple[str, dict[str, Any] | None]:
 def _yaml_document(path: Path) -> Any:
     """文件解析出来的东西；读不了或解析不了是 None。"""
     try:
-        return yaml.safe_load(path.read_bytes().decode("utf-8"))
+        return load_yaml_text(path.read_bytes().decode("utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
 

@@ -30,10 +30,12 @@ _ALLOWED_SHELL_TRUE = {
     "supervisor/scheduler.py",
 }
 _ALLOWED_YAML_LOAD = {
-    # 传的 Loader 是 SafeLoader 子类，只从隐式 resolver 表里摘掉 YAML 1.1 的布尔别名
-    # （on/off/yes/no），构造器一个没加，仍然构造不出任意 Python 对象。
-    "adapters/_shared/yaml_loader.py",
+    # 只有 load_yaml_text / load_yaml_documents 两处：Loader 限定为 ConfigLoader（SafeLoader 子类），
+    # 构造器一个没加，只是把构造失败换成不带原值的报错。手写 yaml 的布尔规则经 loader 参数传进来，
+    # 也是它的子类，仍然构造不出任意 Python 对象。
+    "config_layout.py",
 }
+_YAML_LOAD_CALLS = {"yaml.load", "_yaml.load", "yaml.load_all", "_yaml.load_all"}
 
 
 def _python_files() -> list[Path]:
@@ -108,10 +110,10 @@ def test_no_unsafe_yaml_load(parsed) -> None:
         f"{_rel(path)}:{lineno}"
         for path, tree in parsed
         for name, lineno in _called_names(tree)
-        if name in {"yaml.load", "_yaml.load"} and _rel(path) not in _ALLOWED_YAML_LOAD
+        if name in _YAML_LOAD_CALLS and _rel(path) not in _ALLOWED_YAML_LOAD
     ]
 
-    assert hits == [], f"yaml.load 会构造任意 Python 对象，用 safe_load: {hits}"
+    assert hits == [], f"yaml.load / yaml.load_all 会构造任意 Python 对象，读配置用 config_layout.load_yaml_text: {hits}"
 
 
 def test_no_pickle_loads_and_no_os_system(parsed) -> None:

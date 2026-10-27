@@ -138,6 +138,42 @@ def test_invalid_config_is_not_replaced(tmp_path):
     assert store.settings_path.read_text() == "plugins: [broken]"
 
 
+@pytest.mark.parametrize("broken,reason", [
+    (
+        "version: 1\nplugins:\n  relay:\n    settings:\n      token: sk-SECRET-plugin: x\n",
+        "插件配置无法读取：第 5 行第 30 列：mapping values are not allowed here",
+    ),
+    # 写错的 !!bool 原来让 PyYAML 抛 KeyError，接口层接不住，回的是 500 和带着小写原值的 traceback。
+    ("version: 1\nplugins:\n  relay:\n    enabled: !!bool sk-SECRET-plugin\n", "插件配置无法读取：第 4 行第 14 列：值不是合法的 bool"),
+], ids=["broken-line", "bad-value"])
+def test_unreadable_settings_name_the_place_but_not_the_line(tmp_path, monkeypatch, broken, reason):
+    # 插件设置里写着令牌，读不了的原因原样回给控制台。
+    store = PluginStore(tmp_path)
+    store.settings_path.parent.mkdir()
+    store.settings_path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        store.definitions()
+    assert str(caught.value) == reason
+    for link in (caught.value.__cause__, caught.value.__context__):
+        assert link is None or "sk-SECRET" not in str(link).lower()
+
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "plugin-test")
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    app = FastAPI()
+    app.include_router(create_plugin_router(tmp_path), prefix="/plugins")
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/plugins", headers={"Authorization": "Bearer plugin-test"})
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == reason
+    assert store.settings_path.read_text(encoding="utf-8") == broken
+
+
 def test_plugin_directory_symlink_rejected(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()

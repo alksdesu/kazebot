@@ -28,6 +28,7 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     _load_book,
     delete_memory,
     list_memories,
+    load_memory_catalog,
     save_memory,
 )
 from engine.memory_hit_cache import hit_cache_path, prune_entry_hits, read_hit_cache  # noqa: E402
@@ -36,6 +37,10 @@ from toolbox.context import ToolContext  # noqa: E402
 
 _CONV_KEY = "qq_group:bc3f12b0621298e191a49fa7"
 _BROKEN = "book: people\nentries:\n- id: keep\n  content: 原有内容\n  keywords: [a\n"
+# 坏的正是记着原话的那一行：报错里只该有位置和问题。
+_PRIVATE = "hunter2"
+_BROKEN_ON_A_PRIVATE_LINE = f"book: people\nentries:\n- id: keep\n  content: 她的密码是-{_PRIVATE}-secret: x\n"
+_BROKEN_ON_A_PRIVATE_LINE_REASON = "第 4 行第 32 列：mapping values are not allowed here"
 
 
 def _ctx(tmp_path: Path) -> ToolContext:
@@ -84,6 +89,24 @@ class TestLoadBook:
         with pytest.raises(MemoryBookUnreadable):
             _load_book(_write(tmp_path / "people.yaml", text))
 
+    @pytest.mark.parametrize(("text", "reason"), [
+        pytest.param(_BROKEN_ON_A_PRIVATE_LINE, _BROKEN_ON_A_PRIVATE_LINE_REASON, id="坏行"),
+        # 值构造不出来原来抛的是消息里带着原值的 ValueError，原样拼进了原因
+        pytest.param(
+            f"book: people\nentries:\n- id: keep\n  priority: !!int 她的密码是-{_PRIVATE}-secret\n",
+            "第 4 行第 13 列：值不是合法的 int",
+            id="坏值",
+        ),
+    ])
+    def test_the_reason_names_the_place_but_not_the_line(self, tmp_path: Path, text: str, reason: str) -> None:
+        # 原因会交给模型、写进日志、回给控制台。
+        with pytest.raises(MemoryBookUnreadable) as caught:
+            _load_book(_write(tmp_path / "people.yaml", text))
+
+        assert caught.value.reason == reason
+        for link in (caught.value, caught.value.__cause__, caught.value.__context__):
+            assert link is not None and _PRIVATE not in str(link)
+
     def test_missing_entries_keep_the_other_fields(self, tmp_path: Path) -> None:
         data = _load_book(_write(tmp_path / "people.yaml", "book: people\nnote: 手写\n"))
 
@@ -129,6 +152,35 @@ class TestToolsRefuseToOverwrite:
         assert [entry["id"] for entry in result["data"]["entries"]] == ["r1"]
         assert result["data"]["unreadable_books"] == ["people.yaml"]
 
+    def test_the_refusal_handed_to_the_model_names_the_place_but_not_the_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = _write(_namespace_dir(tmp_path) / "people.yaml", _BROKEN_ON_A_PRIVATE_LINE)
+
+        with caplog.at_level(logging.WARNING, logger="engine.builtin.knowledge_inject"):
+            result = asyncio.run(save_memory(
+                {"id": "new", "book": "people", "content": "新的", "keywords": ["k"]}, _ctx(tmp_path),
+            ))
+
+        assert result["ok"] is False
+        assert _BROKEN_ON_A_PRIVATE_LINE_REASON in result["error"]
+        assert _PRIVATE not in result["error"]
+        assert _PRIVATE not in caplog.text
+        assert path.read_text(encoding="utf-8") == _BROKEN_ON_A_PRIVATE_LINE
+
+    def test_the_prompt_build_skips_it_naming_the_place_but_not_the_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 每轮构建 prompt 都会扫到它，日志里会一遍遍出现。
+        _write(_namespace_dir(tmp_path) / "people.yaml", _BROKEN_ON_A_PRIVATE_LINE)
+
+        with caplog.at_level(logging.WARNING, logger="engine.builtin.knowledge_inject"):
+            catalog = load_memory_catalog(tmp_path, memory_book=conversation_namespace(_CONV_KEY), _use_cache=False)
+
+        assert catalog == []
+        assert f"memory book people.yaml skipped, unreadable: {_BROKEN_ON_A_PRIVATE_LINE_REASON}" in caplog.text
+        assert _PRIVATE not in caplog.text
+
 
 class TestConsoleRefusesToOverwrite:
     def _namespace(self, tmp_path: Path) -> str:
@@ -151,6 +203,23 @@ class TestConsoleRefusesToOverwrite:
             memory_admin.delete_entry(tmp_path, self._namespace(tmp_path), "default", "keep")
 
         assert path.read_text(encoding="utf-8") == _BROKEN
+
+    def test_the_refusal_names_the_place_but_not_the_line(self, tmp_path: Path) -> None:
+        # 控制台把原因原样显示出来；接口层再包一层往上抛，整条链都不能带原话。
+        _write(_namespace_dir(tmp_path) / "default.yaml", _BROKEN_ON_A_PRIVATE_LINE)
+
+        with pytest.raises(memory_admin.MemoryAdminError) as caught:
+            memory_admin.upsert_entry(
+                tmp_path, self._namespace(tmp_path), {"id": "a", "content": "x", "keywords": ["k"]},
+            )
+
+        assert str(caught.value) == (
+            f"记忆本 default.yaml 读不出来（{_BROKEN_ON_A_PRIVATE_LINE_REASON}），先修好或删掉这个文件再改"
+        )
+        link: BaseException | None = caught.value
+        while link is not None:
+            assert _PRIVATE not in str(link)
+            link = link.__cause__ or link.__context__
 
     def test_listing_skips_it_and_shows_the_rest(self, tmp_path: Path) -> None:
         _write(_namespace_dir(tmp_path) / "default.yaml", _BROKEN)

@@ -236,11 +236,13 @@ class TestTheReasonIsSpelledOut:
         assert "_ghost 是模板或示例的名字" in reason and "不能以 _ 开头" in reason
 
     @pytest.mark.parametrize("text, problem", [
-        ("type: [ai\n", "YAML 读不出来"),
-        ("- one\n- two\n", "YAML 读不出来"),
+        ("type: [ai\n", "YAML 读不出来：第 2 行第 1 列："),
+        ("- one\n- two\n", "顶层不是 key: value 的映射"),
+        ("", "文件是空的"),
+        ("model: m\nwhen: 2024-13-45\n", "YAML 读不出来：第 2 行第 7 列：值不是合法的 timestamp"),
         ("kind: skill\ntype: ai\n", "kind 写的是 skill"),
         ("type: robot\n", "type 写的是 robot"),
-    ], ids=["broken-yaml", "not-a-mapping", "wrong-kind", "wrong-type"])
+    ], ids=["broken-yaml", "not-a-mapping", "empty", "bad-value", "wrong-kind", "wrong-type"])
     def test_a_file_that_is_there_but_not_a_node_is_not_reported_missing(
         self, workspace: Path, text: str, problem: str,
     ) -> None:
@@ -251,6 +253,23 @@ class TestTheReasonIsSpelledOut:
         assert load_node(workspace, "scout") is None
         assert "节点未找到" not in reason
         assert "config/nodes/scout.yaml" in reason and problem in reason
+
+    def test_the_reason_names_the_place_but_not_the_line(self, workspace: Path) -> None:
+        # 节点能单配 api_key：原因会交给模型、进日志，写坏的那一行多半就是它。
+        _raw(workspace, "scout", "type: ai\napi_key: sk-SECRET-node: x\n")
+
+        reason = missing_node_reason(workspace, "scout")
+
+        assert "YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here" in reason
+        assert "sk-SECRET" not in reason
+
+    def test_an_alias_declared_by_a_definition_with_a_wrong_type_still_leads_to_it(self, workspace: Path) -> None:
+        # 按旧 id 找过来，要报的是「不是能用的节点定义」，不是「找不到」。
+        _raw(workspace, "scout", "type: robot\naliases: [old_scout]\n")
+
+        reason = missing_node_reason(workspace, "old_scout")
+
+        assert "config/nodes/scout.yaml" in reason and "type 写的是 robot" in reason
 
     def test_a_node_that_is_nowhere_is_still_not_found(self, workspace: Path) -> None:
         assert missing_node_reason(workspace, "nobody") == "节点未找到：nobody"

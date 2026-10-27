@@ -56,10 +56,11 @@ def read_raw(path: Path) -> dict[str, Any]:
 
 
 def parse_mapping(content: str) -> dict[str, Any]:
+    """控制台交上来的一份 YAML 原文。解析不了、顶层不是映射都是 400，原因只有位置和问题：节点、绘图配置里写着密钥。"""
     try:
-        document = yaml.safe_load(content)
+        document = config_layout.load_yaml_text(content)
     except yaml.YAMLError as exc:
-        raise HTTPException(status_code=400, detail=f"YAML 解析失败：{exc}") from exc
+        raise HTTPException(status_code=400, detail=f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     if document is not None and not isinstance(document, dict):
         raise HTTPException(status_code=400, detail="顶层必须是映射（key: value）")
     return document or {}

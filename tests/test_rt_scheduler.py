@@ -328,6 +328,22 @@ class TestTheEditorCheck:
         with pytest.raises(ValueError):
             check_schedules_text(text)
 
+    @pytest.mark.parametrize(("text", "reason"), [
+        (
+            "schedules:\n  - id: a\n    command: run --token sk-SECRET-sched: x\n",
+            "YAML 解析失败：第 3 行第 41 列：mapping values are not allowed here",
+        ),
+        ("schedules:\n  - id: a\n    cron: !!int sk-SECRET-sched\n", "YAML 解析失败：第 3 行第 11 列：值不是合法的 int"),
+    ], ids=["broken-line", "bad-value"])
+    def test_a_refusal_names_the_place_but_not_the_line(self, text: str, reason: str) -> None:
+        # 条目里写着要跑的命令和里面的令牌；原因原样显示在控制台，接口层再包一层往上抛。
+        with pytest.raises(ValueError) as caught:
+            check_schedules_text(text)
+
+        assert str(caught.value) == reason
+        for link in (caught.value.__cause__, caught.value.__context__):
+            assert link is not None and "sk-SECRET" not in str(link)
+
     @pytest.mark.parametrize("text", ["", "schedules: []\n", "schedules:\n", "{}\n"])
     def test_an_empty_list_is_fine(self, text: str) -> None:
         assert check_schedules_text(text) == []
@@ -480,3 +496,23 @@ class TestAnUnreadableFile:
 
         warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
         assert len(warnings) == 2
+
+    def test_the_log_and_a_writer_get_the_place_but_not_the_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 条目里写着要跑的命令和里面的令牌：调度线程每分钟记一次日志，改它的工具把原因交给模型。
+        path = schedules_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("schedules:\n  - id: a\n    command: run --token sk-SECRET-sched: x\n", encoding="utf-8")
+        reason = "第 3 行第 41 列：mapping values are not allowed here"
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.scheduler"):
+            assert load_schedules(tmp_path) == []
+        with pytest.raises(scheduler.ScheduleFileUnreadable) as caught:
+            scheduler.read_schedules(tmp_path)
+
+        assert reason in caplog.text
+        assert "sk-SECRET" not in caplog.text
+        assert str(caught.value).endswith(f"读不懂：{reason}")
+        for link in (caught.value, caught.value.__cause__, caught.value.__context__):
+            assert link is not None and "sk-SECRET" not in str(link)

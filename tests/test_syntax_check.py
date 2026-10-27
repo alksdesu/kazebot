@@ -157,6 +157,53 @@ class TestYaml:
         assert report is not None and not report.ok
         assert "api_token_value_123" not in report.describe()
 
+    def test_the_context_keeps_its_own_position(self) -> None:
+        report = check_syntax(Path("conf.yaml"), "a: 1\nb: [1, 2\nc: 3\n")
+
+        assert report is not None and not report.ok
+        assert (report.line, report.column) == (3, 2)
+        assert report.message == "expected ',' or ']', but got ':'（while parsing a flow sequence，第 2 行第 4 列）"
+
+    @pytest.mark.parametrize(
+        "content,column,kind",
+        [
+            ("when: 2024-13-45\n", 7, "timestamp"),
+            ("port: !!int sk-SECRET-port\n", 7, "int"),
+            ("enabled: !!bool sk-SECRET-flag\n", 10, "bool"),
+            ("ratio: !!float sk-SECRET-ratio\n", 8, "float"),
+        ],
+    )
+    def test_a_value_that_cannot_be_built_fails_instead_of_raising(self, content: str, column: int, kind: str) -> None:
+        # 检查跑在写盘之后：PyYAML 构造值失败抛的是 ValueError 一类，冒出去就成了一次没写上的写入
+        report = check_syntax(Path("conf.yaml"), content)
+
+        assert report is not None and not report.ok
+        assert (report.line, report.column) == (1, column)
+        assert report.message == f"值不是合法的 {kind}"
+        assert "sk-SECRET" not in report.describe()
+
+    @pytest.mark.parametrize("content", ["password: *sk-SECRET-alias\n", "key: !sk-SECRET-tag value\n"])
+    def test_an_alias_or_a_tag_named_in_the_problem_is_not_quoted(self, content: str) -> None:
+        report = check_syntax(Path("conf.yaml"), content)
+
+        assert report is not None and not report.ok
+        assert report.line == 1
+        assert "sk-SECRET" not in report.describe()
+
+    def test_a_broken_later_document_reports_its_own_line(self) -> None:
+        report = check_syntax(Path("conf.yaml"), "a: 1\n---\nb: !!int sk-SECRET-second\n")
+
+        assert report is not None and not report.ok
+        assert (report.line, report.column) == (3, 4)
+        assert "sk-SECRET" not in report.describe()
+
+    def test_deep_nesting_fails_without_a_position(self) -> None:
+        report = check_syntax(Path("conf.yaml"), "[" * 5000 + "]" * 5000)
+
+        assert report is not None and not report.ok
+        assert report.line is None
+        assert report.describe() == "语法检查未通过（YAML）：嵌套太深"
+
 
 class TestToml:
     def test_valid_toml_passes(self) -> None:

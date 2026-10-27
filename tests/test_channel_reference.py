@@ -273,7 +273,7 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 @pytest.fixture
 def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setattr(clonoth_runtime, "_MODELS_CONFIG", {})
+    monkeypatch.setattr(clonoth_runtime, "_MODELS_CONFIG", clonoth_runtime._MODELS_CONFIG.fresh())
     config_layout.models_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     return tmp_path
 
@@ -293,6 +293,35 @@ class TestTheEngineCopyOfTheModelsFile:
         assert (channel.wire, channel.base_url) == ("gemini", "https://relay-a.example/v1")
         assert len(_warnings(caplog)) == 1
         assert "沿用上一份能用的" in _warnings(caplog)[0]
+
+    def test_the_warning_names_the_place_but_not_the_line(self, workspace: Path, caplog) -> None:
+        # 坏的那一行多半就是密钥：日志会被收进诊断包、贴进工单。
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        load_models_config(workspace)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(path, CONFIG.replace("api_key: sk-relay-a", "api_key: sk-relay-a: oops"))
+            load_models_config(workspace)
+
+        assert len(_warnings(caplog)) == 1
+        assert "YAML 解析失败：第 10 行第 " in _warnings(caplog)[0]
+        assert "sk-relay-a" not in _warnings(caplog)[0]
+
+    def test_a_value_that_cannot_be_built_keeps_the_last_good_copy(self, workspace: Path, caplog) -> None:
+        # PyYAML 造日期失败抛的是 ValueError：以前直接从 load_models_config 漏出去，每次解析渠道都崩。
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert resolve_channel(workspace, "gemini-中转A").known
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(path, CONFIG + "note: 2026-02-30\n")
+            channel = resolve_channel(workspace, "gemini-中转A")
+
+        assert channel.base_url == "https://relay-a.example/v1"
+        assert len(_warnings(caplog)) == 1
+        assert "值不是合法的 timestamp" in _warnings(caplog)[0]
+        assert "2026-02-30" not in _warnings(caplog)[0]
 
     def test_a_top_level_that_is_not_a_mapping_counts_as_broken(self, workspace: Path) -> None:
         path = config_layout.models_path(workspace)

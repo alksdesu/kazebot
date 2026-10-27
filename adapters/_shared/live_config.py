@@ -348,7 +348,8 @@ def _parse_document(path: Path, stamp: tuple[int, int, int]) -> tuple[Mapping[st
     try:
         loaded = load_yaml(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        # 平台配置里有白名单号码和接入令牌，原因只带位置和问题：它会进日志和控制台的状态栏。
+        return None, f"{type(exc).__name__}: {config_layout.config_error_text(exc)}"
     if loaded is None:
         return {}, ""
     if isinstance(loaded, Mapping):

@@ -161,3 +161,10 @@ class TestReadImageFollowsTheMainChannel:
     def test_no_key_anywhere_says_so(self, tmp_path) -> None:
         out = self._run(_workspace(tmp_path, CONFIG.replace("api_key: sk-main", "api_key: ''")))
         assert "No API key" in out["error"]
+
+    def test_a_broken_models_file_is_reported_without_its_text(self, tmp_path) -> None:
+        # 子进程的 sys.path 里只有 tools/：_channel 得自己把仓库根补上才导得到 config_layout，报错照样只有位置和问题。
+        out = self._run(_workspace(tmp_path, CONFIG.replace("api_key: sk-main", "api_key: [sk-main-broken")))
+        assert out["ok"] is False
+        assert "config/models.yaml 读不了：第 " in out["error"]
+        assert "sk-main-broken" not in out["error"]

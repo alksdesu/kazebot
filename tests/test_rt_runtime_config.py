@@ -141,6 +141,24 @@ class TestABrokenLayer:
 
         assert "config/runtime.yaml" in runtime_config_error(ws)
 
+    @pytest.mark.parametrize("broken,reason", [
+        ("engine:\n  token: sk-SECRET-runtime: x\n", "YAML 解析失败：第 2 行第 27 列：mapping values are not allowed here"),
+        ("engine:\n  max_steps: !!int sk-SECRET-runtime\n", "YAML 解析失败：第 2 行第 14 列：值不是合法的 int"),
+    ], ids=["broken-line", "bad-value"])
+    def test_the_reason_names_the_place_but_not_the_line(
+        self, ws: Path, code_root: Path, caplog: pytest.LogCaptureFixture, broken: str, reason: str,
+    ) -> None:
+        # 原因进日志、健康检查和诊断导出。值构造不出来原来抛的是 ValueError，每读一次配置炸一次。
+        own = _write(config_layout.runtime_path(ws), "engine:\n  max_steps: 70\n")
+        assert load_runtime_config(ws)["engine"]["max_steps"] == 70
+
+        with caplog.at_level(logging.WARNING, logger="clonoth_runtime"):
+            _write(own, broken)
+            assert load_runtime_config(ws)["engine"]["max_steps"] == 70
+
+        assert runtime_config_error(ws) == f"config/runtime.yaml 用不了，沿用上一份能用的：{reason}"
+        assert "sk-SECRET" not in caplog.text
+
 
 class TestTheEditorCheck:
     @pytest.mark.parametrize("text", ["engine: [unclosed\n", "- a\n- b\n", "engine: 5\n", "engine:\n  retry: nope\n"])
@@ -150,6 +168,14 @@ class TestTheEditorCheck:
 
     def test_a_refusal_is_a_value_error_the_console_turns_into_a_400(self) -> None:
         assert issubclass(RuntimeConfigError, ValueError)
+
+    def test_a_refusal_leaves_nothing_on_the_exception_chain(self, code_root: Path) -> None:
+        # 接口层 raise ... from exc 再交给 uvicorn，500 的 traceback 会把整条链打出来。
+        with pytest.raises(RuntimeConfigError) as caught:
+            check_runtime_text("engine:\n  token: sk-SECRET-runtime: x\n")
+
+        for link in (caught.value, caught.value.__cause__, caught.value.__context__):
+            assert link is None or "sk-SECRET" not in str(link)
 
     @pytest.mark.parametrize("text", ["", "engine:\n  max_steps: 10\n", "engine:\n"])
     def test_a_usable_file_passes_quietly(self, code_root: Path, text: str) -> None:

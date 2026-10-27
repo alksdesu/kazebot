@@ -195,6 +195,24 @@ class TestTheRuntimeLookup:
         assert "oops-token-value" not in warnings[0]
         assert "2026-13-45" not in warnings[0]
 
+    @pytest.mark.parametrize("text,reason", [
+        ("qq:\n  access_token: [oops-token-value\n", "读不了（第 3 行第 1 列：expected ',' or ']'"),
+        ("qq:\n  access_token: 2026-13-45\n", "读不了（第 2 行第 17 列：值不是合法的 timestamp）"),
+        ("- qq\n- oops-token-value\n", "读不了（顶层不是映射）"),
+    ])
+    def test_the_warning_still_says_where_and_what(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, text: str, reason: str,
+    ) -> None:
+        # 只报异常类名的话位置也丢了，人得一行行去猜坏在哪。
+        monkeypatch.setattr(clonoth_runtime, "_platform_secrets_warned", {})
+        _write(config_layout.platform_secrets_path(ws), text)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime.__name__):
+            load_platform_secrets(ws)
+
+        assert reason in caplog.text
+        assert "oops-token-value" not in caplog.text
+
     def test_another_broken_version_is_logged_again(
         self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -298,6 +316,9 @@ class TestDiagnosticsRedactWhatIsInTheNewFiles:
         ("config/drawtools/settings.yaml", "api:\n  api_key: key-in-drawtools\n", "key-in-drawtools"),
         ("data/config.yaml", "openai:\n  api_key: key-in-old-models\n", "key-in-old-models"),
         ("data/mcp_clients.yaml", "clients:\n  fs:\n    env:\n      API_TOKEN: token-in-old-mcp\n", "token-in-old-mcp"),
+        ("tools/drawtools/settings.yaml", "api:\n  api_key: key-in-old-drawtools\n", "key-in-old-drawtools"),
+        ("config/plugins.yaml", "version: 1\nplugins:\n  relay:\n    settings:\n      api_token: token-in-plugins\n", "token-in-plugins"),
+        ("config/nodes/scout.yaml", "id: scout\ntype: ai\napi_key: key-in-node\n", "key-in-node"),
     ])
     def test_every_place_a_key_can_sit_is_scanned(self, ws: Path, rel: str, body: str, value: str) -> None:
         # 搬家后旧位置那几份还留着给退回旧版本用，里面可能是没轮换掉的旧密钥，一并抹。
@@ -308,6 +329,35 @@ class TestDiagnosticsRedactWhatIsInTheNewFiles:
 
         assert value in secrets
         assert value not in service._clean(f"request failed with {value}", secrets)
+
+    @pytest.mark.parametrize(("rel", "body", "value"), [
+        ("config/models.yaml", "openai:\n  api_key: relay-key-models: x\n", "relay-key-models"),
+        ("config/models.yaml", "openai:\n  api_key: *relay-key-alias\n", "relay-key-alias"),
+        ("data/platform_secrets.yaml", "qq:\n  access_token: 'relay-token-quote\n", "relay-token-quote"),
+        ("config/mcp.yaml", "clients:\n  fs:\n    env:\n      API_TOKEN: [relay-token-mcp\n", "relay-token-mcp"),
+        ("config/plugins.yaml", "plugins:\n  relay:\n\tpassword: relay-pass-plugins\n", "relay-pass-plugins"),
+        ("config/nodes/scout.yaml", "id: scout\napi_key: \"relay-key-node\n", "relay-key-node"),
+    ])
+    def test_a_file_that_no_longer_parses_is_scanned_line_by_line(
+        self, ws: Path, rel: str, body: str, value: str,
+    ) -> None:
+        # 文件写坏的时候，正是密钥可能随报错进了日志的时候：整份跳过的话导出里就抹不掉它。
+        _write(ws / rel, body)
+        service = self._service(ws)
+
+        secrets = service._configured_secrets()
+
+        assert value in secrets
+        assert value not in service._clean(f"字段不合法：input_value=['{value}']", secrets)
+
+    def test_a_short_remainder_of_a_broken_line_is_not_taken(self, ws: Path) -> None:
+        # 打码表按子串替换，从坏行里剥出来的短词会把报告里不相干的字也抹掉。
+        _write(ws / "config/models.yaml", "openai:\n  api_key: [abc]: x\n  token: '0123456789\n")
+
+        secrets = set(self._service(ws)._configured_secrets())
+
+        assert "abc" not in secrets
+        assert "0123456789" in secrets
 
     def test_a_declared_platform_secret_is_collected_by_name(self, ws: Path) -> None:
         # access_token 这种名字按 token/secret 的关键词也认得出，但声明那一遍不能少。
