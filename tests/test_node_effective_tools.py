@@ -99,7 +99,9 @@ tool_access:
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "allowlist"
-    assert [row["name"] for row in body["tools"]] == ["read_file", "guarded_tool"]
+    # 最后一行是引擎自己加的超长输出读取工具，白名单里没写也能调
+    assert [row["name"] for row in body["tools"]] == ["read_file", "guarded_tool", "read_tool_output"]
+    assert [bool(row["automatic"]) for row in body["tools"]] == [False, False, True]
 
 
 def test_flags_a_name_that_is_not_registered(client, workspace: Path) -> None:
@@ -246,3 +248,78 @@ tool_access:
     assert "hashline" in plain["edit_lines"]["gated"]
     assert plain["read_file"]["gated"] == ""
     assert hashed["edit_lines"]["gated"] == ""
+
+
+
+def _rows(client, node_id: str) -> dict[str, dict[str, Any]]:
+    return {row["name"]: row for row in client("GET", f"{_BASE}/{node_id}/effective-tools", headers=_AUTH).json()["tools"]}
+
+
+_ISOLATABLE_CODER = "id: w.coder\ntype: ai\nisolation: worktree\ntool_access: all\n"
+
+
+def test_the_merge_tool_comes_with_a_delegate_target_that_opts_into_isolation(client, workspace: Path) -> None:
+    # 没勾也能调：委派目标写了 isolation: worktree，引擎就给合回工具
+    _write_node(workspace, "w.coder", _ISOLATABLE_CODER)
+    _write_node(workspace, "w.lead", """
+id: w.lead
+type: ai
+delegate_targets: [w.coder]
+tool_access:
+  mode: allowlist
+  allow: [read_file]
+""")
+
+    rows = _rows(client, "w.lead")
+
+    assert rows["read_file"]["automatic"] == ""
+    assert rows["merge_worktree"]["gated"] == ""
+    assert "w.coder" in rows["merge_worktree"]["automatic"] and "isolation: worktree" in rows["merge_worktree"]["automatic"]
+    assert rows["read_tool_output"]["gated"] == "" and rows["read_tool_output"]["automatic"]
+
+
+def test_the_merge_tool_does_not_follow_the_checkbox(client, workspace: Path) -> None:
+    _write_node(workspace, "w.coder", _ISOLATABLE_CODER)
+    _write_node(workspace, "w.wide", "id: w.wide\ntype: ai\ntool_access: all\n")
+    _write_node(workspace, "w.listed", """
+id: w.listed
+type: ai
+tool_access:
+  mode: allowlist
+  allow: [read_file, merge_worktree]
+""")
+    _write_node(workspace, "w.denied", """
+id: w.denied
+type: ai
+delegate_targets: [w.coder]
+tool_access:
+  mode: all
+  deny: [merge_worktree]
+""")
+    _write_node(workspace, "w.both", """
+id: w.both
+type: ai
+delegate_targets: [w.coder]
+tool_access:
+  mode: allowlist
+  allow: [read_file, merge_worktree]
+  deny: [merge_worktree]
+""")
+
+    # 全给或者写进白名单，没有能隔离的委派目标照样不给
+    for node_id in ("w.wide", "w.listed"):
+        merge = _rows(client, node_id)["merge_worktree"]
+        assert merge["automatic"] == "" and "没有写 isolation: worktree" in merge["gated"], node_id
+    assert "merge_worktree" not in _rows(client, "w.denied")
+    both = _rows(client, "w.both")["merge_worktree"]
+    assert both["automatic"] == "" and "deny" in both["gated"]
+
+
+@pytest.mark.parametrize("allow", [
+    pytest.param("[ghost_tool]", id="only-unregistered"),
+    pytest.param("[edit_lines]", id="only-dropped"),
+])
+def test_no_reader_for_a_node_left_without_tools(client, workspace: Path, allow: str) -> None:
+    _write_node(workspace, "w.empty", f"id: w.empty\ntype: ai\ntool_access:\n  mode: allowlist\n  allow: {allow}\n")
+
+    assert "read_tool_output" not in _rows(client, "w.empty")

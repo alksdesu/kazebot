@@ -2099,6 +2099,8 @@ export interface EffectiveTool {
   guarded: boolean | null;
   /** 非空 = 这个工具会在构建工具表时被摘掉，理由就是这段文字。 */
   gated: string;
+  /** 非空 = 引擎不看勾选自己会加上这个工具，什么时候给就是这段文字。 */
+  automatic: string;
 }
 
 export interface EffectiveTools {

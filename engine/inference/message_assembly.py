@@ -5,8 +5,10 @@ from typing import Any
 
 from ..attachments import build_multimodal_content
 from ..conversation_routing import render_history_inputs, render_user_input, turn_input_meta
+from ..isolation_notice import isolation_parts
 from ..node import Node
 from ..output_guide import OUTPUT_GUIDE_KEY, static_guide_messages, turn_guide_parts
+from ..project_root import ISOLATION_CONTEXT_KEY
 from ..prompt import assemble_prompt
 
 
@@ -66,6 +68,7 @@ def assemble_messages_with_injections(
     memory_dynamic: list[dict[str, Any]] | None = None,
     output_guide: dict[str, Any] | None = None,
     turn_meta: dict[str, Any] | None = None,
+    isolation: Any = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Lay out prompt messages using precomputed skill and memory injections.
 
@@ -78,6 +81,8 @@ def assemble_messages_with_injections(
 
     turn_meta 是当轮输入落盘时会带的 meta（turn_input_meta 算出）。历史里的用户输入按各自的 meta、
     当轮输入按它渲染，同一条输入当轮发出去的和之后重载的才一字不差。
+    isolation 是 task_context 里的隔离说明：隔离副本里的任务在动态区多一段 [ISOLATION]，排在技能和记忆之前；
+    其余任务的提示词一字不变。
     """
     skill_static = list(skill_static or [])
     skill_dynamic = list(skill_dynamic or [])
@@ -85,6 +90,7 @@ def assemble_messages_with_injections(
     memory_dynamic = list(memory_dynamic or [])
     guide_static = static_guide_messages(output_guide)
     guide_turn = turn_guide_parts(output_guide)
+    isolation_turn = isolation_parts(isolation, workspace_root=workspace_root)
     rendered_history = render_history_inputs(history)
 
     # ---- Prompt cache friendly layout ----
@@ -146,7 +152,7 @@ def assemble_messages_with_injections(
             messages.pop()
 
         # --- Dynamic (在 instruction 之前) ---
-        _dynamic_parts: list[str] = []
+        _dynamic_parts: list[str] = list(isolation_turn)
         for _dm in skill_dynamic:
             if _dm.get("content"):
                 _dynamic_parts.append(_dm["content"])
@@ -216,6 +222,7 @@ def assemble_messages_with_injections(
         _dynamic_parts_s: list[str] = []
         if len(system_prompt) >= 2 and system_prompt[1].get("content"):
             _dynamic_parts_s.append(system_prompt[1]["content"])
+        _dynamic_parts_s.extend(isolation_turn)
         for _dm in skill_dynamic:
             if _dm.get("content"):
                 _dynamic_parts_s.append(_dm["content"])
@@ -251,19 +258,21 @@ def assemble_initial_messages(
     task_context: dict[str, Any] | None = None,
     session_id: str = "",
     attachments: list[dict[str, Any]] | None = None,
+    project_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
     """构建初始 messages 数组。
 
     返回 (messages, is_block_mode, system_prompt_blocks)。
     system_prompt_blocks 是 assemble_prompt 的原始输出，供后续 preempt 注入使用。
+    project_root 是任务的项目根，渲染 {{project_root}}；没给就等于 workspace_root。
     """
     prompt_vars: dict[str, str] = {
         "node_id": node.id,
         "node_name": node.name,
         "instruction": instruction,
     }
-    system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars)
-    # 技能和记忆由 before_prompt_build 钩子补上后按同一个布局重排；输出说明不依赖钩子，骨架里就带上。
+    system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars, project_root=project_root)
+    # 技能和记忆由 before_prompt_build 钩子补上后按同一个布局重排；输出说明和隔离说明不依赖钩子，骨架里就带上。
     messages, is_block_mode = assemble_messages_with_injections(
         workspace_root=workspace_root,
         system_prompt=system_prompt,
@@ -272,5 +281,6 @@ def assemble_initial_messages(
         attachments=attachments,
         output_guide=(task_context or {}).get(OUTPUT_GUIDE_KEY),
         turn_meta=turn_input_meta(task_context),
+        isolation=(task_context or {}).get(ISOLATION_CONTEXT_KEY),
     )
     return messages, is_block_mode, system_prompt

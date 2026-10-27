@@ -17,7 +17,10 @@ export function parseNodeList(nodes: NodeDef[]): NodeDef[] {
   const delegated = new Set<string>();
   for (const n of nodes) {
     if (n.delegate_targets) {
-      for (const t of n.delegate_targets) delegated.add(t);
+      for (const t of n.delegate_targets) {
+        // A node that delegates to itself (a coder handing parts to sub-coders) still has no upstream.
+        if (t !== n.id) delegated.add(t);
+      }
     }
   }
   return nodes.filter(n =>

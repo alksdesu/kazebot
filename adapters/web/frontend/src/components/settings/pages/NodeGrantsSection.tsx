@@ -132,8 +132,9 @@ const DefaultsNotice = ({ nodes }: { nodes: AdminNode[] }) => {
 
 const EffectiveNotes = ({ dead, mode, rows }: { dead: string[]; mode: Mode; rows: EffectiveTool[] }) => {
   const gated = rows.filter((row) => row.gated).map((row) => row.name);
+  const automatic = rows.filter((row) => row.automatic).map((row) => row.name);
   const loose = rows.filter((row) => row.guarded === false).length;
-  if (!dead.length && !gated.length && !loose) return null;
+  if (!dead.length && !gated.length && !automatic.length && !loose) return null;
   return (
     <div className="mb-2">
       {!!dead.length && (
@@ -143,7 +144,10 @@ const EffectiveNotes = ({ dead, mode, rows }: { dead: string[]; mode: Mode; rows
             : `这些名字不存在，注入时会被静默忽略：${dead.join('、')}`}
         </ErrorText>
       )}
-      {!!gated.length && <ErrorText>能调但用不了，渠道没设 model：{gated.join('、')}</ErrorText>}
+      {!!gated.length && <ErrorText>勾了也用不了：{gated.join('、')}，原因看各自的「不可用」。</ErrorText>}
+      {!!automatic.length && (
+        <Facts>没勾也会给：{automatic.join('、')}，引擎不看勾选自己加上，什么时候给看各自的「自动给」。</Facts>
+      )}
       {!!loose && <Facts>其中 {loose} 个是外部脚本，没声明 guard，「服务端策略」那一页管不到它们。</Facts>}
     </div>
   );
@@ -165,6 +169,7 @@ const ToolCell = ({ effective, enabled, missing, missingTitle, name, onToggle }:
           <span className={`break-all font-mono text-mini ${enabled ? 'text-[var(--duties-text)]' : 'text-[var(--duties-tertiary)] line-through'}`}>{name}</span>
           {missing && <Mark title={missingTitle} tone="danger">未注册</Mark>}
           {!!effective?.gated && <Mark title={effective.gated} tone="danger">不可用</Mark>}
+          {!!effective?.automatic && <Mark title={effective.automatic} tone="muted">自动给</Mark>}
           {effective?.guarded === false && (
             <Mark title="外部脚本没声明 guard，服务端策略那一页对它不生效" tone="muted">策略外</Mark>
           )}

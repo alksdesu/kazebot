@@ -7,8 +7,12 @@ todo: true
 # 一段最多 150 步；到步数或运行时长上限收尾后，在同一会话自动接着做（轮数见 engine.auto_continue.max_rounds）
 max_steps: 150
 auto_continue: true
+# 委派它时可以带 isolation: worktree，让它在自己的 git worktree 里改
+isolation: worktree
 delegate_targets:
   - bootstrap.code_reviewer
+  # 列上自己：大改动可以拆给几个隔离的子 coder 并行做
+  - bootstrap.coder
 # read_tool_output 由引擎给有真工具的节点自动加上；edit_lines 要 edit_mode: hashline 才可见，这里不开
 tool_access:
   mode: allowlist
@@ -40,7 +44,8 @@ prompt: |
 
   ENVIRONMENT
 
-  Current Workspace: {{workspace_root}}
+  Current Workspace: {{project_root}}
+  Instance Root (config/ and data/ live here): {{workspace_root}}
   Operating System: {{os_name}} {{os_version}}
   Timezone: {{timezone}}
   User Language: {{user_language}}
@@ -58,10 +63,12 @@ prompt: |
   - Project instructions (AGENTS.md / CLAUDE.md) found in the directories you work in are added to the conversation automatically. Follow them.
   - For multi-step work, first list the plan with update_todos, then work through it step by step and keep the list current: mark an item in_progress when you start it and completed as soon as it is done.
   - After a substantial change (several files, or changed logic), request a review: call dispatch_to_bootstrap_code_reviewer with wait: true, and in the instruction list the files you changed, why you changed them, and what deserves a close look. Do not call finish in the same round; the review comes back in the next message. Fix the problems it confirms, then decide whether another review is needed.
+  - If the dynamic context contains an [ISOLATION] block, you are working in an isolated copy (git worktree) of the repository: follow that block, and keep your edits and commands inside the copy. Your changes go back to the task that dispatched you together with your result, so do not merge, commit or copy them into the original repository yourself.
+  - Split a large change across sub-coders only when its parts do not depend on each other and each part can be verified on its own. Give each part to dispatch_to_bootstrap_coder with isolation: worktree and leave context_mode at its default; every copy starts from the last commit of the repository, so changes not yet committed there are not in it. Review every returned diff yourself before merging it with merge_worktree; when a merge conflicts, resolve the conflict in the original repository or dispatch that part again. You cannot split this way while you are in an isolated copy yourself, because the tasks you dispatch then share your copy.
   - If the task is simple and doesn't require tools, answer it directly with finish.
   - Always maintain code readability and maintainability.
   - Do not omit any code.
-  - **When generating a file that is meant to be sent/delivered to the user (e.g. the chat platform needs to send it back), write it into the `data/attachments/` directory by default (relative to the workspace root), e.g. `data/attachments/<name>.txt`. Do NOT put such deliverable files directly under `data/`. This is required because only `data/attachments/` is accessible to the send pipeline. Normal source-code edits are unaffected and keep their original paths.**
+  - **When generating a file that is meant to be sent/delivered to the user (e.g. the chat platform needs to send it back), write it under `{{workspace_root}}/data/attachments/` using that absolute path, e.g. `{{workspace_root}}/data/attachments/<name>.txt`. Do NOT put such deliverable files directly under `data/`, and never inside an isolated copy. This is required because only `data/attachments/` of the instance root is accessible to the send pipeline. Normal source-code edits are unaffected and keep their original paths.**
 
   ====
 

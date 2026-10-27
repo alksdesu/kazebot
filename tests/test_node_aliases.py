@@ -173,7 +173,7 @@ class TestDelegation:
 
         info = _collect_node_info(workspace, ["qq.web_search"])
 
-        assert info == [{"id": "chat.web_search", "name": "联网搜索入口", "description": "只开放联网工具"}]
+        assert info == [{"id": "chat.web_search", "name": "联网搜索入口", "description": "只开放联网工具", "isolatable": False}]
 
     def test_an_old_id_is_neither_a_switch_target_nor_a_root(self, workspace: Path) -> None:
         _node(workspace, "chat.web_search", id="chat.web_search", aliases=["qq.web_search"])

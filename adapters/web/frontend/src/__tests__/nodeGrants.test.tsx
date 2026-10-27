@@ -44,7 +44,7 @@ const INTENT: AdminNode = { id: 'qq.intent', type: 'ai', tool_access: { mode: 'n
 const REGISTERED = ['clonoth_debug', 'execute_command', 'gemini_image', 'read_file', 'write_file'];
 
 const row = (name: string, over: Partial<EffectiveTool> = {}): EffectiveTool => ({
-  name, registered: true, external: false, guarded: null, gated: '', ...over,
+  name, registered: true, external: false, guarded: null, gated: '', automatic: '', ...over,
 });
 
 const EFFECTIVE: EffectiveTool[] = [
@@ -141,10 +141,31 @@ describe('勾了不等于能用', () => {
     render(<NodeGrantsSection />);
     const item = within(await expand('qq.orchestrator'));
 
-    const note = await item.findByText(/能调但用不了/);
+    const note = await item.findByText(/勾了也用不了/);
     expect(note).toHaveTextContent('gemini_image');
+    expect(note).not.toHaveTextContent('渠道没设 model');
     const cell = item.getByText('gemini_image').closest('div') as HTMLElement;
-    expect(within(cell).getByText('不可用')).toBeTruthy();
+    expect(within(cell).getByTitle('渠道未配置 model，构建工具表时会被摘掉')).toHaveTextContent('不可用');
+  });
+
+  it('引擎不看勾选自己加上的工具，没勾也标出来会给', async () => {
+    const given = '不看 tool_access：委派目标 bootstrap.coder 写了 isolation: worktree，引擎自动给';
+    vi.mocked(getEffectiveTools).mockResolvedValue({
+      node_id: 'qq.orchestrator', mode: 'allowlist', dead_names: [], tools: [
+        row('read_file'),
+        row('merge_worktree', { automatic: given }),
+      ],
+    });
+    vi.mocked(getAllToolNames).mockResolvedValue([...REGISTERED, 'merge_worktree']);
+    render(<NodeGrantsSection />);
+    const item = within(await expand('qq.orchestrator'));
+
+    const note = await item.findByText(/没勾也会给/);
+    expect(note).toHaveTextContent('merge_worktree');
+    expect(note).not.toHaveTextContent('read_file');
+    const cell = item.getByText('merge_worktree').closest('div') as HTMLElement;
+    expect(within(cell).getByRole('checkbox')).not.toBeChecked();
+    expect(within(cell).getByTitle(given)).toHaveTextContent('自动给');
   });
 
   it('没声明 guard 的外部脚本说清服务端策略管不到', async () => {

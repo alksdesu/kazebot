@@ -31,6 +31,8 @@ from .pseudo_tools import (
     _update_todos_spec,
     _to_openai_tools,
     _filter_tool_specs,
+    isolating_targets,
+    merge_tool_offered,
 )
 from .resume_builder import _build_resume_messages
 from .loop_state import (
@@ -69,7 +71,9 @@ from ..context_store import load_context_snapshot
 from ..dispatch_batch import AWAIT_KEY, DispatchTimeouts
 from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
 from ..conversation_store import Message, MessageType
+from ..isolation_notice import task_isolation
 from ..node import Node
+from ..worktree_report import MERGE_TOOL
 from .message_assembly import assemble_initial_messages
 from ..conversation_routing import concise_text, render_user_input, routing_meta, short_reply, turn_input_meta
 from ..protocol import (
@@ -101,7 +105,7 @@ from ..run_budget import (
     RunBudget,
 )
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config, parse_bool
-from toolbox.context import ToolContext
+from toolbox.context import ToolContext, project_root_of
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
 from .tool_format import (
@@ -2159,7 +2163,7 @@ async def run_ai_node(
     run_id: str = "",
     context_ref: str = "",
     resume_data: dict[str, Any] | None = None,
-    downstream_info: list[dict[str, str]] | None = None,
+    downstream_info: list[dict[str, Any]] | None = None,
     switch_info: list[dict[str, str]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
     steps_used: int = 0,
@@ -2235,6 +2239,7 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
+            project_root=project_root_of(rctx),
         )
         _assembled_fresh = True
 
@@ -2308,6 +2313,21 @@ async def run_ai_node(
                     break
 
     # ---- 构建工具列表 ----
+    delegate_targets = list(node.delegate_targets)
+    # 一张图都画不出来的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
+    try:
+        from ..builtin.image_gen_gating import disabled_draw_nodes
+        _disabled_nodes = disabled_draw_nodes(rctx.workspace_root) & set(delegate_targets)
+        if _disabled_nodes:
+            delegate_targets = [t for t in delegate_targets if t not in _disabled_nodes]
+            logger.info("image_gen_gating: removed delegate targets %s (no channel configured, node=%s)", sorted(_disabled_nodes), node.id)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("image_gen_gating delegate filter skipped: %s", _exc)
+    # 隔离副本里的任务不给 isolation、repo，也不给合回工具：它派出的子任务只能沿用这个副本
+    _isolating = isolating_targets(
+        delegate_targets, downstream_info, in_isolation=bool(task_isolation(rctx.task_context)),
+    )
+
     _registry_specs = registry.list_specs()
     tool_specs = _filter_tool_specs(node, _registry_specs)
     # 跑不通的生图工具（gpt_image_2 / gemini_image）从可用工具列表里彻底移除，
@@ -2323,6 +2343,13 @@ async def run_ai_node(
                 logger.info("image_gen_gating: removed unconfigured image tools %s (node=%s)", sorted(_removed), node.id)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("image_gen_gating tool filter skipped: %s", _exc)
+    # 合回工具不看 tool_access，像 await_dispatches 一样跟着委派目标走：有能隔离的目标才给
+    _merge_spec = (
+        next((s for s in _registry_specs if s.get("name") == MERGE_TOOL), None)
+        if merge_tool_offered(node, _isolating) else None
+    )
+    if _merge_spec is not None:
+        tool_specs.append(_merge_spec)
     # 超长输出的 ref 只能用 read_tool_output 读回；它只读本会话自己的产物，不受 tool_access 限制，没有真工具的节点不加
     if tool_specs and not any(s.get("name") == READ_TOOL_OUTPUT for s in tool_specs):
         _reader_spec = next((s for s in _registry_specs if s.get("name") == READ_TOOL_OUTPUT), None)
@@ -2331,16 +2358,6 @@ async def run_ai_node(
     _allowed_real_tools = {s.get("name") for s in tool_specs if s.get("name")}
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
 
-    delegate_targets = list(node.delegate_targets)
-    # 一张图都画不出来的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
-    try:
-        from ..builtin.image_gen_gating import disabled_draw_nodes
-        _disabled_nodes = disabled_draw_nodes(rctx.workspace_root) & set(delegate_targets)
-        if _disabled_nodes:
-            delegate_targets = [t for t in delegate_targets if t not in _disabled_nodes]
-            logger.info("image_gen_gating: removed delegate targets %s (no channel configured, node=%s)", sorted(_disabled_nodes), node.id)
-    except Exception as _exc:  # noqa: BLE001
-        logger.warning("image_gen_gating delegate filter skipped: %s", _exc)
     _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))
     if delegate_targets:
         # [2026-05-04] Register one dynamic dispatch tool per delegate target.
@@ -2352,6 +2369,7 @@ async def run_ai_node(
         _dispatch_timeouts = DispatchTimeouts.from_config(runtime_cfg)
         openai_tools.extend(_dispatch_delegate_specs(
             delegate_targets, downstream_info, allow_wait=not _is_system_task, timeouts=_dispatch_timeouts,
+            isolating=_isolating, can_merge=_merge_spec is not None, caller_id=node.id,
         ))
         openai_tools.extend(_dispatch_control_specs(allow_await=not _is_system_task, timeouts=_dispatch_timeouts))
 
@@ -2382,6 +2400,7 @@ async def run_ai_node(
         max_steps = min(max_steps, _SHORT_REPLY_MAX_STEPS)
         _allowed_real_tools = set()
         delegate_targets = []
+        _isolating = []
         _todo_enabled = False
 
     # ---- 工具定义注入（formatter 统一处理 native/json 差异）----
@@ -2415,6 +2434,7 @@ async def run_ai_node(
         formatter=formatter,
         allowed_real_tools=_allowed_real_tools,
         allowed_dispatch_targets=set(delegate_targets),
+        isolating_targets=set(_isolating),
         compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
         compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
         compact_hard_threshold=_resolve_compact_hard_threshold(runtime_cfg),

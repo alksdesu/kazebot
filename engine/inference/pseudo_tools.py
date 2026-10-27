@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import logging
+from collections.abc import Collection, Mapping
 from typing import Any, TYPE_CHECKING
 
 from toolbox.tool_names import DISPATCH_TOOL_PREFIX
@@ -12,15 +14,22 @@ from toolbox.tool_names import DISPATCH_TOOL_PREFIX
 from ..dispatch_batch import (
     AWAIT_ALL,
     AWAIT_ANY,
+    ISOLATION_KEY,
+    ISOLATION_WORKTREE,
     MAX_AWAIT_HANDLES,
     MAX_DISPATCH_BATCH_ITEMS,
     MIN_TIMEOUT_SEC,
+    OWN_SESSION_MODES,
+    REPO_KEY,
     DispatchTimeouts,
 )
 from ..todo_list import MAX_TODO_CONTENT_CHARS, MAX_TODO_ITEMS, TODO_STATUSES, TODO_TOOL_NAME
+from ..worktree_report import MERGE_TOOL
 
 if TYPE_CHECKING:
     from ..node import Node
+
+logger = logging.getLogger(__name__)
 
 
 import re as _re
@@ -80,6 +89,41 @@ DISPATCH_CONTROL_TOOL_NAMES = frozenset({
     AWAIT_DISPATCHES_TOOL_NAME, LIST_DISPATCHES_TOOL_NAME, CANCEL_DISPATCH_TOOL_NAME,
 })
 
+_REPO_DESCRIPTION = (
+    f"只在 {ISOLATION_KEY}={ISOLATION_WORKTREE} 时有效：要隔离的仓库，填它的绝对路径；不填就是工作区所在的仓库。"
+    "只能是工作区所在的仓库，或者策略 extra_roots 下的 git 仓库。"
+)
+
+
+def _isolation_description(*, can_merge: bool) -> str:
+    if can_merge:
+        after = f"做完后改动按 diff 随结果交回，你审过之后用 {MERGE_TOOL} 合回或放弃。"
+    else:
+        after = f"做完后改动按 diff 随结果交回；这个节点不能调用 {MERGE_TOOL}，审过的改动交给上级或用户去合回。"
+    return (
+        f"{ISOLATION_WORKTREE}=让目标节点在自己的 git worktree（隔离副本）里改代码、跑命令，不动原仓库；"
+        f"副本从原仓库当前的提交（HEAD）检出，原仓库里还没提交的改动不在里面。{after}"
+        "几个子任务要同时改同一个仓库，或者改动要先审再进仓库时用；只读、查询、生图这类任务不要用。"
+        f"用 continue_from 接着一个隔离过的子 agent 时，沿用它原来的副本，不用再填 {ISOLATION_KEY}。"
+    )
+
+
+def _isolation_review(*, can_merge: bool) -> str:
+    """可隔离目标的委派工具说明里多的那一段：交回的副本怎么审、怎么合回或放弃。"""
+    head = (
+        f"带 {ISOLATION_KEY}={ISOLATION_WORKTREE} 派出的，结果里附有副本的改动清单、diff 和完整补丁的位置：先看清单和 diff，"
+        "补丁文件和副本目录都在工作区外，读它们要审批。"
+    )
+    if can_merge:
+        return head + (
+            f"满意就调用 {MERGE_TOOL} 合回，不要就用它带上 abandon=true 放弃；合回冲突时如实说明冲突在哪，"
+            "不要绕开合回把改动手抄进原仓库；既不合回也不放弃的副本过了保留期会被清理。"
+        )
+    return head + (
+        f"这个节点不能调用 {MERGE_TOOL}，审过的改动交给上级或用户去合回，不要自己把改动手抄进原仓库；"
+        "副本过了保留期会被清理。"
+    )
+
 
 # [2026-05-04] Shared parameter schema for dynamic per-target dispatch tools.
 # Why: dispatch:{target_id} fixes the target in the tool name, so exposing a
@@ -89,19 +133,35 @@ DISPATCH_CONTROL_TOOL_NAMES = frozenset({
 # existing supervisor dispatch API while making each delegate target visible as a
 # first-class tool.
 def _dispatch_delegate_parameters(
-    *, allow_wait: bool = True, timeouts: DispatchTimeouts | None = None,
+    *,
+    allow_wait: bool = True,
+    timeouts: DispatchTimeouts | None = None,
+    isolation: bool = False,
+    can_merge: bool = True,
+    to_self: bool = False,
 ) -> dict[str, Any]:
+    """isolation=True 时多带 isolation、repo 两个参数，其余参数一字不变。
+
+    to_self=True 是委派给调用方自己这个节点：context_mode 只有 fresh、fork，也没有只对 accumulate 有效的 context_key。
+    """
     limits = timeouts or DispatchTimeouts()
-    context_mode_description = (
-        "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；"
-        "fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；"
-        "accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。"
-        "不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。"
-    )
-    if allow_wait:
-        context_mode_description += (
-            "wait=true 时子节点的会话随本任务结束清理，accumulate 只在这次任务里延续；要跨任务长期累积，用 wait=false。"
+    if to_self:
+        context_mode_description = (
+            "子节点上下文模式。fresh=从零无历史（不填就是它）；fork=继承你当前的对话历史。"
+            "委派给自己时不能沿用会话（accumulate）：同时派出的几份、以及它们再派出的，会落进同一个会话；"
+            "要接着之前派出的那一份，用 continue_from。"
         )
+    else:
+        context_mode_description = (
+            "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；"
+            "fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；"
+            "accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。"
+            "不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。"
+        )
+        if allow_wait:
+            context_mode_description += (
+                "wait=true 时子节点的会话随本任务结束清理，accumulate 只在这次任务里延续；要跨任务长期累积，用 wait=false。"
+            )
     properties: dict[str, Any] = {
         "instruction": {
             "type": "string",
@@ -109,7 +169,7 @@ def _dispatch_delegate_parameters(
         },
         "context_mode": {
             "type": "string",
-            "enum": ["fresh", "fork", "accumulate"],
+            "enum": list(OWN_SESSION_MODES) if to_self else [*OWN_SESSION_MODES, "accumulate"],
             "description": context_mode_description,
         },
         "context_key": {
@@ -125,11 +185,13 @@ def _dispatch_delegate_parameters(
             "type": "string",
             "description": (
                 "接着上一个子 agent 干：填它的委派结果里给的句柄（task_id@session_id），目标节点要和上次一样。"
-                "子 agent 带着自己原来的对话历史继续，context_mode 和 context_key 不再生效；"
+                f"子 agent 带着自己原来的对话历史继续，{'context_mode' if to_self else 'context_mode 和 context_key'} 不再生效；"
                 "当时用 wait 派的要用 wait 接着派，异步派的要异步接着派。"
             ),
         },
     }
+    if to_self:
+        del properties["context_key"]
     if allow_wait:
         properties["wait"] = {
             "type": "boolean",
@@ -147,6 +209,16 @@ def _dispatch_delegate_parameters(
                 "同一批的其它委派照常收齐。不填就一直等到它做完。"
             ),
         }
+    if isolation:
+        properties[ISOLATION_KEY] = {
+            "type": "string",
+            "enum": [ISOLATION_WORKTREE],
+            "description": _isolation_description(can_merge=can_merge),
+        }
+        properties[REPO_KEY] = {
+            "type": "string",
+            "description": _REPO_DESCRIPTION,
+        }
     return {
         "type": "object",
         "properties": properties,
@@ -156,12 +228,19 @@ def _dispatch_delegate_parameters(
 
 def _dispatch_delegate_spec(
     target_id: str,
-    info: dict[str, str] | None = None,
+    info: Mapping[str, Any] | None = None,
     *,
     allow_wait: bool = True,
     timeouts: DispatchTimeouts | None = None,
+    isolation: bool = False,
+    can_merge: bool = True,
+    to_self: bool = False,
 ) -> dict:
-    """Build one dispatch_to_<target> pseudo-tool spec; allow_wait=False leaves out the wait parameter."""
+    """Build one dispatch_to_<target> pseudo-tool spec; allow_wait=False leaves out the wait parameter.
+
+    isolation=True 给可以隔离的目标：多 isolation、repo 两个参数，说明里多一段交回的副本怎么审、怎么合回。
+    to_self=True 给调用方自己这个节点：派出去的是另一份它，不能沿用会话。
+    """
     target = str(target_id or "").strip()
     node_name = str((info or {}).get("name") or target).strip() or target
     node_description = str((info or {}).get("description") or node_name or target).strip()
@@ -171,6 +250,8 @@ def _dispatch_delegate_spec(
         "",
         "目标节点在自己的会话里执行。参数中不再提供 target，该工具名已经固定了目标节点。",
     ]
+    if to_self:
+        desc_parts.append("目标就是你自己这个节点：派出去的是另一份你，在它自己的会话里做。")
     if allow_wait:
         desc_parts += [
             "两种用法：",
@@ -190,30 +271,45 @@ def _dispatch_delegate_spec(
             "本工具立即返回句柄（handle），不含执行结果。",
             "结果稍后会作为一条新消息送达，那时再向用户汇报；本轮不要臆测结果，也不要承诺完成时间。",
         ]
+    if isolation:
+        desc_parts.append(_isolation_review(can_merge=can_merge))
     desc_parts.append("需要并行委派时，可以在同一轮调用多个委派工具。")
     return {
         "type": "function",
         "function": {
             "name": _dispatch_tool_name(target),
             "description": "\n".join(part for part in desc_parts if part is not None),
-            "parameters": _dispatch_delegate_parameters(allow_wait=allow_wait, timeouts=timeouts),
+            "parameters": _dispatch_delegate_parameters(
+                allow_wait=allow_wait, timeouts=timeouts, isolation=isolation, can_merge=can_merge, to_self=to_self,
+            ),
         },
+    }
+
+
+def _info_by_id(downstream_info: list[dict[str, Any]] | None) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(info.get("id") or "").strip(): info
+        for info in (downstream_info or [])
+        if isinstance(info, Mapping) and str(info.get("id") or "").strip()
     }
 
 
 def _dispatch_delegate_specs(
     targets: list[str],
-    downstream_info: list[dict[str, str]] | None = None,
+    downstream_info: list[dict[str, Any]] | None = None,
     *,
     allow_wait: bool = True,
     timeouts: DispatchTimeouts | None = None,
+    isolating: Collection[str] = (),
+    can_merge: bool = True,
+    caller_id: str = "",
 ) -> list[dict]:
-    """Build dynamic dispatch pseudo-tools for all delegate targets."""
-    info_by_id = {
-        str(info.get("id") or "").strip(): info
-        for info in (downstream_info or [])
-        if isinstance(info, dict) and str(info.get("id") or "").strip()
-    }
+    """Build dynamic dispatch pseudo-tools for all delegate targets; targets in isolating get isolation and repo.
+
+    caller_id 是调用方自己的节点 id：委派清单里列着它自己时，那个工具按委派给自己来建。
+    """
+    info_by_id = _info_by_id(downstream_info)
+    offered = set(isolating)
     result: list[dict] = []
     seen: set[str] = set()
     for raw_target in targets:
@@ -223,8 +319,29 @@ def _dispatch_delegate_specs(
         seen.add(target)
         result.append(_dispatch_delegate_spec(
             target, info_by_id.get(target), allow_wait=allow_wait, timeouts=timeouts,
+            isolation=target in offered, can_merge=can_merge, to_self=bool(caller_id) and target == caller_id,
         ))
     return result
+
+
+def isolating_targets(
+    targets: list[str], downstream_info: list[dict[str, Any]] | None, *, in_isolation: bool,
+) -> list[str]:
+    """委派时给 isolation、repo 的目标：节点信息说它可以隔离的（isolatable，节点 YAML 写了 isolation: worktree）。
+
+    任务自己已在隔离副本里时一个都不给：子任务只能沿用这个副本，嵌套的副本会从原仓库的 HEAD 起步、
+    合回原仓库，绕开外层副本收尾时的审。
+    """
+    if in_isolation:
+        return []
+    info_by_id = _info_by_id(downstream_info)
+    picked: list[str] = []
+    for raw_target in targets:
+        target = str(raw_target or "").strip()
+        info = info_by_id.get(target)
+        if target and target not in picked and info is not None and info.get("isolatable") is True:
+            picked.append(target)
+    return picked
 
 
 def _await_dispatches_spec(timeouts: DispatchTimeouts | None = None) -> dict:
@@ -741,7 +858,10 @@ def tool_allowed(node: "Node", name: str, spec: dict[str, Any] | None = None) ->
 
     授权语义只此一份：列表过滤和单名校验都走它，不然两处迟早漂移成两套规则。
     未知 mode 落 none —— 配错了宁可什么都不给。手里有 spec 的调用方要把它传进来，requires_edit_mode 也在这里判。
+    合回工具不归 tool_access 放行：推理循环按 merge_tool_offered 另给，别的入口（独立工具任务、执行计划）一律不给。
     """
+    if name == MERGE_TOOL:
+        return False
     if not edit_mode_matches(node, spec):
         return False
     mode = (node.tool_access.mode or "none").lower()
@@ -754,3 +874,26 @@ def tool_allowed(node: "Node", name: str, spec: dict[str, Any] | None = None) ->
 
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [s for s in all_specs if tool_allowed(node, s.get("name") or "", s)]
+
+
+def isolatable_node(node: "Node") -> bool:
+    """委派这个节点时能不能要求隔离：节点 YAML 写了 isolation: worktree 才算，取值和委派时填的是同一个。"""
+    extra = getattr(node, "extra", None)
+    raw = extra.get(ISOLATION_KEY) if isinstance(extra, dict) else None
+    if raw is None:
+        return False
+    if isinstance(raw, str) and raw.strip().lower() == ISOLATION_WORKTREE:
+        return True
+    logger.warning(
+        "node %s has an invalid %s %r; only %s is recognized, dispatches to it cannot ask for isolation",
+        getattr(node, "id", "?"), ISOLATION_KEY, raw, ISOLATION_WORKTREE,
+    )
+    return False
+
+
+def merge_tool_offered(node: "Node", isolating: Collection[str]) -> bool:
+    """推理循环给不给合回工具：委派目标里有能要求隔离的（任务已在隔离副本里时一个都没有），而且 tool_access 没有 deny 它。
+
+    白名单里写没写它都不看；mode: all 的节点没有能隔离的目标也不给。
+    """
+    return bool(isolating) and MERGE_TOOL not in set(node.tool_access.deny)

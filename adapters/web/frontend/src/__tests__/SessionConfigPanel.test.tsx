@@ -146,4 +146,22 @@ describe('SessionConfigPanel compact session UX', () => {
     expect(screen.getByText('https://session.example/v1')).toBeInTheDocument();
     expect(screen.getAllByText('（会话覆盖）')).toHaveLength(2);
   });
+
+  it('offers a node that delegates to itself as a switch target', () => {
+    seedStores(null, 'open');
+    // The coder hands independent parts of a change to sub-coders, so it lists itself in delegate_targets.
+    useSettingsStore.setState({
+      availableNodes: [
+        activeNode,
+        { id: 'bootstrap.coder', type: 'ai', name: 'Coder', delegate_targets: ['bootstrap.code_reviewer', 'bootstrap.coder'] },
+        { id: 'bootstrap.code_reviewer', type: 'ai', name: 'Reviewer' },
+      ],
+    });
+    stubSupervisorFetch({});
+
+    render(<SessionConfigPanel sessionId="session-1" />);
+
+    expect(screen.getByRole('option', { name: 'Coder' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Reviewer' })).not.toBeInTheDocument();
+  });
 });

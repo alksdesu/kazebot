@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import yaml
 
 from clonoth_runtime import (
     env_bool,
@@ -40,7 +39,7 @@ from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
 from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
 from .inference.message_model import apply_reasoning_content
-from .inference.pseudo_tools import tool_allowed
+from .inference.pseudo_tools import isolatable_node, tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node, node_file, node_files
@@ -234,12 +233,12 @@ def _create_provider_from_registry(
     return _instantiate_provider(provider_cls, init_kwargs)
 
 
-_NODE_INFO_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+_NODE_INFO_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 
 
-def _fallback_node_info(node_id: str) -> dict[str, str]:
+def _fallback_node_info(node_id: str) -> dict[str, Any]:
     """Build fallback node metadata for absent or invalid node YAML."""
-    return {"id": node_id, "name": node_id, "description": node_id}
+    return {"id": node_id, "name": node_id, "description": node_id, "isolatable": False}
 
 
 def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path | None, int]:
@@ -254,8 +253,8 @@ def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path 
         return None, -1
 
 
-def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]:
-    """Load id/name/description for one node YAML with an mtime cache."""
+def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, Any]:
+    """Load id/name/description for one node YAML, plus whether a dispatch to it may ask for isolation, with an mtime cache."""
     path, mtime = _node_info_path_and_mtime(workspace_root, node_id)
     if path is None:
         # [2026-05-04] Missing delegate YAML must not prevent tool registration.
@@ -278,27 +277,25 @@ def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]
     stem = path.stem
     info = _fallback_node_info(stem)
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        node = load_node(workspace_root, node_id)
     except Exception:
-        data = None
-    if isinstance(data, dict):
-        kind = str(data.get("kind") or "node").strip()
-        node_type = str(data.get("type") or "ai").strip().lower()
-        if kind == "node" and node_type in {"ai", "tool"}:
-            name = str(data.get("name") or stem).strip() or stem
-            description = str(data.get("description") or "").strip() or name
-            info = {
-                "id": str(data.get("id") or stem).strip() or stem,
-                "name": name,
-                "description": description,
-            }
+        logger.warning("loading delegate target %s failed", node_id, exc_info=True)
+        node = None
+    if node is not None:
+        name = node.name or stem
+        info = {
+            "id": node.id or stem,
+            "name": name,
+            "description": node.description or name,
+            "isolatable": isolatable_node(node),
+        }
     _NODE_INFO_CACHE[cache_key] = (mtime, info)
     return info
 
 
-def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
-    """收集指定节点的基本信息（id/name/description）。"""
-    result: list[dict[str, str]] = []
+def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, Any]]:
+    """收集指定节点的基本信息（id/name/description），以及委派它时能不能要求隔离（isolatable）。"""
+    result: list[dict[str, Any]] = []
     for target_id in node_ids:
         tid = str(target_id or "").strip()
         if not tid:
@@ -324,7 +321,8 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             continue
         seen_ids.add(n.id)
         all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
-        all_targets.update(n.delegate_targets)
+        # 委派给自己（coder 拆活给子 coder）不算有上游
+        all_targets.update(target for target in n.delegate_targets if target != n.id)
     # 根节点 = 不被任何节点 delegate 引用的节点
     roots = [n for n in all_nodes if n["id"] not in all_targets]
     if not roots:

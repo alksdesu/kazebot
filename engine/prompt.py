@@ -123,8 +123,13 @@ def _build_variables(
     workspace_root: Path,
     node: Node,
     variables: dict[str, str] | None = None,
+    *,
+    project_root: Path | str | None = None,
 ) -> dict[str, str]:
-    """Build merged template variable dict for prompt rendering."""
+    """Build merged template variable dict for prompt rendering.
+
+    workspace_root 是实例根（config/、data/ 所在）；project_root 是任务的项目根，隔离任务里是它的 worktree，没给就等于实例根。
+    """
     merged: dict[str, str] = {}
     if variables:
         merged.update(variables)
@@ -133,6 +138,8 @@ def _build_variables(
     merged.setdefault("now", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     merged.setdefault("default_language", "zh-CN")
     merged.setdefault("workspace_root", str(workspace_root.resolve()))
+    project = Path(project_root) if project_root else workspace_root
+    merged.setdefault("project_root", str(project.resolve()))
     merged.setdefault("os_name", platform.system())
     merged.setdefault("os_version", platform.version())
     merged.setdefault("timezone", str(datetime.now().astimezone().tzinfo or "UTC"))
@@ -145,6 +152,8 @@ def _assemble_block_prompt(
     node: Node,
     blocks: list,
     variables: dict[str, str] | None = None,
+    *,
+    project_root: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """Process prompt in block list mode.
 
@@ -152,7 +161,7 @@ def _assemble_block_prompt(
     Special role "history" marks the conversation history insertion point.
     Returns processed block list for ai_step to consume.
     """
-    merged = _build_variables(workspace_root, node, variables)
+    merged = _build_variables(workspace_root, node, variables, project_root=project_root)
 
     system_tails: dict[str, str] = {}
     result: list[dict[str, Any]] = []
@@ -205,6 +214,7 @@ def assemble_prompt(
     node: Node,
     *,
     variables: dict[str, str] | None = None,
+    project_root: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """渲染节点的 prompt 模板，返回消息列表。
 
@@ -215,12 +225,14 @@ def assemble_prompt(
     列表模式（prompt 为 list）：
       返回 block 列表，可含 {"role": "history"}（历史展开标记）等。
       不使用 %%DYNAMIC%%，由块排列控制缓存边界。
+
+    project_root 由调用方按任务算好传进来，渲染 {{project_root}}；没给就等于 workspace_root。
     """
     raw = node.prompt
 
     # Block list mode
     if isinstance(raw, list):
-        return _assemble_block_prompt(workspace_root, node, raw, variables)
+        return _assemble_block_prompt(workspace_root, node, raw, variables, project_root=project_root)
 
     # String mode (existing behavior)
     raw_str = raw.strip() if raw else ""
@@ -230,7 +242,7 @@ def assemble_prompt(
     system_tails: dict[str, str] = {}
     expanded = _expand_includes(raw_str, workspace_root, system_tails=system_tails)
 
-    merged = _build_variables(workspace_root, node, variables)
+    merged = _build_variables(workspace_root, node, variables, project_root=project_root)
 
     # 切分在渲染之前：渲染后再找标记，等于让任何变量值（{{instruction}} 就是用户原话）
     # 自带一行标记就能把系统提示词从任意位置劈开，把它上方的规则挤进"动态段"。

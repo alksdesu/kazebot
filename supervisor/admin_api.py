@@ -821,6 +821,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
         勾了不等于能用：名字可能根本不存在，生图渠道没配 model 会在构建工具表时
         被摘掉，而外部脚本除非自己声明 guard，否则服务端策略那一页管不到它。
+        没勾也可能能用：合回工具和超长输出的读取工具由引擎自己加，行里的 automatic 写着什么时候给。
         """
         from toolbox.registry import external_tool_files, extract_tool_spec
 
@@ -869,20 +870,38 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except Exception:
             gated = set()
 
-        from engine.inference.pseudo_tools import edit_mode_satisfied
+        from engine.inference.pseudo_tools import edit_mode_satisfied, isolatable_node, merge_tool_offered
+        from engine.node import load_node
+        from engine.tool_outputs import READ_TOOL_OUTPUT
+        from engine.worktree_report import MERGE_TOOL
 
-        node_edit_mode = data.get("edit_mode")
-        rows: list[dict[str, Any]] = []
-        for name in names:
+        def _merge_tool_offer() -> tuple[str, str]:
+            """合回工具给不给，和推理循环同一个判法：(给的时候的说明, 不给的理由)。"""
+            node = load_node(workspace_root, node_id)
+            if node is None:
+                return "", ""
+            try:
+                from engine.builtin.image_gen_gating import disabled_draw_nodes
+                hidden = disabled_draw_nodes(workspace_root)
+            except Exception:
+                hidden = set()
+            isolating = [
+                target for target in node.delegate_targets
+                if target not in hidden and (target_node := load_node(workspace_root, target)) is not None
+                and isolatable_node(target_node)
+            ]
+            if merge_tool_offered(node, isolating):
+                return (
+                    f"不看 tool_access：委派目标 {'、'.join(isolating)} 写了 isolation: worktree，引擎自动给；"
+                    "tool_access.deny 里写上它就不给，节点自己在隔离副本里时也不给"
+                ), ""
+            if isolating:
+                return "", "tool_access.deny 里写了它，引擎不给"
+            return "", "委派目标里没有写 isolation: worktree 的节点，引擎不给"
+
+        def _row(name: str, gate_note: str, automatic: str) -> dict[str, Any]:
             is_external = name in external
-            required_mode = required_modes.get(name, "")
-            if name in gated:
-                gate_note = "渠道未配置 model，构建工具表时会被摘掉"
-            elif not edit_mode_satisfied(node_edit_mode, required_mode):
-                gate_note = f"节点没有开 {required_mode} 编辑模式（edit_mode: {required_mode}），构建工具表时会被摘掉"
-            else:
-                gate_note = ""
-            rows.append({
+            return {
                 "name": name,
                 "registered": name in known,
                 "external": is_external,
@@ -890,7 +909,33 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 # 能从 SPEC.guard 得到确定答案。None = 不下结论。
                 "guarded": external.get(name) if is_external else None,
                 "gated": gate_note,
-            })
+                "automatic": automatic,
+            }
+
+        merge_given, merge_withheld = _merge_tool_offer() if MERGE_TOOL in known else ("", "")
+        node_edit_mode = data.get("edit_mode")
+        rows: list[dict[str, Any]] = []
+        for name in names:
+            required_mode = required_modes.get(name, "")
+            if name in gated:
+                gate_note = "渠道未配置 model，构建工具表时会被摘掉"
+            elif not edit_mode_satisfied(node_edit_mode, required_mode):
+                gate_note = f"节点没有开 {required_mode} 编辑模式（edit_mode: {required_mode}），构建工具表时会被摘掉"
+            elif name == MERGE_TOOL:
+                # 合回工具不归 tool_access 放行，勾上了也只看委派目标
+                gate_note = merge_withheld
+            else:
+                gate_note = ""
+            rows.append(_row(name, gate_note, merge_given if name == MERGE_TOOL else ""))
+        # 引擎不看 tool_access 自己加上的工具，没勾也照样能调
+        if merge_given and MERGE_TOOL not in names:
+            rows.append(_row(MERGE_TOOL, "", merge_given))
+        if READ_TOOL_OUTPUT in known and READ_TOOL_OUTPUT not in names and any(
+            row["registered"] and not row["gated"] for row in rows
+        ):
+            rows.append(_row(
+                READ_TOOL_OUTPUT, "", "不看 tool_access：节点有别的工具时引擎自动给，只读本会话落盘的超长工具输出",
+            ))
         return {"node_id": node_id, "mode": mode, "dead_names": dead, "tools": rows}
 
     # ----- Memory -----

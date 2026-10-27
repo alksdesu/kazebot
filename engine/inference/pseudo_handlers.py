@@ -22,14 +22,19 @@ from ..dispatch_batch import (
     AWAIT_ALL,
     AWAIT_MODES,
     CONTINUE_FROM_KEY,
+    ISOLATION_KEY,
+    ISOLATION_WORKTREE,
     ITEM_TIMEOUT_KEY,
     MAX_AWAIT_HANDLES,
     MAX_DISPATCH_BATCH_ITEMS,
+    OWN_SESSION_MODES,
+    REPO_KEY,
     AwaitRequest,
     DispatchTimeouts,
     parse_timeout_sec,
 )
 from ..dispatch_handle import format_handle, parse_handle
+from ..isolation_notice import nested_isolation_refusal, task_isolation
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from ..todo_list import TODO_TOOL_NAME, TodoListError, parse_todo_items, render_update_result
 from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id, flush_conversation_writes
@@ -544,9 +549,10 @@ def _target_is_persistent(ls: _LoopState, target: str) -> bool:
 
 @dataclass(frozen=True)
 class DispatchRequest:
-    """一次委派调用校验过的参数：异步和 wait 两条路用同一套目标、上下文模式和附件规则。
+    """一次委派调用校验过的参数：异步和 wait 两条路用同一套目标、上下文模式、附件和隔离规则。
 
     continue_from 非空时 continuation 是 supervisor 核对句柄后给的子会话信息，子节点接着那份历史做。
+    isolation 是 ISOLATION_WORKTREE 时子任务在自己的 git worktree 里做，repo 是要隔离的仓库（空串是工作区所在的仓库）。
     """
 
     target: str
@@ -557,6 +563,55 @@ class DispatchRequest:
     refused_attachments: list[RefusedAttachment]
     continue_from: str = ""
     continuation: dict[str, Any] = field(default_factory=dict)
+    isolation: str = ""
+    repo: str = ""
+
+    def isolation_fields(self) -> dict[str, str]:
+        """写进批次项、dispatch_origin 的隔离字段，supervisor 按 dispatch_isolation、dispatch_repo 读；不隔离时是空表。"""
+        if not self.isolation:
+            return {}
+        fields = {ISOLATION_KEY: self.isolation}
+        if self.repo:
+            fields[REPO_KEY] = self.repo
+        return fields
+
+
+def _unfilled(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _isolation_request(ls: _LoopState, target: str, args: dict) -> tuple[str, str, str]:
+    """模型填的 isolation、repo：返回 (隔离方式, 仓库, 拒绝原因)。
+
+    supervisor 把认不出的 isolation 一律当不隔离，所以写错的取值只能在这里拦下；repo 指得对不对由 supervisor 判。
+    """
+    raw_isolation = args.get(ISOLATION_KEY)
+    raw_repo = args.get(REPO_KEY)
+    if _unfilled(raw_isolation) and _unfilled(raw_repo):
+        return "", "", ""
+    current = task_isolation(getattr(ls.rctx, "task_context", None))
+    if current:
+        return "", "", nested_isolation_refusal(current)
+    if not _unfilled(raw_isolation):
+        chosen = raw_isolation.strip().lower() if isinstance(raw_isolation, str) else ""
+        if chosen != ISOLATION_WORKTREE:
+            return "", "", (
+                f"没有派出：{ISOLATION_KEY} 只能填 {ISOLATION_WORKTREE}（让目标节点在自己的 git worktree 里做），"
+                f"不要隔离就不填；收到的是 {_short(json.dumps(raw_isolation, ensure_ascii=False, default=str), 80)}。"
+            )
+    if not _unfilled(raw_repo) and not isinstance(raw_repo, str):
+        return "", "", f"没有派出：{REPO_KEY} 要填仓库的绝对路径。"
+    if _unfilled(raw_isolation):
+        return "", "", (
+            f"没有派出：{REPO_KEY} 只在 {ISOLATION_KEY}={ISOLATION_WORKTREE} 时有效；"
+            f"要隔离就同时填 {ISOLATION_KEY}: {ISOLATION_WORKTREE}，不隔离就去掉 {REPO_KEY}。"
+        )
+    if target not in (getattr(ls, "isolating_targets", None) or set()):
+        return "", "", (
+            f"没有派出：{target} 的节点配置没有写 {ISOLATION_KEY}: {ISOLATION_WORKTREE}，委派它不能要求隔离；"
+            f"去掉 {ISOLATION_KEY} 和 {REPO_KEY} 再派。"
+        )
+    return ISOLATION_WORKTREE, raw_repo.strip() if isinstance(raw_repo, str) else "", ""
 
 
 async def _resolve_continuation(
@@ -593,7 +648,7 @@ async def _resolve_continuation(
 async def _resolve_dispatch_request(
     ls: _LoopState, args: dict, pseudo_call: Any, *, wait: bool = False,
 ) -> tuple[DispatchRequest | None, str]:
-    """校验委派参数，返回 (请求, 拒绝原因)；目标不在委派清单里、continue_from 的句柄不能用时请求为 None。"""
+    """校验委派参数，返回 (请求, 拒绝原因)；目标不在委派清单里、隔离参数不对、continue_from 的句柄不能用时请求为 None。"""
     # 委派清单加载时已换成现在的 id；模型照着旧历史写出旧 id，也换过来再比
     target = canonical_node_id(Path(ls.rctx.workspace_root), str(args.get("target") or ""))
 
@@ -618,12 +673,27 @@ async def _resolve_dispatch_request(
     # 否则 fresh（一次性搜索、一次性工程执行、审查/debug 等）。
     # Purpose: 让 persistent 字段真正驱动默认行为，语义与 node.persistent 一致。
     _raw_ctx_mode = args.get("context_mode")
+    to_self = target == ls.node.id
     if _raw_ctx_mode is not None and str(_raw_ctx_mode).strip():
         ctx_mode = str(_raw_ctx_mode).strip()
+    elif to_self:
+        # 委派给自己是拆成几份各做各的，持久节点也不沿用会话
+        ctx_mode = "fresh"
     else:
         ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
     context_key = str(args.get("context_key") or "").strip()
     raw_continue = str(args.get(CONTINUE_FROM_KEY) or "").strip()
+    if to_self and not raw_continue and ctx_mode not in OWN_SESSION_MODES:
+        # 子会话按（祖先会话，目标节点，context_key）找：沿用会话的话，同时派出的几份、以及它们再派出的会落进同一个会话
+        return None, (
+            f"没有派出：委派给自己时 context_mode 只能是 fresh 或 fork，收到的是 "
+            f"{_short(json.dumps(_raw_ctx_mode, ensure_ascii=False, default=str), 40)}；"
+            "沿用会话的话，同时派出的几份、以及它们再派出的，都会落进同一个会话。"
+            "要接着之前派出的那一份，用 continue_from 带上它的句柄。"
+        )
+    isolation, repo, refusal = _isolation_request(ls, target, args)
+    if refusal:
+        return None, refusal
     continuation: dict[str, Any] = {}
     if raw_continue:
         continuation, refusal = await _resolve_continuation(ls, raw_continue, target, wait=wait)
@@ -635,6 +705,7 @@ async def _resolve_dispatch_request(
     attachment_paths, refused_attachments = await screen_model_attachment_paths(
         ls, pseudo_call, args.get("attachment_paths") or [], data_dir_only=True,
     )
+    # 接着一个隔离过的子 agent 时 supervisor 沿用它的副本、repo 指向别的仓库时另建，隔离字段照原样交过去由它定
     return DispatchRequest(
         target=target,
         instruction=str(args.get("instruction") or "").strip(),
@@ -644,6 +715,8 @@ async def _resolve_dispatch_request(
         refused_attachments=list(refused_attachments),
         continue_from=str(parse_handle(raw_continue)) if continuation else "",
         continuation=continuation,
+        isolation=isolation,
+        repo=repo,
     ), ""
 
 
@@ -702,7 +775,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
                 "error": "continue_from 指向的子会话找不到会话键，没法接着派；需要的话重新委派。",
             }, ensure_ascii=False))
             return None
-    elif ctx_mode in ("fresh", "fork"):
+    elif ctx_mode in OWN_SESSION_MODES:
         import uuid as _uuid
         conv_key = f"agent:{target_node_id}:{parent_conv_key}:{_uuid.uuid4()}"
     else:  # accumulate
@@ -736,6 +809,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     if caller_task_id:
         # 结果回来时，转述它的那一轮靠这个找回发起任务的输出说明。
         inbound_payload["dispatch_origin"]["caller_task_id"] = caller_task_id
+    inbound_payload["dispatch_origin"].update(request.isolation_fields())
     if request.continue_from:
         inbound_payload["dispatch_origin"][CONTINUE_FROM_KEY] = request.continue_from
     elif ctx_mode == "fork":
@@ -751,7 +825,9 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             timeout=10.0,
         )
         if _dispatch_resp.status_code == 200:
-            dispatch_result = _async_dispatch_result(target, _dispatch_resp.json())
+            dispatch_result = _async_dispatch_result(
+                target, _dispatch_resp.json(), isolation=request.isolation_fields(),
+            )
         else:
             dispatch_result = {
                 "success": False,
@@ -774,22 +850,32 @@ def _runtime_session_id(ls: _LoopState) -> str:
     return str(getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id or "").strip()
 
 
-def _async_dispatch_result(target: str, body: Any) -> dict[str, Any]:
-    """异步委派派出后的工具结果：句柄由 supervisor 建出的任务 id 和它所在的 agent: 会话拼成。"""
+def _isolated_note(isolation: dict[str, str]) -> str:
+    if not isolation:
+        return ""
+    repo = isolation.get(REPO_KEY)
+    return f"（在隔离副本里执行，仓库 {repo}）" if repo else "（在隔离副本里执行）"
+
+
+def _async_dispatch_result(target: str, body: Any, *, isolation: dict[str, str] | None = None) -> dict[str, Any]:
+    """异步委派派出后的工具结果：句柄由 supervisor 建出的任务 id 和它所在的 agent: 会话拼成；要求了隔离的注明在隔离副本里执行。"""
     data = body if isinstance(body, dict) else {}
     session_id = str(data.get("session_id") or "").strip()
     handle = format_handle(data.get("task_id"), session_id)
+    isolated = dict(isolation or {})
+    where = _isolated_note(isolated)
     result: dict[str, Any] = {"success": True, "session_id": session_id}
     if handle:
         result["handle"] = handle
         result["status"] = "dispatched"
         result["message"] = (
-            f"已异步委派给 {target}，结果稍后会作为一条新消息送达。要在本任务里等它，"
+            f"已异步委派给 {target}{where}，结果稍后会作为一条新消息送达。要在本任务里等它，"
             f"用 {AWAIT_DISPATCHES_TOOL_NAME} 带上这个 handle；用 {LIST_DISPATCHES_TOOL_NAME} 查看进度，"
             f"用 {CANCEL_DISPATCH_TOOL_NAME} 取消。"
         )
     else:
-        result["message"] = f"已异步委派给 {target}，结果稍后会作为一条新消息送达。"
+        result["message"] = f"已异步委派给 {target}{where}，结果稍后会作为一条新消息送达。"
+    result.update(isolated)
     return result
 
 
@@ -842,13 +928,14 @@ def _requested_timeout(raw: Any) -> tuple[int | None, bool]:
 
 @dataclass
 class WaitDispatch:
-    """一个通过校验、等着和同轮其它 wait 委派一起派出的调用。"""
+    """一个通过校验、等着和同轮其它 wait 委派一起派出的调用。isolation 是它要求隔离时写进批次项的那几个字段。"""
 
     call: Any
     target: str
     item: dict[str, Any]
     refused_attachments: list[RefusedAttachment] = field(default_factory=list)
     timeout_sec: int = 0
+    isolation: dict[str, str] = field(default_factory=dict)
 
     def result_text(self, outcome: str) -> str:
         """这次调用的工具结果：派出去了就是占位，真正的结果在恢复后的下一条消息里；没派出去说明原因。"""
@@ -857,7 +944,10 @@ class WaitDispatch:
             payload: dict[str, Any] = {
                 "success": True,
                 "status": "waiting",
-                "message": f"已派出给 {self.target}，正在等待结果{limit}；结果会在下一条消息给出。",
+                "message": (
+                    f"已派出给 {self.target}{_isolated_note(self.isolation)}，正在等待结果{limit}；结果会在下一条消息给出。"
+                ),
+                **self.isolation,
             }
         else:
             payload = {"success": False, "error": _WAIT_NOT_SENT.get(outcome, _WAIT_NOT_SENT[WAIT_ABORTED])}
@@ -873,7 +963,7 @@ class WaitDispatchPlan:
 
 
 async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispatchPlan:
-    """校验本轮的 wait 委派并组成批次项，目标、上下文模式和附件的规则与异步委派共用。
+    """校验本轮的 wait 委派并组成批次项，目标、上下文模式、附件和隔离的规则与异步委派共用。
 
     简短回应和系统任务里的、超出每轮上限的、参数不合格的调用都进 rejected，带着给模型看的原因。
     """
@@ -919,7 +1009,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
                 continue
             continued_sessions.add(continued)
         # fresh / fork 每项各开一个子会话；其余模式同一目标同一 context_key 共用一个，同时跑会写乱它
-        elif request.context_mode not in ("fresh", "fork"):
+        elif request.context_mode not in OWN_SESSION_MODES:
             shared = (request.target, request.context_key)
             if shared in shared_contexts:
                 plan.rejected.append((call, _wait_refusal(
@@ -938,6 +1028,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
             item["context_key"] = request.context_key
         if request.continue_from:
             item[CONTINUE_FROM_KEY] = request.continue_from
+        item.update(request.isolation_fields())
         if request.attachments:
             item["attachments"] = [dict(attachment) for attachment in request.attachments]
         call_id = str(getattr(call, "id", "") or "").strip()
@@ -950,6 +1041,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
             call=call, target=request.target, item=item,
             refused_attachments=list(request.refused_attachments),
             timeout_sec=item_timeout,
+            isolation=request.isolation_fields(),
         ))
     return plan
 

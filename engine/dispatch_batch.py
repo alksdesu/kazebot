@@ -22,6 +22,8 @@ ISOLATION_KEY = "isolation"
 ISOLATION_WORKTREE = "worktree"
 # 要隔离的仓库：绝对路径，不写就是工作区所在的仓库
 REPO_KEY = "repo"
+# 每次各开一个子会话的上下文模式；其余取值（写错的也算）supervisor 都按 accumulate 沿用同一个子会话
+OWN_SESSION_MODES = ("fresh", "fork")
 
 # dispatch 动作的 dispatch_input 带这个键：不派新的子任务，挂起调用方等这些异步委派
 AWAIT_KEY = "await_dispatches"

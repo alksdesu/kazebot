@@ -156,7 +156,8 @@ def test_deleting_a_node_that_does_not_exist_is_a_404(client) -> None:
 def test_effective_tools_reads_the_real_file_too(client) -> None:
     body = client("GET", f"{_BASE}/qq.orchestrator/effective-tools", headers=_AUTH).json()
 
-    assert {row["name"] for row in body["tools"]} == {"read_file", "write_file", "execute_command"}
+    # read_tool_output 不在白名单里，引擎给有别的工具的节点自动加上
+    assert {row["name"] for row in body["tools"]} == {"read_file", "write_file", "execute_command", "read_tool_output"}
 
 
 @pytest.mark.parametrize("taken", ["system.compactor", "qq.vision"])

@@ -52,7 +52,10 @@ function getSwitchableNodes(allNodes: NodeDef[]): NodeDef[] {
   );
   const delegated = new Set<string>();
   for (const n of allNodes) {
-    for (const t of (n.delegate_targets || [])) delegated.add(t);
+    for (const t of (n.delegate_targets || [])) {
+      // A node that delegates to itself (a coder handing parts to sub-coders) still has no upstream.
+      if (t !== n.id) delegated.add(t);
+    }
   }
   const roots = aiNodes.filter(n => !delegated.has(n.id));
   return roots.length > 0 ? roots : aiNodes;

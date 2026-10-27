@@ -314,6 +314,15 @@ def map_worktree_paths(text: str, mappings: tuple[tuple[Path, Path], ...]) -> st
     return mapped
 
 
+# 实例的配置和运行数据：被 gitignore，不在隔离副本里，交付给用户的文件也写在 data/attachments 下
+_INSTANCE_DIRS = frozenset({config_layout.CONFIG_DIR, "data"})
+
+
+def _instance_file(rel: str, external: bool) -> bool:
+    """工作区里按逻辑名属于实例的 config/、data/ 的路径。"""
+    return not external and rel.split("/", 1)[0] in _INSTANCE_DIRS
+
+
 def _inside(path: Path, root: Path | None) -> bool:
     if root is None:
         return False
@@ -945,11 +954,11 @@ class PolicyEngine:
     def _origin_write_guard(
         readings: list[tuple[Path | None, str, bool]], scope: PathScope | None,
     ) -> PolicyDecision | None:
-        """隔离任务绕开自己的副本、直接改原仓库里的文件：至少要人确认。"""
+        """隔离任务绕开自己的副本、直接改原仓库里的文件：至少要人确认。实例自己的 config/、data/ 副本里没有，照普通规则判。"""
         if scope is None or not scope.isolated or scope.origin_repo is None:
             return None
-        for resolved, _rel, _external in readings:
-            if resolved is None or _inside(resolved, scope.project_root):
+        for resolved, rel, external in readings:
+            if resolved is None or _inside(resolved, scope.project_root) or _instance_file(rel, external):
                 continue
             if _inside(resolved, scope.origin_repo):
                 return PolicyDecision(

@@ -40,7 +40,8 @@ def find_root_nodes(nodes: list[NodeInfo]) -> list[NodeInfo]:
     """找出无上游的根节点（不被任何其他节点 delegate_targets 引用）。"""
     all_targets: set[str] = set()
     for n in nodes:
-        all_targets.update(n.delegate_targets)
+        # 委派给自己（coder 拆活给子 coder）不算有上游
+        all_targets.update(target for target in n.delegate_targets if target != n.id)
     roots = [n for n in nodes if n.id not in all_targets]
     # 如果所有节点都被引用，返回全部作为备选
     return roots if roots else nodes

@@ -56,6 +56,17 @@ describe('remaining Settings optimizations', () => {
     expect(parseNodeList(nodeList).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
   });
 
+  it('keeps a node that delegates to itself as a root entry', () => {
+    // The coder hands independent parts of a change to sub-coders, so it lists itself in delegate_targets.
+    const selfDelegating: AdminNode[] = [
+      ...nodeList.filter((node) => node.id !== 'bootstrap.coder'),
+      { id: 'bootstrap.coder', type: 'ai', name: 'Coder', description: '编程入口', delegate_targets: ['bootstrap.code_reviewer', 'bootstrap.coder'] },
+      { id: 'bootstrap.code_reviewer', type: 'ai', name: 'Reviewer', description: '审查子节点' },
+    ];
+
+    expect(parseNodeList(selfDelegating).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
+  });
+
   it('renders Client entry-node selection before approval rules and selects the configured node', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

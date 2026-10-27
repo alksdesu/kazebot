@@ -9,6 +9,7 @@ from typing import Any
 
 from engine.attachments import build_multimodal_content
 from engine.inference.loop_state import conversation_writer, flush_conversation_writes
+from engine.isolation_notice import isolation_parts
 from engine.memory_subjects import resolve_load_subjects
 from engine.output_guide import (
     OUTPUT_GUIDE_KEY,
@@ -17,6 +18,7 @@ from engine.output_guide import (
     static_guide_messages,
     turn_guide_parts,
 )
+from engine.project_root import ISOLATION_CONTEXT_KEY
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
@@ -133,6 +135,10 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     dynamic_parts: list[str] = []
     if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
         dynamic_parts.append(ls.system_prompt[1]["content"])
+    # 和初次组装排在同一个位置：节点自己的动态段之后、技能和记忆之前
+    dynamic_parts.extend(isolation_parts(
+        task_context.get(ISOLATION_CONTEXT_KEY), workspace_root=ls.rctx.workspace_root,
+    ))
     for dynamic_msg in skill_dynamic:
         if dynamic_msg.get("content"):
             dynamic_parts.append(dynamic_msg["content"])

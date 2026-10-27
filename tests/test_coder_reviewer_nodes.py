@@ -18,7 +18,7 @@ if str(_TESTS) not in sys.path:
 from _engine_loop_fixture import NodeRun, ScriptedRegistry, call, turn  # noqa: E402
 from _node_prompts import assembled_prompt  # noqa: E402
 from clonoth_runtime import SYSTEM_MODEL_SLOTS, parse_bool, resolve_system_model  # noqa: E402
-from engine.inference.pseudo_tools import _dispatch_tool_name, _filter_tool_specs  # noqa: E402
+from engine.inference.pseudo_tools import _dispatch_tool_name, _filter_tool_specs, isolatable_node  # noqa: E402
 from engine.node import load_node  # noqa: E402
 from engine.runner import _resolve_system_model_slot  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -61,12 +61,14 @@ def registry_specs() -> list[dict[str, Any]]:
 
 
 class TestTheCoder:
-    def test_it_runs_in_native_mode_with_a_todo_list_and_a_reviewer(self, tmp_path: Path) -> None:
+    def test_it_runs_in_native_mode_with_a_todo_list_a_reviewer_and_sub_coders(self, tmp_path: Path) -> None:
         node = _shipped(tmp_path, CODER)
 
         assert node.tool_mode == "native"
         assert parse_bool(node.extra.get("todo"), False) is True
-        assert node.delegate_targets == [REVIEWER]
+        # 列上自己：大改动可以拆给几个隔离的子 coder 并行做
+        assert node.delegate_targets == [REVIEWER, CODER]
+        assert isolatable_node(node) is True
         assert "edit_mode" not in node.extra
 
     def test_it_is_granted_exactly_the_programming_tools(self, tmp_path: Path) -> None:
@@ -112,6 +114,18 @@ class TestTheCoder:
             assert phrase in prompt, phrase
         assert _dispatch_tool_name(REVIEWER) == "dispatch_to_bootstrap_code_reviewer"
 
+    def test_the_prompt_teaches_isolated_sub_coders(self, tmp_path: Path) -> None:
+        prompt = assembled_prompt(CODER, tmp_path)
+
+        for phrase in (
+            "[ISOLATION]", "dispatch_to_bootstrap_coder", "isolation: worktree", "merge_worktree",
+            "can be verified on its own", "resolve the conflict in the original repository",
+        ):
+            assert phrase in prompt, phrase
+        root = tmp_path.resolve()
+        assert f"Current Workspace: {root}\nInstance Root (config/ and data/ live here): {root}\n" in prompt
+        assert f"`{root}/data/attachments/<name>.txt`" in prompt
+
     def test_the_prompt_no_longer_forbids_repeating_a_call_outright(self, tmp_path: Path) -> None:
         prompt = assembled_prompt(CODER, tmp_path)
 
@@ -128,6 +142,8 @@ class TestTheReviewer:
         assert set(node.tool_access.allow) == REVIEWER_TOOLS
         assert WRITE_TOOLS.isdisjoint(node.tool_access.allow)
         assert node.delegate_targets == []
+        # 只读的审查就地看改动，委派它不给隔离
+        assert isolatable_node(node) is False
 
     def test_it_has_a_bounded_loop_and_the_review_slot(self, tmp_path: Path) -> None:
         node = _shipped(tmp_path, REVIEWER)

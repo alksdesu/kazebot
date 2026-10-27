@@ -220,6 +220,19 @@ class TestPolicy:
         # 相对路径写的是副本里的那份，不算绕开副本
         assert policy.evaluate_write_file(path="notes.md", scope=scope).safety_level == SafetyLevel.auto
 
+    def test_the_instance_config_and_data_follow_the_ordinary_rules(self, layout: SimpleNamespace) -> None:
+        # 实例的 config/、data/ 被 gitignore，副本里没有这一份，写它们不算绕开副本
+        policy = _policy(layout)
+        scope = _own_scope(layout)
+
+        for rel in ("data/attachments/report.txt", "config/runtime.yaml", "config/nodes/a.yaml", "data/worktrees.json"):
+            target = str(layout.ws / rel)
+            assert _same(policy.evaluate_write_file(path=target, scope=scope), policy.evaluate_write_file(path=target)), rel
+        delivered = policy.evaluate_write_file(path=str(layout.ws / "data" / "attachments" / "report.txt"), scope=scope)
+        assert delivered.safety_level == SafetyLevel.auto
+        # 只是名字以 data 开头的仓库目录照样要确认
+        assert "原仓库" in policy.evaluate_write_file(path=str(layout.ws / "database" / "x.py"), scope=scope).reason
+
     def test_an_unusable_worktree_denies_every_path_operation(self, layout: SimpleNamespace) -> None:
         policy = _policy(layout)
         scope = PathScope(worktree="task-gone", invalid="这个任务所在的隔离副本 task-gone 用不了")

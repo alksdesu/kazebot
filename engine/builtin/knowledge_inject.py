@@ -2248,6 +2248,7 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
     from engine.conversation_routing import turn_input_meta
     from engine.inference.message_assembly import assemble_messages_with_injections
     from engine.output_guide import OUTPUT_GUIDE_KEY
+    from engine.project_root import ISOLATION_CONTEXT_KEY
 
     task_context = getattr(ctx.rctx, "task_context", None) or {}
     rebuilt, is_block_mode = assemble_messages_with_injections(
@@ -2262,6 +2263,7 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
         memory_dynamic=list(ctx.extra.get("memory_dynamic_messages") or []),
         output_guide=task_context.get(OUTPUT_GUIDE_KEY),
         turn_meta=turn_input_meta(task_context),
+        isolation=task_context.get(ISOLATION_CONTEXT_KEY),
     )
     ctx.messages[:] = rebuilt
     ctx.extra["is_block_mode"] = is_block_mode
