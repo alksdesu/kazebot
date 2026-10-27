@@ -394,18 +394,33 @@ function applyEdits(lines: readonly string[], prev: Mapping, next: Mapping, opti
   return { lines: current, dropped };
 }
 
-/** 原文解析成映射。原文坏了就不写：照着坏文件合出来的结果谁也说不准。 */
-export function parseYamlMapping(raw: string): Mapping {
+type MappingRead = { mapping: Mapping } | { notYaml: string } | { notMapping: true };
+
+function readMapping(raw: string): MappingRead {
   let loaded: unknown;
   try {
     loaded = yaml.load(raw);
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`原文不是合法的 YAML，请先修好再改，原文件未修改：${reason}`);
+    return { notYaml: error instanceof Error ? error.message : String(error) };
   }
-  if (loaded === undefined || loaded === null) return {};
-  if (!isMapping(loaded)) throw new Error('原文顶层不是映射（key: value），请先修好再改，原文件未修改');
-  return loaded;
+  if (loaded === undefined || loaded === null) return { mapping: {} };
+  return isMapping(loaded) ? { mapping: loaded } : { notMapping: true };
+}
+
+/** 原文解析成映射。原文坏了就不写：照着坏文件合出来的结果谁也说不准。 */
+export function parseYamlMapping(raw: string): Mapping {
+  const read = readMapping(raw);
+  if ('notYaml' in read) throw new Error(`原文不是合法的 YAML，请先修好再改，原文件未修改：${read.notYaml}`);
+  if ('notMapping' in read) throw new Error('原文顶层不是映射（key: value），请先修好再改，原文件未修改');
+  return read.mapping;
+}
+
+/** 原文当不了映射的原因，当得了给空串。给只读的地方提示：照着坏文件读出来的空对象显示，看着就像文件是空的。 */
+export function yamlMappingProblem(raw: string): string {
+  const read = readMapping(raw);
+  if ('notYaml' in read) return `不是合法的 YAML：${read.notYaml}`;
+  if ('notMapping' in read) return '顶层不是映射（key: value）';
+  return '';
 }
 
 function reparsesTo(text: string, next: Mapping): boolean {

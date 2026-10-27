@@ -444,6 +444,21 @@ describe('日志', () => {
     await waitFor(() => expect(screen.getByText(/还没有日志文件/)).toBeTruthy());
     expect(readLogTail).not.toHaveBeenCalled();
   });
+
+  it('列表读失败时报出原因，不说成还没有日志文件，重新读取读到了就照常列出', async () => {
+    vi.mocked(listLogFiles).mockRejectedValueOnce(new Error('403 日志目录读不了')).mockResolvedValue(LOGS_A);
+    render(<RuntimeSettingsPage />);
+
+    expect(await screen.findByText('日志列表没读到：403 日志目录读不了')).toBeInTheDocument();
+    expect(screen.queryByText(/还没有日志文件/)).toBeNull();
+    expect(readLogTail).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新读取' }));
+
+    await screen.findAllByText('supervisor.log');
+    expect(screen.queryByText(/日志列表没读到/)).toBeNull();
+    await waitFor(() => expect(readLogTail).toHaveBeenCalledWith('admin-token', 'supervisor.log', 500));
+  });
 });
 
 describe('换人之后的日志', () => {
@@ -468,7 +483,7 @@ describe('换人之后的日志', () => {
     const slow = deferred<LogFileInfo[]>();
     vi.mocked(listLogFiles).mockImplementation((token) => (token === 'admin-token' ? slow.promise : Promise.resolve(LOGS_B)));
     render(<RuntimeSettingsPage />);
-    await screen.findByText(/还没有日志文件/);
+    await screen.findByText(/正在读取日志列表/);
 
     await act(async () => { swapToken(); });
     await screen.findAllByText('engine-2-20260901.log');
@@ -484,7 +499,7 @@ describe('换人之后的日志', () => {
     const slow = deferred<LogFileInfo[]>();
     vi.mocked(listLogFiles).mockImplementation((token) => (token === 'admin-token' ? slow.promise : Promise.resolve(LOGS_B)));
     render(<RuntimeSettingsPage />);
-    await screen.findByText(/还没有日志文件/);
+    await screen.findByText(/正在读取日志列表/);
 
     await act(async () => { swapToken(); });
     await screen.findAllByText('engine-2-20260901.log');

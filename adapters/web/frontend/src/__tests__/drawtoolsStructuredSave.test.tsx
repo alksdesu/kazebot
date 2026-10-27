@@ -485,6 +485,49 @@ describe('每一份配置带自己的指纹', () => {
   });
 });
 
+describe('没读成的配置不说成空的', () => {
+  const EMPTY_LIBRARY = /暂无角色配置/;
+
+  it('整包没读到时报出原因，不说暂无角色配置', async () => {
+    vi.mocked(api.getDrawtoolsBundle).mockRejectedValue(new Error(RELOAD_FAILURE));
+
+    render(<DrawtoolsSettingsPage />);
+
+    expect(await alertText()).toBe(RELOAD_FAILURE);
+    expect(screen.queryByText(EMPTY_LIBRARY)).toBeNull();
+  });
+
+  it('角色库写坏了说出来，不说暂无角色配置', async () => {
+    serve(bundle(SETTINGS_YAML, 'characters:\n  - name: 初音未来\n    danbooru: [未闭合\n'));
+
+    render(<DrawtoolsSettingsPage />);
+
+    const note = await screen.findByText(/下面没有列出 character_tags.yaml 里的角色/);
+    expect(note).toHaveTextContent('character_tags.yaml 不是合法的 YAML：');
+    expect(screen.queryByText(EMPTY_LIBRARY)).toBeNull();
+    expect(screen.queryByText(/不是 settings.yaml 里的值/)).toBeNull();
+  });
+
+  it('设置文件顶层不是映射，也说字段显示的不是文件里的值', async () => {
+    serve(bundle('- base_url\n- api_key\n'));
+
+    render(<DrawtoolsSettingsPage />);
+
+    const note = await screen.findByText(/不是 settings.yaml 里的值/);
+    expect(note).toHaveTextContent('settings.yaml 顶层不是映射（key: value）');
+    expect(screen.queryByText(/下面没有列出 character_tags.yaml 里的角色/)).toBeNull();
+  });
+
+  it('角色库里真没有角色时照常说暂无，也不报文件读不出来', async () => {
+    serve(bundle(SETTINGS_YAML, 'version: 1\n'));
+
+    render(<DrawtoolsSettingsPage />);
+
+    expect(await screen.findByText(EMPTY_LIBRARY)).toBeInTheDocument();
+    expect(screen.queryByText(/原始配置编辑器里修好/)).toBeNull();
+  });
+});
+
 describe('分析节点那一栏', () => {
   const settled = () => waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
 

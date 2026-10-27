@@ -53,6 +53,8 @@ const ApprovalsSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { selectedApproval, setSelectedApproval } = useSettingsSelectionStore();
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
+  // 没读成时空列表不代表没人等审批：不能说「暂无待审批项」，读成过的那份照常留着
+  const [listFailed, setListFailed] = useState(false);
   const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const approvalDecision = useApprovalDecision();
@@ -68,12 +70,14 @@ const ApprovalsSettingsPageBody = () => {
       if (!request.isCurrent()) return;
       const pending = state.pending_approvals || [];
       setApprovals(pending);
+      setListFailed(false);
       // Read the selection at call time: depending on it would tear down and restart the poll on every click.
       const selected = useSettingsSelectionStore.getState().selectedApproval;
       if (selected && !pending.some((item) => item.approval_id === selected.approval_id)) setSelectedApproval(null);
       setLoadError('');
     } catch (caught) {
       if (!request.isCurrent()) return;
+      setListFailed(true);
       setLoadError(errorMessage(caught, '加载审批失败'));
     } finally {
       if (showSpinner) setLoading(false);
@@ -110,7 +114,7 @@ const ApprovalsSettingsPageBody = () => {
         <div className="mb-3 flex flex-wrap gap-2">
           <Button tone="quiet" disabled={loading} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
         </div>
-        {approvals.length === 0 ? (
+        {approvals.length === 0 ? !listFailed && (
           <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">
             {/* [2026-06-02] Add a muted icon to the empty approvals state. Why: the
                 requested empty state includes both text and a gray visual marker.

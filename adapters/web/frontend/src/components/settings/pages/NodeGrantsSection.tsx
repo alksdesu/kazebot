@@ -197,6 +197,8 @@ const NodeRow = ({ node, tools, onSaved }: {
   const { notice, error, setMessage, setError } = usePageNotice();
   const [effective, setEffective] = useState<Record<string, EffectiveTool>>({});
   const [deadNames, setDeadNames] = useState<string[]>([]);
+  // 没问到实际给不给时下面一个「不可用」都不标，看着就像勾了的都能用
+  const [effectiveError, setEffectiveError] = useState('');
 
   useEffect(() => {
     setMode(saved.mode);
@@ -213,8 +215,15 @@ const NodeRow = ({ node, tools, onSaved }: {
         if (!request.isCurrent()) return;
         setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
         setDeadNames(data.dead_names || []);
+        setEffectiveError('');
       })
-      .catch(() => undefined);
+      .catch((caught) => {
+        if (!request.isCurrent()) return;
+        // 上一次问到的是存之前那份的：留着会把旧的「不可用」标到新勾选上
+        setEffective({});
+        setDeadNames([]);
+        setEffectiveError(errorMessage(caught));
+      });
     return () => { requests.drop('effective'); };
   }, [requests, open, adminToken, node.id, saved]);
 
@@ -343,6 +352,9 @@ const NodeRow = ({ node, tools, onSaved }: {
                 <span className="text-[var(--duties-text)]">{enabledCount} 个可调用</span>
                 {filtered && `，当前筛出 ${candidates.length} 个`}
               </p>
+              {effectiveError && (
+                <ErrorText>没问到每个工具实际给不给，下面的勾选只是节点文件里写的，标不出哪些勾了也用不了：{effectiveError}</ErrorText>
+              )}
               <EffectiveNotes dead={deadNames} mode={mode} rows={Object.values(effective)} />
               <div className="grid max-h-64 grid-cols-1 gap-1 overflow-y-auto sm:grid-cols-2">
                 {candidates.map((name) => (

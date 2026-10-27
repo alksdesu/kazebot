@@ -66,6 +66,9 @@ const ModelsPageEditor = () => {
   const [catalog, setCatalog] = useState<ProviderOptionsCatalog>({});
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
   const [nodes, setNodes] = useState<NodeChoice[]>([]);
+  // 渠道表、节点表没读到不能当成读到了空的：「在用」标在哪、作用域里列得出哪些节点都会跟着错
+  const [providersError, setProvidersError] = useState('');
+  const [nodesError, setNodesError] = useState('');
   const [scope, setScope] = useState<string>(GLOBAL);
   const [provider, setProvider] = useState('');
   const [raw, setRaw] = useState('');
@@ -86,13 +89,18 @@ const ModelsPageEditor = () => {
       } catch (caught) {
         setCatalogError(errorMessage(caught));
       }
-      void getProviders(token).then(setProviders).catch(() => undefined);
+      void getProviders(token)
+        .then((data) => { setProviders(data); setProvidersError(''); })
+        .catch((caught) => setProvidersError(errorMessage(caught)));
       void getNodes(token)
-        .then((list) => setNodes(
-          list.map((item: any) => ({ id: String(item.id), provider: String(item.provider || '') }))
-            .filter((item: NodeChoice) => item.id),
-        ))
-        .catch(() => undefined);
+        .then((list) => {
+          setNodes(
+            list.map((item: any) => ({ id: String(item.id), provider: String(item.provider || '') }))
+              .filter((item: NodeChoice) => item.id),
+          );
+          setNodesError('');
+        })
+        .catch((caught) => setNodesError(errorMessage(caught)));
     })();
   }, [token]);
 
@@ -199,6 +207,8 @@ const ModelsPageEditor = () => {
               {scopeProvider ? '' : '（它自己没指定渠道，跟随全局在用的那个）'}。
             </Facts>
           )}
+          {providersError && <ErrorText>渠道表没读到，这里认的「在用」渠道是猜的，不一定是 bot 正在用的那家：{providersError}</ErrorText>}
+          {nodesError && <ErrorText>节点表没读到，作用域里只列得出全局：{nodesError}</ErrorText>}
         </Panel>
       </Block>
 
@@ -234,6 +244,7 @@ const ModelsPageEditor = () => {
         key={`${token}\0${scope}`}
         catalog={catalog}
         data={providers}
+        error={providersError}
         onSaved={setProviders}
         scope={scope === GLOBAL ? null : scope}
       />

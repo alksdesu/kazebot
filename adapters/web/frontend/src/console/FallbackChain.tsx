@@ -214,10 +214,12 @@ const NodeChainMode = ({
 };
 
 export const FallbackChain = ({
-  scope, data, catalog, onSaved,
+  scope, data, error = '', catalog, onSaved,
 }: {
   scope: string | null;
   data: ProvidersResponse | null;
+  /** 渠道表没读到的原因：有它时不再说「正在读取」，那份数据不会来了。 */
+  error?: string;
   catalog: ProviderOptionsCatalog;
   onSaved: (next: ProvidersResponse) => void;
 }) => {
@@ -276,7 +278,7 @@ export const FallbackChain = ({
     '已保存。下一次主渠道失败就按这条链往下试。',
   );
 
-  if (!data) return <Empty>正在读取备选链…</Empty>;
+  if (!data) return <Empty>{error ? `渠道表没读到，备选链显示不了：${error}` : '正在读取备选链…'}</Empty>;
 
   const hint = scope === null
     ? '主渠道失败时按顺序往下试'

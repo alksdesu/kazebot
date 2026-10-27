@@ -255,6 +255,39 @@ describe('审批页两次读取撞车', () => {
   });
 });
 
+describe('审批列表没读成', () => {
+  it('首读失败不说暂无待审批项，下一轮读成了空列表才说', async () => {
+    vi.mocked(api.getAdminState)
+      .mockRejectedValueOnce(new Error('503 待审批列表拉不到'))
+      .mockResolvedValue(adminState());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+
+    expect(alertText()).toBe('503 待审批列表拉不到');
+    expect(screen.queryByText('暂无待审批项')).toBeNull();
+
+    await tick(APPROVALS_POLL_MS);
+
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+    expectNoAlert();
+  });
+
+  it('读成过之后某一轮失败，读到的那份照常留着', async () => {
+    vi.mocked(api.getAdminState)
+      .mockResolvedValueOnce(withApproval())
+      .mockRejectedValue(new Error('503 待审批列表拉不到'));
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+
+    await tick(APPROVALS_POLL_MS);
+
+    expect(alertText()).toBe('503 待审批列表拉不到');
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+    expect(screen.queryByText('暂无待审批项')).toBeNull();
+  });
+});
+
 describe('审批页写完发现换了人', () => {
   it('允许之后既不写提示，也不拿旧 token 重读', async () => {
     vi.mocked(api.getAdminState).mockResolvedValue(withApproval());

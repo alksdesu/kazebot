@@ -11,8 +11,10 @@ import {
   BLOCK_COMMENTS_DROPPED,
   WHOLE_FILE_REWRITTEN,
   diffDocuments,
+  parseYamlMapping,
   rewriteYaml,
   sameData,
+  yamlMappingProblem,
 } from '../console/yamlRewrite';
 
 // 和 consoleStore 写配置时用的一套参数一致。
@@ -720,6 +722,28 @@ describe('sameData', () => {
 
   it('matches two dates at the same instant', () => {
     expect(sameData(new Date(Date.UTC(2026, 0, 1)), new Date(Date.UTC(2026, 0, 1)))).toBe(true);
+  });
+});
+
+describe('yamlMappingProblem', () => {
+  it.each(['a: 1', '', '# only a comment'])('has nothing to say about %j', (raw) => {
+    expect(yamlMappingProblem(raw)).toBe('');
+    expect(() => parseYamlMapping(raw)).not.toThrow();
+  });
+
+  it('names a file that is not YAML, the same file parseYamlMapping refuses to write over', () => {
+    const broken = 'a: [1';
+    const reason = (() => {
+      try { yaml.load(broken); return ''; } catch (error) { return (error as Error).message; }
+    })();
+
+    expect(yamlMappingProblem(broken)).toBe(`不是合法的 YAML：${reason}`);
+    expect(() => parseYamlMapping(broken)).toThrow(`原文不是合法的 YAML，请先修好再改，原文件未修改：${reason}`);
+  });
+
+  it.each(['- a', 'just text', '42'])('names a top level that is not a mapping in %j', (raw) => {
+    expect(yamlMappingProblem(raw)).toBe('顶层不是映射（key: value）');
+    expect(() => parseYamlMapping(raw)).toThrow('原文顶层不是映射（key: value），请先修好再改，原文件未修改');
   });
 });
 

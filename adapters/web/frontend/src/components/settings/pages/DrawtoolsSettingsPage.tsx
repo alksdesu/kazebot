@@ -22,7 +22,7 @@ import {
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { savedMessage } from '../../../utils/sentence';
 import { commitYamlKeys } from '../../../console/yamlCommit';
-import { parseYamlMapping, sameData, type YamlKeyEdit } from '../../../console/yamlRewrite';
+import { parseYamlMapping, sameData, yamlMappingProblem, type YamlKeyEdit } from '../../../console/yamlRewrite';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -214,6 +214,9 @@ export const DrawtoolsSettingsPage = () => {
   const generation = settingsObj?.generation || {};
   const storage = settingsObj?.storage || {};
   const characterObj = useMemo(() => parseYamlObject(bundle?.character_tags?.content || ''), [bundle]);
+  // parseYamlObject 把坏文件读成空对象：不说一声，字段和角色列表看着就像文件本来是空的
+  const settingsProblem = useMemo(() => (bundle ? yamlMappingProblem(bundle.settings?.content || '') : ''), [bundle]);
+  const charactersProblem = useMemo(() => (bundle ? yamlMappingProblem(bundle.character_tags?.content || '') : ''), [bundle]);
   const characters = Array.isArray(characterObj?.characters) ? characterObj.characters : [];
   const characterItems: CharacterListItem[] = characters.map((character: any, index: number) => ({ character, index }));
   const normalizedCharacterQuery = characterQuery.trim().toLowerCase();
@@ -529,6 +532,11 @@ export const DrawtoolsSettingsPage = () => {
             <Button tone="quiet" disabled={loading} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新'}</Button>
             <Button onClick={initConfigs}>从 Example 初始化用户配置</Button>
           </div>
+          {settingsProblem && (
+            <ErrorText className="whitespace-pre-wrap break-words">
+              {`下面 API、队列、清理和预设显示的不是 settings.yaml 里的值，改了也存不进去，先在页面最下面的原始配置编辑器里修好：\nsettings.yaml ${settingsProblem}`}
+            </ErrorText>
+          )}
           <Feedback error={error} notice={notice} />
         </Block>
 
@@ -747,7 +755,11 @@ export const DrawtoolsSettingsPage = () => {
             <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">已填外貌：{characters.filter((character: any) => String(character?.appearance || '').trim()).length}</div>
             <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">含服装：{characters.filter((character: any) => normalizeCharacterOutfits(character?.outfits).length).length}</div>
           </div>
-          {!characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
+          {charactersProblem ? (
+            <ErrorText className="whitespace-pre-wrap break-words">
+              {`下面没有列出 character_tags.yaml 里的角色，新增、修改也存不进去，先在页面最下面的原始配置编辑器里修好：\ncharacter_tags.yaml ${charactersProblem}`}
+            </ErrorText>
+          ) : bundle !== null && !characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
           {!!characters.length && !filteredCharacters.length && <p className="text-sm text-[var(--duties-secondary)]">没有匹配的角色，试试调整搜索关键词。</p>}
           <div className="space-y-3">
             {filteredCharacters.map(({ character, index }: CharacterListItem) => {

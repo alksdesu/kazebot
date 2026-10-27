@@ -236,6 +236,35 @@ describe('模型参数页', () => {
   });
 });
 
+describe('渠道表、节点表没读到', () => {
+  it('渠道表没读到时说「在用」是猜的，备选链报出原因而不是一直在读', async () => {
+    vi.mocked(getProviders).mockRejectedValue(new Error('503 渠道表读不了'));
+
+    render(<ModelsPage />);
+
+    expect(await screen.findByText('渠道表没读到，备选链显示不了：503 渠道表读不了')).toBeInTheDocument();
+    expect(screen.getByText('渠道表没读到，这里认的「在用」渠道是猜的，不一定是 bot 正在用的那家：503 渠道表读不了')).toBeInTheDocument();
+    expect(screen.queryByText('正在读取备选链…')).toBeNull();
+  });
+
+  it('节点表没读到时说作用域里只列得出全局', async () => {
+    vi.mocked(getNodes).mockRejectedValue(new Error('503 节点表读不了'));
+
+    render(<ModelsPage />);
+
+    expect(await screen.findByText('节点表没读到，作用域里只列得出全局：503 节点表读不了')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'qq.vision' })).toBeNull();
+  });
+
+  it('都读到了就不报', async () => {
+    render(<ModelsPage />);
+
+    await screen.findByRole('button', { name: 'qq.vision' });
+    await waitFor(() => expect(screen.queryByText('正在读取备选链…')).toBeNull());
+    expect(screen.queryByText(/没读到/)).toBeNull();
+  });
+});
+
 describe('设置页外壳里的模型页', () => {
   beforeEach(() => {
     platformConsoleStore('qq').setState({ live: null, loading: false, draft: {} });

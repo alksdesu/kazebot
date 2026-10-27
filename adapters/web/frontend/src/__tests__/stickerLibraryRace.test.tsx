@@ -150,6 +150,38 @@ describe('图库只认最后发出的那次读', () => {
   });
 });
 
+describe('这一页没读成', () => {
+  it('首读失败不说这一档还没有图，读成了空页才说', async () => {
+    vi.mocked(api.listStickers)
+      .mockRejectedValueOnce(new Error(LIST_FAILURE))
+      .mockResolvedValue(page([], { library: 0 }));
+
+    render(<StickersPage />);
+    expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('这一档还没有图。')).toBeNull();
+
+    click('在库 0');
+
+    expect(await screen.findByText('这一档还没有图。')).toBeInTheDocument();
+    expect(screen.queryByText(LIST_FAILURE)).toBeNull();
+  });
+
+  it('换页签没读成，上一个页签的图不摆到这一档底下', async () => {
+    vi.mocked(api.listStickers)
+      .mockResolvedValueOnce(page(['待审图']))
+      .mockRejectedValue(new Error(LIST_FAILURE));
+
+    render(<StickersPage />);
+    await screen.findByText('待审图');
+
+    click('在库 3');
+
+    expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('待审图')).toBeNull();
+    expect(screen.queryByText('这一档还没有图。')).toBeNull();
+  });
+});
+
 describe('图库的那一句提示', () => {
   it('这一档读失败，切到另一档读成功就不再报那句', async () => {
     vi.mocked(api.listStickers)

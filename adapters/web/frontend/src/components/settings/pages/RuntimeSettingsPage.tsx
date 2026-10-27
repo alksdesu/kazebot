@@ -130,7 +130,10 @@ const GaveUpNotice = ({ workers, busy, onRetry }: {
 );
 
 const LogViewer = ({ token }: { token: string }) => {
-  const [files, setFiles] = useState<LogFileInfo[]>([]);
+  // null 是列表还没读成：在读、读失败都不能说成「还没有日志文件」
+  const [files, setFiles] = useState<LogFileInfo[] | null>(null);
+  // 列表和正文两条读取线各报各的：点开文件时清正文的原因，不能把列表没读成的原因一起清掉
+  const [listError, setListError] = useState('');
   const [picked, setPicked] = useState('');
   const [text, setText] = useState('');
   const [truncated, setTruncated] = useState(false);
@@ -145,9 +148,10 @@ const LogViewer = ({ token }: { token: string }) => {
       const rows = await listLogFiles(token);
       if (!request.isCurrent()) return;
       setFiles(rows);
+      setListError('');
       setPicked((current) => current || rows[0]?.name || '');
     } catch (caught) {
-      if (request.isCurrent()) setError(errorMessage(caught));
+      if (request.isCurrent()) setListError(errorMessage(caught));
     }
   }, [requests, token]);
 
@@ -179,7 +183,14 @@ const LogViewer = ({ token }: { token: string }) => {
 
   return (
     <Block hint={`最多 ${TAIL_LINES} 行，密钥已在服务端打码`} title="日志">
-      {files.length === 0 ? <Empty>还没有日志文件。</Empty> : (
+      {files === null ? (
+        listError ? (
+          <>
+            <ErrorText role="alert">日志列表没读到：{listError}</ErrorText>
+            <Button className="mt-2" onClick={() => void loadList()} tone="quiet">重新读取</Button>
+          </>
+        ) : <Empty>正在读取日志列表…</Empty>
+      ) : files.length === 0 ? <Empty>还没有日志文件。</Empty> : (
         <div className="grid gap-3 md:grid-cols-[var(--duties-split-columns)]">
           <ul className="max-h-[var(--duties-pane-height)] overflow-y-auto border border-[var(--duties-border)]">
             {files.map((file) => (

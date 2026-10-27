@@ -83,6 +83,8 @@ const LibraryBlock = () => {
   const [search, setSearch] = useState('');
   const [offset, setOffset] = useState(0);
   const [items, setItems] = useState<Sticker[]>([]);
+  // 这一页没读成时手上的图可能是上一个页签、上一次搜索留下的：不摆出来，也不说「还没有图」
+  const [listFailed, setListFailed] = useState(false);
   const [counts, setCounts] = useState<StickerCounts>(EMPTY_COUNTS);
   const [editing, setEditing] = useState('');
   const [draft, setDraft] = useState(EMPTY_DRAFT);
@@ -115,8 +117,13 @@ const LibraryBlock = () => {
       if (!request.isCurrent()) return;
       setItems(page.items);
       setCounts(page.counts);
+      setListFailed(false);
       setLoadError('');
-    } catch (caught) { if (request.isCurrent()) setLoadError(errorMessage(caught)); }
+    } catch (caught) {
+      if (!request.isCurrent()) return;
+      setListFailed(true);
+      setLoadError(errorMessage(caught));
+    }
   };
 
   useEffect(() => { void load(); }, [requests, tab, search, offset]);
@@ -340,13 +347,13 @@ const LibraryBlock = () => {
           </Button>
         </div>
 
-        {items.length === 0 ? (
+        {!listFailed && (items.length === 0 ? (
           <Empty>{search ? '没有名字或标签含「' + search + '」的图。' : '这一档还没有图。'}</Empty>
         ) : (
           <div className="grid grid-cols-[var(--duties-thumb-grid)] gap-2.5">
             {items.map(card)}
           </div>
-        )}
+        ))}
 
         <Pager offset={offset} onOffset={setOffset} pageSize={PAGE_SIZE} total={total} unit="张" />
         {error && <ErrorText role="alert">{error}</ErrorText>}

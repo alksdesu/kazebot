@@ -148,6 +148,42 @@ describe('勾了不等于能用', () => {
     expect(within(cell).getByTitle('渠道未配置 model，构建工具表时会被摘掉')).toHaveTextContent('不可用');
   });
 
+  it('没问到实际给不给时说出来，不留一片没标记的勾选让人以为都能用', async () => {
+    vi.mocked(getEffectiveTools).mockRejectedValue(new Error('503 工具表读不了'));
+    render(<NodeGrantsSection />);
+    const item = within(await expand('qq.orchestrator'));
+
+    const note = await item.findByText(/没问到每个工具实际给不给/);
+    expect(note).toHaveTextContent('503 工具表读不了');
+    expect(note).toHaveClass('text-[var(--duties-danger)]');
+    expect(item.queryByText('不可用')).toBeNull();
+  });
+
+  it('存完再问没问到，存之前那份的「不可用」不留在新勾选上', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    // 存完整页重读回来的是新对象，这一行才会按新存的那份再问一次
+    vi.mocked(getNodes).mockResolvedValueOnce([ORCHESTRATOR, INTENT]).mockResolvedValue([{ ...ORCHESTRATOR }, INTENT]);
+    vi.mocked(getEffectiveTools)
+      .mockResolvedValueOnce({ node_id: 'qq.orchestrator', mode: 'allowlist', dead_names: ['ghost_tool'], tools: EFFECTIVE })
+      .mockRejectedValue(new Error('503 工具表读不了'));
+    vi.mocked(getNodeRaw).mockResolvedValue({
+      content: 'id: qq.orchestrator\ntool_access:\n  mode: allowlist\n  allow:\n    - read_file\n',
+      hash: 'orchestrator-1',
+    });
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'orchestrator-2' });
+    render(<NodeGrantsSection />);
+    const item = within(await expand('qq.orchestrator'));
+    await item.findByText(/^勾了也用不了：/);
+
+    fireEvent.click(within(item.getByText('write_file').closest('div') as HTMLElement).getByRole('checkbox'));
+    fireEvent.click(item.getByRole('button', { name: '保存授权' }));
+
+    expect(await item.findByText(/没问到每个工具实际给不给/)).toHaveTextContent('503 工具表读不了');
+    expect(item.queryByText(/^勾了也用不了：/)).toBeNull();
+    expect(item.queryByText(/这些名字不存在/)).toBeNull();
+    expect(item.queryByText('不可用')).toBeNull();
+  });
+
   it('引擎不看勾选自己加上的工具，没勾也标出来会给', async () => {
     const given = '不看 tool_access：委派目标 bootstrap.coder 写了 isolation: worktree，引擎自动给';
     vi.mocked(getEffectiveTools).mockResolvedValue({
