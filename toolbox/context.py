@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from .approval_wait import waiting_for_approval
+
 # 工具按 0.2s 轮询取消，单次查询不能被无响应的 supervisor 拖住；超时当作没取消，下一轮再问。
 _CANCEL_PROBE_TIMEOUT_SEC = 2.0
 # 等审批期间引擎心跳仍在跑，这里的续租只是兜底，所以间隔放宽、租期放长。
@@ -187,6 +189,11 @@ class ToolContext:
             return 3600.0
 
     async def wait_for_approval(self, approval_id: str, poll_interval: float | None = None) -> dict[str, Any]:
+        """等审批有结论。等的这段时间报给 engine worker，任务不占并发名额。"""
+        with waiting_for_approval():
+            return await self._poll_approval(approval_id, poll_interval)
+
+    async def _poll_approval(self, approval_id: str, poll_interval: float | None) -> dict[str, Any]:
         interval = float(poll_interval) if poll_interval is not None else float(self.approval_poll_interval_sec or 0.5)
         if interval <= 0:
             interval = 0.5

@@ -170,7 +170,11 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
             # 由 event WS 推导写入 Task.current_phase/current_detail。
             "current_phase",
             "current_detail",
+            "lane",
+            "awaiting_approval",
         }
+        assert item["lane"] == "interactive"
+        assert item["awaiting_approval"] is False
         assert "large_prompt" not in str(item)
         assert "secret_input" not in str(item)
         assert "must-not-leak" not in str(item)

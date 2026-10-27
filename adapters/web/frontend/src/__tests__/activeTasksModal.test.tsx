@@ -1,5 +1,5 @@
 // 活跃任务弹窗的提示。五秒一次的轮询会不停重读，取消的结果不能被它顺手冲掉。
-import { act, cleanup, fireEvent, render, screen, type RenderResult } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within, type RenderResult } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../api/supervisorClient';
@@ -30,6 +30,8 @@ const task = (over: Partial<ActiveTask> = {}): ActiveTask => ({
   cancel_requested: false,
   current_phase: '',
   current_detail: '',
+  lane: 'interactive',
+  awaiting_approval: false,
   ...over,
 });
 
@@ -255,5 +257,68 @@ describe('在途的读取撞上新一轮', () => {
     await act(async () => { slow.reject(new Error('503 活跃任务读不到')); });
 
     expect(screen.queryByText('503 活跃任务读不到')).not.toBeInTheDocument();
+  });
+});
+
+describe('按道分组', () => {
+  const laneNames = () => screen.getAllByRole('region').map(region => region.getAttribute('aria-label'));
+
+  it('快道、交互道、后台道依次成组，组头数出各状态的个数', async () => {
+    vi.mocked(fetchActiveTasks).mockResolvedValue([
+      task({ task_id: 'task-summary-0001', node_id: 'system.turn_summarizer', lane: 'background', status: 'pending', input_summary: '写轮摘要' }),
+      task({ task_id: 'task-memory-00001', node_id: 'system.memory_extractor', lane: 'background', input_summary: '提取记忆' }),
+      task({ task_id: 'task-intent-00001', node_id: 'chat.intent', lane: 'fast', input_summary: '判断要不要接话' }),
+      task(),
+    ]);
+    await open();
+
+    expect(laneNames()).toEqual(['快道', '交互道', '后台道']);
+    const fast = screen.getByRole('region', { name: '快道' });
+    expect(within(fast).getByText('判断要不要接话')).toBeInTheDocument();
+    expect(within(fast).getByText('运行 1')).toBeInTheDocument();
+    const background = screen.getByRole('region', { name: '后台道' });
+    expect(within(background).getByText('写轮摘要')).toBeInTheDocument();
+    expect(within(background).getByText('提取记忆')).toBeInTheDocument();
+    expect(within(background).getByText('运行 1 · 排队 1')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: '交互道' })).getByText('在查日志')).toBeInTheDocument();
+  });
+
+  it('没有任务的道不出现', async () => {
+    await open();
+
+    expect(laneNames()).toEqual(['交互道']);
+  });
+
+  it('等审批的任务标成等待审批，组头单独数', async () => {
+    vi.mocked(fetchActiveTasks).mockResolvedValue([
+      task({ awaiting_approval: true, current_phase: 'tool_call', current_detail: 'write_file' }),
+      task({ task_id: 'task-bbbbbbbb2222', input_summary: '另一件事' }),
+    ]);
+    await open();
+
+    expect(screen.getByText('等待审批')).toBeInTheDocument();
+    expect(screen.queryByText('工具: write_file')).not.toBeInTheDocument();
+    expect(screen.getByText('运行 1 · 等审批 1')).toBeInTheDocument();
+  });
+
+  it('等审批的标记盖过实时推来的工具阶段', async () => {
+    useChatStore.setState({
+      taskActivities: { [TASK_ID]: { phase: 'tool_call', detail: 'execute_command', lastEventAt: Date.now() } },
+    });
+    vi.mocked(fetchActiveTasks).mockResolvedValue([task({ awaiting_approval: true })]);
+    await open();
+
+    expect(screen.getByText('等待审批')).toBeInTheDocument();
+    expect(screen.queryByText('工具: execute_command')).not.toBeInTheDocument();
+  });
+
+  it('服务端没给分道的任务归进未分道', async () => {
+    const legacy: Partial<ActiveTask> = task({ input_summary: '老版本服务端' });
+    delete legacy.lane;
+    vi.mocked(fetchActiveTasks).mockResolvedValue([legacy as ActiveTask]);
+    await open();
+
+    expect(laneNames()).toEqual(['未分道']);
+    expect(within(screen.getByRole('region', { name: '未分道' })).getByText('老版本服务端')).toBeInTheDocument();
   });
 });

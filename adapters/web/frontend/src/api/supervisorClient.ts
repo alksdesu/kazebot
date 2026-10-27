@@ -217,7 +217,13 @@ export interface ActiveTask {
   cancel_requested: boolean;
   current_phase: string;
   current_detail: string;
+  lane: TaskLane;
+  /** 在等人工审批：这段时间不占 engine 的并发名额。 */
+  awaiting_approval: boolean;
 }
+
+/** 领任务时排哪一道：快道是接话判断，交互道是用户在等的，后台道是压缩、记忆提取这类系统流程。 */
+export type TaskLane = 'fast' | 'interactive' | 'background';
 
 /**
  * 配置文件从哪来。仓库默认直接生效，改过就在 config/ 下存一份本实例的，没改过的跟着代码更新。

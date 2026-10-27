@@ -653,10 +653,15 @@ def create_app(
     def task_next(
         worker_id: str = Query(..., min_length=1),
         lease_sec: float = Query(120.0, ge=1.0, le=3600.0),
+        # 老 engine 不带这两项，领任务时就不给交互道保留空位
+        free_slots: int | None = Query(None, ge=0, le=1024),
+        capacity: int | None = Query(None, ge=1, le=1024),
     ) -> Task:
         st: SupervisorState = app.state.state
         st.mark_engine_seen(worker_id=worker_id)
-        item = st.assign_next_task(worker_id=worker_id, lease_sec=float(lease_sec))
+        item = st.assign_next_task(
+            worker_id=worker_id, lease_sec=float(lease_sec), free_slots=free_slots, capacity=capacity,
+        )
         if item is None:
             return Response(status_code=204)  # type: ignore[return-value]
         return Task.model_validate(item)
@@ -1709,6 +1714,7 @@ def create_app(
         active_statuses = {TaskStatus.running, TaskStatus.pending, TaskStatus.suspended}
         result: list[dict[str, Any]] = []
         with st._lock:
+            awaiting_approval = st._tasks_awaiting_approval_locked()
             for t in st.tasks.values():
                 if t.status not in active_statuses:
                     continue
@@ -1738,6 +1744,9 @@ def create_app(
                     "cancel_requested": t.cancel_requested,
                     "current_phase": t.current_phase,
                     "current_detail": t.current_detail,
+                    "lane": t.lane.value,
+                    # 在等人工审批的任务不占 engine 的并发名额，控制台要分得出来
+                    "awaiting_approval": t.task_id in awaiting_approval,
                 })
         result.sort(key=lambda x: x["created_at"], reverse=True)
         return result
@@ -1770,8 +1779,8 @@ def create_app(
         pm: ProcessManager | None = app.state.process_manager
         with st._lock:
             generations = dict(st._engine_generations)
-            queued = sum(1 for t in st.tasks.values() if t.status == "queued")
-            running = sum(1 for t in st.tasks.values() if t.status == "running")
+            queued = sum(1 for t in st.tasks.values() if t.status == TaskStatus.pending)
+            running = sum(1 for t in st.tasks.values() if t.status == TaskStatus.running)
         workers = pm.worker_health() if pm is not None else {}
         for name, row in workers.items():
             row["generation"] = generations.get(name, "")

@@ -11,7 +11,13 @@ engine:
   max_steps: 64
   streaming: true
   poll_interval_sec: 1.0
-  max_workers: 4               # 并发 task 处理数（默认 4）
+  max_workers: 4               # 每个 engine 进程同时跑几个任务（默认 4）；等人工审批的任务不占名额
+  max_active_tasks: 0          # 每个 engine 进程手里最多几个任务，等审批的也算（0 = max_workers 的两倍；小于 max_workers 时按 max_workers；最多 64）
+
+  # 领任务分三道：接话判断走快道先领，用户在等的走交互道，压缩、记忆提取、轮摘要、dream、执行计划步骤走后台道
+  lanes:
+    background_max_running: 2  # 后台道所有 engine 进程合计最多同时跑几个，等审批的不算（0 = 不限）
+    interactive_reserve: 1     # engine 进程的空位只剩这么多时不领后台道的任务，留给用户消息和接话判断；整个空着的进程不受这条限制（0 = 不保留）
 
   wrapup:
     time_ratio: 0.9            # 单段运行用到运行上限（CLONOTH_TASK_MAX_RUNNING_SECONDS）的这个比例就收尾：只给 finish，交代进度（0.5-0.99）

@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .task_lanes import TaskLane, derive_lane, parse_lane
+
 
 OUTPUT_GUIDE_MAX_SECTIONS = 32
 OUTPUT_GUIDE_SECTION_MAX_CHARS = 32_000
@@ -157,6 +159,8 @@ class Task(BaseModel):
     kind: TaskKind
     node_id: str | None = None
     tool_name: str | None = None
+    # 建任务时定下、随快照落盘：重排回队列的任务照旧排原来那一道，不按领取时的情形现算
+    lane: TaskLane = TaskLane.interactive
     input: dict[str, Any] = Field(default_factory=dict)
     continuation: dict[str, Any] = Field(default_factory=dict)
     source_inbound_seq: int | None = None
@@ -208,6 +212,14 @@ class Task(BaseModel):
     # approval_*) arrive. Read by GET /v1/admin/tasks/active.
     current_phase: str = ""
     current_detail: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lane_for_legacy_snapshot(cls, data: Any) -> Any:
+        """旧快照、旧事件没有 lane，或者写的是认不出的值：按任务自己的 input 推导。"""
+        if not isinstance(data, dict) or parse_lane(data.get("lane")) is not None:
+            return data
+        return {**data, "lane": derive_lane(data.get("input"))}
 
 
 class TaskCompleteIn(BaseModel):

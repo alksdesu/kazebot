@@ -57,6 +57,7 @@ from .run_budget import (
     steps_used as task_steps_used,
     wrapup_time_ratio,
 )
+from .worker_slots import MAX_ACTIVE_CEILING, WorkerSlots
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
 
@@ -637,6 +638,10 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     llm_timeout = get_float(runtime_cfg, "providers.openai.timeout_sec", 600.0, min_value=5.0, max_value=600.0)
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
     max_workers = get_int(runtime_cfg, "engine.max_workers", 4, min_value=1, max_value=32)
+    slots = WorkerSlots(
+        max_workers=max_workers,
+        max_active=get_int(runtime_cfg, "engine.max_active_tasks", 0, min_value=0, max_value=MAX_ACTIVE_CEILING),
+    )
 
     # Resolve admin token: env var > shared file > (removed: register response)
     _admin_token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
@@ -682,7 +687,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             except (NotImplementedError, RuntimeError):
                 pass  # Windows or non-main thread
 
-        print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers})", flush=True)
+        print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers}, max_active={slots.max_active})", flush=True)
         _active: set[asyncio.Task] = set()
         plugin_manager = get_manager(workspace_root, process="engine")
         from plugin_runtime.host import PluginHost
@@ -730,13 +735,19 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                         pass
 
                     # ---- poll for new task (only if below capacity) ----
-                    if len(_active) < max_workers:
-                        nr = await http.get(f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid})
+                    # 等审批的任务不占名额；空位数带给 supervisor，它据此给交互道留位置
+                    claim_params = slots.claim_params()
+                    if claim_params["free_slots"] > 0:
+                        nr = await http.get(
+                            f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid, **claim_params},
+                        )
                         if nr.status_code == 200:
                             item = nr.json()
                             if isinstance(item, dict) and item.get("task_id"):
-                                _t = asyncio.create_task(
-                                    _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid)
+                                _t = slots.start(
+                                    _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid),
+                                    task_id=str(item.get("task_id")),
+                                    lane=str(item.get("lane") or ""),
                                 )
                                 _active.add(_t)
                                 continue

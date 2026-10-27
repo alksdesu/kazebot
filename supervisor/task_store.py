@@ -20,8 +20,18 @@ from . import child_retention
 from ._helpers import _now
 from .auto_continue import chain_input
 from .context_calibration import calibrated_chars_per_token
+from .task_lanes import CLAIM_ORDER, LaneLimits, TaskLane, derive_lane, parse_lane
 from .task_traits import REQUEUE_MARK
-from .types import OutputGuide, RouteStatus, Task, TaskKind, TaskStatus, output_guide_payload
+from .types import (
+    Approval,
+    ApprovalStatus,
+    OutputGuide,
+    RouteStatus,
+    Task,
+    TaskKind,
+    TaskStatus,
+    output_guide_payload,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -359,7 +369,9 @@ class TaskStoreMixin:
         caller_task_id: str | None = None,
         batch_id: str | None = None,
         batch_index: int = 0,
+        lane: TaskLane | str | None = None,
     ) -> Task:
+        """建任务并记 task_created。lane 不给（或给的认不出）就按 derive_lane 定。"""
         now = _now()
         task_input = dict(input_data or {})
         # [2026-05-29 方案C第一步] 为什么：task_created 事件在 Task 创建时立即
@@ -396,6 +408,9 @@ class TaskStoreMixin:
                 task_context.setdefault("parent_conversation_key", parent_conv_key)
                 task_context.setdefault("route_conversation_key", parent_conv_key)
 
+        task_lane = parse_lane(lane) if lane is not None else None
+        if task_lane is None:
+            task_lane = derive_lane(task_input, inherited=self._origin_lane_locked(caller_task_id, task_input))
         task = Task(
             task_id=str(uuid.uuid4()),
             session_id=session_id,
@@ -403,6 +418,7 @@ class TaskStoreMixin:
             kind=kind,
             node_id=node_id,
             tool_name=tool_name,
+            lane=task_lane,
             input=task_input,
             continuation=dict(continuation or {}),
             source_inbound_seq=source_inbound_seq,
@@ -422,6 +438,17 @@ class TaskStoreMixin:
         self._task_order.append(task.task_id)
         self._event_task_snapshot("task_created", task)
         return task
+
+    def _origin_lane_locked(self, caller_task_id: str | None, task_input: dict[str, Any]) -> TaskLane | None:
+        """新任务替之干活的那个任务排哪一道：同步派发看 caller，异步派发看 dispatch_origin 里的发起任务。"""
+        origin = task_input.get("_dispatch_origin")
+        source_id = str(
+            caller_task_id
+            or (origin.get("caller_task_id") if isinstance(origin, dict) else "")
+            or ""
+        ).strip()
+        source = self.tasks.get(source_id) if source_id else None
+        return source.lane if source is not None else None
 
     # ---- 取消、恢复、失败：所有路径共用的状态迁移 ----
 
@@ -1174,40 +1201,125 @@ class TaskStoreMixin:
 
     # ---- task 队列（公开方法） ----
 
-    def assign_next_task(self, *, worker_id: str, lease_sec: float = 120.0) -> dict[str, Any] | None:
+    def assign_next_task(
+        self,
+        *,
+        worker_id: str,
+        lease_sec: float = 120.0,
+        free_slots: int | None = None,
+        capacity: int | None = None,
+    ) -> dict[str, Any] | None:
+        """给 worker 领一个任务：快道先于交互道，交互道先于后台道，同一道里按排队先后。
+
+        free_slots、capacity 是 worker 报来的空位数和名额（等审批的任务不占名额）：只剩保留给交互道的空位时
+        不给后台道的任务，报了 0 个空位就什么都不给。不报的老 engine 只受后台道的全局上限约束。
+        """
         wid = (worker_id or "").strip()
-        if not wid:
+        if not wid or (free_slots is not None and free_slots <= 0):
             return None
+        limits = LaneLimits.from_config(load_runtime_config(self.workspace_root))
         with self._lock:
             now = _now()
             lease_val = max(10.0, min(lease_sec, 600.0))
-            for tid in list(self._task_order):
-                task = self.tasks.get(tid)
-                if task is None or task.status != TaskStatus.pending:
-                    continue
+            task = self._next_claimable_task_locked(now, limits=limits, free_slots=free_slots, capacity=capacity)
+            if task is None:
+                return None
 
-                if self._task_cancel_pending_locked(task):
-                    self._cancel_task_locked(task, now)
-                    continue
+            if task.worker_id and task.worker_id != wid:
+                # lease expired – 重新排队
+                task.worker_id = None
+                task.lease_expires_at = None
+                self._event_task_snapshot("task_requeued", task)
 
-                if task.lease_expires_at and task.lease_expires_at > now:
-                    continue
+            task.status = TaskStatus.running
+            task.worker_id = wid
+            task.claim_id = uuid.uuid4().hex
+            task.claimed_at = now
+            task.updated_at = now
+            task.lease_expires_at = now + timedelta(seconds=lease_val)
+            self._event_task_snapshot("task_started", task)
+            return task.model_dump(mode="json")
 
-                if task.worker_id and task.worker_id != wid:
-                    # lease expired – 重新排队
-                    task.worker_id = None
-                    task.lease_expires_at = None
-                    self._event_task_snapshot("task_requeued", task)
+    def _next_claimable_task_locked(
+        self,
+        now: datetime,
+        *,
+        limits: LaneLimits,
+        free_slots: int | None,
+        capacity: int | None,
+    ) -> Task | None:
+        """各道排在最前、现在就能领的那个，再按道的先后挑。路过的待取消任务顺手取消掉。"""
+        heads: dict[TaskLane, Task] = {}
+        for tid in list(self._task_order):
+            task = self.tasks.get(tid)
+            if task is None or task.status != TaskStatus.pending:
+                continue
+            if self._task_cancel_pending_locked(task):
+                self._cancel_task_locked(task, now)
+                continue
+            if task.lease_expires_at and task.lease_expires_at > now:
+                continue
+            if task.lane in heads:
+                continue
+            heads[task.lane] = task
+            if task.lane is CLAIM_ORDER[0]:
+                break
+        for lane in CLAIM_ORDER:
+            head = heads.get(lane)
+            if head is None:
+                continue
+            if lane is TaskLane.background and not self._background_claimable_locked(
+                limits, free_slots=free_slots, capacity=capacity,
+            ):
+                continue
+            return head
+        return None
 
-                task.status = TaskStatus.running
-                task.worker_id = wid
-                task.claim_id = uuid.uuid4().hex
-                task.claimed_at = now
-                task.updated_at = now
-                task.lease_expires_at = now + timedelta(seconds=lease_val)
-                self._event_task_snapshot("task_started", task)
-                return task.model_dump(mode="json")
-            return None
+    def _background_claimable_locked(
+        self, limits: LaneLimits, *, free_slots: int | None, capacity: int | None,
+    ) -> bool:
+        if not limits.worker_takes_background(free_slots, capacity):
+            return False
+        if limits.background_max_running <= 0:
+            return True
+        return limits.background_has_room(self._background_running_locked())
+
+    def _background_running_locked(self) -> int:
+        """所有 worker 合计正在跑的后台道任务。等人工审批的不算，和 engine 那边等审批不占名额是一个道理。"""
+        running = {
+            task.task_id for task in self.tasks.values()
+            if task.status == TaskStatus.running and task.lane is TaskLane.background
+        }
+        if not running:
+            return 0
+        return len(running - self._tasks_awaiting_approval_locked())
+
+    def _tasks_awaiting_approval_locked(self) -> set[str]:
+        """正在跑、这一次领取之后提了审批还没定案的任务。
+
+        没带 task_id 的审批认不出是谁的，不算；重排之前那次领取留下的审批已经没人在等，也不算。
+        """
+        waiting: set[str] = set()
+        for approval in self.approvals.values():
+            task_id = str(approval.task_id or "").strip()
+            if approval.status != ApprovalStatus.pending or not task_id:
+                continue
+            task = self.tasks.get(task_id)
+            if task is None or task.status != TaskStatus.running:
+                continue
+            if self._asked_in_current_claim(task, approval):
+                waiting.add(task_id)
+        return waiting
+
+    @staticmethod
+    def _asked_in_current_claim(task: Task, approval: Approval) -> bool:
+        if task.claimed_at is None:
+            return True
+        try:
+            return approval.requested_at >= task.claimed_at
+        except TypeError:
+            # 旧数据里不带时区的时间没法和带时区的比，按还在等算
+            return True
 
     def _completion_outcome_locked(self, task: Task, *, worker_id: str, claim_id: str) -> CompletionOutcome:
         if claim_id:
