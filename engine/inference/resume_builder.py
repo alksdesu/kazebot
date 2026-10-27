@@ -65,7 +65,7 @@ def resume_outcome(message: Any) -> tuple[str, str]:
     return str(meta.get("resume_type") or ""), str(meta.get("resume_from_node") or "")
 
 
-def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> list[dict[str, Any]]:
     """从 resume_data / resume_event 构建恢复消息。
 
     v2 格式:
@@ -75,8 +75,10 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     v1 兼容:
       - tool_results:    工具调用结果
       - handoff_result:  子链返回结果
+
+    can_merge 是这个任务的工具表里有没有合回工具，子任务交回的隔离副本说明按它写怎么合回。
     """
-    messages = _resume_messages(resume_data)
+    messages = _resume_messages(resume_data, can_merge=can_merge)
     rtype = str(resume_data.get("type") or "").strip()
     if rtype in _CHILD_RESUME_TYPES:
         # 下游结果的判定读这里，不去匹配中文正文；_meta 发给模型前会被剥掉。
@@ -152,7 +154,7 @@ def _running_lines(entry: dict[str, Any], node: str, where: str) -> list[str]:
     return [head, _RUNNING_KEPT_NOTE]
 
 
-def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
+def _batch_node_message(entry: dict[str, Any], *, can_merge: bool = True) -> dict[str, Any]:
     """批次里一个子节点的结果：先说清对应哪次调用、哪条指令、结局如何，失败、取消、打断都明说没有结果。
 
     await_dispatches 交回的项还会是还在运行（running）或拿不到结果（unavailable）。
@@ -207,7 +209,7 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
     if earlier:
         lines.append(earlier)
     lines.extend(_continue_lines(entry, node))
-    lines.extend(worktree_lines(entry.get("worktree")))
+    lines.extend(worktree_lines(entry.get("worktree"), can_merge=can_merge))
 
     meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}
     resume_type = _BATCH_NODE_RESUME_TYPES.get(status)
@@ -222,8 +224,9 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
     return {"role": "user", "content": "\n".join(lines), "_meta": meta}
 
 
-def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> list[dict[str, Any]]:
     rtype = str(resume_data.get("type") or "").strip()
+    worktree = worktree_lines(resume_data.get("worktree"), can_merge=can_merge)
 
     # v2: child_result
     if rtype == "child_result":
@@ -239,7 +242,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             lines.append("结果：")
             lines.append(text)
         lines.extend(_continue_lines(resume_data, from_node))
-        lines.extend(worktree_lines(resume_data.get("worktree")))
+        lines.extend(worktree)
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
             return [_child_message(build_multimodal_content(content_text, child_atts), from_node)]
@@ -258,7 +261,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             content = f"下游节点 {from_node} 需要补充信息。"
         else:
             content = "下游节点需要补充信息。"
-        return [_child_message("\n".join([content, *worktree_lines(resume_data.get("worktree"))]), from_node)]
+        return [_child_message("\n".join([content, *worktree]), from_node)]
 
     # v2: child_failed
     if rtype == "child_failed":
@@ -268,14 +271,14 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         return [_child_message("\n".join([
             f"{prefix}{error}",
             *_continue_lines(resume_data, from_node),
-            *worktree_lines(resume_data.get("worktree")),
+            *worktree,
         ]), from_node)]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
-        return [_child_message("\n".join([text, *worktree_lines(resume_data.get("worktree"))]), from_node)]
+        return [_child_message("\n".join([text, *worktree]), from_node)]
 
     # v2: child_preempted
     if rtype == "child_preempted":
@@ -284,7 +287,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
         if ctx_ref:
             prefix += f"（context_ref: {ctx_ref}）"
-        return [_child_message("\n".join([prefix, *worktree_lines(resume_data.get("worktree"))]), from_node)]
+        return [_child_message("\n".join([prefix, *worktree]), from_node)]
 
     # 服务重启打断后重排的任务：缺结果的工具调用 runner 已补成「中断，结果未知」，这里只提醒先核对再接着做
     if rtype == INTERRUPTED_RESUME_TYPE:
@@ -336,7 +339,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                     else:
                         msgs.append(_tool_message(f'Tool result for "{_name}":\n{_raw}'))
                 else:
-                    msgs.append(_batch_node_message(e))
+                    msgs.append(_batch_node_message(e, can_merge=can_merge))
 
                 atts = payload_attachments(e)
                 if atts:

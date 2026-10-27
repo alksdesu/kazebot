@@ -870,32 +870,29 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except Exception:
             gated = set()
 
-        from engine.inference.pseudo_tools import edit_mode_satisfied, isolatable_node, merge_tool_offered
+        from engine.inference.pseudo_tools import edit_mode_satisfied, isolatable_node, plan_delegation
         from engine.node import load_node
         from engine.tool_outputs import READ_TOOL_OUTPUT
         from engine.worktree_report import MERGE_TOOL
 
         def _merge_tool_offer() -> tuple[str, str]:
-            """合回工具给不给，和推理循环同一个判法：(给的时候的说明, 不给的理由)。"""
+            """合回工具给不给，和推理循环同一个 plan_delegation 判：(给的时候的说明, 不给的理由)。"""
             node = load_node(workspace_root, node_id)
             if node is None:
                 return "", ""
-            try:
-                from engine.builtin.image_gen_gating import disabled_draw_nodes
-                hidden = disabled_draw_nodes(workspace_root)
-            except Exception:
-                hidden = set()
-            isolating = [
-                target for target in node.delegate_targets
-                if target not in hidden and (target_node := load_node(workspace_root, target)) is not None
-                and isolatable_node(target_node)
+            targets = [
+                {"id": target, "isolatable": (target_node := load_node(workspace_root, target)) is not None
+                 and isolatable_node(target_node)}
+                for target in node.delegate_targets
             ]
-            if merge_tool_offered(node, isolating):
+            # 注册表里有没有合回工具，调用前已经按 known 判过
+            plan = plan_delegation(node, workspace_root, targets, [{"name": MERGE_TOOL}], in_isolation=False)
+            if plan.can_merge:
                 return (
-                    f"不看 tool_access：委派目标 {'、'.join(isolating)} 写了 isolation: worktree，引擎自动给；"
+                    f"不看 tool_access：委派目标 {'、'.join(plan.isolating)} 写了 isolation: worktree，引擎自动给；"
                     "tool_access.deny 里写上它就不给，节点自己在隔离副本里时也不给"
                 ), ""
-            if isolating:
+            if plan.isolating:
                 return "", "tool_access.deny 里写了它，引擎不给"
             return "", "委派目标里没有写 isolation: worktree 的节点，引擎不给"
 

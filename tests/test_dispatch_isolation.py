@@ -1,5 +1,6 @@
 """委派时要求隔离：节点 YAML 写了 isolation: worktree 的目标才多 isolation、repo 两个参数，有这样的目标才给合回工具；
-两个参数随 wait 批次项和异步 dispatch_origin 交给 supervisor，写错的、只给 repo 的、已在副本里又要求的当场拒绝。"""
+两个参数随 wait 批次项和异步 dispatch_origin 交给 supervisor，写错的、只给 repo 的、已在副本里又要求的当场拒绝。
+子任务交回的副本说明按调用方工具表里有没有合回工具来写怎么合回。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import yaml
 
@@ -51,6 +53,7 @@ from engine.dispatch_batch import (  # noqa: E402
 )
 from engine.inference.ai_step import _handle_tool_calls  # noqa: E402
 from engine.inference.pseudo_handlers import prepare_wait_dispatches  # noqa: E402
+from engine import runner  # noqa: E402
 from engine.inference.pseudo_tools import (  # noqa: E402
     _dispatch_delegate_spec,
     _dispatch_delegate_specs,
@@ -58,15 +61,17 @@ from engine.inference.pseudo_tools import (  # noqa: E402
     isolatable_node,
     isolating_targets,
     merge_tool_offered,
+    plan_delegation,
     tool_allowed,
 )
 from engine.isolation_notice import isolation_parts  # noqa: E402
 from engine.node import Node, ToolAccess, load_node  # noqa: E402
-from engine.project_root import ISOLATION_CONTEXT_KEY  # noqa: E402
-from engine.protocol import ACTION_DISPATCH  # noqa: E402
+from engine.project_root import INBOUND_CHILD_WORKTREE_KEY, ISOLATION_CONTEXT_KEY  # noqa: E402
+from engine.protocol import ACTION_DISPATCH, TaskAction  # noqa: E402
 from engine.runner import _collect_node_info, _discover_switchable_nodes  # noqa: E402
 from engine.worktree_report import MERGE_TOOL  # noqa: E402
 from shell.tui.services.node_scanner import find_root_nodes, scan_nodes  # noqa: E402
+from toolbox.registry import ToolRegistry  # noqa: E402
 
 CODER = "coder"
 SCOUT = "scout"
@@ -796,3 +801,118 @@ class TestThroughTheSupervisor:
 
         shared = f"隔离副本 {child.task_id} 里，子任务会沿用这个副本，不能再要求隔离；去掉 isolation 和 repo 再派"
         assert shared in engine_reason and shared in nested.result["error"]
+
+
+# 一份做完的隔离副本，随子任务的结果交回调用方
+WORKTREE_VIEW = {
+    "id": "wt-1", "state": "finished", "repo": "E:/repos/app", "branch": "clonoth/wt-1", "base": "0" * 40,
+    "path": "E:/repos/app-worktrees/wt-1", "patch": "E:/repos/app-worktrees/wt-1.patch", "handle": "wt-1@agent-session-1",
+    "files": [{"path": "app.py", "status": "M", "added": 1, "deleted": 1}], "file_count": 1, "added": 1, "deleted": 1,
+    "diff": "", "merge_allowed": True,
+}
+DENIES_MERGE = ToolAccess(mode="allowlist", allow=["probe"], deny=[MERGE_TOOL])
+HANDED_UP = f"这个节点不能调用 {MERGE_TOOL}：审过之后把 handle wt-1@agent-session-1"
+MERGE_HINT = f"审过之后要合回原仓库就调用 {MERGE_TOOL}，handle 填 wt-1@agent-session-1"
+
+
+class TestPlanDelegation:
+    def test_targets_isolation_and_the_merge_tool_are_settled_together(self, tmp_path: Path) -> None:
+        plan = plan_delegation(_node(), tmp_path, DOWNSTREAM, [{"name": "probe"}, {"name": MERGE_TOOL}], in_isolation=False)
+
+        assert plan.targets == (CODER, SCOUT) and plan.isolating == (CODER,)
+        assert plan.merge_spec == {"name": MERGE_TOOL} and plan.can_merge is True
+
+    @pytest.mark.parametrize("node, specs, in_isolation", [
+        pytest.param(_node(access=DENIES_MERGE), [{"name": MERGE_TOOL}], False, id="denied"),
+        pytest.param(_node(), [{"name": "probe"}], False, id="not-registered"),
+        pytest.param(_node(), [{"name": MERGE_TOOL}], True, id="inside-a-worktree"),
+        pytest.param(_node(targets=(SCOUT,)), [{"name": MERGE_TOOL}], False, id="no-isolatable-target"),
+    ])
+    def test_without_the_tool_there_is_no_merging(
+        self, tmp_path: Path, node: Node, specs: list[dict[str, Any]], in_isolation: bool,
+    ) -> None:
+        plan = plan_delegation(node, tmp_path, DOWNSTREAM, specs, in_isolation=in_isolation)
+
+        assert plan.merge_spec is None and plan.can_merge is False
+
+    def test_a_draw_node_that_cannot_draw_is_left_out(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from engine.builtin import image_gen_gating
+
+        monkeypatch.setattr(image_gen_gating, "disabled_draw_nodes", lambda root: {CODER})
+
+        plan = plan_delegation(_node(), tmp_path, DOWNSTREAM, [{"name": MERGE_TOOL}], in_isolation=False)
+
+        assert plan.targets == (SCOUT,) and plan.isolating == () and plan.can_merge is False
+
+
+class TestMergeHintInResults:
+    @staticmethod
+    def _wait_result() -> dict[str, Any]:
+        return {"type": "batch_results", "entries": [{
+            "kind": "node", "node_id": CODER, "status": "finish", "text": "改好了", "call_id": "w1",
+            "handle": WORKTREE_VIEW["handle"], "worktree": dict(WORKTREE_VIEW),
+        }]}
+
+    @pytest.mark.parametrize("access, expected", [
+        pytest.param(DENIES_MERGE, HANDED_UP, id="denied"),
+        pytest.param(None, MERGE_HINT, id="offered"),
+    ])
+    def test_a_wait_result_follows_the_tool_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access: ToolAccess | None, expected: str,
+    ) -> None:
+        run = NodeRun(monkeypatch, tmp_path, registry=_registry(), node=_node(access=access))
+
+        run.run(_finish(), instruction="", resume_data=self._wait_result(), downstream_info=DOWNSTREAM)
+
+        shown = "\n".join(
+            str(message.get("content") or "") for message in run.requests[0]["messages"]
+            if "隔离副本 wt-1" in str(message.get("content") or "")
+        )
+        assert expected in shown
+        assert (MERGE_TOOL in run.tool_names(0)) is (access is None)
+
+    @pytest.mark.parametrize("deny, expected", [
+        pytest.param([MERGE_TOOL], HANDED_UP, id="denied"),
+        pytest.param([], MERGE_HINT, id="offered"),
+    ])
+    def test_the_async_result_prefix_follows_the_tool_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deny: list[str], expected: str,
+    ) -> None:
+        nodes = tmp_path / "config" / "nodes"
+        nodes.mkdir(parents=True)
+        (nodes / f"{CODER}.yaml").write_text(
+            yaml.safe_dump({"id": CODER, "type": "ai", ISOLATION_KEY: ISOLATION_WORKTREE, "tool_access": "all"}),
+            encoding="utf-8",
+        )
+        lead = Node(
+            id="lead", type="ai", prompt="Work.", tool_mode="native", delegate_targets=[CODER],
+            tool_access=ToolAccess(mode="allowlist", allow=["probe"], deny=deny),
+        )
+        load_real = runner.load_node
+        monkeypatch.setattr(runner, "load_node", lambda root, node_id: lead if node_id == "lead" else load_real(root, node_id))
+        monkeypatch.setattr(runner, "_fetch_session_provider_override", AsyncMock(return_value=None))
+        monkeypatch.setattr(runner, "_create_provider_from_registry", lambda *args, **kwargs: SimpleNamespace())
+        monkeypatch.setattr(runner, "install_event_bridge", lambda *args, **kwargs: None)
+        run_ai_node = AsyncMock(return_value=TaskAction(action="finish", node_id="lead", result={"text": "done"}))
+        monkeypatch.setattr(runner, "run_ai_node", run_ai_node)
+        task = {"task_id": "task", "node_id": "lead", "input": {
+            "instruction": "改好了", "task_context": {},
+            "inbound_message_type": "dispatch_result", "inbound_child_node_id": CODER, "inbound_child_status": "finish",
+            INBOUND_CHILD_WORKTREE_KEY: dict(WORKTREE_VIEW),
+        }}
+
+        async def run_task() -> None:
+            transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+            async with httpx.AsyncClient(transport=transport) as http:
+                await runner._run_node_task(
+                    http=http, llm_http=http, sup_url="http://local", ws_root=tmp_path,
+                    registry=ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools"),
+                    task=task, worker_id="worker", session_id="session", session_generation=1,
+                    api_key="test", base_url="http://model.invalid", default_model="test",
+                )
+
+        asyncio.run(run_task())
+
+        instruction = run_ai_node.await_args.kwargs["instruction"]
+        assert instruction.startswith(f"[Async task completed] Node {CODER} finished.")
+        assert expected in instruction

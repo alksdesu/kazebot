@@ -31,8 +31,7 @@ from .pseudo_tools import (
     _update_todos_spec,
     _to_openai_tools,
     _filter_tool_specs,
-    isolating_targets,
-    merge_tool_offered,
+    plan_delegation,
 )
 from .resume_builder import _build_resume_messages
 from .loop_state import (
@@ -73,7 +72,6 @@ from ..attachments import build_multimodal_content, payload_attachments, screen_
 from ..conversation_store import Message, MessageType
 from ..isolation_notice import task_isolation
 from ..node import Node
-from ..worktree_report import MERGE_TOOL
 from .message_assembly import assemble_initial_messages
 from ..conversation_routing import concise_text, render_user_input, routing_meta, short_reply, turn_input_meta
 from ..protocol import (
@@ -2275,10 +2273,19 @@ async def run_ai_node(
             return _prompt_result.action
         _is_block_mode = bool(_prompt_ctx.extra.get("is_block_mode", _is_block_mode))
 
+    # 恢复消息里子任务交回的合回提示要按工具表里有没有合回工具来写，委派判定得排在它前面
+    _registry_specs = registry.list_specs()
+    _delegation = plan_delegation(
+        node, rctx.workspace_root, downstream_info, _registry_specs,
+        in_isolation=bool(task_isolation(rctx.task_context)),
+    )
+
     # ---- 追加恢复消息 ----
     resumed_messages: list[dict[str, Any]] = []
     if resume_data:
-        resumed_messages = _build_resume_messages(await _resume_data_for_context(resume_data, rctx, runtime_cfg))
+        resumed_messages = _build_resume_messages(
+            await _resume_data_for_context(resume_data, rctx, runtime_cfg), can_merge=_delegation.can_merge,
+        )
         for message in resumed_messages:
             message.setdefault("_meta", {}).update({**route_meta, "source_task_id": rctx.task_id})
         messages.extend(resumed_messages)
@@ -2313,22 +2320,8 @@ async def run_ai_node(
                     break
 
     # ---- 构建工具列表 ----
-    delegate_targets = list(node.delegate_targets)
-    # 一张图都画不出来的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
-    try:
-        from ..builtin.image_gen_gating import disabled_draw_nodes
-        _disabled_nodes = disabled_draw_nodes(rctx.workspace_root) & set(delegate_targets)
-        if _disabled_nodes:
-            delegate_targets = [t for t in delegate_targets if t not in _disabled_nodes]
-            logger.info("image_gen_gating: removed delegate targets %s (no channel configured, node=%s)", sorted(_disabled_nodes), node.id)
-    except Exception as _exc:  # noqa: BLE001
-        logger.warning("image_gen_gating delegate filter skipped: %s", _exc)
-    # 隔离副本里的任务不给 isolation、repo，也不给合回工具：它派出的子任务只能沿用这个副本
-    _isolating = isolating_targets(
-        delegate_targets, downstream_info, in_isolation=bool(task_isolation(rctx.task_context)),
-    )
-
-    _registry_specs = registry.list_specs()
+    delegate_targets = list(_delegation.targets)
+    _isolating = list(_delegation.isolating)
     tool_specs = _filter_tool_specs(node, _registry_specs)
     # 跑不通的生图工具（gpt_image_2 / gemini_image）从可用工具列表里彻底移除，
     # 杜绝「未配置却被误调用、调完 404」。
@@ -2343,13 +2336,8 @@ async def run_ai_node(
                 logger.info("image_gen_gating: removed unconfigured image tools %s (node=%s)", sorted(_removed), node.id)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("image_gen_gating tool filter skipped: %s", _exc)
-    # 合回工具不看 tool_access，像 await_dispatches 一样跟着委派目标走：有能隔离的目标才给
-    _merge_spec = (
-        next((s for s in _registry_specs if s.get("name") == MERGE_TOOL), None)
-        if merge_tool_offered(node, _isolating) else None
-    )
-    if _merge_spec is not None:
-        tool_specs.append(_merge_spec)
+    if _delegation.merge_spec is not None:
+        tool_specs.append(_delegation.merge_spec)
     # 超长输出的 ref 只能用 read_tool_output 读回；它只读本会话自己的产物，不受 tool_access 限制，没有真工具的节点不加
     if tool_specs and not any(s.get("name") == READ_TOOL_OUTPUT for s in tool_specs):
         _reader_spec = next((s for s in _registry_specs if s.get("name") == READ_TOOL_OUTPUT), None)
@@ -2369,7 +2357,7 @@ async def run_ai_node(
         _dispatch_timeouts = DispatchTimeouts.from_config(runtime_cfg)
         openai_tools.extend(_dispatch_delegate_specs(
             delegate_targets, downstream_info, allow_wait=not _is_system_task, timeouts=_dispatch_timeouts,
-            isolating=_isolating, can_merge=_merge_spec is not None, caller_id=node.id,
+            isolating=_isolating, can_merge=_delegation.can_merge, caller_id=node.id,
         ))
         openai_tools.extend(_dispatch_control_specs(allow_await=not _is_system_task, timeouts=_dispatch_timeouts))
 

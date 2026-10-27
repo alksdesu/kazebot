@@ -38,12 +38,24 @@ def file_line(item: Any) -> str:
     return f"  {status or '?'} {path}（{label}，+{added or 0} -{deleted or 0}）"
 
 
-def _merge_hint(view: dict[str, Any]) -> str:
-    handle = str(view.get("handle") or view.get("id") or "").strip()
+def _handle(view: dict[str, Any]) -> str:
+    return str(view.get("handle") or view.get("id") or "").strip()
+
+
+def _merge_hint(view: dict[str, Any], *, can_merge: bool) -> str:
+    handle = _handle(view)
     patch = str(view.get("patch") or "").strip()
     if view.get("merge_allowed") is False:
         where = f"补丁在 {patch}" if patch else "没有补丁文件"
+        if not can_merge:
+            return f"本实例不能合回这个仓库，{where}；这个节点也不能调用 {MERGE_TOOL}，副本到了保留期会被清理。"
         return f"本实例不能合回这个仓库，{where}；不要了就调用 {MERGE_TOOL}，handle 填 {handle}，带上 abandon=true 放弃。"
+    if not can_merge:
+        # 同一会话家族里有合回工具的上级拿这个句柄就能合回
+        return (
+            f"这个节点不能调用 {MERGE_TOOL}：审过之后把 handle {handle} 连同你的结论交给上级或用户，由他们合回或放弃；"
+            "不要自己把改动手抄进原仓库。副本到了保留期会被清理。"
+        )
     return (
         f"审过之后要合回原仓库就调用 {MERGE_TOOL}，handle 填 {handle}；"
         f"不要了就同样调用它并带上 abandon=true 放弃。合回前副本一直留着，到了保留期会被清理。"
@@ -60,8 +72,11 @@ def worktree_brief(view: Any) -> dict[str, Any]:
     return {key: view[key] for key in _BRIEF_KEYS if view.get(key) not in (None, "")}
 
 
-def worktree_lines(view: Any) -> list[str]:
-    """把一份副本结果写成几行；不是字典或没有登记号时什么都不写。"""
+def worktree_lines(view: Any, *, can_merge: bool = True) -> list[str]:
+    """把一份副本结果写成几行；不是字典或没有登记号时什么都不写。
+
+    can_merge=False 是收到结果的节点工具表里没有合回工具：不叫它调用，让它把句柄交给上级或用户。
+    """
     if not isinstance(view, dict):
         return []
     worktree_id = str(view.get("id") or "").strip()
@@ -91,7 +106,8 @@ def worktree_lines(view: Any) -> list[str]:
     if error:
         lines = [f"{head}：收尾时没算出改动（{error}）。"]
         if path:
-            lines.append(f"副本还在 {path}；调用 {MERGE_TOOL} 时会重新算一遍。")
+            who = "" if can_merge else "上级或用户"
+            lines.append(f"副本还在 {path}；{who}调用 {MERGE_TOOL} 时会重新算一遍。")
         return lines
     files = view.get("files") if isinstance(view.get("files"), list) else []
     total = _count(view.get("file_count"))
@@ -99,7 +115,10 @@ def worktree_lines(view: Any) -> list[str]:
     lines = [f"{head}，副本目录 {path}。" if path else f"{head}。"]
     if total <= 0:
         lines.append("副本里没有改动，不需要合回。")
-        lines.append(f"不要了就调用 {MERGE_TOOL}，handle 填 {str(view.get('handle') or worktree_id)}，带上 abandon=true 放弃。")
+        if can_merge:
+            lines.append(f"不要了就调用 {MERGE_TOOL}，handle 填 {_handle(view)}，带上 abandon=true 放弃。")
+        else:
+            lines.append("副本到了保留期会被清理。")
         return lines
     added, deleted = _count(view.get("added")) or 0, _count(view.get("deleted")) or 0
     lines.append(f"相对基准提交改了 {total} 个文件（+{added} -{deleted}，含未提交和未跟踪的文件）：")
@@ -117,5 +136,5 @@ def worktree_lines(view: Any) -> list[str]:
             lines.append(f"完整补丁：{patch}")
     elif patch:
         lines.append(f"完整补丁：{patch}")
-    lines.append(_merge_hint(view))
+    lines.append(_merge_hint(view, can_merge=can_merge))
     return lines

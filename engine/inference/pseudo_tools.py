@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from toolbox.tool_names import DISPATCH_TOOL_PREFIX
@@ -897,3 +899,47 @@ def merge_tool_offered(node: "Node", isolating: Collection[str]) -> bool:
     白名单里写没写它都不看；mode: all 的节点没有能隔离的目标也不给。
     """
     return bool(isolating) and MERGE_TOOL not in set(node.tool_access.deny)
+
+
+@dataclass(frozen=True)
+class Delegation:
+    """这个任务能派给谁、派哪些时能要求隔离、工具表里有没有合回工具。"""
+
+    targets: tuple[str, ...]
+    isolating: tuple[str, ...]
+    merge_spec: dict[str, Any] | None
+
+    @property
+    def can_merge(self) -> bool:
+        return self.merge_spec is not None
+
+
+def plan_delegation(
+    node: "Node",
+    workspace_root: Path | str,
+    downstream_info: list[dict[str, Any]] | None,
+    registry_specs: list[dict[str, Any]],
+    *,
+    in_isolation: bool,
+) -> Delegation:
+    """工具表、委派工具的说明和子任务交回结果里的合回提示都按这一份，不然会出现提示让调一个工具表里没有的工具。"""
+    targets = list(node.delegate_targets)
+    # 一张图都画不出来的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
+    try:
+        from ..builtin.image_gen_gating import disabled_draw_nodes
+        disabled = disabled_draw_nodes(workspace_root) & set(targets)
+        if disabled:
+            targets = [target for target in targets if target not in disabled]
+            logger.info(
+                "image_gen_gating: removed delegate targets %s (no channel configured, node=%s)", sorted(disabled), node.id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("image_gen_gating delegate filter skipped: %s", exc)
+    # 隔离副本里的任务不给 isolation、repo，也不给合回工具：它派出的子任务只能沿用这个副本
+    isolating = isolating_targets(targets, downstream_info, in_isolation=in_isolation)
+    # 合回工具不看 tool_access，像 await_dispatches 一样跟着委派目标走：有能隔离的目标才给
+    merge_spec = (
+        next((spec for spec in registry_specs if spec.get("name") == MERGE_TOOL), None)
+        if merge_tool_offered(node, isolating) else None
+    )
+    return Delegation(tuple(targets), tuple(isolating), merge_spec)

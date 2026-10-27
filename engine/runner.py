@@ -39,7 +39,7 @@ from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
 from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
 from .inference.message_model import apply_reasoning_content
-from .inference.pseudo_tools import isolatable_node, tool_allowed
+from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node, node_file, node_files
@@ -47,6 +47,7 @@ from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_out
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
 from .interrupted_calls import INTERRUPTED_RESUME_TYPE, append_interrupted_results
+from .isolation_notice import task_isolation
 from .project_root import INBOUND_CHILD_WORKTREE_KEY, isolation_error, task_project_origin, task_project_root
 from .run_budget import (
     AUTO_CONTINUE_KEY,
@@ -1374,7 +1375,12 @@ async def _run_node_task(
         _prefix_parts.extend(_dispatch_handle_lines(input_data, _inbound_child_handle, _inbound_node_id))
         if _inbound_summary:
             _prefix_parts.append(f"Summary: {_inbound_summary}")
-        _prefix_parts.extend(worktree_lines(input_data.get(INBOUND_CHILD_WORKTREE_KEY)))
+        _child_worktree = input_data.get(INBOUND_CHILD_WORKTREE_KEY)
+        if _child_worktree:
+            _delegation = plan_delegation(
+                node, ws_root, ds_info, registry.list_specs(), in_isolation=bool(task_isolation(rctx.task_context)),
+            )
+            _prefix_parts.extend(worktree_lines(_child_worktree, can_merge=_delegation.can_merge))
         _prefix_parts.append(f"{_body_label}:\n{instruction}")
         instruction = "\n".join(_prefix_parts)
 

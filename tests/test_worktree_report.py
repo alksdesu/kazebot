@@ -1,10 +1,13 @@
 """隔离子任务交回的副本说明写成文字：改了哪些文件、diff、补丁在哪、怎么合回或放弃；算不出改动、没有改动、
-被取消按放弃处理、本实例不能合回时各有说法。单个委派、同步批次的恢复消息都把它带上，没有副本时一字不加。"""
+被取消按放弃处理、本实例不能合回时各有说法，收到结果的节点没有合回工具时不叫它调用。
+单个委派、同步批次的恢复消息都把它带上，没有副本时一字不加。"""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -138,6 +141,51 @@ class TestWorktreeLines:
             assert worktree_lines(view) == [], view
 
 
+class TestWithoutTheMergeTool:
+    def test_a_finished_worktree_is_handed_up_with_its_handle(self) -> None:
+        lines = worktree_lines(_view(), can_merge=False)
+
+        assert lines[:-1] == worktree_lines(_view())[:-1]
+        assert lines[-1] == (
+            f"这个节点不能调用 {MERGE_TOOL}：审过之后把 handle {HANDLE} 连同你的结论交给上级或用户，由他们合回或放弃；"
+            "不要自己把改动手抄进原仓库。副本到了保留期会被清理。"
+        )
+
+    def test_no_changes_leave_nothing_to_do(self) -> None:
+        lines = worktree_lines(_view(files=[], file_count=0, added=0, deleted=0, diff=""), can_merge=False)
+
+        assert lines == [f"{HEAD}，副本目录 {PATH}。", "副本里没有改动，不需要合回。", "副本到了保留期会被清理。"]
+
+    def test_an_outcome_that_could_not_be_computed_says_who_merges(self) -> None:
+        lines = worktree_lines(_view(error="git diff 失败"), can_merge=False)
+
+        assert lines[-1] == f"副本还在 {PATH}；上级或用户调用 {MERGE_TOOL} 时会重新算一遍。"
+
+    def test_an_instance_that_may_not_merge_leaves_only_the_patch(self) -> None:
+        lines = worktree_lines(_view(merge_allowed=False), can_merge=False)
+
+        assert lines[-1] == (
+            f"本实例不能合回这个仓库，补丁在 {PATCH}；这个节点也不能调用 {MERGE_TOOL}，副本到了保留期会被清理。"
+        )
+
+    def test_an_abandoned_worktree_reads_the_same(self) -> None:
+        view = _view(state="abandoned", note="子任务被取消")
+
+        assert worktree_lines(view, can_merge=False) == worktree_lines(view)
+
+    @pytest.mark.parametrize("fields", [
+        pytest.param({}, id="finished"),
+        pytest.param({"files": [], "file_count": 0, "added": 0, "deleted": 0, "diff": ""}, id="no-changes"),
+        pytest.param({"error": "git diff 失败"}, id="not-computed"),
+        pytest.param({"merge_allowed": False}, id="instance-may-not-merge"),
+    ])
+    def test_nothing_tells_the_node_to_call_the_tool_itself(self, fields: dict[str, Any]) -> None:
+        text = "\n".join(worktree_lines(_view(**fields), can_merge=False))
+
+        assert "abandon=true" not in text
+        assert f"就调用 {MERGE_TOOL}" not in text and "就同样调用它" not in text
+
+
 class TestBrief:
     def test_the_brief_keeps_the_facts_and_drops_diff_and_file_list(self) -> None:
         assert worktree_brief(_view()) == {
@@ -205,3 +253,26 @@ class TestResumeMessages:
         }]})
 
         assert message["content"] == "子节点 a.node（调用 w1）执行失败：boom\n它没有给出结果，不要臆测它的输出。"
+
+    @pytest.mark.parametrize("resume_type", ["child_result", "child_ask", "child_failed", "child_cancelled", "child_preempted"])
+    def test_a_single_result_follows_whether_the_node_can_merge(self, resume_type: str) -> None:
+        resume = {"type": resume_type, "from_node": "a.node", "result": {"text": "done"}, "worktree": _view()}
+
+        [handed_up] = _build_resume_messages(resume, can_merge=False)
+        [merged] = _build_resume_messages(resume)
+
+        assert f"这个节点不能调用 {MERGE_TOOL}：审过之后把 handle {HANDLE}" in handed_up["content"]
+        assert "abandon=true" not in handed_up["content"]
+        assert f"审过之后要合回原仓库就调用 {MERGE_TOOL}" in merged["content"]
+
+    def test_a_batch_entry_follows_it_too(self) -> None:
+        resume = {"type": "batch_results", "entries": [{
+            "kind": "node", "node_id": "a.node", "status": "finish", "text": "done", "call_id": "w1",
+            "handle": HANDLE, "worktree": _view(),
+        }]}
+
+        [handed_up] = _build_resume_messages(resume, can_merge=False)
+        [merged] = _build_resume_messages(resume)
+
+        assert f"这个节点不能调用 {MERGE_TOOL}" in handed_up["content"] and "abandon=true" not in handed_up["content"]
+        assert "abandon=true" in merged["content"]
