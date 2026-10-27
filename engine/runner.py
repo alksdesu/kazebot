@@ -1005,6 +1005,26 @@ def _carried_todos(input_data: dict[str, Any]) -> list[dict[str, Any]] | None:
     return [dict(item) for item in todos if isinstance(item, dict)] if isinstance(todos, list) and todos else None
 
 
+# 异步委派结果的前缀按子任务的结局写：失败不能说成 finished，问问题的要说清它已经结束
+_ASYNC_RESULT_HEADLINES = {
+    "finish": "[Async task completed] Node {node} finished.",
+    "ask": (
+        "[Async task needs input] Node {node} stopped to ask for more information and has ended. "
+        "Dispatch it again with the missing details if the work should go on."
+    ),
+    "fail": "[Async task failed] Node {node} failed and returned no result. Do not guess its output.",
+}
+_ASYNC_RESULT_LABELS = {"finish": "Result", "ask": "Question", "fail": "Error"}
+
+
+def _dispatch_result_headline(input_data: dict[str, Any], node_id: str) -> tuple[str, str]:
+    """异步委派结果前缀的第一行和正文的标签；没带结局的旧入站按完成写。"""
+    status = str(input_data.get("inbound_child_status") or "").strip()
+    if status not in _ASYNC_RESULT_HEADLINES:
+        status = "finish"
+    return _ASYNC_RESULT_HEADLINES[status].format(node=node_id or "unknown"), _ASYNC_RESULT_LABELS[status]
+
+
 def _dispatch_handle_lines(input_data: dict[str, Any], handle: str, node_id: str) -> list[str]:
     """异步委派结果前缀里的句柄；子会话为接着做留着时，再说明怎么用 continue_from。"""
     if not handle:
@@ -1318,6 +1338,9 @@ async def _run_node_task(
             _inbound_meta["caller_node_id"] = _inbound_caller_node_id
         if _inbound_child_handle:
             _inbound_meta["child_handle"] = _inbound_child_handle
+        _inbound_child_status = str(input_data.get("inbound_child_status") or "").strip()
+        if _inbound_child_status:
+            _inbound_meta["child_status"] = _inbound_child_status
         _async_tool_status = async_result_tool_status(rctx.task_context)
         if _async_tool_status:
             _inbound_meta["tool_status"] = _async_tool_status
@@ -1339,11 +1362,12 @@ async def _run_node_task(
         # ConversationStore. How: prepend an English, LLM-only wrapper after the raw
         # callback row has been stored. Purpose: storage remains pure while the caller
         # node receives an actionable instruction.
-        _prefix_parts = [f"[Async task completed] Node {_inbound_node_id or 'unknown'} finished."]
+        _headline, _body_label = _dispatch_result_headline(input_data, _inbound_node_id)
+        _prefix_parts = [_headline]
         _prefix_parts.extend(_dispatch_handle_lines(input_data, _inbound_child_handle, _inbound_node_id))
         if _inbound_summary:
             _prefix_parts.append(f"Summary: {_inbound_summary}")
-        _prefix_parts.append(f"Result:\n{instruction}")
+        _prefix_parts.append(f"{_body_label}:\n{instruction}")
         instruction = "\n".join(_prefix_parts)
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。

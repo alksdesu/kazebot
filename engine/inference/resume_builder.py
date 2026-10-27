@@ -38,6 +38,17 @@ _BATCH_NODE_RESUME_TYPES = {
 }
 _BATCH_INSTRUCTION_PREVIEW = 200
 
+# await_dispatches 交回的项里还没结束的和拿不到结果的，取值要和 supervisor 写进恢复数据的一致
+AWAIT_RUNNING = "running"
+AWAIT_UNAVAILABLE = "unavailable"
+_RUNNING_KEPT_NOTE = (
+    "它的结果会留给你：之后再调用 await_dispatches 收取；本任务结束时还没收取的，会作为单独的消息交回。"
+)
+_DELIVERED_EARLIER_NOTES = {
+    "inbound": "这个结果之前已经作为一条单独的消息交回过，那一轮可能已经处理或汇报过它，不要重复汇报。",
+    "join": "这个结果之前已经由另一次 await_dispatches 收到过。",
+}
+
 _INTERRUPTED_NOTICE = (
     "[SYSTEM] 这个任务刚才被服务重启打断了，现在接着做。中断那一步的工具调用已经标成「中断，结果未知」："
     "它们可能没执行、只执行了一部分，也可能已经执行完。先核对实际状态（重新读相关文件、查看命令的产物），"
@@ -118,10 +129,37 @@ def _continue_lines(source: dict[str, Any], node: str) -> list[str]:
     return lines
 
 
+def _unavailable_message(entry: dict[str, Any]) -> dict[str, Any]:
+    handle = str(entry.get("handle") or "").strip() or "（空）"
+    error = str(entry.get("error") or "").strip() or "认不出这个句柄。"
+    return {
+        "role": "user",
+        "content": f"句柄 {handle} 拿不到结果：{error}",
+        "_meta": {"message_type": DISPATCH_RESULT_TYPE, "handle": handle},
+    }
+
+
+def _running_lines(entry: dict[str, Any], node: str, where: str) -> list[str]:
+    """await_dispatches 恢复时还没结束的异步委派。"""
+    if entry.get("lifetime_capped"):
+        head = f"子节点 {node}{where}还没做完：本任务的总运行时长快到上限了，没有再等下去，它仍在运行。"
+    elif entry.get("timed_out"):
+        waited = entry.get("waited_sec")
+        head = f"子节点 {node}{where}等了 {waited} 秒还没做完，仍在运行。" if waited else f"子节点 {node}{where}到点还没做完，仍在运行。"
+    else:
+        head = f"子节点 {node}{where}还在运行。"
+    return [head, _RUNNING_KEPT_NOTE]
+
+
 def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
-    """批次里一个子节点的结果：先说清对应哪次调用、哪条指令、结局如何，失败、取消、打断都明说没有结果。"""
+    """批次里一个子节点的结果：先说清对应哪次调用、哪条指令、结局如何，失败、取消、打断都明说没有结果。
+
+    await_dispatches 交回的项还会是还在运行（running）或拿不到结果（unavailable）。
+    """
     node = str(entry.get("node_id") or "unknown")
     status = str(entry.get("status") or "").strip()
+    if status == AWAIT_UNAVAILABLE:
+        return _unavailable_message(entry)
     text = str(entry.get("text") or "")
     summary = str(entry.get("summary") or "").strip()
     error = str(entry.get("error") or "").strip()
@@ -158,10 +196,15 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
         lines = [f"子节点 {node}{where}被打断，没有做完，也没有结果。"]
         if summary:
             lines.append(f"打断前的摘要：{summary}")
+    elif status == AWAIT_RUNNING:
+        lines = _running_lines(entry, node, where)
     else:
         lines = [f"子节点 {node}{where}结束了，但没有拿到结果（状态：{status}）。"]
         if error:
             lines.append(f"原因：{error}")
+    earlier = _DELIVERED_EARLIER_NOTES.get(str(entry.get("delivered_earlier") or "").strip())
+    if earlier:
+        lines.append(earlier)
     lines.extend(_continue_lines(entry, node))
 
     meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}

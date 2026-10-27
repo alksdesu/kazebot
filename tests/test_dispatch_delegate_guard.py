@@ -109,8 +109,10 @@ async def test_allowed_target_passes_the_check(tmp_path: Path) -> None:
 
     with pytest.raises(AttributeError):
         # 过了校验之后要读 rctx 里的会话信息，而这个替身只带了工作区路径。
-        # 换句话说：没有被那条拒绝分支拦下来。
-        await pseudo_handlers._handle_pseudo_dispatch(ls, {"target": "draw.image_gen"}, _Call())
+        # 换句话说：没有被那条拒绝分支拦下来。instruction 得写：空指令会先被拒。
+        await pseudo_handlers._handle_pseudo_dispatch(
+            ls, {"target": "draw.image_gen", "instruction": "画一只猫"}, _Call(),
+        )
 
     assert ls.emitted == []
 

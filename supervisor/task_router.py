@@ -20,7 +20,7 @@ from typing import Any
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
-from . import auto_continue, child_retention, continuation
+from . import async_dispatches, auto_continue, child_retention, continuation
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
@@ -28,10 +28,14 @@ from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from engine.compact import COMPACT_SUMMARY_PREFIX
 from engine.dispatch_batch import (
+    AWAITING_INPUT_KEY,
     CONTINUE_FROM_KEY,
     MAX_DISPATCH_BATCH_ITEMS,
+    DispatchTimeouts,
+    await_request,
     batch_item_attachments,
     batch_item_continue_from,
+    batch_item_timeout,
 )
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
@@ -1247,6 +1251,8 @@ class TaskRouterMixin:
                 ),
             )
             raise
+        # 结果先交出去，它等过却没收的异步委派结果才作为新消息排在后面
+        async_dispatches.release_if_ended_locked(self, task)
 
         needs_post_work = bool(task.delivery_id and int(task.route_schema_version or 0) >= 1)
         if needs_post_work:
@@ -1374,6 +1380,9 @@ class TaskRouterMixin:
                 self._settle_child_locked(
                     task, self._child_cancelled_resume_data(task), action_type="cancelled",
                 )
+            else:
+                # 取消的异步委派不作为新消息交回，只交给在等它的 await_dispatches
+                async_dispatches.settle_locked(self, task)
 
 
     # ------------------------------------------------------------------ #
@@ -1473,6 +1482,11 @@ class TaskRouterMixin:
         return context
 
     def _route_dispatch_locked(self, task: Task, action: dict[str, Any]) -> None:
+        awaited = await_request(action)
+        if awaited is not None:
+            # 不派新的子任务：挂起等已经派出的异步委派
+            async_dispatches.route_await_locked(self, task, awaited)
+            return
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
         dispatch_batch = action.get("dispatch_batch")
@@ -1527,6 +1541,7 @@ class TaskRouterMixin:
             batch_id = next(
                 (child.batch_id for child in existing_children.values() if child.batch_id), None,
             ) or str(uuid.uuid4())
+            item_timeouts = DispatchTimeouts.from_config(load_runtime_config(self.workspace_root))
             for idx, item in enumerate(dispatch_batch):
                 if not isinstance(item, dict):
                     continue
@@ -1537,7 +1552,10 @@ class TaskRouterMixin:
                 reused = existing_children.get(idx)
                 if reused is not None and reused.batch_id == batch_id:
                     created_child_ids.append(reused.task_id)
+                    async_dispatches.watch_item_locked(self, reused)
                     continue
+                item_timeout = batch_item_timeout(item, item_timeouts)
+                item_deadline = async_dispatches.item_deadline_inputs(item_timeout) if item_timeout else {}
 
                 if item_kind == "tool":
                     _tool_input = {
@@ -1556,6 +1574,7 @@ class TaskRouterMixin:
                         _tool_input["parent_session_id"] = route_parent_for_child
                     if delivery_key:
                         _tool_input["_dispatch_delivery_id"] = delivery_key
+                    _tool_input.update(item_deadline)
                     child = self._create_task_locked(
                         session_id=task.session_id,
                         session_generation=task.session_generation,
@@ -1635,6 +1654,7 @@ class TaskRouterMixin:
                     )
                     if delivery_key:
                         _batch_input["_dispatch_delivery_id"] = delivery_key
+                    _batch_input.update(item_deadline)
 
                     child = self._create_task_locked(
                         session_id=task.session_id,
@@ -1649,6 +1669,7 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                 created_child_ids.append(child.task_id)
+                async_dispatches.watch_item_locked(self, child)
             if not created_child_ids:
                 batch_id = None
 
@@ -1709,21 +1730,31 @@ class TaskRouterMixin:
 
         # ---- 挂起当前 task ----
         if created_child_ids:
-            task.status = TaskStatus.suspended
-            # 挂起期间不归哪个 worker：那个 worker 重新注册时不会把它当成自己没跑完的任务
-            task.worker_id = None
-            task.lease_expires_at = None
-            # engine 报的是含挂起前各段的累计步数，恢复后接着数
-            task.input[STEPS_USED_KEY] = max(steps_used(task.input), reported_step_count(task.result))
-            task.waiting_for_batch_id = batch_id
-            task.waiting_for_task_id = None if batch_id else created_child_ids[0]
-            task.updated_at = _now()
-            self._event_task_snapshot("task_suspended", task)
+            self._suspend_caller_locked(
+                task,
+                waiting_task_id=None if batch_id else created_child_ids[0],
+                waiting_batch_id=batch_id,
+            )
             if batch_id:
                 children = [self.tasks[child_id] for child_id in created_child_ids if child_id in self.tasks]
                 # 一项都没真正派出去（比如 continue_from 全被拒），没有子任务的完成来唤醒它，这里直接交回结果
                 if children and all(self._task_terminal(child) for child in children):
                     self._collect_batch_locked(children[0])
+
+    def _suspend_caller_locked(
+        self, task: Task, *, waiting_task_id: str | None = None, waiting_batch_id: str | None = None,
+    ) -> None:
+        """调用方交回 dispatch 之后挂起：等一个子任务、一个批次，或者两样都不填时等 await_dispatches 的汇合。"""
+        task.status = TaskStatus.suspended
+        # 挂起期间不归哪个 worker：那个 worker 重新注册时不会把它当成自己没跑完的任务
+        task.worker_id = None
+        task.lease_expires_at = None
+        # engine 报的是含挂起前各段的累计步数，恢复后接着数
+        task.input[STEPS_USED_KEY] = max(steps_used(task.input), reported_step_count(task.result))
+        task.waiting_for_batch_id = waiting_batch_id
+        task.waiting_for_task_id = waiting_task_id
+        task.updated_at = _now()
+        self._event_task_snapshot("task_suspended", task)
 
     def _create_refused_batch_child_locked(
         self,
@@ -1826,6 +1857,8 @@ class TaskRouterMixin:
                 "child_node_id": str(task.node_id or ""),
                 "context_ref": context_ref,
             }, action_type="preempted")
+        else:
+            async_dispatches.settle_locked(self, task)
 
         # 不输出给用户，不注入 inbound
 
@@ -1906,6 +1939,9 @@ class TaskRouterMixin:
             return False
         if caller.waiting_for_batch_id:
             return caller.waiting_for_batch_id == child.batch_id
+        if caller.input.get(AWAITING_INPUT_KEY):
+            # 挂起等的是 await_dispatches 的汇合，两个等待字段同样为空，不能当成下面的旧快照
+            return False
         # 旧快照没有批次等待字段：多项批次挂起时两个等待字段都为空，单项批次记在 waiting_for_task_id 上
         return not caller.waiting_for_task_id or caller.waiting_for_task_id == child.task_id
 
@@ -1955,52 +1991,56 @@ class TaskRouterMixin:
         self._resume_suspended_task_locked(caller, self._batch_resume_data(siblings))
 
     def _batch_resume_data(self, siblings: list[Task]) -> dict[str, Any]:
-        entries: list[dict[str, Any]] = []
-        for t in siblings:
-            tr = t.result.get("result") if isinstance(t.result.get("result"), dict) else {}
-            act = self._task_outcome_action(t)
+        return {"type": "batch_results", "entries": [self._dispatch_result_entry_locked(t) for t in siblings]}
 
-            entry: dict[str, Any] = {
-                "kind": t.kind.value,
-                "status": act,
-                "summary": str(t.result.get("summary") or tr.get("summary") or ""),
-            }
+    def _dispatch_result_entry_locked(self, t: Task) -> dict[str, Any]:
+        """一个子任务交回调用方的那一项：同步批次和 await_dispatches 收异步委派都用这一份。"""
+        tr = t.result.get("result") if isinstance(t.result.get("result"), dict) else {}
+        act = self._task_outcome_action(t)
 
-            if t.kind == TaskKind.node:
-                entry["node_id"] = str(t.node_id or "")
-                entry["instruction"] = str(t.input.get("instruction") or "")
-                entry["text"] = str(tr.get("text") or "")
-                entry["child_task_id"] = t.task_id
-                for source_key, entry_key in (("child_session_id", "child_session_id"), ("_dispatch_call_id", "call_id")):
-                    value = str(t.input.get(source_key) or "").strip()
-                    if value:
-                        entry[entry_key] = value
-                if act in ("finish", "fail"):
-                    entry.update(child_retention.continue_fields_locked(self, t))
-            elif t.kind == TaskKind.tool:
-                entry["name"] = str(t.tool_name or tr.get("tool_name") or "")
-                entry["args"] = dict(tr.get("arguments") or t.input.get("arguments") or {})
-                entry["format"] = str(tr.get("raw_format") or tr.get("format") or "json")
-                entry["raw_inline"] = str(tr.get("raw_inline") or tr.get("text") or "")
-                entry["truncated"] = bool(tr.get("truncated", False))
-                entry["ref"] = str(tr.get("ref") or "")
+        entry: dict[str, Any] = {
+            "kind": t.kind.value,
+            "status": act,
+            "summary": str(t.result.get("summary") or tr.get("summary") or ""),
+        }
 
-            if act in ("fail", "cancelled"):
-                entry["error"] = str(t.result.get("error") or "")
+        if t.kind == TaskKind.node:
+            entry["node_id"] = str(t.node_id or "")
+            entry["instruction"] = str(t.input.get("instruction") or "")
+            entry["text"] = str(tr.get("text") or "")
+            entry["child_task_id"] = t.task_id
+            for source_key, entry_key in (("child_session_id", "child_session_id"), ("_dispatch_call_id", "call_id")):
+                value = str(t.input.get(source_key) or "").strip()
+                if value:
+                    entry[entry_key] = value
+            if act in ("finish", "fail"):
+                entry.update(child_retention.continue_fields_locked(self, t))
+        elif t.kind == TaskKind.tool:
+            entry["name"] = str(t.tool_name or tr.get("tool_name") or "")
+            entry["args"] = dict(tr.get("arguments") or t.input.get("arguments") or {})
+            entry["format"] = str(tr.get("raw_format") or tr.get("format") or "json")
+            entry["raw_inline"] = str(tr.get("raw_inline") or tr.get("text") or "")
+            entry["truncated"] = bool(tr.get("truncated", False))
+            entry["ref"] = str(tr.get("ref") or "")
 
-            atts = tr.get("attachments")
-            if isinstance(atts, list):
-                entry["attachments"] = atts
+        if act in ("fail", "cancelled"):
+            entry["error"] = str(t.result.get("error") or "")
+        if t.input.get(async_dispatches.ITEM_TIMED_OUT_KEY):
+            entry["timed_out"] = True
 
-            entries.append(entry)
-        return {"type": "batch_results", "entries": entries}
+        atts = tr.get("attachments")
+        if isinstance(atts, list):
+            entry["attachments"] = atts
+        return entry
 
     def _settle_cancelled_task_locked(self, task: Task, *, finalize_branch: bool = True) -> None:
         """supervisor 直接终结的取消：收束分支、拆临时会话，并像正常完成一样结算调用方。"""
         release_if_ended_locked(self, task)
+        async_dispatches.release_if_ended_locked(self, task)
         if finalize_branch:
             self._schedule_cancelled_task_teardown_locked(task)
         if not (task.caller_task_id or "").strip():
+            async_dispatches.settle_locked(self, task)
             return
         if self._is_compact_dispatch_result(task):
             self._apply_compact_result_locked(task)
@@ -2161,7 +2201,19 @@ class TaskRouterMixin:
     def _inject_dispatch_result_via_origin_locked(
         self, task: Task, fallback_result: dict[str, Any],
     ) -> None:
-        """异步委派的子任务完成后，把结果作为新 inbound 注入 dispatch_origin 记的发起方会话。
+        """异步委派的子任务完成：有 await_dispatches 在等、或者结果留给了等过它的任务时交给那边，否则作为新消息交回。
+
+        此方法在 self._lock 内调用。
+        """
+        if async_dispatches.settle_locked(self, task, fallback_result=fallback_result):
+            return
+        if self._deliver_dispatch_result_inbound_locked(task, fallback_result):
+            async_dispatches.mark_delivered_locked(self, task)
+
+    def _deliver_dispatch_result_inbound_locked(
+        self, task: Task, fallback_result: dict[str, Any],
+    ) -> bool:
+        """把异步委派的结果作为新 inbound 注入 dispatch_origin 记的发起方会话，返回这条消息现在在不在。
 
         回调目标是 dispatch_origin.parent_session_id，不是子任务自己的 route session。
         此方法在 self._lock 内调用。
@@ -2176,7 +2228,7 @@ class TaskRouterMixin:
                 "dispatch_origin callback skipped: no parent_session_id in task %s",
                 task.task_id[:12],
             )
-            return
+            return False
 
         session_info = self.sessions.get(target_session_id)
         if not session_info:
@@ -2184,7 +2236,7 @@ class TaskRouterMixin:
                 "dispatch_origin callback skipped: session %s not found for task %s",
                 target_session_id[:12], task.task_id[:12],
             )
-            return
+            return False
 
         # 旧任务没有父代次快照，继续沿用原来的保守校验。
         parent_generation = self._to_positive_int(origin.get("parent_session_generation"))
@@ -2196,13 +2248,13 @@ class TaskRouterMixin:
                 "dispatch_origin callback skipped: session %s generation %s != %s for task %s",
                 target_session_id[:12], parent_generation, current_gen, task.task_id[:12],
             )
-            return
+            return False
         if target_session_id in self._cancelled_sessions:
             log.warning(
                 "dispatch_origin callback skipped: session %s cancelled for task %s",
                 target_session_id[:12], task.task_id[:12],
             )
-            return
+            return False
 
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
@@ -2235,6 +2287,8 @@ class TaskRouterMixin:
             "child_node_id": task.node_id,
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
+            # 前缀照它写成功、要补充信息还是失败，失败不能说成完成
+            "child_status": self._task_outcome_action(task),
         }
         # [2026-07-15] Why: 异步 dispatch 结果回调以新 inbound 注入时，若不指定
         # entry_node_id，_create_entry_task_for_inbound_locked 会回退到 session 最后绑定
@@ -2266,7 +2320,7 @@ class TaskRouterMixin:
             if self.eventlog.find_delivery_event(
                 callback_delivery_id, event_type="inbound_message",
             ):
-                return
+                return True
 
         evt = self.eventlog.append(
             session_id=target_session_id,
@@ -2279,6 +2333,7 @@ class TaskRouterMixin:
         self._create_entry_task_for_inbound_locked(
             inbound_seq=seq, session_id=target_session_id, payload=payload,
         )
+        return True
 
     def _async_result_origin_guard_locked(
         self, session_id: str, task_id: str,

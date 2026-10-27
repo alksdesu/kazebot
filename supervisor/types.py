@@ -134,6 +134,8 @@ class InboundMessageOut(BaseModel):
     session_id: str
     inbound_seq: int = 0
     accepted: bool = True
+    # 这条消息建出的入口任务；内容为空没建任务时为空串。异步委派拿它和 session_id 拼出句柄
+    task_id: str = ""
 
 
 class OutboundMessageIn(BaseModel):

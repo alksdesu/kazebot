@@ -548,6 +548,11 @@ class SessionMixin:
             for branch_sid in self._entry_branch_ids_for_parent_locked(sid):
                 self._cancelled_sessions.add(branch_sid)
                 self._cancel_session_tasks_locked(branch_sid)
+            # 异步委派跑在 agent: 会话里，顺着会话树一起取消；先全部标记，被取消的子任务结算时调用方就不会被唤醒
+            downstream = self._session_tree_locked(sid, self.sessions[sid].conversation_key) - {sid}
+            self._cancelled_sessions.update(downstream)
+            for tree_sid in downstream:
+                self._cancel_session_tasks_locked(tree_sid)
             self.eventlog.append(
                 session_id=sid,
                 component="supervisor",
@@ -577,9 +582,10 @@ class SessionMixin:
                 return True
             return self._task_cancel_pending_locked(task)
 
-    def record_inbound_message_event(self, evt: dict[str, Any]) -> None:
+    def record_inbound_message_event(self, evt: dict[str, Any]) -> Task | None:
+        """记下一条入站消息并建入口任务，返回建出的任务；没建（内容为空、会话不在）给 None。"""
         if not isinstance(evt, dict) or evt.get("type") != "inbound_message":
-            return
+            return None
         try:
             seq = int(evt.get("seq", 0))
         except Exception:
@@ -587,11 +593,14 @@ class SessionMixin:
         session_id = str(evt.get("session_id") or "")
         payload = evt.get("payload") or {}
         if not isinstance(payload, dict):
-            return
+            return None
         with self._lock:
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             if session_id and session_id in self.sessions:
-                self._create_entry_task_for_inbound_locked(inbound_seq=seq, session_id=session_id, payload=payload)
+                return self._create_entry_task_for_inbound_locked(
+                    inbound_seq=seq, session_id=session_id, payload=payload,
+                )
+            return None
 
     def record_outbound_message_event(self, evt: dict[str, Any]) -> None:
         if not isinstance(evt, dict) or evt.get("type") != "outbound_message":

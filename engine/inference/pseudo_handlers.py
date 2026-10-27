@@ -18,15 +18,32 @@ from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
 from ..compaction_plan import build_compaction_plan
 from ..conversation_routing import short_reply as _is_short_reply
-from ..dispatch_batch import CONTINUE_FROM_KEY, MAX_DISPATCH_BATCH_ITEMS
-from ..dispatch_handle import parse_handle
+from ..dispatch_batch import (
+    AWAIT_ALL,
+    AWAIT_MODES,
+    CONTINUE_FROM_KEY,
+    ITEM_TIMEOUT_KEY,
+    MAX_AWAIT_HANDLES,
+    MAX_DISPATCH_BATCH_ITEMS,
+    AwaitRequest,
+    DispatchTimeouts,
+    parse_timeout_sec,
+)
+from ..dispatch_handle import format_handle, parse_handle
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from ..todo_list import TODO_TOOL_NAME, TodoListError, parse_todo_items, render_update_result
-from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
+from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id, flush_conversation_writes
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
 # MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
 from .tool_format import ParsedToolCall
-from .pseudo_tools import NO_REPLY_MARKER, STAY_SILENT_TOOL_NAME, _dispatch_target_from_tool_name
+from .pseudo_tools import (
+    AWAIT_DISPATCHES_TOOL_NAME,
+    CANCEL_DISPATCH_TOOL_NAME,
+    LIST_DISPATCHES_TOOL_NAME,
+    NO_REPLY_MARKER,
+    STAY_SILENT_TOOL_NAME,
+    _dispatch_target_from_tool_name,
+)
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
 from ..node import canonical_node_id
@@ -253,6 +270,17 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     if pseudo_call.name == STAY_SILENT_TOOL_NAME:
         return await _handle_pseudo_stay_silent(ls, pseudo_call, step)
+
+    if pseudo_call.name == LIST_DISPATCHES_TOOL_NAME:
+        return await _handle_pseudo_list_dispatches(ls, pseudo_call)
+
+    if pseudo_call.name == CANCEL_DISPATCH_TOOL_NAME:
+        return await _handle_pseudo_cancel_dispatch(ls, pseudo_call, args)
+
+    if pseudo_call.name == AWAIT_DISPATCHES_TOOL_NAME:
+        # 正常由 _handle_tool_calls 收到本轮最后再挂起；走到这里说明是从别的路径进来的，只补一个结果保住配对
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(_AWAIT_NOT_SENT[WAIT_ABORTED]))
+        return None
 
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
@@ -632,6 +660,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             "error": refusal,
         }, ensure_ascii=False))
         return None
+    if not request.instruction:
+        # supervisor 对空消息不建任务，不拦的话这里会报「已派出」却什么也没派
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(_EMPTY_INSTRUCTION))
+        return None
     target = request.target
     instr = request.instruction
     ctx_mode = request.context_mode
@@ -707,7 +739,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     if request.continue_from:
         inbound_payload["dispatch_origin"][CONTINUE_FROM_KEY] = request.continue_from
     elif ctx_mode == "fork":
-        inbound_payload["dispatch_fork_from_session"] = parent_session_id
+        # 和同步 fork 一样从调用方自己写对话的会话复制：入口分支上这一轮还没合并的内容也要带上
+        inbound_payload["dispatch_fork_from_session"] = _runtime_session_id(ls)
+        # supervisor 建任务时当场复制，排在写入队列里的消息得先落盘
+        await flush_conversation_writes(ls.rctx)
 
     try:
         _dispatch_resp = await ls.rctx.http.post(
@@ -716,12 +751,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             timeout=10.0,
         )
         if _dispatch_resp.status_code == 200:
-            _d_data = _dispatch_resp.json()
-            dispatch_result: dict[str, Any] = {
-                "success": True,
-                "session_id": _d_data.get("session_id", ""),
-                "message": f"已异步委派给 {target}",
-            }
+            dispatch_result = _async_dispatch_result(target, _dispatch_resp.json())
         else:
             dispatch_result = {
                 "success": False,
@@ -729,10 +759,38 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             }
     except Exception as e:
         dispatch_result = {"success": False, "error": str(e)}
+    if dispatch_result.get("success") and args.get(ITEM_TIMEOUT_KEY) not in (None, ""):
+        dispatch_result["note"] = (
+            f"timeout_sec 只对 wait=true 的委派有效，这次没有用上；要限时等异步委派，用 {AWAIT_DISPATCHES_TOOL_NAME} 的 timeout_sec。"
+        )
     if refused_attachments:
         dispatch_result["refused_attachments"] = [item.as_dict() for item in refused_attachments]
     _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(dispatch_result, ensure_ascii=False))
     return None
+
+
+def _runtime_session_id(ls: _LoopState) -> str:
+    """调用方这一程写对话的会话：子节点是它的 child session，入口任务是它的入口分支。"""
+    return str(getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id or "").strip()
+
+
+def _async_dispatch_result(target: str, body: Any) -> dict[str, Any]:
+    """异步委派派出后的工具结果：句柄由 supervisor 建出的任务 id 和它所在的 agent: 会话拼成。"""
+    data = body if isinstance(body, dict) else {}
+    session_id = str(data.get("session_id") or "").strip()
+    handle = format_handle(data.get("task_id"), session_id)
+    result: dict[str, Any] = {"success": True, "session_id": session_id}
+    if handle:
+        result["handle"] = handle
+        result["status"] = "dispatched"
+        result["message"] = (
+            f"已异步委派给 {target}，结果稍后会作为一条新消息送达。要在本任务里等它，"
+            f"用 {AWAIT_DISPATCHES_TOOL_NAME} 带上这个 handle；用 {LIST_DISPATCHES_TOOL_NAME} 查看进度，"
+            f"用 {CANCEL_DISPATCH_TOOL_NAME} 取消。"
+        )
+    else:
+        result["message"] = f"已异步委派给 {target}，结果稍后会作为一条新消息送达。"
+    return result
 
 
 WAIT_DISPATCHED = "dispatched"
@@ -747,6 +805,14 @@ _WAIT_NOT_SENT = {
     WAIT_CANCELLED: "没有派出：任务已取消。",
     WAIT_ABORTED: "没有派出：这一轮提前结束了，还需要的话重新委派。",
 }
+_AWAIT_NOT_SENT = {
+    WAIT_INTERCEPTED: "没有开始等：用户刚发来了新消息。先看新消息，还需要的话再调用 await_dispatches。",
+    WAIT_PREEMPTED: "没有开始等：任务被打断了。",
+    WAIT_CANCELLED: "没有开始等：任务已取消。",
+    WAIT_ABORTED: "没有开始等：这一轮提前结束了，还需要的话再调用 await_dispatches。",
+}
+_EMPTY_INSTRUCTION = "没有派出：instruction 不能为空，写清楚要目标节点做什么。"
+_BAD_ITEM_TIMEOUT = "没有派出：timeout_sec 要填正数秒数；不想限时就不填。"
 
 
 def is_wait_dispatch(call: Any) -> bool:
@@ -757,8 +823,21 @@ def is_wait_dispatch(call: Any) -> bool:
     return isinstance(arguments, dict) and bool(parse_bool(arguments.get("wait"), False))
 
 
+def is_await_dispatch(call: Any) -> bool:
+    """await_dispatches 调用：和 wait 委派一样等本轮其它调用跑完，再挂起本任务。"""
+    return str(getattr(call, "name", "") or "").strip() == AWAIT_DISPATCHES_TOOL_NAME
+
+
 def _wait_refusal(error: str) -> str:
     return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+
+def _requested_timeout(raw: Any) -> tuple[int | None, bool]:
+    """模型填的 timeout_sec：(秒数, 写得对不对)。没填（缺省、null、空串）给 (None, True)。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None, True
+    seconds = parse_timeout_sec(raw)
+    return seconds, seconds is not None
 
 
 @dataclass
@@ -769,14 +848,16 @@ class WaitDispatch:
     target: str
     item: dict[str, Any]
     refused_attachments: list[RefusedAttachment] = field(default_factory=list)
+    timeout_sec: int = 0
 
     def result_text(self, outcome: str) -> str:
         """这次调用的工具结果：派出去了就是占位，真正的结果在恢复后的下一条消息里；没派出去说明原因。"""
         if outcome == WAIT_DISPATCHED:
+            limit = f"（最多等 {self.timeout_sec} 秒，到点没做完按失败交回）" if self.timeout_sec else ""
             payload: dict[str, Any] = {
                 "success": True,
                 "status": "waiting",
-                "message": f"已派出给 {self.target}，正在等待结果；结果会在下一条消息给出。",
+                "message": f"已派出给 {self.target}，正在等待结果{limit}；结果会在下一条消息给出。",
             }
         else:
             payload = {"success": False, "error": _WAIT_NOT_SENT.get(outcome, _WAIT_NOT_SENT[WAIT_ABORTED])}
@@ -809,6 +890,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
         return plan
     shared_contexts: set[tuple[str, str]] = set()
     continued_sessions: set[str] = set()
+    timeouts = DispatchTimeouts.from_config(getattr(ls, "runtime_cfg", None))
     for index, call in enumerate(calls):
         if index >= MAX_DISPATCH_BATCH_ITEMS:
             plan.rejected.append((call, _wait_refusal(
@@ -816,13 +898,17 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
             )))
             continue
         arguments = dict(getattr(call, "arguments", None) or {})
+        requested_timeout, timeout_ok = _requested_timeout(arguments.get(ITEM_TIMEOUT_KEY))
+        if not timeout_ok:
+            plan.rejected.append((call, _wait_refusal(_BAD_ITEM_TIMEOUT)))
+            continue
         target = _dispatch_target_from_tool_name(str(getattr(call, "name", "") or ""))
         request, refusal = await _resolve_dispatch_request(ls, {**arguments, "target": target}, call, wait=True)
         if request is None:
             plan.rejected.append((call, _wait_refusal(refusal)))
             continue
         if not request.instruction:
-            plan.rejected.append((call, _wait_refusal("没有派出：instruction 不能为空，写清楚要目标节点做什么。")))
+            plan.rejected.append((call, _wait_refusal(_EMPTY_INSTRUCTION)))
             continue
         if request.continue_from:
             continued = str(request.continuation.get("session_id") or request.continue_from)
@@ -857,11 +943,227 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
         call_id = str(getattr(call, "id", "") or "").strip()
         if call_id:
             item["call_id"] = call_id
+        item_timeout = timeouts.clamp(requested_timeout) if requested_timeout is not None else 0
+        if item_timeout:
+            item[ITEM_TIMEOUT_KEY] = item_timeout
         plan.items.append(WaitDispatch(
             call=call, target=request.target, item=item,
             refused_attachments=list(request.refused_attachments),
+            timeout_sec=item_timeout,
         ))
     return plan
+
+
+@dataclass
+class AwaitDispatch:
+    """本轮通过校验的那次 await_dispatches：等本轮其它调用跑完，再挂起本任务。"""
+
+    call: Any
+    request: AwaitRequest
+    timeout_sec: int
+    adjusted: bool = False
+
+    def result_text(self, outcome: str) -> str:
+        """占位结果：开始等了就说在等什么，真正的结果在恢复后的下一条消息里；没开始等说明原因。"""
+        if outcome != WAIT_DISPATCHED:
+            return _wait_refusal(_AWAIT_NOT_SENT.get(outcome, _AWAIT_NOT_SENT[WAIT_ABORTED]))
+        until = "全部结束" if self.request.mode == AWAIT_ALL else "任意一个结束"
+        payload: dict[str, Any] = {
+            "success": True,
+            "status": "waiting",
+            "message": (
+                f"正在等 {len(self.request.handles)} 个异步委派，{until}或者等满 {self.timeout_sec} 秒就恢复；"
+                "结果会在下一条消息给出。"
+            ),
+        }
+        if self.adjusted:
+            payload["note"] = f"timeout_sec 超出了允许的范围，按 {self.timeout_sec} 秒等。"
+        return json.dumps(payload, ensure_ascii=False)
+
+
+@dataclass
+class AwaitDispatchPlan:
+    item: AwaitDispatch | None = None
+    rejected: list[tuple[Any, str]] = field(default_factory=list)
+
+
+def _await_request_from(call: Any, timeouts: DispatchTimeouts) -> tuple[AwaitDispatch | None, str]:
+    """把一次 await_dispatches 调用的参数理成请求；参数不合格时给出原因。"""
+    arguments = getattr(call, "arguments", None)
+    arguments = arguments if isinstance(arguments, dict) else {}
+    raw_handles = arguments.get("handles")
+    if isinstance(raw_handles, str):
+        raw_handles = [raw_handles]
+    if not isinstance(raw_handles, list):
+        return None, "没有开始等：handles 要填句柄列表，照抄异步委派返回的 handle。"
+    handles: list[str] = []
+    malformed: list[str] = []
+    for raw in raw_handles:
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        text = raw.strip() if isinstance(raw, str) else ""
+        if not text or parse_handle(text) is None:
+            malformed.append(_short(text, 80))
+        elif text not in handles:
+            handles.append(text)
+    if malformed:
+        return None, (
+            "没有开始等：这些句柄格式不对，要照抄异步委派返回的 handle（task_id@session_id）："
+            + "、".join(malformed)
+        )
+    if not handles:
+        return None, "没有开始等：handles 不能为空，填异步委派返回的 handle。"
+    if len(handles) > MAX_AWAIT_HANDLES:
+        return None, f"没有开始等：一次最多等 {MAX_AWAIT_HANDLES} 个句柄，这次有 {len(handles)} 个；分几次等。"
+    raw_mode = arguments.get("mode")
+    mode = str(raw_mode or "").strip().lower() or AWAIT_ALL
+    if mode not in AWAIT_MODES:
+        return None, f"没有开始等：mode 只能是 {' 或 '.join(AWAIT_MODES)}。"
+    requested, timeout_ok = _requested_timeout(arguments.get("timeout_sec"))
+    if not timeout_ok:
+        return None, f"没有开始等：timeout_sec 要填正数秒数；不填就最多等 {timeouts.await_default} 秒。"
+    seconds = timeouts.clamp(requested) if requested is not None else timeouts.await_default
+    request = AwaitRequest(
+        handles=tuple(handles),
+        mode=mode,
+        timeout_sec=seconds if requested is not None else None,
+        call_id=str(getattr(call, "id", "") or "").strip(),
+    )
+    return AwaitDispatch(
+        call=call, request=request, timeout_sec=seconds, adjusted=requested is not None and requested != seconds,
+    ), ""
+
+
+async def prepare_await_dispatches(
+    ls: _LoopState, calls: list[Any], *, has_wait_items: bool = False,
+) -> AwaitDispatchPlan:
+    """校验本轮的 await_dispatches：一轮只认一次，不能和 wait 委派同轮，简短回应和系统任务里不能挂起。"""
+    plan = AwaitDispatchPlan()
+    if not calls:
+        return plan
+    task_context = getattr(ls.rctx, "task_context", None) or {}
+    blocked = ""
+    if _is_short_reply(task_context):
+        blocked = "本轮为简短回应，请仅调用 finish。"
+    elif task_context.get("is_system_task"):
+        blocked = "没有开始等：系统任务不能挂起等待异步委派的结果。"
+    elif not ls.allowed_dispatch_targets:
+        blocked = "没有开始等：这个节点没有委派目标，也就没有异步委派可等。"
+    elif has_wait_items:
+        blocked = "没有开始等：同一轮已经有 wait=true 的委派，它们的结果回来之后再调用 await_dispatches。"
+    if blocked:
+        plan.rejected.extend((call, _wait_refusal(blocked)) for call in calls)
+        return plan
+    timeouts = DispatchTimeouts.from_config(getattr(ls, "runtime_cfg", None))
+    for call in calls:
+        if plan.item is not None:
+            plan.rejected.append((call, _wait_refusal(
+                "没有开始等：同一轮只能调用一次 await_dispatches，要等的句柄写进同一次调用。"
+            )))
+            continue
+        item, refusal = _await_request_from(call, timeouts)
+        if item is None:
+            plan.rejected.append((call, _wait_refusal(refusal)))
+            continue
+        plan.item = item
+    return plan
+
+
+def _dispatch_tools_refusal(ls: _LoopState) -> str:
+    caller_task_id = str(getattr(ls.rctx, "task_id", "") or "").strip()
+    if not ls.allowed_dispatch_targets:
+        return "这个节点没有委派目标，也就没有异步委派可以查看或取消。"
+    if not caller_task_id:
+        return "找不到发起这次调用的任务，没法确定该在哪些委派里找。"
+    return ""
+
+
+async def _handle_pseudo_list_dispatches(ls: _LoopState, pseudo_call: Any) -> None:
+    """list_dispatches：这段对话里还没结束的异步委派，加上最近结束的几个。始终返回 None。"""
+    refusal = _dispatch_tools_refusal(ls)
+    if refusal:
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(refusal))
+        return None
+    try:
+        response = await ls.rctx.http.get(f"{ls.rctx.supervisor_url}/v1/tasks/{ls.rctx.task_id}/dispatches")
+        failure = _http_failure(response)
+        body = response.json() if not failure else None
+    except Exception as error:
+        failure = f"{type(error).__name__}: {error}"
+        body = None
+    if failure or not isinstance(body, dict):
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(f"查询异步委派失败：{failure or 'supervisor 没有给出结果'}"))
+        return None
+    active = body.get("active") if isinstance(body.get("active"), list) else []
+    finished = body.get("finished") if isinstance(body.get("finished"), list) else []
+    listed: dict[str, Any] = {"success": True, "active": active, "finished": finished}
+    active_total = int(body.get("active_total") or len(active))
+    finished_total = int(body.get("finished_total") or len(finished))
+    notes: list[str] = []
+    if not active and not finished:
+        notes.append("这段对话里现在没有异步委派。")
+    if active_total > len(active):
+        notes.append(f"还没结束的一共 {active_total} 个，这里列了最早的 {len(active)} 个。")
+    if finished_total > len(finished):
+        notes.append(f"结束的只列了最近 {len(finished)} 个。")
+    if notes:
+        listed["note"] = "".join(notes)
+    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(listed, ensure_ascii=False))
+    return None
+
+
+async def _handle_pseudo_cancel_dispatch(ls: _LoopState, pseudo_call: Any, args: dict) -> None:
+    """cancel_dispatch：取消这段对话里的一个异步委派，连同它派出去的子任务。始终返回 None。"""
+    refusal = _dispatch_tools_refusal(ls)
+    handle = str(args.get("handle") or "").strip()
+    if not refusal and parse_handle(handle) is None:
+        refusal = "handle 的格式不对：要照抄异步委派返回的句柄（task_id@session_id）。"
+    if refusal:
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(refusal))
+        return None
+    try:
+        response = await ls.rctx.http.post(
+            f"{ls.rctx.supervisor_url}/v1/tasks/{ls.rctx.task_id}/dispatches/cancel", json={"handle": handle},
+        )
+        failure = _http_failure(response)
+        body = response.json() if not failure else None
+    except Exception as error:
+        failure = f"{type(error).__name__}: {error}"
+        body = None
+    if failure or not isinstance(body, dict):
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(f"取消失败：{failure or 'supervisor 没有给出结果'}"))
+        return None
+    if not body.get("ok"):
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(str(body.get("message") or "取消被拒绝。")))
+        return None
+    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(_cancel_outcome(body), ensure_ascii=False))
+    return None
+
+
+def _cancel_outcome(body: dict[str, Any]) -> dict[str, Any]:
+    node = str(body.get("node_id") or "子节点")
+    status = str(body.get("status") or "")
+    cancelled = int(body.get("cancelled_count") or 0)
+    stopping = int(body.get("stopping_count") or 0)
+    finished = bool(body.get("already_finished"))
+    # 计数里含委派本身；已经结束的委派没有算进去
+    descendants = cancelled + stopping - (0 if finished else 1)
+    if finished:
+        message = f"{node} 这个委派已经结束了（{status or '已结束'}），它本身不用取消。"
+    elif status == "cancelled":
+        message = f"已取消 {node} 这个委派。"
+    else:
+        message = f"已通知 {node} 停下：它会在手上这一步做完后结束，不再交回结果。"
+    if descendants > 0:
+        message += f"它派出去还没结束的 {descendants} 个子任务一并取消。"
+    return {
+        "success": True,
+        "handle": str(body.get("handle") or ""),
+        "status": status,
+        "cancelled_count": cancelled,
+        "stopping_count": stopping,
+        "message": message,
+    }
 
 
 async def _handle_pseudo_update_todos(ls: _LoopState, pseudo_call: Any, args: dict) -> None:

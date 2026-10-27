@@ -1,0 +1,974 @@
+"""supervisor 一侧的异步委派：句柄和结局、await_dispatches 汇合、list / cancel 只认会话家族、取消顺着派发链往下走、wait 批次的单项超时、异步 fork 从分支复制。"""
+from __future__ import annotations
+
+import asyncio
+import sys
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+import yaml
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from engine.conversation_store import ConversationStore, Message  # noqa: E402
+from engine.dispatch_batch import AWAIT_KEY, AWAITING_INPUT_KEY  # noqa: E402
+from engine.dispatch_handle import format_handle  # noqa: E402
+from supervisor import admin_api, async_dispatches  # noqa: E402
+from supervisor.api import create_app  # noqa: E402
+from supervisor.config_store import ConfigStore  # noqa: E402
+from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.task_reaper import reap_stuck_tasks_locked  # noqa: E402
+from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
+
+CONV = "qq_group:1001"
+OTHER_CONV = "qq_group:2002"
+AUTH = {"platform": "qq", "user_id": "u-1", "is_admin": True}
+_TOKEN = "async-dispatch-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _default_running_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 等待截止受任务总寿命约束，寿命按默认的运行上限算
+    monkeypatch.delenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", raising=False)
+
+
+def _state(workspace: Path) -> SupervisorState:
+    state = SupervisorState(
+        workspace_root=workspace,
+        eventlog=EventLog(workspace / "data" / "events.jsonl", run_id="run-async-dispatch"),
+        policy=PolicyEngine(workspace_root=workspace),
+    )
+    state._defer_post_work_enqueue = True
+    return state
+
+
+def _session(state: SupervisorState, key: str = CONV) -> str:
+    return state.get_or_create_session(channel="qq", conversation_key=key)
+
+
+def _inbound(state: SupervisorState, session_id: str, *, node: str = "test.orchestrator", text: str = "", **extra: Any) -> Task:
+    payload = {
+        "channel": "qq",
+        "conversation_key": state.sessions[session_id].conversation_key,
+        "text": text or f"run {node}",
+        "entry_node_id": node,
+        "platform_auth": dict(AUTH),
+        **extra,
+    }
+    event = state.eventlog.append(session_id=session_id, component="shell", type_="inbound_message", payload=payload)
+    task = state.record_inbound_message_event(event)
+    assert task is not None
+    return task
+
+
+def _caller(state: SupervisorState, session_id: str, *, key: str = CONV) -> Task:
+    """不在入口分支上的调用方：被判失败时路由当场跑完，不另起线程。"""
+    with state._lock:
+        return state._create_task_locked(
+            session_id=session_id,
+            session_generation=1,
+            kind=TaskKind.node,
+            node_id="test.orchestrator",
+            input_data={"task_context": {"conversation_key": key, "channel": "qq", "platform_auth": dict(AUTH)}},
+            continuation={},
+            source_inbound_seq=None,
+        )
+
+
+def _origin(session_id: str, caller: Task, *, mode: str = "fresh", caller_node: str = "test.orchestrator") -> dict[str, Any]:
+    return {
+        "parent_session_id": session_id, "caller_node_id": caller_node, "parent_conversation_key": CONV,
+        "context_mode": mode, "caller_task_id": caller.task_id,
+    }
+
+
+def _async_child(
+    state: SupervisorState, session_id: str, caller: Task, *, node: str = "a.node", text: str = "",
+    caller_node: str = "test.orchestrator",
+) -> Task:
+    """照 engine 异步委派那样投一条带 dispatch_origin 的入站，子节点在自己的 agent: 会话里跑。"""
+    agent_sid = state.get_or_create_session(channel="qq", conversation_key=f"agent:{node}:{CONV}:{uuid.uuid4()}")
+    return _inbound(
+        state, agent_sid, node=node, text=text,
+        dispatch_context_mode="fresh", dispatch_origin=_origin(session_id, caller, caller_node=caller_node),
+    )
+
+
+def _handle(child: Task) -> str:
+    """engine 拿 /v1/inbound 应答里的 task_id 和 session_id 拼出的句柄。"""
+    return format_handle(child.task_id, child.input["parent_session_id"])
+
+
+def _report(state: SupervisorState, task: Task, result: dict[str, Any]) -> None:
+    task.status = TaskStatus.running
+    task.worker_id = "worker-1"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    state.complete_task(task_id=task.task_id, worker_id="worker-1", result=result)
+
+
+def _finish(state: SupervisorState, task: Task, text: str = "done") -> None:
+    _report(state, task, {"action": "finish", "result": {"text": text}})
+
+
+def _fail(state: SupervisorState, task: Task, error: str = "network down") -> None:
+    _report(state, task, {"action": "fail", "error": error})
+
+
+def _await(
+    state: SupervisorState, caller: Task, *handles: str, mode: str = "all", timeout_sec: Any = None, call_id: str = "",
+) -> None:
+    """caller 这一程交回 await_dispatches，和 engine 报上来的一样。"""
+    request: dict[str, Any] = {"handles": list(handles), "mode": mode}
+    if timeout_sec is not None:
+        request["timeout_sec"] = timeout_sec
+    if call_id:
+        request["call_id"] = call_id
+    _report(state, caller, {"action": "dispatch", "target_node": "", "dispatch_input": {AWAIT_KEY: request}})
+
+
+def _item(target: str = "a.node", **extra: Any) -> dict[str, Any]:
+    return {"kind": "node", "target": target, "instruction": f"do {target}", "context_mode": "fresh", **extra}
+
+
+def _wait_batch(state: SupervisorState, caller: Task, *items: dict[str, Any]) -> list[Task]:
+    """caller 这一程交回 wait 批次；返回派出的子任务，按批次序号排。"""
+    _report(state, caller, {"action": "dispatch", "dispatch_batch": list(items)})
+    return sorted(
+        (task for task in state.tasks.values() if task.caller_task_id == caller.task_id),
+        key=lambda task: task.batch_index,
+    )
+
+
+def _entries(task: Task) -> list[dict[str, Any]]:
+    return task.input["resume_data"]["entries"]
+
+
+def _callbacks(state: SupervisorState) -> list[Task]:
+    return [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
+
+
+def _callback_children(state: SupervisorState) -> list[str]:
+    return [task.input["inbound_child_task_id"] for task in _callbacks(state)]
+
+
+def _expire(state: SupervisorState, *, after: timedelta) -> None:
+    with state._lock:
+        async_dispatches.expire_due_locked(state, now=datetime.now(timezone.utc) + after)
+
+
+def _write_runtime(workspace: Path, data: dict[str, Any]) -> None:
+    path = workspace / "config" / "runtime.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+class TestOutcomes:
+    @pytest.mark.parametrize("result, status", [
+        ({"action": "finish", "result": {"text": "done"}}, "finish"),
+        ({"action": "ask", "result": {"text": "要查哪个仓库？"}}, "ask"),
+        ({"action": "fail", "error": "network down"}, "fail"),
+    ])
+    def test_the_callback_says_how_the_dispatch_ended(
+        self, tmp_path: Path, result: dict[str, Any], status: str,
+    ) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        _report(state, child, result)
+
+        [callback] = _callbacks(state)
+        assert callback.input["inbound_child_status"] == status
+        assert callback.input["inbound_child_task_id"] == child.task_id
+        assert callback.input["inbound_child_handle"] == _handle(child)
+
+    def test_an_outcome_it_does_not_know_is_left_out(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+
+        task = _inbound(state, sid, message_type="dispatch_result", child_status="exploded")
+
+        assert "inbound_child_status" not in task.input
+
+
+class TestAwaitAll:
+    def test_one_await_collects_three_dispatches_without_extra_messages(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        children = [_async_child(state, sid, caller, text=f"job {index}") for index in range(3)]
+        handles = [_handle(child) for child in children]
+
+        _await(state, caller, *handles, call_id="aw1")
+
+        assert caller.status == TaskStatus.suspended
+        assert caller.input[AWAITING_INPUT_KEY]["handles"] == handles
+        _finish(state, children[0], "first")
+        _fail(state, children[1], "disk full")
+        assert caller.status == TaskStatus.suspended
+        _finish(state, children[2], "third")
+
+        assert caller.status == TaskStatus.pending
+        assert AWAITING_INPUT_KEY not in caller.input
+        resume = caller.input["resume_data"]
+        assert resume["type"] == "batch_results"
+        assert resume["await"] == {"mode": "all", "timeout_sec": 600, "timed_out": False, "call_id": "aw1"}
+        entries = resume["entries"]
+        assert [entry["status"] for entry in entries] == ["finish", "fail", "finish"]
+        assert [entry["handle"] for entry in entries] == handles
+        assert [entry["child_task_id"] for entry in entries] == [child.task_id for child in children]
+        assert [entry["instruction"] for entry in entries] == ["job 0", "job 1", "job 2"]
+        assert [entry["child_session_id"] for entry in entries] == [child.input["parent_session_id"] for child in children]
+        assert entries[0]["text"] == "first" and entries[2]["text"] == "third"
+        assert entries[1]["error"] == "disk full" and entries[1]["continuable"] is True
+        assert _callbacks(state) == []
+
+        _finish(state, caller, "三个都好了")
+
+        assert _callbacks(state) == []
+
+    def test_results_that_came_back_before_the_await_are_not_lost(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        early = _async_child(state, sid, caller)
+        late = _async_child(state, sid, caller)
+        _finish(state, early, "early result")
+        assert _callback_children(state) == [early.task_id]
+
+        _await(state, caller, _handle(early), _handle(late))
+
+        assert caller.status == TaskStatus.suspended
+        _finish(state, late, "late result")
+        first, second = _entries(caller)
+        assert first["status"] == "finish" and first["text"] == "early result"
+        assert first["delivered_earlier"] == "inbound"
+        assert second["text"] == "late result" and "delivered_earlier" not in second
+        assert _callback_children(state) == [early.task_id]
+
+    def test_an_await_on_dispatches_that_all_ended_resumes_at_once(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _fail(state, child, "boom")
+
+        _await(state, caller, _handle(child))
+
+        assert caller.status == TaskStatus.pending
+        [entry] = _entries(caller)
+        assert entry["status"] == "fail" and entry["error"] == "boom"
+        assert entry["delivered_earlier"] == "inbound"
+        assert caller.input["resume_data"]["await"]["timed_out"] is False
+
+
+class TestAwaitAny:
+    def test_any_resumes_on_the_first_result_and_keeps_the_rest_for_the_caller(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        slow = _async_child(state, sid, caller)
+        fast = _async_child(state, sid, caller)
+
+        _await(state, caller, _handle(slow), _handle(fast), mode="any")
+        _finish(state, fast, "fast")
+
+        assert caller.status == TaskStatus.pending
+        running, done = _entries(caller)
+        assert running["status"] == "running" and running["handle"] == _handle(slow)
+        assert running["state"] == "pending" and "timed_out" not in running
+        assert done["status"] == "finish" and done["text"] == "fast"
+
+        _finish(state, slow, "slow")
+
+        assert _callbacks(state) == []
+        _await(state, caller, _handle(slow))
+        assert caller.status == TaskStatus.pending
+        [entry] = _entries(caller)
+        assert entry["status"] == "finish" and entry["text"] == "slow"
+        assert "delivered_earlier" not in entry
+        assert _callbacks(state) == []
+
+    def test_a_second_await_before_the_rest_finish_waits_for_them(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        slow = _async_child(state, sid, caller)
+        fast = _async_child(state, sid, caller)
+        _await(state, caller, _handle(slow), _handle(fast), mode="any")
+        _finish(state, fast)
+
+        _await(state, caller, _handle(slow))
+
+        assert caller.status == TaskStatus.suspended
+        _finish(state, slow, "slow")
+        assert caller.status == TaskStatus.pending
+        assert [entry["text"] for entry in _entries(caller)] == ["slow"]
+        assert _callbacks(state) == []
+
+    def test_a_result_kept_for_the_caller_comes_back_as_a_message_once_it_ends(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        slow = _async_child(state, sid, caller)
+        fast = _async_child(state, sid, caller)
+        _await(state, caller, _handle(slow), _handle(fast), mode="any")
+        _finish(state, fast)
+        _finish(state, slow, "slow")
+        assert _callbacks(state) == []
+
+        _finish(state, caller, "先报了快的那个")
+
+        assert _callback_children(state) == [slow.task_id]
+        [callback] = _callbacks(state)
+        assert callback.input["inbound_child_status"] == "finish"
+
+
+class TestAwaitDeadlines:
+    def test_an_await_that_runs_out_of_time_resumes_with_what_it_has(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        done = _async_child(state, sid, caller)
+        slow = _async_child(state, sid, caller)
+        _await(state, caller, _handle(done), _handle(slow), timeout_sec=30)
+        assert caller.input[AWAITING_INPUT_KEY]["timeout_sec"] == 30
+        _finish(state, done, "ok")
+
+        _expire(state, after=timedelta(seconds=10))
+        assert caller.status == TaskStatus.suspended
+        _expire(state, after=timedelta(seconds=31))
+
+        assert caller.status == TaskStatus.pending
+        resume = caller.input["resume_data"]
+        assert resume["await"]["timed_out"] is True and resume["await"]["timeout_sec"] == 30
+        finished, running = resume["entries"]
+        assert finished["status"] == "finish"
+        assert running["status"] == "running" and running["timed_out"] is True and running["waited_sec"] == 30
+        assert "lifetime_capped" not in running
+
+        # 到点时还在跑的那个仍然留给调用方：不另开消息，调用方结束时才交回
+        _finish(state, slow, "late")
+        assert _callbacks(state) == []
+        _finish(state, caller, "先说做完的那个")
+        assert _callback_children(state) == [slow.task_id]
+
+    @pytest.mark.parametrize("raw, expected", [
+        (None, 600), (999999, 3600), (1, 5), ("45", 45), (12.2, 13), ("abc", 600),
+    ])
+    def test_the_supervisor_clamps_the_wait_on_its_own(self, tmp_path: Path, raw: Any, expected: int) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        _await(state, caller, _handle(child), timeout_sec=raw)
+
+        assert caller.input[AWAITING_INPUT_KEY]["timeout_sec"] == expected
+
+    def test_the_limits_come_from_the_runtime_config(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        _write_runtime(tmp_path, {"engine": {"dispatch": {"await_timeout_sec": 90, "max_timeout_sec": 120}}})
+        sid = _session(state)
+        unlimited = _inbound(state, sid)
+        greedy = _inbound(state, sid)
+        child = _async_child(state, sid, unlimited)
+        other = _async_child(state, sid, greedy)
+
+        _await(state, unlimited, _handle(child))
+        _await(state, greedy, _handle(other), timeout_sec=999999)
+
+        assert unlimited.input[AWAITING_INPUT_KEY]["timeout_sec"] == 90
+        assert greedy.input[AWAITING_INPUT_KEY]["timeout_sec"] == 120
+
+    def test_a_wait_that_would_outlive_the_task_is_cut_short(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 运行上限 300 秒，总寿命 30 分钟：截止留出 10 分钟余量，落在第 20 分钟
+        monkeypatch.setenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "300")
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        _await(state, caller, _handle(child), timeout_sec=3600)
+
+        deadline = datetime.fromisoformat(caller.input[AWAITING_INPUT_KEY]["deadline"])
+        assert deadline <= caller.created_at + timedelta(minutes=20)
+        _expire(state, after=timedelta(minutes=21))
+        [entry] = _entries(caller)
+        assert entry["status"] == "running" and entry["timed_out"] is True and entry["lifetime_capped"] is True
+        assert entry["waited_sec"] < 3600
+
+    def test_the_reaper_leaves_an_awaiting_task_alone(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _await(state, caller, _handle(child), timeout_sec=3600)
+
+        with state._lock:
+            reaped = reap_stuck_tasks_locked(
+                state, now=datetime.now(timezone.utc) + timedelta(minutes=25), session_ids={caller.session_id},
+            )
+
+        assert reaped == []
+        assert caller.status == TaskStatus.suspended
+
+    def test_the_housekeeping_sweep_resumes_a_join_past_its_deadline(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _await(state, caller, _handle(child))
+
+        with state._lock:
+            reaped = reap_stuck_tasks_locked(state, now=datetime.now(timezone.utc) + timedelta(minutes=11))
+
+        assert reaped == []
+        assert caller.status == TaskStatus.pending
+        assert caller.input["resume_data"]["await"]["timed_out"] is True
+
+    def test_a_task_still_marked_as_awaiting_without_its_join_is_reaped(self, tmp_path: Path) -> None:
+        # 汇合登记没了（比如恢复到一半出错）的挂起任务不会一直挂着，按丢了等待目标回收
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        child = _async_child(state, sid, caller)
+        _await(state, caller, _handle(child))
+
+        with state._lock:
+            async_dispatches.registry_locked(state).joins.clear()
+            reaped = reap_stuck_tasks_locked(
+                state, now=datetime.now(timezone.utc) + timedelta(minutes=6), session_ids={sid},
+            )
+
+        assert reaped == [caller.task_id]
+        assert caller.status == TaskStatus.failed
+        _finish(state, child, "still delivered")
+        assert _callback_children(state) == [child.task_id]
+
+
+class TestAwaitRefusals:
+    def test_handles_that_cannot_be_read_or_found_come_back_as_unavailable(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        _await(state, caller, "not-a-handle", "abc@agent-missing", _handle(child))
+
+        assert caller.status == TaskStatus.suspended
+        _finish(state, child, "ok")
+        malformed, missing, found = _entries(caller)
+        assert malformed["status"] == "unavailable" and malformed["handle"] == "not-a-handle"
+        assert "句柄格式不对" in malformed["error"]
+        assert missing["status"] == "unavailable" and "找不到这个委派" in missing["error"]
+        assert found["status"] == "finish"
+
+    def test_a_handle_from_another_conversation_is_treated_as_unknown(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        owner = _inbound(state, sid)
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+        child = _async_child(state, sid, owner)
+
+        _await(state, stranger, _handle(child))
+
+        assert stranger.status == TaskStatus.pending
+        [entry] = _entries(stranger)
+        assert entry["status"] == "unavailable" and "找不到这个委派" in entry["error"]
+        _finish(state, child, "for the owner")
+        [callback] = _callbacks(state)
+        assert callback.input["inbound_child_task_id"] == child.task_id
+        assert callback.input["parent_session_id"] == sid
+
+    def test_a_wait_dispatch_handle_is_not_awaited(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        batch_caller = _caller(state, sid)
+        [child] = _wait_batch(state, batch_caller, _item())
+        other = _inbound(state, sid)
+
+        _await(state, other, format_handle(child.task_id, child.input["child_session_id"]))
+
+        [entry] = _entries(other)
+        assert entry["status"] == "unavailable" and "wait=true" in entry["error"]
+
+    def test_a_task_cannot_await_itself_or_the_task_that_dispatched_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        parent = _async_child(state, sid, caller)
+        grandchild = _async_child(state, parent.input["parent_session_id"], parent, node="g.node", caller_node="a.node")
+
+        _await(state, grandchild, _handle(grandchild), _handle(parent))
+
+        assert grandchild.status == TaskStatus.pending
+        assert [entry["status"] for entry in _entries(grandchild)] == ["unavailable", "unavailable"]
+        assert all("不能等自己" in entry["error"] for entry in _entries(grandchild))
+
+    def test_the_same_dispatch_written_twice_counts_once(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        _await(state, caller, _handle(child), _handle(child).replace("@", " @ "))
+        _finish(state, child)
+
+        first, second = _entries(caller)
+        assert first["status"] == "finish"
+        assert second["status"] == "unavailable" and "同一个委派" in second["error"]
+
+    def test_a_system_task_cannot_wait(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid, _system_task=True)
+        child = _async_child(state, sid, caller)
+
+        _await(state, caller, _handle(child))
+
+        assert caller.status == TaskStatus.pending
+        [entry] = _entries(caller)
+        assert entry["status"] == "unavailable" and "系统任务" in entry["error"]
+
+    def test_a_dispatch_another_task_is_waiting_for_is_not_taken(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        first = _inbound(state, sid)
+        second = _inbound(state, sid)
+        child = _async_child(state, sid, first)
+        _await(state, first, _handle(child))
+
+        _await(state, second, _handle(child))
+
+        [entry] = _entries(second)
+        assert entry["status"] == "unavailable" and "已经在等这个委派" in entry["error"]
+        _finish(state, child, "ok")
+        assert first.status == TaskStatus.pending
+        assert [entry["text"] for entry in _entries(first)] == ["ok"]
+
+    def test_a_result_another_waiting_task_already_collected_is_not_taken_twice(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        first = _inbound(state, sid)
+        second = _inbound(state, sid)
+        done = _async_child(state, sid, first)
+        slow = _async_child(state, sid, first)
+        _await(state, first, _handle(done), _handle(slow))
+        _finish(state, done, "for the first")
+
+        _await(state, second, _handle(done))
+
+        [entry] = _entries(second)
+        assert entry["status"] == "unavailable" and "还在等这个结果" in entry["error"]
+        _finish(state, slow)
+        assert [entry["status"] for entry in _entries(first)] == ["finish", "finish"]
+        assert "delivered_earlier" not in _entries(first)[0]
+
+
+class TestListAndCancel:
+    def test_the_list_shows_running_and_finished_dispatches_of_the_family(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        running = _async_child(state, sid, caller, text="crawl the docs")
+        done = _async_child(state, sid, caller, text="summarise")
+        _finish(state, done, "summary text")
+
+        listed = async_dispatches.list_dispatches(state, caller.task_id)
+
+        assert listed["ok"] is True
+        [active] = listed["active"]
+        assert active["handle"] == _handle(running) and active["node_id"] == "a.node"
+        assert active["status"] == "queued" and active["instruction"] == "crawl the docs"
+        assert active["dispatched_by"] == "you"
+        [finished] = listed["finished"]
+        assert finished["handle"] == _handle(done) and finished["status"] == "finish"
+        assert finished["summary"] == "summary text" and finished["delivered"] == "inbound"
+        assert listed["active_total"] == 1 and listed["finished_total"] == 1
+
+    def test_another_conversation_sees_none_of_them(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        _async_child(state, sid, caller)
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+
+        listed = async_dispatches.list_dispatches(state, stranger.task_id)
+
+        assert listed["active"] == [] and listed["finished"] == []
+        assert async_dispatches.list_dispatches(state, "no-such-task") is None
+
+    def test_cancelling_one_dispatch_leaves_the_others_running(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        target = _async_child(state, sid, caller)
+        other = _async_child(state, sid, caller)
+
+        result = async_dispatches.cancel_dispatch(state, caller.task_id, _handle(target))
+
+        assert result == {
+            "ok": True, "handle": _handle(target), "node_id": "a.node",
+            "cancelled_count": 1, "stopping_count": 0, "status": "cancelled",
+        }
+        assert target.status == TaskStatus.cancelled
+        assert other.status == TaskStatus.pending
+        _finish(state, other, "still here")
+        assert _callback_children(state) == [other.task_id]
+
+    def test_a_running_dispatch_is_asked_to_stop_and_its_result_is_not_delivered(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        target = _async_child(state, sid, caller)
+        target.status = TaskStatus.running
+        target.worker_id = "worker-1"
+        target.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+
+        result = async_dispatches.cancel_dispatch(state, caller.task_id, _handle(target))
+
+        assert result["status"] == "stopping" and result["stopping_count"] == 1 and result["cancelled_count"] == 0
+        assert target.cancel_requested is True and target.status == TaskStatus.running
+        state.complete_task(task_id=target.task_id, worker_id="worker-1", result={"action": "finish", "result": {"text": "late"}})
+        assert target.status == TaskStatus.cancelled
+        assert _callbacks(state) == []
+
+    def test_cancelling_reaches_everything_the_dispatch_sent_out(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        worker = _async_child(state, sid, caller)
+        [helper] = _wait_batch(state, worker, _item("b.node"))
+        leaf = _async_child(state, worker.input["parent_session_id"], helper, node="c.node", caller_node="b.node")
+        bystander = _async_child(state, sid, caller)
+
+        result = async_dispatches.cancel_dispatch(state, caller.task_id, _handle(worker))
+
+        assert result["ok"] is True and result["status"] == "cancelled"
+        assert result["cancelled_count"] == 3
+        assert [worker.status, helper.status, leaf.status] == [TaskStatus.cancelled] * 3
+        assert bystander.status == TaskStatus.pending
+
+    def test_a_finished_dispatch_still_takes_its_running_descendants_down(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        worker = _async_child(state, sid, caller)
+        leaf = _async_child(state, worker.input["parent_session_id"], worker, node="c.node", caller_node="a.node")
+        _finish(state, worker, "handed off")
+
+        result = async_dispatches.cancel_dispatch(state, caller.task_id, _handle(worker))
+
+        assert result == {
+            "ok": True, "handle": _handle(worker), "node_id": "a.node",
+            "cancelled_count": 1, "stopping_count": 0, "status": "finish", "already_finished": True,
+        }
+        assert leaf.status == TaskStatus.cancelled
+
+    def test_cancel_refuses_what_is_not_the_callers_to_cancel(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        grandchild = _async_child(state, child.input["parent_session_id"], child, node="g.node", caller_node="a.node")
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+
+        foreign = async_dispatches.cancel_dispatch(state, stranger.task_id, _handle(child))
+        malformed = async_dispatches.cancel_dispatch(state, caller.task_id, "nonsense")
+        upward = async_dispatches.cancel_dispatch(state, grandchild.task_id, _handle(child))
+        unknown_caller = async_dispatches.cancel_dispatch(state, "no-such-task", _handle(child))
+
+        assert (foreign["ok"], foreign["reason"]) == (False, "not_found")
+        assert (malformed["ok"], malformed["reason"]) == (False, "invalid_handle")
+        assert (upward["ok"], upward["reason"]) == (False, "self")
+        assert (unknown_caller["ok"], unknown_caller["reason"]) == (False, "caller_not_found")
+        assert child.status == TaskStatus.pending and grandchild.status == TaskStatus.pending
+
+    def test_a_waiting_task_sees_a_cancelled_dispatch_as_cancelled(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        waiter = _inbound(state, sid)
+        target = _async_child(state, sid, waiter)
+        other = _async_child(state, sid, waiter)
+        _await(state, waiter, _handle(target), _handle(other))
+        canceller = _inbound(state, sid)
+
+        async_dispatches.cancel_dispatch(state, canceller.task_id, _handle(target))
+        _finish(state, other, "ok")
+
+        cancelled, finished = _entries(waiter)
+        assert cancelled["status"] == "cancelled" and cancelled["error"] == "调用方取消了这个委派"
+        assert finished["status"] == "finish"
+
+
+class TestEndingTheWaiter:
+    def test_a_cancelled_waiter_drops_what_it_collected(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        done = _async_child(state, sid, caller)
+        slow = _async_child(state, sid, caller)
+        _await(state, caller, _handle(done), _handle(slow))
+        _finish(state, done, "collected")
+
+        state.cancel_active_tasks(sid, node_id="test.orchestrator")
+
+        assert caller.status == TaskStatus.cancelled
+        assert slow.status == TaskStatus.pending
+        assert _callbacks(state) == []
+        # 取消之后才结束的照常作为新消息交回，和没有汇合时一样
+        _finish(state, slow, "arrived later")
+        assert _callback_children(state) == [slow.task_id]
+        # 丢掉的结果还查得到，也还能由别的任务收取
+        newcomer = _inbound(state, sid)
+        listed = async_dispatches.list_dispatches(state, newcomer.task_id)
+        assert {item["handle"]: item["delivered"] for item in listed["finished"]}[_handle(done)] == "dropped"
+        _await(state, newcomer, _handle(done))
+        [entry] = _entries(newcomer)
+        assert entry["text"] == "collected" and "delivered_earlier" not in entry
+
+    def test_a_waiter_that_fails_hands_what_it_collected_back_as_messages(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        done = _async_child(state, sid, caller)
+        slow = _async_child(state, sid, caller)
+        _await(state, caller, _handle(done), _handle(slow), timeout_sec=3600)
+        _finish(state, done, "collected")
+
+        with state._lock:
+            reaped = reap_stuck_tasks_locked(
+                state, now=datetime.now(timezone.utc) + timedelta(hours=7), session_ids={sid},
+            )
+
+        assert reaped == [caller.task_id]
+        assert caller.status == TaskStatus.failed
+        assert _callback_children(state) == [done.task_id]
+        _finish(state, slow, "after the caller")
+        assert _callback_children(state) == [done.task_id, slow.task_id]
+
+    def test_cancelling_the_session_reaches_its_async_dispatches(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        done = _async_child(state, sid, caller)
+        slow = _async_child(state, sid, caller)
+        _await(state, caller, _handle(done), _handle(slow))
+        _finish(state, done)
+
+        assert state.cancel_session(sid) is True
+
+        assert caller.status == TaskStatus.cancelled and slow.status == TaskStatus.cancelled
+        assert _callbacks(state) == []
+
+    def test_cancelling_the_active_tasks_reaches_async_dispatches(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+
+        result = state.cancel_active_tasks(sid)
+
+        assert result == {"ok": True, "cancelled_count": 2}
+        assert caller.status == TaskStatus.cancelled and child.status == TaskStatus.cancelled
+
+    def test_cancelling_one_task_reaches_its_async_dispatches(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        other_caller = _inbound(state, sid)
+        unrelated = _async_child(state, sid, other_caller)
+
+        result = state.cancel_single_task(caller.task_id)
+
+        assert result == {"ok": True, "cancelled_count": 2}
+        assert child.status == TaskStatus.cancelled
+        assert unrelated.status == TaskStatus.pending
+
+
+class TestWaitItemTimeout:
+    def test_an_item_past_its_deadline_fails_and_the_rest_still_come_back(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        slow, quick = _wait_batch(
+            state, caller, _item("a.node", timeout_sec=30, call_id="w1"), _item("b.node", call_id="w2"),
+        )
+        assert slow.input[async_dispatches.ITEM_TIMEOUT_SEC_KEY] == 30
+        assert async_dispatches.ITEM_DEADLINE_KEY in slow.input
+        assert async_dispatches.ITEM_TIMEOUT_SEC_KEY not in quick.input
+
+        _expire(state, after=timedelta(seconds=10))
+        assert slow.status == TaskStatus.pending
+        _expire(state, after=timedelta(seconds=31))
+
+        assert slow.status == TaskStatus.failed
+        assert caller.status == TaskStatus.suspended
+        _finish(state, quick, "quick result")
+        assert caller.status == TaskStatus.pending
+        timed_out, finished = _entries(caller)
+        assert timed_out["status"] == "fail" and timed_out["timed_out"] is True
+        assert timed_out["error"] == "等待超时：30 秒内没有做完，已被停下。"
+        assert timed_out["call_id"] == "w1" and timed_out["continuable"] is True
+        assert timed_out["handle"] == format_handle(slow.task_id, slow.input["child_session_id"])
+        assert finished["status"] == "finish" and "timed_out" not in finished
+
+    def test_a_tool_item_can_time_out_too(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        [tool_task] = _wait_batch(
+            state, caller, {"kind": "tool", "target": "slow_tool", "arguments": {"x": 1}, "call_id": "t1", "timeout_sec": 30},
+        )
+
+        _expire(state, after=timedelta(seconds=31))
+
+        assert tool_task.status == TaskStatus.failed
+        [entry] = _entries(caller)
+        assert entry["kind"] == "tool" and entry["status"] == "fail" and entry["timed_out"] is True
+        assert entry["name"] == "slow_tool"
+
+    def test_an_item_that_finished_in_time_is_left_alone(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        [child] = _wait_batch(state, caller, _item(timeout_sec=30))
+        _finish(state, child, "in time")
+
+        _expire(state, after=timedelta(seconds=31))
+
+        assert child.status == TaskStatus.completed
+        [entry] = _entries(caller)
+        assert entry["status"] == "finish" and "timed_out" not in entry
+
+    def test_a_timeout_is_clamped_and_a_bad_one_ignored(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+
+        big, bad = _wait_batch(state, caller, _item(timeout_sec=999999), _item("b.node", timeout_sec="abc"))
+
+        assert big.input[async_dispatches.ITEM_TIMEOUT_SEC_KEY] == 3600
+        assert async_dispatches.ITEM_TIMEOUT_SEC_KEY not in bad.input
+        assert async_dispatches.ITEM_DEADLINE_KEY not in bad.input
+        with state._lock:
+            assert set(async_dispatches.registry_locked(state).item_deadlines) == {big.task_id}
+
+
+class TestForkSource:
+    def test_an_async_fork_from_a_branch_sees_what_the_branch_has_not_merged_yet(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        branch = caller.session_id
+        store = ConversationStore(tmp_path / "data" / "conversations")
+        store.append_batch(branch, [Message(id="branch-only", role="user", content="这一轮刚写下、还没合并的内容")])
+        assert "branch-only" not in [message.id for message in store.load(sid)]
+        agent_sid = state.get_or_create_session(channel="qq", conversation_key=f"agent:a.node:{CONV}:{uuid.uuid4()}")
+
+        _inbound(
+            state, agent_sid, node="a.node", dispatch_context_mode="fork",
+            dispatch_origin=_origin(sid, caller, mode="fork"), dispatch_fork_from_session=branch,
+        )
+
+        copied = ConversationStore(tmp_path / "data" / "conversations").load(agent_sid)
+        assert "这一轮刚写下、还没合并的内容" in [message.content for message in copied]
+
+
+@pytest.fixture()
+def admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
+
+
+def _app(state: SupervisorState, workspace: Path) -> Any:
+    return create_app(
+        state=state,
+        process_manager=None,
+        config_store=ConfigStore(path=workspace / "config" / "models.yaml", workspace_root=workspace),
+    )
+
+
+def _call(app: Any, method: str, path: str, *, json: Any = None, auth: bool = True) -> httpx.Response:
+    async def _run() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.request(method, path, json=json, headers=_AUTH if auth else {})
+
+    return asyncio.run(_run())
+
+
+@pytest.mark.usefixtures("admin_token")
+class TestEndpoints:
+    def test_the_inbound_answer_names_the_task_it_created(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json={
+            "channel": "qq", "conversation_key": CONV, "text": "你好", "platform_auth": AUTH,
+        })
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert state.tasks[body["task_id"]].source_inbound_seq == body["inbound_seq"]
+        assert body["session_id"] == state.conversation_map[CONV]
+
+    def test_an_inbound_that_creates_no_task_says_so(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json={"conversation_key": CONV, "text": "   "})
+
+        assert response.status_code == 200
+        assert response.json()["task_id"] == ""
+
+    def test_the_list_endpoint(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        app = _app(state, tmp_path)
+
+        listed = _call(app, "GET", f"/v1/tasks/{caller.task_id}/dispatches")
+
+        assert listed.status_code == 200, listed.text
+        assert [item["handle"] for item in listed.json()["active"]] == [_handle(child)]
+        assert _call(app, "GET", f"/v1/tasks/{caller.task_id}/dispatches", auth=False).status_code == 401
+        assert _call(app, "GET", "/v1/tasks/no-such-task/dispatches").status_code == 404
+
+    def test_the_cancel_endpoint(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+        app = _app(state, tmp_path)
+        path = f"/v1/tasks/{caller.task_id}/dispatches/cancel"
+
+        assert _call(app, "POST", path, json={"handle": _handle(child)}, auth=False).status_code == 401
+        assert _call(app, "POST", path, json={"handle": ""}).status_code == 422
+        assert _call(app, "POST", path, json={"handle": "x" * 400}).status_code == 422
+        assert _call(app, "POST", "/v1/tasks/no-such-task/dispatches/cancel", json={"handle": _handle(child)}).status_code == 404
+        refused = _call(app, "POST", f"/v1/tasks/{stranger.task_id}/dispatches/cancel", json={"handle": _handle(child)})
+        assert refused.status_code == 200 and refused.json()["ok"] is False
+        assert child.status == TaskStatus.pending
+
+        cancelled = _call(app, "POST", path, json={"handle": _handle(child)})
+
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
+        assert child.status == TaskStatus.cancelled

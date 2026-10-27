@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any
 
 from clonoth_runtime import get_str, load_runtime_config, main_session_enabled, parse_bool
-from engine.dispatch_batch import CONTINUE_FROM_KEY
+from engine.dispatch_batch import AWAITING_INPUT_KEY, CONTINUE_FROM_KEY
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
@@ -37,7 +37,11 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 # 恢复运行时会从 input 里拿掉的键；task_resumed 快照只存增量，回放要靠这份清单把它们删掉。
-_RESUME_REMOVABLE_INPUT_KEYS = ("_compact_dispatch_pending", "_compact_plan", "_compact_failures")
+_RESUME_REMOVABLE_INPUT_KEYS = (
+    "_compact_dispatch_pending", "_compact_plan", "_compact_failures", AWAITING_INPUT_KEY,
+)
+# 异步委派结果回调入站带的子任务结局，只认这几种
+_INBOUND_CHILD_STATUSES = frozenset({"finish", "ask", "fail"})
 
 
 class CompletionOutcome(str, Enum):
@@ -286,7 +290,7 @@ class TaskStoreMixin:
                     "_compact_dispatch_pending", "_system_task", "_session_reset",
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
                     "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
-                    "context_ref", STEPS_USED_KEY, REQUEUE_MARK,
+                    "context_ref", STEPS_USED_KEY, REQUEUE_MARK, AWAITING_INPUT_KEY,
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -504,6 +508,29 @@ class TaskStoreMixin:
                     queue.append(child.task_id)
         return found
 
+    def _dispatched_descendants_locked(self, root_task_id: str) -> list[Task]:
+        """root 派出去的全部后代里还没到终态的，同步派的（caller）和异步派的（dispatch_origin 记的发起任务）都算，父在子前。
+
+        异步委派派完就结束的中间任务也要穿过去：它结束了，它派出去的还可能在跑。
+        """
+        children: dict[str, list[Task]] = {}
+        for candidate in self.tasks.values():
+            parent_id = child_retention.parent_task_id(candidate)
+            if parent_id:
+                children.setdefault(parent_id, []).append(candidate)
+        found: list[Task] = []
+        seen = {root_task_id}
+        queue = [root_task_id]
+        while queue:
+            for child in children.get(queue.pop(0), []):
+                if child.task_id in seen:
+                    continue
+                seen.add(child.task_id)
+                queue.append(child.task_id)
+                if not self._task_terminal(child):
+                    found.append(child)
+        return found
+
     def _resume_suspended_task_locked(
         self,
         task: Task,
@@ -716,6 +743,9 @@ class TaskStoreMixin:
         if bool(payload.get("attachments_outbound_sent")):
 
             inbound_metadata["inbound_attachments_outbound_sent"] = True
+        _inbound_child_status = str(payload.get("child_status") or "").strip()
+        if _inbound_child_status in _INBOUND_CHILD_STATUSES:
+            inbound_metadata["inbound_child_status"] = _inbound_child_status
         _inbound_child_handle = str(payload.get("child_handle") or "").strip()
         if _inbound_child_handle:
             inbound_metadata["inbound_child_handle"] = _inbound_child_handle
@@ -993,6 +1023,10 @@ class TaskStoreMixin:
             now = _now()
             count = 0
             session_ids = {sid, *self._entry_branch_ids_for_parent_locked(sid)}
+            info = self.sessions.get(sid)
+            if info is not None:
+                # 异步委派跑在 agent: 会话的入口分支上，不在这段对话自己的入口分支里，要顺着会话树找
+                session_ids |= self._session_tree_locked(sid, info.conversation_key)
             for task in list(self.tasks.values()):
                 if task.session_id not in session_ids or task.task_id in keep_ids:
                     continue
@@ -1004,7 +1038,7 @@ class TaskStoreMixin:
             return {"ok": True, "cancelled_count": count}
 
     def cancel_single_task(self, task_id: str) -> dict[str, Any]:
-        """取消单个 task 及其所有子任务链。"""
+        """取消单个 task 及其所有子任务链，异步委派出去的也算。"""
         tid = (task_id or "").strip()
         if not tid:
             return {"ok": False, "error": "task_id required"}
@@ -1017,7 +1051,7 @@ class TaskStoreMixin:
             now = _now()
             count = 0
             # 父在子前：子任务结算时父已是终态，不会被先唤醒再取消
-            for target in (task, *self._live_descendants_locked(tid)):
+            for target in (task, *self._dispatched_descendants_locked(tid)):
                 if self._cancel_task_locked(target, now) is not CancelEffect.none:
                     count += 1
             return {"ok": True, "cancelled_count": count}

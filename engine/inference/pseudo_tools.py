@@ -9,7 +9,14 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.tool_names import DISPATCH_TOOL_PREFIX
 
-from ..dispatch_batch import MAX_DISPATCH_BATCH_ITEMS
+from ..dispatch_batch import (
+    AWAIT_ALL,
+    AWAIT_ANY,
+    MAX_AWAIT_HANDLES,
+    MAX_DISPATCH_BATCH_ITEMS,
+    MIN_TIMEOUT_SEC,
+    DispatchTimeouts,
+)
 from ..todo_list import MAX_TODO_CONTENT_CHARS, MAX_TODO_ITEMS, TODO_STATUSES, TODO_TOOL_NAME
 
 if TYPE_CHECKING:
@@ -66,6 +73,14 @@ def _is_control_tool_name(name: str) -> bool:
 #  v3 伪工具 spec 构建
 # ---------------------------------------------------------------------------
 
+AWAIT_DISPATCHES_TOOL_NAME = "await_dispatches"
+LIST_DISPATCHES_TOOL_NAME = "list_dispatches"
+CANCEL_DISPATCH_TOOL_NAME = "cancel_dispatch"
+DISPATCH_CONTROL_TOOL_NAMES = frozenset({
+    AWAIT_DISPATCHES_TOOL_NAME, LIST_DISPATCHES_TOOL_NAME, CANCEL_DISPATCH_TOOL_NAME,
+})
+
+
 # [2026-05-04] Shared parameter schema for dynamic per-target dispatch tools.
 # Why: dispatch:{target_id} fixes the target in the tool name, so exposing a
 # target argument would let model output disagree with the registered tool.
@@ -73,7 +88,10 @@ def _is_control_tool_name(name: str) -> bool:
 # default context behavior in schema. Purpose: keep execution compatible with the
 # existing supervisor dispatch API while making each delegate target visible as a
 # first-class tool.
-def _dispatch_delegate_parameters(*, allow_wait: bool = True) -> dict[str, Any]:
+def _dispatch_delegate_parameters(
+    *, allow_wait: bool = True, timeouts: DispatchTimeouts | None = None,
+) -> dict[str, Any]:
+    limits = timeouts or DispatchTimeouts()
     context_mode_description = (
         "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；"
         "fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；"
@@ -117,7 +135,16 @@ def _dispatch_delegate_parameters(*, allow_wait: bool = True) -> dict[str, Any]:
             "type": "boolean",
             "description": (
                 "true：挂起当前任务，等目标节点做完、把结果交回来再继续；同一轮发出的多个 wait 委派并行执行，"
-                "全部完成后结果一起在下一条消息里给出。false（默认）：异步派出，结果稍后作为一条新消息送达。"
+                "全部完成后结果一起在下一条消息里给出。false（默认）：异步派出，立即返回句柄（handle），"
+                "结果稍后作为一条新消息送达。"
+            ),
+        }
+        properties["timeout_sec"] = {
+            "type": "number",
+            "description": (
+                f"只对 wait=true 有效：最多等这个子节点多少秒（{MIN_TIMEOUT_SEC}-{limits.maximum}，超出按上限算）。"
+                "到点还没做完就按失败交回：它会被停下，会话保留，之后可以用 continue_from 带上它的句柄接着做；"
+                "同一批的其它委派照常收齐。不填就一直等到它做完。"
             ),
         }
     return {
@@ -127,7 +154,13 @@ def _dispatch_delegate_parameters(*, allow_wait: bool = True) -> dict[str, Any]:
     }
 
 
-def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None, *, allow_wait: bool = True) -> dict:
+def _dispatch_delegate_spec(
+    target_id: str,
+    info: dict[str, str] | None = None,
+    *,
+    allow_wait: bool = True,
+    timeouts: DispatchTimeouts | None = None,
+) -> dict:
     """Build one dispatch_to_<target> pseudo-tool spec; allow_wait=False leaves out the wait parameter."""
     target = str(target_id or "").strip()
     node_name = str((info or {}).get("name") or target).strip() or target
@@ -143,15 +176,18 @@ def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None, 
             "两种用法：",
             "- wait: true（等结果）：当前任务挂起，目标节点做完后把结果交回来，你接着往下做。"
             "后续步骤要用到它的结果时用这种，例如要看命令输出、要拿读到的内容继续处理。"
-            "本工具当轮只返回「已派出」，结果在下一条消息里给出；同一轮的多个 wait 委派并行执行，全部完成后一起返回。",
-            "- wait: false（默认，异步）：立即返回「已派出」，不含执行结果；结果稍后作为一条新消息送达，那时再向用户汇报。"
-            "不需要结果，或者要跑很久（例如生图）时用这种。本轮不要臆测结果，也不要承诺完成时间。",
+            "本工具当轮只返回「已派出」，结果在下一条消息里给出；同一轮的多个 wait 委派并行执行，全部完成后一起返回。"
+            "可以用 timeout_sec 给某一项设等待上限。",
+            "- wait: false（默认，异步）：立即返回句柄（handle），不含执行结果；结果稍后作为一条新消息送达，那时再向用户汇报。"
+            "不需要结果，或者要跑很久（例如生图）时用这种。本轮不要臆测结果，也不要承诺完成时间。"
+            f"之后想在本任务里拿结果，用 {AWAIT_DISPATCHES_TOOL_NAME} 带上句柄等它；"
+            f"用 {LIST_DISPATCHES_TOOL_NAME} 查看进度，用 {CANCEL_DISPATCH_TOOL_NAME} 取消。",
             f"同一轮最多 {MAX_DISPATCH_BATCH_ITEMS} 个 wait 委派。和 wait 委派同一轮调用的 finish/ask 不会执行，"
             "结果回来之后再单独调用 finish。",
         ]
     else:
         desc_parts += [
-            "本工具立即返回，返回值只表示「已派出」，不含执行结果。",
+            "本工具立即返回句柄（handle），不含执行结果。",
             "结果稍后会作为一条新消息送达，那时再向用户汇报；本轮不要臆测结果，也不要承诺完成时间。",
         ]
     desc_parts.append("需要并行委派时，可以在同一轮调用多个委派工具。")
@@ -160,7 +196,7 @@ def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None, 
         "function": {
             "name": _dispatch_tool_name(target),
             "description": "\n".join(part for part in desc_parts if part is not None),
-            "parameters": _dispatch_delegate_parameters(allow_wait=allow_wait),
+            "parameters": _dispatch_delegate_parameters(allow_wait=allow_wait, timeouts=timeouts),
         },
     }
 
@@ -170,6 +206,7 @@ def _dispatch_delegate_specs(
     downstream_info: list[dict[str, str]] | None = None,
     *,
     allow_wait: bool = True,
+    timeouts: DispatchTimeouts | None = None,
 ) -> list[dict]:
     """Build dynamic dispatch pseudo-tools for all delegate targets."""
     info_by_id = {
@@ -184,8 +221,111 @@ def _dispatch_delegate_specs(
         if not target or target in seen:
             continue
         seen.add(target)
-        result.append(_dispatch_delegate_spec(target, info_by_id.get(target), allow_wait=allow_wait))
+        result.append(_dispatch_delegate_spec(
+            target, info_by_id.get(target), allow_wait=allow_wait, timeouts=timeouts,
+        ))
     return result
+
+
+def _await_dispatches_spec(timeouts: DispatchTimeouts | None = None) -> dict:
+    """伪工具：挂起当前任务，等之前异步派出的委派交回结果。"""
+    limits = timeouts or DispatchTimeouts()
+    return {
+        "type": "function",
+        "function": {
+            "name": AWAIT_DISPATCHES_TOOL_NAME,
+            "description": (
+                "等之前异步（wait=false）委派出去的子任务交回结果。当前任务挂起，等到这些句柄的结果全部回来"
+                f"（mode={AWAIT_ALL}，默认），或者其中任意一个回来（mode={AWAIT_ANY}），或者到了 timeout_sec，"
+                "就带着结果恢复；结果在下一条消息里给出，每个句柄一项，失败、取消的如实标出。\n\n"
+                "- 在调用之前就已经结束的委派也直接给出结果；如果它的结果早先已经作为一条单独的消息交回过，"
+                "会注明，不要重复汇报。\n"
+                "- 等到时还没做完的标成「还在运行」，它的结果留给你：之后再调用本工具收取；"
+                "本任务结束时还没收取的，会作为单独的消息交回。\n"
+                "- 句柄写错、或者不属于这段对话的，会注明拿不到结果，不影响其余的。\n"
+                "- 本工具当轮只返回「正在等待」。和它同一轮调用的 finish/ask 不会执行；"
+                "也不能和 wait=true 的委派放在同一轮，同一轮只能调用一次。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": MAX_AWAIT_HANDLES,
+                        "description": (
+                            f"要等的委派句柄（task_id@session_id），照抄异步委派返回的 handle，一次最多 {MAX_AWAIT_HANDLES} 个。"
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": [AWAIT_ALL, AWAIT_ANY],
+                        "description": (
+                            f"{AWAIT_ALL}=全部结束再恢复（默认）；{AWAIT_ANY}=任意一个结束就恢复，其余的之后还能再收。"
+                        ),
+                    },
+                    "timeout_sec": {
+                        "type": "number",
+                        "description": (
+                            f"最多等多少秒，不填就等 {limits.await_default} 秒（{MIN_TIMEOUT_SEC}-{limits.maximum}，"
+                            "超出按上限算）。到点时已经结束的照常给出结果，没结束的标成还在运行。"
+                        ),
+                    },
+                },
+                "required": ["handles"],
+            },
+        },
+    }
+
+
+def _list_dispatches_spec() -> dict:
+    """伪工具：查看这段对话里的异步委派。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": LIST_DISPATCHES_TOOL_NAME,
+            "description": (
+                "列出这段对话里异步（wait=false）委派出去的子任务：还没结束的（排队、运行中、正在等它自己的子任务）"
+                "全部列出，再加上最近结束的几个。每项给出句柄、目标节点、状态、指令摘要和已经过了多久；"
+                "结束的还给出结局、摘要，以及结果交到了哪里。只查看，不改变任何东西。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+
+
+def _cancel_dispatch_spec() -> dict:
+    """伪工具：取消一个异步委派和它派出去的子任务。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": CANCEL_DISPATCH_TOOL_NAME,
+            "description": (
+                "取消一个还在运行的异步（wait=false）委派，连同它派出去的全部子任务。正在执行的会在当前这一步做完后停下，"
+                f"被取消的委派不再交回结果，正在用 {AWAIT_DISPATCHES_TOOL_NAME} 等它的会收到「已取消」。"
+                "已经结束的委派不用取消。只能取消这段对话里的委派，不能取消自己或派出自己的任务。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": "要取消的委派句柄（task_id@session_id），照抄异步委派返回的 handle。",
+                    },
+                },
+                "required": ["handle"],
+            },
+        },
+    }
+
+
+def _dispatch_control_specs(*, allow_await: bool, timeouts: DispatchTimeouts | None = None) -> list[dict]:
+    """有委派目标的节点才给；系统任务不能挂起，不给 await_dispatches。"""
+    specs = [_await_dispatches_spec(timeouts)] if allow_await else []
+    specs += [_list_dispatches_spec(), _cancel_dispatch_spec()]
+    return specs
+
 
 def _finish_spec() -> dict:
     """Build the finish pseudo-tool spec.

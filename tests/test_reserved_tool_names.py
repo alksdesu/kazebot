@@ -38,9 +38,10 @@ def registry(tmp_path: Path) -> ToolRegistry:
 
 
 def test_the_pseudo_tool_roster_is_the_one_the_engine_injects() -> None:
-    assert PSEUDO_TOOL_NAMES == frozenset(
-        {"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task", "update_todos", "stay_silent"}
-    )
+    assert PSEUDO_TOOL_NAMES == frozenset({
+        "finish", "ask", "reply", "switch_node", "compact_context", "preempt_task", "update_todos", "stay_silent",
+        "await_dispatches", "list_dispatches", "cancel_dispatch",
+    })
     assert DISPATCH_TOOL_PREFIX == "dispatch_to_"
 
 

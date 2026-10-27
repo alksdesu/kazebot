@@ -17,6 +17,7 @@ from toolbox.tool_names import is_pseudo_tool_name
 
 from .pseudo_tools import (
     NO_REPLY_MARKER,
+    _dispatch_control_specs,
     _dispatch_delegate_specs,
     _finish_spec,
     _ask_spec,
@@ -53,13 +54,17 @@ from .pseudo_handlers import (
     WAIT_DISPATCHED,
     WAIT_INTERCEPTED,
     WAIT_PREEMPTED,
+    AwaitDispatch,
     WaitDispatch,
     _handle_pseudo_tool,
+    is_await_dispatch,
     is_wait_dispatch,
+    prepare_await_dispatches,
     prepare_wait_dispatches,
 )
 
 from ..context_store import load_context_snapshot
+from ..dispatch_batch import AWAIT_KEY, DispatchTimeouts
 from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
 from ..conversation_store import Message, MessageType
 from ..node import Node
@@ -254,6 +259,9 @@ _SUPERSEDED_TERMINAL_MESSAGE = "{tool} 没有执行：同一轮调用了多个 f
 _WAIT_TERMINAL_MESSAGE = (
     "{tool} 没有执行：同一轮发出了等结果的委派（wait=true），它们的结果在下一条消息回来；看完结果再单独调用 {tool}。"
 )
+_AWAIT_TERMINAL_MESSAGE = (
+    "{tool} 没有执行：同一轮调用了 await_dispatches，等到的结果在下一条消息回来；看完结果再单独调用 {tool}。"
+)
 _FINAL_STEP_REJECT_MESSAGE = "{tool} 没有执行：这是本任务允许的最后一步，只能调用 finish。"
 _FINAL_STEP_HINT = (
     "[SYSTEM] 这是本任务允许的最后一步（已用 {used}/{total} 步）。不要再调用其它工具，直接调用 finish："
@@ -300,11 +308,11 @@ def _flush_round_tail(
     ls: _LoopState,
     tool_calls: list,
     late_errors: list[tuple[Any, str]],
-    wait_pending: list[WaitDispatch],
+    wait_pending: list[WaitDispatch | AwaitDispatch],
     outcome: str,
     attachment_messages: list[dict[str, Any]],
 ) -> bool:
-    """补本轮最后的结果：排在后面的不执行调用，加上按 outcome 写的 wait 委派结果，按调用原顺序写，最后才写工具产出图片的消息。
+    """补本轮最后的结果：排在后面的不执行调用，加上按 outcome 写的 wait 委派和 await_dispatches 结果，按调用原顺序写，最后才写工具产出图片的消息。
 
     图片消息是 user 消息，夹在工具结果中间会被配对修复当成新一轮的开始，排在它后面的结果就成了孤儿。
     三个列表写完就清空，重复调用不会写两遍；返回这次有没有写东西。
@@ -339,6 +347,25 @@ async def _dispatch_wait_batch(ls: _LoopState, items: list[WaitDispatch], step: 
         dispatch_batch=[dict(item.item) for item in items],
         context_ref=_persist_ctx(ls, step + 1),
         summary=_short(f"等待 {len(items)} 个子节点：{targets}", 240),
+    )
+
+
+async def _dispatch_await(ls: _LoopState, item: AwaitDispatch, step: int) -> TaskAction:
+    """await_dispatches 交给 supervisor：本任务挂起，等到点名的异步委派结束（或到点）后带着结果恢复。"""
+    count = len(item.request.handles)
+    await ls.rctx.emit_event("handoff_progress", {
+        "message": f"[{ls.node.id}] 等待 {count} 个异步委派",
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+    })
+    # 恢复时历史从会话里重新读，挂起前占位结果必须已经落盘
+    await flush_conversation_writes(ls.rctx)
+    return TaskAction(
+        action=ACTION_DISPATCH,
+        node_id=ls.node.id,
+        dispatch_input={AWAIT_KEY: item.request.payload()},
+        context_ref=_persist_ctx(ls, step + 1),
+        summary=_short(f"等待 {count} 个异步委派", 240),
     )
 
 
@@ -604,11 +631,23 @@ async def _handle_tool_calls(
     if _wait_calls:
         _wait_call_ids = {id(_pc) for _pc in _wait_calls}
         pseudo_calls = [_pc for _pc in pseudo_calls if id(_pc) not in _wait_call_ids]
-    if _wait_items:
+    # await_dispatches 也等本轮其它调用跑完再挂起；和 wait 委派同轮时不开始等
+    _await_calls = [_pc for _pc in pseudo_calls if is_await_dispatch(_pc)]
+    _await_plan = (
+        await prepare_await_dispatches(ls, _await_calls, has_wait_items=bool(_wait_items)) if _await_calls else None
+    )
+    _await_item = _await_plan.item if _await_plan is not None else None
+    if _await_plan is not None:
+        _wait_rejected += _await_plan.rejected
+    if _await_calls:
+        _await_call_ids = {id(_pc) for _pc in _await_calls}
+        pseudo_calls = [_pc for _pc in pseudo_calls if id(_pc) not in _await_call_ids]
+    if _wait_items or _await_item is not None:
         # 结果下一条消息才回来，同轮的 finish/ask 不能先把任务结束掉
+        _terminal_message = _WAIT_TERMINAL_MESSAGE if _wait_items else _AWAIT_TERMINAL_MESSAGE
         _already_rejected = {id(_call) for _call, _ in _rejected_terminals}
         _rejected_terminals = _rejected_terminals + [
-            (_pc, _WAIT_TERMINAL_MESSAGE.format(tool=_pc.name))
+            (_pc, _terminal_message.format(tool=_pc.name))
             for _pc in pseudo_calls
             if _pc.name in TERMINAL_TOOLS and id(_pc) not in _already_rejected
         ]
@@ -623,12 +662,12 @@ async def _handle_tool_calls(
     if _terminal_call is not None:
         _executed_ids.add(id(_terminal_call))
     # wait 委派的结果在本轮最后才补：排位时把它们当成会执行的调用，排在后面的不执行调用跟着留到最后，顺序才对得上
-    _anchor_ids = _executed_ids | {id(_item.call) for _item in _wait_items}
+    _wait_pending: list[WaitDispatch | AwaitDispatch] = [*_wait_items, *([_await_item] if _await_item else [])]
+    _anchor_ids = _executed_ids | {id(_item.call) for _item in _wait_pending}
     _early_errors, _late_errors = _split_by_position(
         resp.tool_calls, _skipped_terminals + _wait_rejected, _anchor_ids,
     )
     _flush_tool_errors(ls, _early_errors)
-    _wait_pending = list(_wait_items)
     _wait_outcome = WAIT_ABORTED
     _attachment_messages: list[dict[str, Any]] = []
     _tail_written = False
@@ -692,6 +731,11 @@ async def _handle_tool_calls(
         ls.use_stream = ls.streaming
         if _wait_outcome == WAIT_DISPATCHED:
             return await _dispatch_wait_batch(ls, _wait_items, step)
+        return None
+    if _await_item is not None:
+        ls.use_stream = ls.streaming
+        if _wait_outcome == WAIT_DISPATCHED:
+            return await _dispatch_await(ls, _await_item, step)
         return None
 
     # finish/ask 最后执行（同轮真实工具已完成）
@@ -2273,10 +2317,12 @@ async def run_ai_node(
         # aggregate dispatch schema. How: expand node.delegate_targets into only
         # dispatch:{target_id} specs. Purpose: keep dynamic dispatch intact while
         # removing the old aggregate dispatch tools from the model-visible list.
-        # 系统任务不许挂起等子任务（supervisor 也会拒），不给它 wait 参数
+        # 系统任务不许挂起等子任务（supervisor 也会拒），不给它 wait 参数，也不给 await_dispatches
+        _dispatch_timeouts = DispatchTimeouts.from_config(runtime_cfg)
         openai_tools.extend(_dispatch_delegate_specs(
-            delegate_targets, downstream_info, allow_wait=not _is_system_task,
+            delegate_targets, downstream_info, allow_wait=not _is_system_task, timeouts=_dispatch_timeouts,
         ))
+        openai_tools.extend(_dispatch_control_specs(allow_await=not _is_system_task, timeouts=_dispatch_timeouts))
 
     # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
     if not _is_system_task:

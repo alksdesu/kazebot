@@ -26,7 +26,7 @@ from engine.attachments import blocked_file_reject_reason
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 
-from . import continuation, provisioning, share_groups
+from . import async_dispatches, continuation, provisioning, share_groups
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
@@ -644,9 +644,12 @@ def create_app(
             type_="inbound_message",
             payload=msg.model_dump(),
         )
-        st.record_inbound_message_event(evt)
+        created = st.record_inbound_message_event(evt)
         inbound_seq = int(evt.get("seq", 0) or 0)
-        return InboundMessageOut(session_id=session_id, inbound_seq=inbound_seq, accepted=True)
+        return InboundMessageOut(
+            session_id=session_id, inbound_seq=inbound_seq, accepted=True,
+            task_id=created.task_id if created is not None else "",
+        )
 
     # 下面这批端点都要拿全局锁，完成还会在锁里路由；写成普通 def 交给线程池，免得卡住事件循环
     @app.get("/v1/tasks/next", response_model=Task)
@@ -882,6 +885,34 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         return continuation.resolve(st, task_id, handle, target, wait=wait)
+
+    @app.get("/v1/tasks/{task_id}/dispatches")
+    def task_dispatches(task_id: str, request: Request) -> dict[str, Any]:
+        """Engine 调用：路径里这个调用方任务的会话家族里的异步委派，还没结束的和最近结束的。
+
+        调用方不存在或已结束回 404。
+        """
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        listed = async_dispatches.list_dispatches(st, task_id)
+        if listed is None:
+            raise HTTPException(status_code=404, detail="caller task not found or not active")
+        return listed
+
+    @app.post("/v1/tasks/{task_id}/dispatches/cancel")
+    def task_dispatch_cancel(
+        task_id: str, body: async_dispatches.DispatchCancelIn, request: Request,
+    ) -> dict[str, Any]:
+        """Engine 调用：取消调用方会话家族里的一个异步委派，连同它的后代。
+
+        家族外的句柄和不存在一样；不能取消时 ok 为假，message 是给模型看的原因。调用方不存在或已结束回 404。
+        """
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        result = async_dispatches.cancel_dispatch(st, task_id, body.handle)
+        if result.get("reason") == "caller_not_found":
+            raise HTTPException(status_code=404, detail="caller task not found or not active")
+        return result
 
     @app.post("/v1/tasks/{task_id}/renew_lease")
     def renew_lease(task_id: str, body: TaskLeaseRenewIn) -> dict[str, Any]:

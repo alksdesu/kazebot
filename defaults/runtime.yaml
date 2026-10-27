@@ -25,6 +25,11 @@ engine:
   auto_continue:
     max_rounds: 3              # 到步数或运行时长上限收尾后，同一会话最多自动接着做几轮（0-20；0 = 不自动续跑）；只对有没做完的待办或声明了 auto_continue 的节点生效，整条链仍受任务总寿命约束
 
+  # 委派时挂起等结果最多等多久；挂起的任务仍受任务总寿命约束，快到寿命时会带着已有结果提前恢复
+  dispatch:
+    await_timeout_sec: 600     # await_dispatches 不写 timeout_sec 时最多等这么多秒（5-21600，且不超过下一项）
+    max_timeout_sec: 3600      # await_dispatches 和 wait 委派单项 timeout_sec 的上限（60-21600）
+
   compact:
     threshold_tokens: 256000   # 软阈值：超过此值在后台静默压缩，当轮回复照常进行（优先用 LLM 返回的真实值，无则按字符估算）
     hard_threshold_tokens: 0   # 硬阈值：超过此值挂起当轮同步压缩，避免顶爆上下文窗口；0 = 取软阈值的 1.25 倍

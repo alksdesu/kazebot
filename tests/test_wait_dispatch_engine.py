@@ -168,7 +168,10 @@ class TestMixedRounds:
         assert posted.args[0].endswith("/v1/inbound")
         assert posted.kwargs["json"]["entry_node_id"] == "helper"
         assert [item["target"] for item in action.dispatch_batch] == ["scout"]
-        assert _payload(ls, "a1") == {"success": True, "session_id": "s-async", "message": "已异步委派给 helper"}
+        # 应答里没有 task_id（旧 supervisor）时拼不出句柄，照样算派出了
+        assert _payload(ls, "a1") == {
+            "success": True, "session_id": "s-async", "message": "已异步委派给 helper，结果稍后会作为一条新消息送达。",
+        }
         assert _payload(ls, "w1")["status"] == "waiting"
         assert answered_once(ls.messages)
 

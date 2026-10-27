@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from clonoth_runtime import task_max_running_seconds
+from engine.dispatch_batch import AWAITING_INPUT_KEY
 from engine.run_budget import TASK_LIFETIME_FACTOR, lifetime_origin
 
+from . import async_dispatches
 from .file_claims import release_if_ended_locked
 from .types import ApprovalStatus, Task, TaskStatus
 
@@ -111,6 +113,8 @@ def _wait_target_state(
     """挂起任务等待目标的 (全部结束, 找不到, 还有没结束的)。"""
     if task.status != TaskStatus.suspended:
         return False, False, False
+    if task.input.get(AWAITING_INPUT_KEY):
+        return async_dispatches.wait_target_state_locked(state, task)
     if task.waiting_for_task_id:
         child = state.tasks.get(task.waiting_for_task_id)
         if child is None:
@@ -147,6 +151,9 @@ def reap_stuck_tasks_locked(
     now = now or datetime.now(timezone.utc)
     max_running_sec = task_max_running_seconds()
     scope = set(session_ids) if session_ids is not None else None
+    if scope is None:
+        # 到点的 await_dispatches 和 wait 委派单项超时平时由定时器处理，这里每轮兜底一次
+        async_dispatches.expire_due_locked(state, now=now)
     waiting_sessions = {
         approval.session_id
         for approval in state.approvals.values()
