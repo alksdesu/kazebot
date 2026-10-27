@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import SwitchValueError, parse_bool, switch_arg, switch_refusal
 
 from .resume_builder import _select_attachments
 from .attachment_access import RefusedAttachment, screen_model_attachment_paths
@@ -925,18 +925,15 @@ _BAD_ITEM_TIMEOUT = "没有派出：timeout_sec 要填正数秒数；不想限�
 
 
 def _wait_flag(arguments: Any) -> bool | None:
-    """委派调用写的 wait：没写（缺省、null、空串）是 False，认得出的开关照读，认不出的给 None。"""
-    raw = arguments.get("wait") if isinstance(arguments, dict) else None
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return False
-    return parse_bool(raw)
+    """委派调用写的 wait，读法同 switch_arg：没写（缺省、null、空串）是 False，认不出的给 None。"""
+    try:
+        return switch_arg(arguments if isinstance(arguments, dict) else {}, "wait", False)
+    except SwitchValueError:
+        return None
 
 
 def _wait_value_refusal(raw: Any) -> str:
-    return (
-        f"没有派出：wait 只能是 true 或 false，收到的是 {_short(json.dumps(raw, ensure_ascii=False, default=str), 40)}；"
-        "要等结果就填 true，不等就填 false 或不填。"
-    )
+    return f"没有派出：{switch_refusal('wait', raw)}；要等结果就填 true，不等就填 false 或不填。"
 
 
 def is_wait_dispatch(call: Any) -> bool:
