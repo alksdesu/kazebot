@@ -28,10 +28,11 @@ import config_layout  # noqa: E402
 import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 import toolbox.registry as registry_module  # noqa: E402
 from clonoth_runtime import SwitchValueError, switch_refusal  # noqa: E402
-from toolbox.builtins.mcp_clients import create_or_update_mcp_client, list_mcp_clients  # noqa: E402
+from toolbox.builtins.mcp_clients import create_or_update_mcp_client, delete_mcp_client, list_mcp_clients  # noqa: E402
 from toolbox.builtins.tool_manage import reload_tools  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
 from toolbox.registry import ToolRegistry  # noqa: E402
+from toolbox.reload_seqs import ReloadSeqs  # noqa: E402
 
 _SPEC = {"id": "fs", "transport": "stdio", "command": "fake-mcp-server", "args": ["--stdio"]}
 
@@ -41,9 +42,10 @@ def _text_result(text: str) -> SimpleNamespace:
 
 
 class _FakeSession:
-    def __init__(self, server: _FakeServer, index: int) -> None:
+    def __init__(self, server: _FakeServer, index: int, plan: Any = None) -> None:
         self.server = server
         self.index = index
+        self.plan = plan
         self.loop = asyncio.get_running_loop()
         self.requests: list[str] = []
         self.closed = False
@@ -52,6 +54,8 @@ class _FakeSession:
 
     async def list_tools(self) -> Any:
         self.requests.append("tools/list")
+        if self.server.list_handler is not None:
+            await self.server.list_handler(self)
         return mcp_types.ListToolsResult(tools=list(self.server.tools))
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
@@ -62,7 +66,7 @@ class _FakeSession:
 
 
 class _FakeServer:
-    """替掉建连层：记下每次建连、关闭和收到的请求，可以让建连失败、让请求卡住，或让关闭卡在 close_gate 上。"""
+    """替掉建连层：记下每次建连、关闭和收到的请求，可以让建连失败、让请求或列工具表卡住，或让关闭卡在 close_gate 上。"""
 
     def __init__(self) -> None:
         self.connects = 0
@@ -73,6 +77,7 @@ class _FakeServer:
         self.fail_connects = 0
         self.tools: list[mcp_types.Tool] = []
         self.handler: Any = None
+        self.list_handler: Any = None
         self.close_gate: asyncio.Event | None = None
 
     @asynccontextmanager
@@ -83,7 +88,7 @@ class _FakeServer:
             self.fail_connects -= 1
             self.events.append("refused")
             raise ConnectionRefusedError("fake server refused the connection")
-        session = _FakeSession(self, len(self.sessions))
+        session = _FakeSession(self, len(self.sessions), plan)
         self.sessions.append(session)
         self.events.append(f"open {session.index}")
         send, receive = anyio.create_memory_object_stream(0)
@@ -1024,6 +1029,412 @@ def test_reloading_tools_retires_the_sessions_of_every_conversation_and_client(
     assert set(server.events[2:4]) == {"close 0", "close 1"}
     assert server.events[4:6] == ["open 2", "open 3"]
     assert [plan.client_id for plan in server.plans[2:4]] == ["fs", "web"]
+
+
+# --- 跟上 supervisor 的重载序号 ---
+
+
+def _seqs(run_id: str = "run-a", *, scripts: int = 0, config: int = 0, reload: int = 0) -> ReloadSeqs:
+    return ReloadSeqs(run_id=run_id, scripts=scripts, mcp_config=config, mcp_reload=reload)
+
+
+def _rewrite_clients(ws: Path, edit: Any) -> None:
+    """整份改 clients，好比在控制台、在共享组别的实例里改：不经 upsert_client / delete_client，也就没有主动退役。"""
+    path = config_layout.mcp_path(ws)
+    with config_layout.locked(path):
+        cfg = mcp_runtime._load_raw_config(ws)
+        edit(cfg["clients"])
+        mcp_runtime._save_raw_config(ws, cfg)
+
+
+def _break_config(ws: Path, text: str = "clients: [unclosed\n") -> None:
+    config_layout.write_config_text(config_layout.mcp_path(ws), text)
+
+
+def _plans_for(server: _FakeServer, client_id: str) -> list[Any]:
+    return [plan for plan in server.plans if plan.client_id == client_id]
+
+
+def _serve_ping(server: _FakeServer) -> None:
+    server.tools = [mcp_types.Tool(name="ping", inputSchema={"type": "object"})]
+
+
+def test_a_changed_client_is_relisted_alone_and_the_others_keep_their_sessions(ws: Path, server: _FakeServer) -> None:
+    mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        assert await registry.load_mcp_tools(seqs=_seqs()) == 2
+        await mcp_runtime.call_tool(ws, "web", "echo", {}, scope="conv-a")
+        await mcp_runtime.call_tool(ws, "web", "echo", {}, scope="conv-b")
+        web_sessions = [session for session in server.sessions if session.plan.client_id == "web"]
+        before = len(server.plans)
+
+        _rewrite_client(ws, args=["--other"])
+
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert [plan.client_id for plan in server.plans[before:]] == ["fs"]
+        assert server.plans[-1].args == ("--other",)
+        assert len(web_sessions) == 3
+        assert not any(session.closed for session in web_sessions)
+        assert registry.get_spec("mcp_fs_ping") is not None
+        assert registry.get_spec("mcp_web_ping") is not None
+
+    asyncio.run(main())
+
+
+def test_changing_only_the_description_relists_nothing(ws: Path, server: _FakeServer) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        _rewrite_client(ws, description="只改了说明")
+
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert server.connects == 1
+        assert server.sessions[0].requests == ["tools/list"]
+        assert server.sessions[0].closed is False
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("edit", [
+    pytest.param(lambda clients: clients.pop("fs"), id="deleted"),
+    pytest.param(lambda clients: clients["fs"].update(enabled=False), id="disabled"),
+])
+def test_a_deleted_or_disabled_client_loses_its_tools_and_its_sessions(
+    ws: Path, server: _FakeServer, edit: Any,
+) -> None:
+    mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        await _call(ws, scope="conv-a")
+        await _call(ws, scope="conv-b")
+        fs_sessions = [session for session in server.sessions if session.plan.client_id == "fs"]
+
+        _rewrite_clients(ws, edit)
+
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert registry.get_spec("mcp_fs_ping") is None
+        assert registry.get_spec("mcp_web_ping") is not None
+        # 不再有人调它，各对话里攥着的会话也得收掉，不能等闲置超时
+        assert len(fs_sessions) == 3
+        await _until(lambda: all(session.closed for session in fs_sessions))
+
+    asyncio.run(main())
+
+
+def test_a_new_client_is_listed_without_touching_the_existing_ones(ws: Path, server: _FakeServer) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        _rewrite_clients(ws, lambda clients: clients.update(web={**clients["fs"], "args": ["--web"]}))
+
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert [plan.client_id for plan in server.plans] == ["fs", "web"]
+        assert server.sessions[0].closed is False
+        assert registry.get_spec("mcp_web_ping") is not None
+
+    asyncio.run(main())
+
+
+def test_an_explicit_reload_restarts_every_client(ws: Path, server: _FakeServer) -> None:
+    mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        await _call(ws, scope="conv-a")
+        old = list(server.sessions)
+
+        assert await registry.sync_mcp_tools(_seqs(scripts=1, reload=1)) is True
+        assert all(session.closed for session in old)
+        assert [plan.client_id for plan in server.plans[len(old):]] == ["fs", "web"]
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(("offered", "restarts"), [
+    pytest.param(_seqs(config=2, reload=1), False, id="already-followed"),
+    pytest.param(_seqs(config=1, reload=1), False, id="older"),
+    pytest.param(_seqs("run-b", config=1), True, id="supervisor-restarted"),
+])
+def test_sequences_the_worker_may_already_have_followed(
+    ws: Path, server: _FakeServer, offered: ReloadSeqs, restarts: bool,
+) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs(config=2, reload=1))
+        old = list(server.sessions)
+
+        assert await registry.sync_mcp_tools(offered) is restarts
+        # supervisor 重启过，序号从头数，比不出先后：只能全部重来
+        assert server.connects == (2 if restarts else 1)
+        assert all(session.closed for session in old) is restarts
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("broken", ["clients: [unclosed\n", "- a list\n", "version: abc\nclients: {}\n", "clients: 5\n"])
+def test_a_file_broken_while_running_keeps_the_last_good_clients_until_it_is_fixed(
+    ws: Path, server: _FakeServer, broken: str,
+) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        _break_config(ws, broken)
+
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert registry.get_spec("mcp_fs_ping") is not None
+        assert server.sessions[0].closed is False
+        called = await registry.execute(name="mcp_fs_ping", arguments={}, ctx=None)
+        assert called["data"]["result"] == "ping@0"
+        assert [client["id"] for client in mcp_runtime.list_clients(ws)] == ["fs"]
+        assert registry.mcp_config_error().startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
+
+        # 修好时连同改了的启动参数一起写回：这一份照常跟上
+        _rewrite_client(ws, args=["--fixed"])
+
+        assert await registry.sync_mcp_tools(_seqs(config=2)) is True
+        assert registry.mcp_config_error() == ""
+        assert server.plans[-1].args == ("--fixed",)
+
+    asyncio.run(main())
+
+
+def test_a_file_broken_before_the_first_read_means_no_clients(tmp_path: Path, server: _FakeServer) -> None:
+    root = tmp_path / "fresh"
+    config_layout.write_config_text(config_layout.mcp_path(root), "clients: [unclosed\n")
+    registry = ToolRegistry(workspace_root=root, tools_dir=root / "tools")
+
+    assert asyncio.run(registry.load_mcp_tools()) == 0
+
+    assert server.connects == 0
+    assert mcp_runtime.config_error(root).startswith(f"{config_layout.MCP_FILE} 用不了，现在按没有客户端算")
+    assert mcp_runtime.list_clients(root) == []
+
+
+def test_a_client_whose_listing_hangs_times_out_without_holding_up_the_others(ws: Path, server: _FakeServer) -> None:
+    mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
+    _serve_ping(server)
+    runtime = config_layout.runtime_path(ws)
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text("tools:\n  mcp:\n    list_timeout_sec: 1\n", encoding="utf-8")
+    hanging = {"fs"}
+
+    async def list_handler(session: _FakeSession) -> None:
+        if session.plan.client_id in hanging:
+            await asyncio.Event().wait()
+
+    server.list_handler = list_handler
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        started = time.monotonic()
+        assert await registry.load_mcp_tools(seqs=_seqs()) == 1
+        assert time.monotonic() - started < 10
+        assert registry.get_spec("mcp_fs_ping") is None
+        assert registry.get_spec("mcp_web_ping") is not None
+        await _until(lambda: all(session.closed for session in server.sessions if session.plan.client_id == "fs"))
+
+        # 别的客户端的配置变了：没列成的这个配置没变，不跟着再等一轮超时
+        _rewrite_clients(ws, lambda clients: clients["web"].update(description="别处改的"))
+        assert await registry.sync_mcp_tools(_seqs(config=1)) is True
+        assert len(_plans_for(server, "fs")) == 1
+
+        # 显式重载才再试
+        hanging.clear()
+        assert await registry.sync_mcp_tools(_seqs(config=1, reload=1)) is True
+        assert len(_plans_for(server, "fs")) == 2
+        assert registry.get_spec("mcp_fs_ping") is not None
+
+    asyncio.run(main())
+
+
+def test_the_old_tools_stay_registered_while_a_client_is_relisted(ws: Path, server: _FakeServer) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> None:
+        await registry.load_mcp_tools(seqs=_seqs())
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def list_handler(session: _FakeSession) -> None:
+            entered.set()
+            await gate.wait()
+
+        server.list_handler = list_handler
+        server.tools = [mcp_types.Tool(name="pong", inputSchema={"type": "object"})]
+        _rewrite_client(ws, args=["--other"])
+        sync = asyncio.create_task(registry.sync_mcp_tools(_seqs(config=1)))
+        await entered.wait()
+
+        # 重列途中开始的任务照样拿得到旧工具，不会碰上一张缺了这个客户端的工具表
+        assert registry.get_spec("mcp_fs_ping") is not None
+        assert registry.get_spec("mcp_fs_pong") is None
+
+        gate.set()
+        assert await sync is True
+        assert registry.get_spec("mcp_fs_ping") is None
+        assert registry.get_spec("mcp_fs_pong") is not None
+
+    asyncio.run(main())
+
+
+def test_two_syncs_at_once_relist_once(ws: Path, server: _FakeServer) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+
+    async def main() -> list[bool]:
+        await registry.load_mcp_tools(seqs=_seqs())
+        _rewrite_client(ws, args=["--other"])
+        return list(await asyncio.gather(
+            registry.sync_mcp_tools(_seqs(config=1)), registry.sync_mcp_tools(_seqs(config=1)),
+        ))
+
+    assert sorted(asyncio.run(main())) == [False, True]
+    assert len(_plans_for(server, "fs")) == 2
+
+
+class _SupervisorReply:
+    """reload_tools 发给 supervisor 的那一下：记下地址和请求体，回给定的状态码和应答体。"""
+
+    def __init__(self, status: int, body: Any) -> None:
+        self.status = status
+        self.body = body
+        self.posts: list[tuple[str, Any]] = []
+
+    async def post(self, url: str, json: Any = None, **kwargs: Any) -> SimpleNamespace:
+        self.posts.append((url, json))
+        return SimpleNamespace(status_code=self.status, json=lambda: self.body)
+
+
+def _reload_ctx(registry: ToolRegistry, http: Any) -> SimpleNamespace:
+    return SimpleNamespace(registry=registry, http=http, supervisor_url="http://supervisor")
+
+
+def test_reload_tools_tells_the_supervisor_and_this_worker_does_not_restart_twice(
+    ws: Path, server: _FakeServer,
+) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+    reply = _SupervisorReply(200, {"ok": True, **_seqs(scripts=1, reload=1).payload()})
+
+    async def main() -> dict[str, Any]:
+        await registry.load_mcp_tools(seqs=_seqs())
+        result = await reload_tools({}, _reload_ctx(registry, reply))
+        # 本 worker 的 follower 随后从 supervisor 拿到的是同一组序号
+        assert await registry.sync_mcp_tools(_seqs(scripts=1, reload=1)) is False
+        return result
+
+    result = asyncio.run(main())
+
+    assert result["ok"] is True
+    assert result["data"]["other_workers_notified"] is True
+    assert result["data"]["mcp_tools"] == 1
+    assert reply.posts == [("http://supervisor/v1/tools/reload", {"mcp": True})]
+    assert server.connects == 2
+    assert server.events[:3] == ["open 0", "close 0", "open 1"]
+
+
+def test_reload_tools_refused_by_the_supervisor_restarts_this_worker_and_says_the_others_were_not_told(
+    ws: Path, server: _FakeServer,
+) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+    reply = _SupervisorReply(401, {"detail": "Unauthorized"})
+
+    async def main() -> dict[str, Any]:
+        await registry.load_mcp_tools(seqs=_seqs())
+        return await reload_tools({}, _reload_ctx(registry, reply))
+
+    result = asyncio.run(main())
+
+    assert result["ok"] is True
+    assert result["data"]["other_workers_notified"] is False
+    assert "Unauthorized" in result["data"]["result"]
+    assert server.events[:3] == ["open 0", "close 0", "open 1"]
+
+
+def test_reload_tools_on_a_broken_file_rescans_the_scripts_only(ws: Path, server: _FakeServer) -> None:
+    _serve_ping(server)
+    registry = ToolRegistry(workspace_root=ws, tools_dir=ws / "tools")
+    reply = _SupervisorReply(200, {"ok": True, **_seqs(scripts=1).payload()})
+
+    async def main() -> dict[str, Any]:
+        await registry.load_mcp_tools(seqs=_seqs())
+        _break_config(ws)
+        result = await reload_tools({}, _reload_ctx(registry, reply))
+        # 文件坏着重开也只是按旧配置再连一遍，白丢各对话的会话状态
+        assert server.sessions[0].closed is False
+        return result
+
+    result = asyncio.run(main())
+
+    assert result["ok"] is False
+    assert f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的" in result["error"]
+    assert result["data"]["mcp_tools"] == 1
+    assert reply.posts == [("http://supervisor/v1/tools/reload", {"mcp": False})]
+    assert server.connects == 1
+
+
+class _RecordingCtx(_ApprovingCtx):
+    """放行一切，同时记下送审过哪些操作。"""
+
+    def __init__(self, workspace_root: Path) -> None:
+        super().__init__(workspace_root)
+        self.requested: list[str] = []
+
+    async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        self.requested.append(op)
+        return {"safety_level": "auto"}
+
+
+def test_saving_or_deleting_a_client_is_refused_before_approval_while_the_file_is_broken(ws: Path) -> None:
+    path = config_layout.mcp_path(ws)
+    _break_config(ws)
+    before = path.read_bytes()
+    ctx = _RecordingCtx(ws)
+
+    saved = asyncio.run(create_or_update_mcp_client({**_SPEC, "id": "web"}, ctx))
+    deleted = asyncio.run(delete_mcp_client({"id": "fs"}, ctx))
+
+    for result in (saved, deleted):
+        assert result["ok"] is False
+        assert "先修好这份文件再改" in result["error"]
+    # 存不进去的改动不送审，审批人不用批一份注定被拒的配置
+    assert ctx.requested == []
+    with pytest.raises(mcp_runtime.McpConfigError):
+        mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
+    with pytest.raises(mcp_runtime.McpConfigError):
+        mcp_runtime.delete_client(ws, "fs")
+    # 坏文件原样留着等人修，不会被整份盖成只剩一个客户端
+    assert path.read_bytes() == before
+
+
+def test_listing_clients_on_a_broken_file_says_why_and_shows_the_ones_in_use(ws: Path) -> None:
+    mcp_runtime.list_clients(ws)
+    _break_config(ws)
+
+    result = asyncio.run(list_mcp_clients({}, _ApprovingCtx(ws)))
+
+    assert result["ok"] is True
+    assert result["data"]["config_error"].startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
+    assert result["data"]["result"].startswith(f"{config_layout.MCP_FILE} 用不了")
+    assert [client["id"] for client in result["data"]["clients"]] == ["fs"]
 
 
 # --- share_sessions 配置 ---

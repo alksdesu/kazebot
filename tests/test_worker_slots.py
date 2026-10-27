@@ -363,7 +363,7 @@ class TestWorkerLoop:
             def __init__(self, **kwargs: Any) -> None:
                 pass
 
-            async def load_mcp_tools(self) -> int:
+            async def load_mcp_tools(self, *, seqs: Any = None) -> int:
                 return 0
 
         async def ready(*args: Any, **kwargs: Any) -> dict[str, Any]:

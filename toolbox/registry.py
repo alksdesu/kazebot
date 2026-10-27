@@ -23,6 +23,7 @@ from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from .context import project_origin_of
 from . import mcp_runtime
+from .reload_seqs import ReloadSeqs
 from .builtins.execute_command import CAPTURE_HEAD_BYTES, CAPTURE_TAIL_BYTES, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS
 from .builtins.glob_files import DEFAULT_MAX_RESULTS as _GLOB_DEFAULT_RESULTS
 from .builtins.glob_files import MAX_RESULTS_LIMIT as _GLOB_MAX_RESULTS
@@ -500,6 +501,25 @@ def _make_script_tool(
     return _run
 
 
+@dataclass(frozen=True)
+class _McpClientTools:
+    """一个 MCP 客户端最近一次列出的工具，记在列的时候的启动指纹名下；没列成的工具表是空的。"""
+
+    fingerprint: str
+    tools: tuple[tuple[str, dict[str, Any], ToolFunc], ...] = ()
+
+
+def _listed_mcp_tools(result: Any) -> list[Any] | None:
+    """list_tools 的应答里的工具表，先认 data.tools 再认顶层 tools；都不是列表给 None。"""
+    if not isinstance(result, dict):
+        return None
+    data = result.get("data")
+    if isinstance(data, dict) and isinstance(data.get("tools"), list):
+        return data["tools"]
+    tools = result.get("tools")
+    return tools if isinstance(tools, list) else None
+
+
 class ToolRegistry:
     def __init__(self, *, workspace_root: Path, tools_dir: Path, load_external: bool = True) -> None:
         self.workspace_root = workspace_root
@@ -507,8 +527,14 @@ class ToolRegistry:
 
         self._tool_specs: dict[str, dict[str, Any]] = {}
         self._tool_funcs: dict[str, ToolFunc] = {}
+        # 各客户端的工具按客户端顺序拼成的一张表，同名的先到先得；能不能进工具表另由 _merge_mcp_tools 定
         self._mcp_specs: dict[str, dict[str, Any]] = {}
         self._mcp_funcs: dict[str, ToolFunc] = {}
+        self._mcp_clients: dict[str, _McpClientTools] = {}
+        # 不知道对齐到哪（None）时，下一次跟序号就得全部重连
+        self._mcp_seqs: ReloadSeqs | None = None
+        # 启动加载、跟上序号的后台对齐、reload_tools 可能同时来，重列一次只许一个
+        self._mcp_lock = asyncio.Lock()
         self._plugin_conflicts: set[tuple[str, str, str]] = set()
 
         self._load_builtin_meta_tools()
@@ -961,8 +987,10 @@ class ToolRegistry:
                 "create_or_update_mcp_client",
                 "Create or update an MCP client config in config/mcp.yaml. Supports stdio, sse, and streamable_http transports. "
                 "The client's entry is replaced as a whole: omitted fields go back to their defaults, except share_sessions, "
-                "which keeps its current value. Saving closes the client's open sessions in every conversation (a call in "
-                "progress finishes first), so the next call starts a new session; call reload_tools to pick up a changed tool list.",
+                "which keeps its current value. Saving closes the client's open sessions in every conversation of this worker "
+                "(a call in progress finishes first). Within a few seconds every worker relists the tools of a new client or of "
+                "one whose launch settings changed; tasks already running keep the tool list they started with. No reload_tools "
+                "needed. Refused while config/mcp.yaml is unreadable.",
                 {
                     "type": "object",
                     "properties": {
@@ -990,13 +1018,15 @@ class ToolRegistry:
             ),
             (
                 "list_mcp_clients",
-                "List configured MCP clients.",
+                "List configured MCP clients. When config/mcp.yaml is unreadable the result says why and lists the "
+                "clients still in use.",
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.list_mcp_clients,
             ),
             (
                 "delete_mcp_client",
-                "Delete an MCP client config by id.",
+                "Delete an MCP client config by id. Every worker drops its tools within a few seconds. Refused while "
+                "config/mcp.yaml is unreadable.",
                 {
                     "type": "object",
                     "properties": {
@@ -1026,7 +1056,11 @@ class ToolRegistry:
             ),
             (
                 "reload_tools",
-                "Reload script tools (config/tools/ and the bundled tools/) and MCP tools.",
+                "Rescan script tools (config/tools/ and the bundled tools/) in every worker, restart every MCP client's "
+                "sessions in every worker and relist their tools. MCP config changes are picked up without it: use it when "
+                "an MCP server program itself changed. Restarting drops the state stateful servers (browser, memory) keep "
+                "for each conversation. New tools reach tasks started afterwards. While config/mcp.yaml is unreadable only "
+                "the scripts are rescanned.",
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.reload_tools,
             ),
@@ -1185,12 +1219,16 @@ class ToolRegistry:
             )
 
         # MCP 工具由 load_mcp_tools 单独登记；只重扫脚本时得原样留着，不然热重载一次就全没了。
-        for mcp_name, mcp_spec in self._mcp_specs.items():
-            if mcp_name not in self._tool_specs:
-                self._tool_specs[mcp_name] = mcp_spec
-                self._tool_funcs[mcp_name] = self._mcp_funcs[mcp_name]
+        self._merge_mcp_tools()
 
         return len(self._tool_specs)
+
+    def _merge_mcp_tools(self) -> None:
+        """MCP 工具让着内置和脚本工具：名字被占了先不进工具表，占名的走了，下一次重扫脚本或重列 MCP 时自己回来。"""
+        for name, spec in self._mcp_specs.items():
+            if name not in self._tool_specs:
+                self._tool_specs[name] = spec
+                self._tool_funcs[name] = self._mcp_funcs[name]
 
     def list_specs(self) -> list[dict[str, Any]]:
         with self._tool_view() as (specs, _funcs, _owners):
@@ -1301,82 +1339,140 @@ class ToolRegistry:
             result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
         return _ensure_tool_response_shape(result)
 
-    async def load_mcp_tools(self) -> int:
-        """Scan enabled MCP clients and register their tools as first-class tools.
+    async def load_mcp_tools(self, *, seqs: ReloadSeqs | None = None) -> int:
+        """所有启用的 MCP 客户端重连、重列工具，返回进了工具表的 MCP 工具数。
 
-        整批重登：删掉或停用的客户端，它的工具这一轮就摘掉。
         已有的 MCP 会话先全部退役（正在用的等调用结束再关），工具表从新会话里取：
-        配置没变、服务端程序改了的 stdio 服务也得换新进程才看得到。
+        配置没变、服务端程序改了的 stdio 服务也得换新进程才看得到。seqs 是这次对齐到的 supervisor 重载序号。
         """
-        for mcp_name, mcp_spec in self._mcp_specs.items():
-            if self._tool_specs.get(mcp_name) is mcp_spec:
-                self._tool_specs.pop(mcp_name, None)
-                self._tool_funcs.pop(mcp_name, None)
-        self._mcp_specs, self._mcp_funcs = {}, {}
-        count = 0
-        try:
-            await mcp_runtime.retire_sessions(self.workspace_root)
-        except Exception:
-            log.warning("[registry] retiring MCP sessions before the rescan failed", exc_info=True)
-        try:
-            clients = mcp_runtime.list_clients(self.workspace_root)
-        except Exception:
-            return 0
+        async with self._mcp_lock:
+            if await self._refresh_mcp_locked(reconnect=True) and seqs is not None:
+                self._mcp_seqs = seqs.merged_with(self._mcp_seqs)
+        return self.mcp_tool_count()
 
-        for client in clients:
+    async def sync_mcp_tools(self, seqs: ReloadSeqs) -> bool:
+        """跟上 supervisor 的 MCP 序号，做了重列返回 True。
+
+        已经对齐过这组序号就什么都不做。这之后有过显式重载、或者接不上历史，就全部重连；
+        否则只重列启动指纹变了的和新加的客户端，摘掉删了和停用的，上回没列成、配置也没变的不重试。
+        """
+        async with self._mcp_lock:
+            applied = self._mcp_seqs
+            if seqs.mcp_covered_by(applied):
+                return False
+            if not await self._refresh_mcp_locked(reconnect=seqs.mcp_reconnect_after(applied)):
+                return False
+            self._mcp_seqs = seqs.merged_with(applied)
+            return True
+
+    def mcp_tool_count(self) -> int:
+        """进了工具表、没被同名内置或脚本工具挡住的 MCP 工具数。"""
+        return sum(1 for name, spec in self._mcp_specs.items() if self._tool_specs.get(name) is spec)
+
+    def mcp_config_error(self) -> str:
+        """config/mcp.yaml 现在为什么用不了、MCP 工具按哪份配置在跑；空串表示用的就是文件里那份。"""
+        return mcp_runtime.config_error(self.workspace_root)
+
+    async def _refresh_mcp_locked(self, *, reconnect: bool) -> bool:
+        """按现在的配置重列，所有 await 做完才整批换上：重列途中开始的任务照样看得到旧的 MCP 工具。
+
+        连客户端清单都读不出来时什么都不动，返回 False，对齐到的序号也不往前记。
+        """
+        try:
+            clients = await asyncio.to_thread(self._mcp_client_fingerprints)
+        except Exception:
+            log.warning("reading the MCP client list failed, MCP tools stay as they are", exc_info=True)
+            return False
+        if reconnect:
+            try:
+                await mcp_runtime.retire_sessions(self.workspace_root)
+            except Exception:
+                log.warning("retiring MCP sessions before the relisting failed", exc_info=True)
+        timeout = self._mcp_list_timeout_sec()
+        previous = self._mcp_clients
+        current: dict[str, _McpClientTools] = {}
+        for client_id, fingerprint in clients:
+            known = previous.get(client_id)
+            if not reconnect and known is not None and known.fingerprint == fingerprint:
+                current[client_id] = known
+            else:
+                current[client_id] = await self._list_mcp_client(client_id, fingerprint, timeout)
+        removed = [] if reconnect else [client_id for client_id in previous if client_id not in current]
+        self._mcp_clients = current
+        self._install_mcp_tools()
+        for client_id in removed:
+            await self._retire_mcp_client(client_id)
+        return True
+
+    def _mcp_client_fingerprints(self) -> list[tuple[str, str]]:
+        """启用着的客户端和它们的启动指纹，按 list_clients 的顺序：同名工具谁先登记跟着这个顺序走。"""
+        listed: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for client in mcp_runtime.list_clients(self.workspace_root):
             if not isinstance(client, dict):
                 continue
-            cid = str(client.get("id") or "").strip()
-            if not cid or not client.get("enabled", True):
+            client_id = str(client.get("id") or "").strip()
+            if not client_id or client_id in seen or not client.get("enabled", True):
                 continue
+            seen.add(client_id)
+            listed.append((client_id, mcp_runtime.launch_fingerprint(client)))
+        return listed
 
-            try:
-                result = await mcp_runtime.list_tools(self.workspace_root, cid)
-                # [AutoC 2026-05-31] Why: MCP list_tools may be migrated to the
-                # unified data wrapper while older code returns top-level tools.
-                # How: read data.tools first, then fall back to result.tools.
-                # Purpose: keep dynamic MCP registration working across schemas.
-                result_data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
-                tools = result_data.get("tools") if isinstance(result_data.get("tools"), list) else (result.get("tools") if isinstance(result, dict) else [])
-                if not isinstance(tools, list):
-                    continue
-            except Exception:
-                log.warning("[registry] MCP client '%s' tool list unavailable, skipping", cid)
-                continue
+    def _mcp_list_timeout_sec(self) -> float:
+        try:
+            runtime_cfg = load_runtime_config(self.workspace_root)
+            return get_float(runtime_cfg, "tools.mcp.list_timeout_sec", 120.0, min_value=1.0, max_value=3600.0)
+        except Exception:
+            return 120.0
 
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                raw_name = str(tool.get("name") or "").strip()
-                if not raw_name:
-                    continue
+    async def _list_mcp_client(self, client_id: str, fingerprint: str, timeout: float) -> _McpClientTools:
+        try:
+            result = await asyncio.wait_for(mcp_runtime.list_tools(self.workspace_root, client_id), timeout)
+        except TimeoutError:
+            log.warning(
+                "MCP client '%s' did not list its tools within %ss; it stays without tools until its config "
+                "changes or reload_tools runs",
+                client_id, timeout,
+            )
+            return _McpClientTools(fingerprint)
+        except Exception as error:
+            log.warning(
+                "MCP client '%s' tool list unavailable (%s); it stays without tools until its config changes "
+                "or reload_tools runs",
+                client_id, _describe_exception(error),
+            )
+            return _McpClientTools(fingerprint)
+        tools = _listed_mcp_tools(result)
+        if tools is None:
+            log.warning("MCP client '%s' answered the tool listing without a tool list, skipping it", client_id)
+            return _McpClientTools(fingerprint)
+        return _McpClientTools(fingerprint, tuple(_mcp_tool_entries(self.workspace_root, client_id, tools)))
 
-                reg_name = f"mcp_{cid}_{raw_name}"
-                if reg_name in self._tool_specs:
-                    continue
+    def _install_mcp_tools(self) -> None:
+        """各客户端的工具拼成新的一张表，整批换掉上一张；整个过程不让出事件循环，任务看到的工具表不会缺一半。"""
+        specs: dict[str, dict[str, Any]] = {}
+        funcs: dict[str, ToolFunc] = {}
+        for listed in self._mcp_clients.values():
+            for name, spec, func in listed.tools:
+                if name not in specs:
+                    specs[name] = spec
+                    funcs[name] = func
+        for name, spec in self._mcp_specs.items():
+            if self._tool_specs.get(name) is spec:
+                del self._tool_specs[name]
+                del self._tool_funcs[name]
+        self._mcp_specs, self._mcp_funcs = specs, funcs
+        self._merge_mcp_tools()
 
-                desc = str(tool.get("description") or "").strip()
-                schema = tool.get("input_schema")
-                if not isinstance(schema, dict):
-                    schema = {"type": "object", "properties": {}, "required": []}
-
-                mcp_spec = {
-                    "name": reg_name,
-                    "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
-                    "input_schema": schema,
-                }
-                annotations = tool.get("annotations")
-                # 只读提示是服务端自报的；engine 按 parallel_safe 让同一轮里的这类调用并发
-                if isinstance(annotations, dict) and parse_bool(annotations.get("readOnlyHint"), False):
-                    mcp_spec["parallel_safe"] = True
-                mcp_func = _make_mcp_tool(self.workspace_root, cid, raw_name)
-                self._mcp_specs[reg_name] = mcp_spec
-                self._mcp_funcs[reg_name] = mcp_func
-                self._tool_specs[reg_name] = mcp_spec
-                self._tool_funcs[reg_name] = mcp_func
-                count += 1
-
-        return count
+    async def _retire_mcp_client(self, client_id: str) -> None:
+        # 删了、停用了的客户端没人再调，会话不收掉就攥着子进程一直等到闲置超时
+        try:
+            await mcp_runtime.retire_sessions(self.workspace_root, client_id)
+        except ValueError:
+            # 会话池不认的 id 起不了会话，也就没什么可收
+            return
+        except Exception:
+            log.warning("retiring the sessions of removed MCP client '%s' failed", client_id, exc_info=True)
 
 
 async def _call_plugin_tool(func: Any, arguments: dict[str, Any], ctx: Any) -> Any:
@@ -1395,6 +1491,40 @@ async def _call_plugin_tool(func: Any, arguments: dict[str, Any], ctx: Any) -> A
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def _mcp_tool_entries(
+    workspace_root: Path, client_id: str, tools: list[Any],
+) -> list[tuple[str, dict[str, Any], ToolFunc]]:
+    """一个客户端列出的工具换成注册表里的名字、spec 和调用函数；服务端重复报的同名工具只认第一个。"""
+    entries: list[tuple[str, dict[str, Any], ToolFunc]] = []
+    taken: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        raw_name = str(tool.get("name") or "").strip()
+        if not raw_name:
+            continue
+        reg_name = f"mcp_{client_id}_{raw_name}"
+        if reg_name in taken:
+            continue
+        taken.add(reg_name)
+
+        desc = str(tool.get("description") or "").strip()
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}, "required": []}
+        spec: dict[str, Any] = {
+            "name": reg_name,
+            "description": f"[MCP:{client_id}] {desc}" if desc else f"[MCP:{client_id}] {raw_name}",
+            "input_schema": schema,
+        }
+        annotations = tool.get("annotations")
+        # 只读提示是服务端自报的；engine 按 parallel_safe 让同一轮里的这类调用并发
+        if isinstance(annotations, dict) and parse_bool(annotations.get("readOnlyHint"), False):
+            spec["parallel_safe"] = True
+        entries.append((reg_name, spec, _make_mcp_tool(workspace_root, client_id, raw_name)))
+    return entries
 
 
 def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> ToolFunc:

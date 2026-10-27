@@ -6,9 +6,14 @@ import re
 from typing import Any
 
 import config_layout
+from clonoth_sdk.refusals import refusal_reason
 
 from ..context import ToolContext
+from ..reload_seqs import ReloadSeqs
 from ..tool_names import TOOL_NAME_RE
+
+# The announcement only bumps counters on the supervisor; a supervisor that takes longer is treated as unreachable.
+_ANNOUNCE_TIMEOUT_SEC = 10.0
 
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
@@ -119,17 +124,63 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
     return _ok(f"Tool written: {path}", path=path, reloaded=count)
 
 
-async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Reload script tools (config/tools/ and the bundled tools/) and MCP tools.
-
-    [AutoC 2026-05-31] Why: MCP tools were only loaded at engine startup,
-    requiring a full restart after adding/modifying MCP clients.
-    How: reload_tools now also calls load_mcp_tools() after reloading
-    local tools. Purpose: hot-reload MCP tool changes without restart.
-    """
+async def _announce_reload(ctx: Any, *, mcp: bool) -> tuple[ReloadSeqs | None, str]:
+    """Ask the supervisor to make every worker follow. Returns the sequences it answered with, or None and the reason."""
+    http = getattr(ctx, "http", None)
+    supervisor_url = str(getattr(ctx, "supervisor_url", "") or "").rstrip("/")
+    if http is None or not supervisor_url:
+        return None, "no supervisor connection in this context"
     try:
-        count = ctx.registry.reload()
-        mcp_count = await ctx.registry.load_mcp_tools()
-        return _ok(f"Tools reloaded: {count} local, {mcp_count} MCP", tools=count, mcp_tools=mcp_count)
+        response = await http.post(
+            f"{supervisor_url}/v1/tools/reload", json={"mcp": mcp}, timeout=_ANNOUNCE_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        return None, f"supervisor unreachable ({type(exc).__name__}: {exc})"
+    if response.status_code >= 400:
+        return None, refusal_reason(response)
+    try:
+        seqs = ReloadSeqs.from_payload(response.json())
+    except Exception:
+        seqs = None
+    if seqs is None:
+        return None, "the supervisor answered without reload sequences"
+    return seqs, ""
+
+
+async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Rescan script tools and restart every MCP client's sessions, in this worker and, through the supervisor, in every other."""
+    registry = ctx.registry
+    try:
+        count = registry.reload()
+        config_error = registry.mcp_config_error()
     except Exception as e:
         return _err(e)
+
+    # Restarting on a broken file only reconnects with the old config and throws away every conversation's session state.
+    seqs, unannounced = await _announce_reload(ctx, mcp=not config_error)
+    if config_error:
+        return _err(
+            f"{config_error}. Script tools were rescanned ({count} tools); MCP tools were left as they are and every "
+            "worker picks the file up by itself once it is fixed",
+            tools=count, mcp_tools=registry.mcp_tool_count(),
+        )
+
+    try:
+        if seqs is not None:
+            await registry.sync_mcp_tools(seqs)
+        else:
+            await registry.load_mcp_tools()
+        mcp_count = registry.mcp_tool_count()
+    except Exception as e:
+        return _err(f"script tools were rescanned ({count} tools) but relisting MCP tools failed: {e}", tools=count)
+
+    if unannounced:
+        return _ok(
+            f"Tools reloaded in this worker only: {count} local, {mcp_count} MCP. The other workers were not notified "
+            f"({unannounced}) and keep their tools until the config changes or they restart",
+            tools=count, mcp_tools=mcp_count, other_workers_notified=False,
+        )
+    return _ok(
+        f"Tools reloaded: {count} local, {mcp_count} MCP; the other workers follow within a few seconds",
+        tools=count, mcp_tools=mcp_count, other_workers_notified=True,
+    )

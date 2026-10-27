@@ -236,6 +236,12 @@ class TaskLeaseRenewIn(BaseModel):
     claim_id: str | None = None
 
 
+class ToolsReloadIn(BaseModel):
+    """让每个 engine worker 重扫脚本工具。"""
+    # 重开会话会丢掉有状态服务在各对话里攒下的状态，只在点名要时才让 MCP 一起重来
+    mcp: bool = False
+
+
 class TaskOriginOut(BaseModel):
     """任务的发起来源：派发出去的子任务回溯到发起会话和入口任务的已校验身份。"""
 

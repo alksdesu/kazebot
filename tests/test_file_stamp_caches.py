@@ -23,6 +23,7 @@ import clonoth_runtime  # noqa: E402
 import config_layout  # noqa: E402
 import engine.node as node_module  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
+import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from adapters._shared.live_config import BOOL, LiveConfig, LiveKey, int_in  # noqa: E402
 from engine.conversation_store import (  # noqa: E402
     ConversationChangedError,
@@ -550,6 +551,31 @@ class TestTheConversationStore:
 
 
 # ---------------------------------------------------------------------------
+#  config/mcp.yaml：调用期读的那份
+# ---------------------------------------------------------------------------
+
+class TestTheMcpConfig:
+    _GOOD = "clients:\n  aaa:\n    command: x\n"
+
+    def test_a_same_tick_rewrite_is_picked_up(self, tmp_path: Path) -> None:
+        path = _write(config_layout.mcp_path(tmp_path), self._GOOD)
+        assert [client["id"] for client in mcp_runtime.list_clients(tmp_path)] == ["aaa"]
+
+        _same_tick_replace(path, "clients:\n  bbb:\n    command: x\n")
+
+        assert [client["id"] for client in mcp_runtime.list_clients(tmp_path)] == ["bbb"]
+
+    def test_a_same_tick_breakage_is_noticed_and_the_last_good_one_stays(self, tmp_path: Path) -> None:
+        path = _write(config_layout.mcp_path(tmp_path), self._GOOD)
+        assert mcp_runtime.config_error(tmp_path) == ""
+
+        _same_tick_replace(path, "clients:\n  aaa:\n    command: [\n")
+
+        assert mcp_runtime.config_error(tmp_path).startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
+        assert [client["id"] for client in mcp_runtime.list_clients(tmp_path)] == ["aaa"]
+
+
+# ---------------------------------------------------------------------------
 #  同一个指纹被这几处共用
 # ---------------------------------------------------------------------------
 
@@ -558,6 +584,7 @@ class TestEveryCacheUsesTheSameStamp:
         "supervisor.config_store",
         "adapters._shared.user_profiles",
         "supervisor.tool_watch",
+        "toolbox.mcp_runtime",
         "supervisor.policy",
         "engine.node",
         "engine.conversation_store",

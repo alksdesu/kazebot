@@ -170,6 +170,9 @@ meta:
 tools:
   script:
     default_timeout_sec: 60.0   # tools/ 下的脚本工具没写 TIMEOUT_SEC 时的超时（1-3600 秒）
+  mcp:
+    # 每个 MCP 客户端起会话、列工具表最多等多久（1-3600 秒）。超时的先不登记工具，等它的配置变了或调 reload_tools 再试
+    list_timeout_sec: 120.0
 
 skills:
   max_budget_chars: 0       # 0 = no limit; max total chars of skill body to inject

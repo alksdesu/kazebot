@@ -257,6 +257,8 @@ def _literal_default(path: Path, dotted: str) -> Any:
     ("toolbox/builtins/execute_command.py", "meta.execute_command.default_timeout_sec"),
     ("toolbox/builtins/execute_command.py", "meta.execute_command.max_output_chars"),
     ("toolbox/builtins/search_in_files.py", "meta.search.max_file_size_bytes"),
+    ("toolbox/registry.py", "tools.script.default_timeout_sec"),
+    ("toolbox/registry.py", "tools.mcp.list_timeout_sec"),
 ])
 def test_call_site_fallbacks_match_the_shipped_default(module_path: str, dotted: str) -> None:
     """兜底值永远轮不到生效（读出来的 cfg 一定并过默认表），但对不上会让看调用点的人读到假数。"""

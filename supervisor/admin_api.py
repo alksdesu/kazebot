@@ -29,6 +29,7 @@ from engine.node import (
     template_reference_warnings,
 )
 from real_paths import real_path
+from toolbox import mcp_runtime
 
 from . import config_files
 from .config_store import check_models_text
@@ -305,10 +306,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return _node_yaml if path.suffix == ".yaml" else _yaml_check_for(path)
 
     def _mcp_check(content: str) -> list[str]:
-        clients = config_files.parse_mapping(content).get("clients")
-        if clients is not None and not isinstance(clients, (dict, list)):
-            raise ValueError("clients 要写成「客户端 id: 配置」的映射")
-        return []
+        return mcp_runtime.check_mcp_text(content)
 
     def _remove(p: Path) -> bool:
         try:
@@ -804,21 +802,12 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     # ----- MCP Clients -----
     @router.get("/mcp-clients")
     def list_mcp_clients() -> list[dict[str, Any]]:
-        p = config_layout.mcp_path(workspace_root)
-        if not p.exists():
-            return []
-        data = _read_yaml(p)
-        clients = data.get("clients")
-        if not isinstance(clients, dict):
-            return []
-        res = []
-        for cid, spec in sorted(clients.items()):
-            if not isinstance(spec, dict):
-                continue
-            item = {"id": str(cid)}
-            item.update(spec)
-            res.append(item)
-        return res
+        # 写坏的文件显示成「没有客户端」，页面就会照着空表新建、删除；报出来，等原文修好再改
+        try:
+            config = mcp_runtime.editable_config(workspace_root)
+        except mcp_runtime.McpConfigError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return [{**spec, "id": cid} for cid, spec in sorted(config["clients"].items())]
 
     @router.get("/mcp-clients/raw")
     def get_mcp_clients_raw() -> dict[str, Any]:

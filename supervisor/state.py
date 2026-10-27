@@ -138,6 +138,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         self._cancelled_sessions: set[str] = set()
         self._tools_reload_seq: int = 0
+        self._mcp_config_seq: int = 0
+        self._mcp_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self.session_last_entry_node: dict[str, str] = {}  # session_id -> last used entry node
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage

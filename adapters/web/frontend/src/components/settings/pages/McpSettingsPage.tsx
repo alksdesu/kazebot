@@ -29,6 +29,8 @@ export const McpSettingsPage = () => {
   const { adminToken, isAuthenticated, setRightPanelOpen } = useSettingsStore();
   const { selectedMcpClient, setSelectedMcpClient } = useSettingsSelectionStore();
   const [clients, setClients] = useState<McpClient[]>([]);
+  // 列表没读成（比如 mcp.yaml 写坏了）时空列表不代表没有 Client，不能显示「暂无」
+  const [listFailed, setListFailed] = useState(false);
   const [newId, setNewId] = useState('');
   const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
@@ -44,10 +46,12 @@ export const McpSettingsPage = () => {
       const items = await getMcpClients(adminToken);
       if (!request.isCurrent()) return;
       setClients(items);
+      setListFailed(false);
       if (selectedMcpClient && !items.some((item) => item.id === selectedMcpClient.id)) setSelectedMcpClient(null);
       setLoadError('');
     } catch (caught) {
       if (!request.isCurrent()) return;
+      setListFailed(true);
       setLoadError(errorMessage(caught, '加载 MCP 配置失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
@@ -133,7 +137,7 @@ export const McpSettingsPage = () => {
           <Button tone="danger" disabled={loading || busy || !selectedMcpClient} onClick={remove}>删除选中 Client</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
-          {clients.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
+          {clients.length === 0 ? !listFailed && <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
             <button className={`w-full border p-3 text-left ${selectedMcpClient?.id === client.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={client.id} disabled={busy} onClick={() => { setSelectedMcpClient(client); setMessage(''); setRightPanelOpen(true); }} type="button">
               <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{client.id}</span><span className={`border px-1.5 py-0.5 text-xs ${client.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{client.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-xs text-[var(--duties-tertiary)]">{client.transport || '未知传输'}</span></div>
               <p className="mt-1 truncate text-xs text-[var(--duties-secondary)]">{preview(client)}</p>

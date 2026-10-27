@@ -30,6 +30,7 @@ from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader, redact
 from supervisor.platform_api import platform_health
+from toolbox import mcp_runtime
 
 # 平台没声明自己的排查提示时用的说法。
 _CONNECTION_HINT = "检查平台账号登录和适配进程的连接配置"
@@ -252,6 +253,9 @@ class OperationsService:
             runtime_error = runtime_config_error(self.root)
             if runtime_error:
                 add("运行参数文件", "warning", runtime_error, f"在原文编辑器里修好 {config_layout.RUNTIME_FILE}")
+            mcp_error = mcp_runtime.config_error(self.root)
+            if mcp_error:
+                add("MCP 配置文件", "warning", mcp_error, f"修好 {config_layout.MCP_FILE}，各 worker 会自己换上修好的配置")
             store = getattr(self.state, "feature_config_store", None) or ConfigStore(
                 path=config_layout.models_path(self.root), workspace_root=self.root,
             )

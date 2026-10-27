@@ -67,7 +67,10 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "tools": {
         "script": {
             "default_timeout_sec": 60.0,
-        }
+        },
+        "mcp": {
+            "list_timeout_sec": 120.0,
+        },
     },
     "skills": {
         "max_budget_chars": 0,

@@ -32,7 +32,7 @@ from . import async_dispatches, continuation, provisioning, session_reuse, share
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
-from .tool_watch import ToolTreeWatch
+from .tool_watch import McpConfigWatch, ToolTreeWatch
 from .instances import InstanceDirectoryError, load_instance_directory, load_instances, url_prefix
 from .log_access import LogReader
 from .process_manager import ProcessManager
@@ -84,6 +84,7 @@ from .types import (
     TaskLeaseRenewIn,
     TaskOriginOut,
     TaskStatus,
+    ToolsReloadIn,
 )
 
 
@@ -945,20 +946,26 @@ def create_app(
         return result
 
     tool_watch = ToolTreeWatch(state.workspace_root)
+    mcp_watch = McpConfigWatch(state.workspace_root)
 
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        # 共享组里别的实例改了工具目录不会通知这边，engine 靠这里的序号变了才重载。
+        # 共享组里别的实例、控制台、手改动了工具目录或 config/mcp.yaml 都不会通知这边，engine 靠这里的序号变了才跟上。
         if tool_watch.changed():
             st.bump_tools_reload()
-        return {"seq": st.tools_reload_seq()}
+        if mcp_watch.changed():
+            st.bump_mcp_config()
+        return st.reload_seqs().payload()
 
     @app.post("/v1/tools/reload")
-    async def tools_reload_trigger() -> dict[str, Any]:
+    async def tools_reload_trigger(request: Request, body: ToolsReloadIn | None = None) -> dict[str, Any]:
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
-        seq = st.bump_tools_reload()
-        return {"ok": True, "seq": seq}
+        st.bump_tools_reload()
+        if body is not None and body.mcp:
+            st.bump_mcp_reload()
+        return {"ok": True, **st.reload_seqs().payload()}
 
     @app.post("/v1/memory/dream/run", response_model=DreamRunOut)
     async def run_dream_now(body: DreamRunIn, request: Request) -> DreamRunOut:

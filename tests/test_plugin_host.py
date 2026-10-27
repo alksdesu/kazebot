@@ -693,7 +693,7 @@ def setup(api):
     class BaseTools:
         def __init__(self, **kwargs):
             pass
-        async def load_mcp_tools(self):
+        async def load_mcp_tools(self, *, seqs=None):
             return 0
 
     async def ready(*args, **kwargs):

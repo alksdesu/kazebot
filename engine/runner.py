@@ -48,6 +48,7 @@ from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allow
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, entry_node_problem, load_node, missing_node_reason, node_file, node_files
+from .tool_reload import ToolReloadFollower, fetch_reload_seqs
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
@@ -623,7 +624,6 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     generation_id = str(uuid.uuid4())  # Direction 2: unique generation per engine startup
     runtime_cfg = load_runtime_config(workspace_root)
     registry = ToolRegistry(workspace_root=workspace_root, tools_dir=workspace_root / "tools")
-    _last_reload_seq = 0
 
     sup_timeout = get_float(runtime_cfg, "engine.http.client_timeout_sec", 60.0, min_value=5.0, max_value=600.0)
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
@@ -658,7 +658,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         # Token should already be resolved from env or shared file above.
         # Register no longer returns admin_token to avoid API-based token leakage.
 
-        mcp_count = await registry.load_mcp_tools()
+        # 先取序号再加载：加载途中别处改了配置，下一轮比序号照样看得出来
+        reload_seqs = await fetch_reload_seqs(http, supervisor_url)
+        mcp_count = await registry.load_mcp_tools(seqs=reload_seqs)
         if mcp_count:
             print(f"[engine] loaded {mcp_count} MCP tools", flush=True)
 
@@ -686,6 +688,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         http = plugin_host.register_base("supervisor_http", http)
         llm_http = plugin_host.register_base("llm_http", llm_http)
         await plugin_host.start()
+        tool_reload = ToolReloadFollower(registry, http, supervisor_url, seen=reload_seqs)
         plugin_refresh_at = 0.0
         outbox_flush_at = 0.0
         outbox_task: asyncio.Task | None = None
@@ -713,16 +716,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                     _active -= _done
 
                     # ---- tools hot-reload check ----
-                    try:
-                        rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
-                        if rr.status_code == 200:
-                            new_seq = int(rr.json().get("seq", 0))
-                            if new_seq > _last_reload_seq:
-                                _last_reload_seq = new_seq
-                                count = registry.reload()
-                                print(f"[engine] tools reloaded ({count} tools)", flush=True)
-                    except Exception:
-                        pass
+                    reloaded = await tool_reload.poll()
+                    if reloaded is not None:
+                        print(f"[engine] tools reloaded ({reloaded} tools)", flush=True)
 
                     # ---- poll for new task (only if below capacity) ----
                     # 等审批的任务不占名额；空位数带给 supervisor，它据此给交互道留位置
@@ -753,6 +749,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             if outbox_task is not None and not outbox_task.done():
                 outbox_task.cancel()
                 await asyncio.gather(outbox_task, return_exceptions=True)
+            await tool_reload.aclose()
             # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
             if _active:
                 print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)

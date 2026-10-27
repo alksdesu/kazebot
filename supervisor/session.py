@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from toolbox.reload_seqs import ReloadSeqs
+
 from ._helpers import SessionInfo, _now
 from .types import ApprovalStatus, RouteStatus, Task, TaskKind, TaskStatus
 
@@ -436,9 +438,25 @@ class SessionMixin:
             self._tools_reload_seq += 1
             return self._tools_reload_seq
 
-    def tools_reload_seq(self) -> int:
+    def bump_mcp_config(self) -> int:
         with self._lock:
-            return self._tools_reload_seq
+            self._mcp_config_seq += 1
+            return self._mcp_config_seq
+
+    def bump_mcp_reload(self) -> int:
+        with self._lock:
+            self._mcp_reload_seq += 1
+            return self._mcp_reload_seq
+
+    def reload_seqs(self) -> ReloadSeqs:
+        """几个重载序号一次取齐；带上本次运行的 run_id，engine 才认得出 supervisor 重启后序号从头数了。"""
+        with self._lock:
+            return ReloadSeqs(
+                run_id=self.eventlog.run_id,
+                scripts=self._tools_reload_seq,
+                mcp_config=self._mcp_config_seq,
+                mcp_reload=self._mcp_reload_seq,
+            )
 
     # ---- 事件 apply（rebuild 用） ----
 

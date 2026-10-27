@@ -23,6 +23,7 @@ from supervisor.admin_api import create_admin_router  # noqa: E402
 from supervisor.config_store import check_models_text  # noqa: E402
 from supervisor.policy import check_policy_text  # noqa: E402
 from supervisor.scheduler import schedules_path  # noqa: E402
+from toolbox.mcp_runtime import McpConfigError, check_mcp_text  # noqa: E402
 
 _TOKEN = "rt-raw-editor-token"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
@@ -85,6 +86,8 @@ _REFUSED = [
     ("/schedules/raw", "data/schedules.yaml", "- a list\n"),
     ("/mcp-clients/raw", "config/mcp.yaml", "clients: 5\n"),
     ("/mcp-clients/raw", "config/mcp.yaml", "clients: [unclosed\n"),
+    ("/mcp-clients/raw", "config/mcp.yaml", "version: abc\nclients: {}\n"),
+    ("/mcp-clients/raw", "config/mcp.yaml", "- a list\n"),
     ("/nodes/scout/raw", "config/nodes/scout.yaml", "just a string\n"),
     ("/drawtools/settings/raw", "config/drawtools/settings.yaml", "- a list\n"),
 ]
@@ -166,3 +169,64 @@ class TestTheChecksThemselves:
         warnings = check_policy_text("read_file:\n  rules:\n    - {pattern: a, decision: deny, reson: typo}\n")
 
         assert len(warnings) == 1 and "read_file.rules[0].reson" in warnings[0]
+
+    @pytest.mark.parametrize("text", [
+        "", "version: 1\nclients: {}\n", "clients:\n  fs:\n    command: npx\n",
+        "clients:\n  - id: fs\n    command: npx\n", "clients:\n",
+    ])
+    def test_mcp_configs_that_load_are_accepted(self, text: str) -> None:
+        assert check_mcp_text(text) == []
+
+    @pytest.mark.parametrize("text", ["clients: [x\n", "- a\n", "version: abc\n", "clients: 5\n", "clients: text\n"])
+    def test_mcp_configs_that_would_not_load_are_refused(self, text: str) -> None:
+        # 运行期读到这样的文件只能沿用上一份，或者按没有客户端算。
+        with pytest.raises(McpConfigError):
+            check_mcp_text(text)
+
+
+class TestTheMcpClientList:
+    def test_the_clients_in_the_file_are_listed_under_their_ids(self, admin, ws: Path) -> None:
+        _write(config_layout.mcp_path(ws), "clients:\n  web:\n    url: http://x\n  fs:\n    command: npx\n    id: other\n")
+
+        response = admin("GET", "/mcp-clients")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == [{"command": "npx", "id": "fs"}, {"url": "http://x", "id": "web"}]
+
+    def test_clients_written_as_a_list_are_listed_too(self, admin, ws: Path) -> None:
+        # 运行期认这种写法，控制台不能把它显示成没有客户端。
+        _write(config_layout.mcp_path(ws), "clients:\n  - id: fs\n    command: npx\n")
+
+        response = admin("GET", "/mcp-clients")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == [{"command": "npx", "id": "fs"}]
+
+    def test_no_file_means_no_clients(self, admin) -> None:
+        response = admin("GET", "/mcp-clients")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == []
+
+    @pytest.mark.parametrize("content", ["clients: [unclosed\n", "version: abc\nclients: {}\n", "- a list\n"])
+    def test_an_unusable_file_is_reported_instead_of_shown_as_empty(self, admin, ws: Path, content: str) -> None:
+        _write(config_layout.mcp_path(ws), content)
+
+        response = admin("GET", "/mcp-clients")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail.startswith(f"{config_layout.MCP_FILE} 用不了")
+        assert detail.endswith("先修好这份文件再改")
+
+    def test_the_raw_editor_still_opens_and_fixes_an_unusable_file(self, admin, ws: Path) -> None:
+        _write(config_layout.mcp_path(ws), "clients: [unclosed\n")
+
+        opened = admin("GET", "/mcp-clients/raw")
+        saved = admin("PUT", "/mcp-clients/raw", json={
+            "content": "clients:\n  fs:\n    command: npx\n", "base_hash": opened.json()["hash"],
+        })
+
+        assert opened.status_code == 200 and opened.json()["content"] == "clients: [unclosed\n"
+        assert saved.status_code == 200, saved.text
+        assert admin("GET", "/mcp-clients").json() == [{"command": "npx", "id": "fs"}]

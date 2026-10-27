@@ -319,6 +319,23 @@ class TestMcpToolsSurviveAScriptReload:
 
         assert registry.get_spec("own") is not None
 
+    def test_an_mcp_tool_shadowed_by_a_script_comes_back_when_the_script_goes(
+        self, ws: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 脚本删掉以后只做一次脚本重扫：MCP 那边不重连，被挡住的工具也得自己回来
+        self._clients(monkeypatch, "fs")
+        shadow = _write(config_layout.custom_tools_dir(ws) / "shadow.py", _spec("mcp_fs_ping"))
+        registry = ToolRegistry(workspace_root=ws, tools_dir=bundled)
+
+        assert asyncio.run(registry.load_mcp_tools()) == 0
+        assert registry.get_spec("mcp_fs_ping")["description"] == "mcp_fs_ping tool"
+
+        shadow.unlink()
+        registry.reload()
+
+        assert registry.get_spec("mcp_fs_ping")["description"] == "[MCP:fs] from fs"
+        assert registry.mcp_tool_count() == 1
+
 
 class TestTheSupervisorSideCatalog:
     def test_each_entry_carries_its_origin_and_relative_path(self, ws: Path, bundled: Path, code_root: Path) -> None:

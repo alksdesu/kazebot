@@ -5,6 +5,7 @@ import atexit
 import base64
 import binascii
 import contextvars
+import copy
 import dataclasses
 import hashlib
 import itertools
@@ -112,22 +113,23 @@ def _normalize_client_id(client_id: Any) -> str:
     return s
 
 
-def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
-    p = _config_path(workspace_root)
-    if not p.exists():
-        return _default_config()
+class McpConfigError(ValueError):
+    """config/mcp.yaml 用不了：读不了、解析不了，或者结构不对。"""
 
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-    except Exception:
-        return _default_config()
 
+def _parse_config(data: Any) -> dict[str, Any]:
+    """yaml 读出来的内容整理成 {"version", "clients"}，clients 写成列表的按每项的 id 收。用不了抛 McpConfigError。"""
+    if data is None:
+        return _default_config()
     if not isinstance(data, dict):
-        return _default_config()
+        raise McpConfigError("顶层必须是映射（key: value）")
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError) as exc:
+        raise McpConfigError(f"version 要写成整数，写的是 {data.get('version')!r}") from exc
 
     raw_clients = data.get("clients")
     clients: dict[str, Any] = {}
-
     if isinstance(raw_clients, dict):
         for cid, spec in raw_clients.items():
             if isinstance(cid, str) and isinstance(spec, dict):
@@ -141,11 +143,89 @@ def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
                 copied = dict(item)
                 copied.pop("id", None)
                 clients[cid.strip()] = copied
+    elif raw_clients is not None:
+        raise McpConfigError("clients 要写成「客户端 id: 配置」的映射")
+    return {"version": version, "clients": clients}
 
-    return {
-        "version": int(data.get("version") or 1),
-        "clients": clients,
-    }
+
+def _parse_mcp_text(text: str) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise McpConfigError(f"YAML 解析失败：{exc}") from exc
+    return _parse_config(data)
+
+
+def check_mcp_text(text: str) -> list[str]:
+    """控制台原文编辑器保存前的校验，和运行期读文件是同一套：这里不过的，存下去运行期也只能沿用上一份。"""
+    _parse_mcp_text(text)
+    return []
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConfigVersion:
+    """mcp.yaml 按某一版文件读出来的样子。文件写坏时 config 停在上一份能用的，error 说明为什么。"""
+
+    stamp: tuple[int, int, int] | None
+    config: dict[str, Any]
+    error: str = ""
+
+
+_CONFIG_VERSIONS: dict[str, _ConfigVersion] = {}
+_CONFIG_VERSIONS_LOCK = threading.Lock()
+
+
+def _read_config_file(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return _default_config()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise McpConfigError(f"读不了：{exc}") from exc
+    return _parse_mcp_text(text)
+
+
+def _unusable(error: str, kept: dict[str, Any]) -> str:
+    fallback = "沿用上一份能用的" if kept.get("clients") else "现在按没有客户端算"
+    return f"{_CONFIG_REL_PATH} 用不了，{fallback}：{error}"
+
+
+def _config_version(workspace_root: Path) -> _ConfigVersion:
+    """按 file_stamp 认出改动。新的那版用不了时记一次日志、沿用上一份能用的；这个进程还没读成过，就按没有客户端算。"""
+    path = _config_path(workspace_root)
+    stamp = config_layout.file_stamp(path)
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _CONFIG_VERSIONS_LOCK:
+        cached = _CONFIG_VERSIONS.get(key)
+        if cached is not None and cached.stamp == stamp:
+            return cached
+        try:
+            version = _ConfigVersion(stamp, _read_config_file(path))
+        except McpConfigError as exc:
+            kept = cached.config if cached is not None else _default_config()
+            version = _ConfigVersion(stamp, kept, str(exc))
+            logger.warning("%s", _unusable(version.error, kept))
+        _CONFIG_VERSIONS[key] = version
+        return version
+
+
+def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
+    """调用期读的那份：文件写坏时是上一份能用的。给的是副本。"""
+    return copy.deepcopy(_config_version(workspace_root).config)
+
+
+def editable_config(workspace_root: Path) -> dict[str, Any]:
+    """照着显示、照着改的那份。文件现在用不了就抛 McpConfigError，不拿上一份或空配置顶上：改完写回去，整份坏文件就只剩改的那一项了。"""
+    version = _config_version(workspace_root)
+    if version.error:
+        raise McpConfigError(f"{_CONFIG_REL_PATH} 用不了：{version.error}。先修好这份文件再改")
+    return copy.deepcopy(version.config)
+
+
+def config_error(workspace_root: Path) -> str:
+    """文件现在为什么用不了、调用按哪份在跑；空串表示用的就是文件里那份。"""
+    version = _config_version(workspace_root)
+    return _unusable(version.error, version.config) if version.error else ""
 
 
 def _save_raw_config(workspace_root: Path, cfg: dict[str, Any]) -> None:
@@ -249,7 +329,7 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
         }
 
     with config_layout.locked(_config_path(workspace_root)):
-        cfg = _load_raw_config(workspace_root)
+        cfg = editable_config(workspace_root)
         clients = cfg.get("clients")
         if not isinstance(clients, dict):
             clients = {}
@@ -273,7 +353,7 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
 def delete_client(workspace_root: Path, client_id: str) -> bool:
     cid = _normalize_client_id(client_id)
     with config_layout.locked(_config_path(workspace_root)):
-        cfg = _load_raw_config(workspace_root)
+        cfg = editable_config(workspace_root)
         clients = cfg.get("clients")
         if not isinstance(clients, dict) or cid not in clients:
             return False
@@ -480,39 +560,49 @@ def _pool_key(workspace_root: Path, client_id: str) -> tuple[str, str]:
     return _root_key(workspace_root), _normalize_client_id(client_id)
 
 
+def _launch_fields(spec: dict[str, Any]) -> tuple[str, bool, dict[str, Any]]:
+    """一份客户端配置（list_clients 的一项）解析后的传输方式、共不共用会话和连接参数，引用的变量按现在的值展开。"""
+    transport = str(spec.get("transport") or "stdio")
+    share_sessions = bool(spec.get("share_sessions"))
+    if transport == "stdio":
+        return transport, share_sessions, {
+            "command": str(spec.get("command") or "").strip(),
+            "args": tuple(str(x) for x in spec.get("args") or []),
+            "env": tuple(sorted((str(k), resolve_env_ref(v)) for k, v in (spec.get("env") or {}).items())),
+        }
+    return transport, share_sessions, {
+        "url": str(spec.get("url") or "").strip(),
+        "headers": tuple(sorted((str(k), resolve_env_ref(v)) for k, v in (spec.get("headers") or {}).items())),
+    }
+
+
+def _fingerprint(transport: str, share_sessions: bool, fields: dict[str, Any]) -> str:
+    # 共享与否也进指纹：切换后旧会话一律退役，里面攒下的状态不带进新的分法
+    material = json.dumps([transport, share_sessions, fields], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def launch_fingerprint(spec: dict[str, Any]) -> str:
+    """会话池换会话认的就是这个指纹：它变了，起出来的可能是另一个服务，工具表也得重列。"""
+    return _fingerprint(*_launch_fields(spec))
+
+
 def _launch_plan(workspace_root: Path, client_id: str) -> _LaunchPlan:
     spec = get_client_spec(workspace_root, client_id)
     cid = str(spec["id"])
     if not bool(spec.get("enabled", True)):
         raise RuntimeError(f"MCP client is disabled: {cid}")
 
-    transport = str(spec.get("transport") or "stdio")
-    share_sessions = bool(spec.get("share_sessions"))
-    fields: dict[str, Any]
-    if transport == "stdio":
-        command = str(spec.get("command") or "").strip()
-        if not command:
-            raise RuntimeError("stdio client missing command")
-        fields = {
-            "command": command,
-            "args": tuple(str(x) for x in spec.get("args") or []),
-            "env": tuple(sorted((str(k), resolve_env_ref(v)) for k, v in (spec.get("env") or {}).items())),
-        }
-    else:
-        url = str(spec.get("url") or "").strip()
-        if not url:
-            raise RuntimeError(f"{transport} client missing url")
-        fields = {
-            "url": url,
-            "headers": tuple(sorted((str(k), resolve_env_ref(v)) for k, v in (spec.get("headers") or {}).items())),
-        }
-    # 共享与否也进指纹：切换后旧会话一律退役，里面攒下的状态不带进新的分法
-    material = json.dumps([transport, share_sessions, fields], ensure_ascii=False, sort_keys=True)
+    transport, share_sessions, fields = _launch_fields(spec)
+    if transport == "stdio" and not fields["command"]:
+        raise RuntimeError("stdio client missing command")
+    if transport != "stdio" and not fields["url"]:
+        raise RuntimeError(f"{transport} client missing url")
     return _LaunchPlan(
         key=_pool_key(workspace_root, cid),
         client_id=cid,
         transport=transport,
-        fingerprint=hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        fingerprint=_fingerprint(transport, share_sessions, fields),
         share_sessions=share_sessions,
         **fields,
     )

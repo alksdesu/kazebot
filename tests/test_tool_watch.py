@@ -1,7 +1,7 @@
-"""config/tools 的指纹。
+"""config/tools 和 config/mcp.yaml 的指纹，以及 engine 每轮来问的重载序号。
 
-共享组里别的实例加了、改了、删了一个脚本工具，这边没人通知；engine 每轮都来问 reload-seq，
-序号变了才重载。扫目录的频率得压住，但一次改动必须恰好报一次。
+共享组里别的实例、控制台、手改动了脚本工具或 MCP 配置，这边没人通知；engine 每轮都来问 reload-seq，
+序号变了才跟上。扫目录的频率得压住，但一次改动必须恰好报一次。
 """
 from __future__ import annotations
 
@@ -24,24 +24,34 @@ import config_layout  # noqa: E402
 import supervisor.api as supervisor_api  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 import supervisor.tool_watch as tool_watch  # noqa: E402
+import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.share_groups import _make_dir_link  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
-from supervisor.tool_watch import ToolTreeWatch  # noqa: E402
+from supervisor.tool_watch import McpConfigWatch, ToolTreeWatch  # noqa: E402
+from toolbox.reload_seqs import ReloadSeqs  # noqa: E402
 
 _TOKEN = "test-tool-watch-token"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
 
 _SCRIPT = "SPEC = {'name': 'alpha'}\n"
+_MCP = "clients:\n  fs:\n    command: npx\n"
 
 
 def _tool(root: Path, rel: str, text: str = _SCRIPT) -> Path:
     path = root / "config" / "tools" / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _mcp(root: Path, text: str = _MCP) -> Path:
+    """按生产里的保存路径写 config/mcp.yaml：同目录临时文件替换，每次换 inode。"""
+    path = config_layout.mcp_path(root)
+    config_layout.write_config_text(path, text)
     return path
 
 
@@ -198,14 +208,103 @@ class TestTheResolvedDirectory:
         assert watch.changed() is False
 
 
+class TestTheMcpConfigFile:
+    @pytest.fixture
+    def mcp_watch(self, tmp_path: Path) -> McpConfigWatch:
+        _mcp(tmp_path)
+        return McpConfigWatch(tmp_path, min_interval=0.0)
+
+    def test_an_untouched_file_never_reports(self, mcp_watch: McpConfigWatch) -> None:
+        assert mcp_watch.changed() is False
+        assert mcp_watch.changed() is False
+
+    def test_an_edit_reports_once(self, mcp_watch: McpConfigWatch, tmp_path: Path) -> None:
+        _mcp(tmp_path, "clients:\n  fs:\n    command: npx\n    args: [--other]\n")
+
+        assert mcp_watch.changed() is True
+        assert mcp_watch.changed() is False
+
+    def test_a_same_size_save_in_the_same_tick_is_noticed(self, mcp_watch: McpConfigWatch, tmp_path: Path) -> None:
+        path = config_layout.mcp_path(tmp_path)
+        before = path.stat()
+        replacement = "clients:\n  fs:\n    command: npm\n"
+        assert len(replacement) == len(_MCP)
+
+        _mcp(tmp_path, replacement)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        after = path.stat()
+        assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+        assert after.st_ino != before.st_ino
+        assert mcp_watch.changed() is True
+        assert mcp_watch.changed() is False
+
+    def test_removing_the_file_reports_once(self, mcp_watch: McpConfigWatch, tmp_path: Path) -> None:
+        config_layout.mcp_path(tmp_path).unlink()
+
+        assert mcp_watch.changed() is True
+        assert mcp_watch.changed() is False
+
+    def test_a_missing_file_is_not_a_change_until_it_appears(self, tmp_path: Path) -> None:
+        watch = McpConfigWatch(tmp_path, min_interval=0.0)
+        assert watch.changed() is False
+
+        _mcp(tmp_path)
+
+        assert watch.changed() is True
+        assert watch.changed() is False
+
+    def test_a_broken_save_is_a_change_like_any_other(self, mcp_watch: McpConfigWatch, tmp_path: Path) -> None:
+        # 写坏也得让各 worker 知道：它们自己决定沿用上一份，修好那次同样要报
+        _mcp(tmp_path, "clients: [unclosed\n")
+        assert mcp_watch.changed() is True
+
+        _mcp(tmp_path)
+        assert mcp_watch.changed() is True
+
+    def test_every_version_it_sees_is_read_so_a_later_breakage_is_reported_as_kept(self, tmp_path: Path) -> None:
+        """supervisor 自己不调 MCP，诊断却要说清 worker 在用哪份：它得像 worker 一样读过每一版能用的。"""
+        root = tmp_path / "ws"
+        watch = McpConfigWatch(root, min_interval=0.0)
+        _mcp(root)
+        assert watch.changed() is True
+
+        _mcp(root, "clients: [unclosed\n")
+        assert watch.changed() is True
+
+        assert mcp_runtime.config_error(root).startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
+
+    def test_swapping_config_for_a_group_link_counts_even_when_the_file_is_the_same(self, tmp_path: Path) -> None:
+        """换了共享组就是换了一份配置。两边是同一个文件的硬链接时 file_stamp 一模一样，只剩解析到哪里不同。"""
+        root = tmp_path / "ws"
+        original = _mcp(root)
+        group = tmp_path / "group"
+        (group / "config").mkdir(parents=True)
+        try:
+            os.link(original, group / "config" / "mcp.yaml")
+        except OSError as exc:
+            pytest.skip(f"这个文件系统建不了硬链接：{exc}")
+        watch = McpConfigWatch(root, min_interval=0.0)
+
+        os.rename(root / "config", tmp_path / "config.archived")
+        _make_dir_link(root / "config", group / "config")
+
+        assert config_layout.file_stamp(config_layout.mcp_path(root)) == config_layout.file_stamp(
+            tmp_path / "config.archived" / "mcp.yaml"
+        )
+        assert watch.changed() is True
+        assert watch.changed() is False
+
+
 # ---------------------------------------------------------------------------
-#  GET /v1/tools/reload-seq
+#  GET /v1/tools/reload-seq、POST /v1/tools/reload
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def api(root: Path, monkeypatch: pytest.MonkeyPatch):
-    # 真的 ToolTreeWatch，只是把扫描间隔压到 0：engine 的轮询频率不是这里要测的东西。
+    # 真的两个 watch，只是把扫描间隔压到 0：engine 的轮询频率不是这里要测的东西。
     monkeypatch.setattr(supervisor_api, "ToolTreeWatch", functools.partial(ToolTreeWatch, min_interval=0.0))
+    monkeypatch.setattr(supervisor_api, "McpConfigWatch", functools.partial(McpConfigWatch, min_interval=0.0))
     monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
@@ -219,21 +318,27 @@ def api(root: Path, monkeypatch: pytest.MonkeyPatch):
         config_store=ConfigStore(path=root / "config" / "models.yaml", workspace_root=root),
     )
 
-    def call(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    def call(method: str, url: str, *, headers: dict[str, str] | None = None, **kwargs: Any) -> httpx.Response:
         async def go() -> httpx.Response:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
-                return await http.request(method, url, headers=_AUTH, **kwargs)
+                return await http.request(method, url, headers=_AUTH if headers is None else headers, **kwargs)
 
         return asyncio.run(go())
 
     return call
 
 
-def _seq(api: Any) -> int:
+def _seqs(api: Any) -> ReloadSeqs:
     response = api("GET", "/v1/tools/reload-seq")
     assert response.status_code == 200, response.text
-    return response.json()["seq"]
+    seqs = ReloadSeqs.from_payload(response.json())
+    assert seqs is not None, response.text
+    return seqs
+
+
+def _seq(api: Any) -> int:
+    return _seqs(api).scripts
 
 
 class TestTheReloadSeqEndpoint:
@@ -283,3 +388,69 @@ class TestTheReloadSeqEndpoint:
         _tool(root, "__pycache__/alpha.cpython-312.py")
 
         assert _seq(api) == first
+
+
+class TestTheMcpSequences:
+    def test_the_answer_carries_this_runs_id_and_every_counter(self, api: Any) -> None:
+        # run_id 换了 engine 才知道 supervisor 重启过、序号从头数了
+        assert _seqs(api) == ReloadSeqs(run_id="run-tool-watch", scripts=0, mcp_config=0, mcp_reload=0)
+
+    def test_an_mcp_config_edit_bumps_only_its_own_counter_once(self, api: Any, root: Path) -> None:
+        first = _seqs(api)
+
+        _mcp(root)
+
+        bumped = _seqs(api)
+        assert bumped.mcp_config > first.mcp_config
+        assert (bumped.scripts, bumped.mcp_reload) == (first.scripts, first.mcp_reload)
+        assert _seqs(api) == bumped
+
+    def test_a_script_edit_leaves_the_mcp_counters_alone(self, api: Any, root: Path) -> None:
+        first = _seqs(api)
+
+        _tool(root, "beta.py")
+
+        bumped = _seqs(api)
+        assert bumped.scripts > first.scripts
+        assert (bumped.mcp_config, bumped.mcp_reload) == (first.mcp_config, first.mcp_reload)
+
+    @pytest.mark.parametrize("body", [None, {}, {"mcp": False}])
+    def test_a_reload_request_without_mcp_bumps_only_the_scripts(self, api: Any, body: Any) -> None:
+        first = _seqs(api)
+
+        response = api("POST", "/v1/tools/reload", json=body)
+
+        assert response.status_code == 200, response.text
+        answered = ReloadSeqs.from_payload(response.json())
+        assert response.json()["ok"] is True
+        assert answered == ReloadSeqs(
+            run_id=first.run_id, scripts=first.scripts + 1, mcp_config=first.mcp_config, mcp_reload=first.mcp_reload,
+        )
+        assert _seqs(api) == answered
+
+    def test_a_reload_request_with_mcp_also_bumps_the_explicit_mcp_counter(self, api: Any) -> None:
+        first = _seqs(api)
+
+        response = api("POST", "/v1/tools/reload", json={"mcp": True})
+
+        assert response.status_code == 200, response.text
+        assert ReloadSeqs.from_payload(response.json()) == ReloadSeqs(
+            run_id=first.run_id, scripts=first.scripts + 1, mcp_config=first.mcp_config,
+            mcp_reload=first.mcp_reload + 1,
+        )
+
+    def test_a_reload_request_without_the_admin_token_bumps_nothing(self, api: Any) -> None:
+        first = _seqs(api)
+
+        response = api("POST", "/v1/tools/reload", json={"mcp": True}, headers={})
+
+        assert response.status_code == 401
+        assert _seqs(api) == first
+
+    def test_an_unreadable_mcp_switch_is_refused_instead_of_guessed(self, api: Any) -> None:
+        first = _seqs(api)
+
+        response = api("POST", "/v1/tools/reload", json={"mcp": "sometimes"})
+
+        assert response.status_code == 422
+        assert _seqs(api) == first

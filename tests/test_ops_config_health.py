@@ -1,7 +1,7 @@
-"""策略文件和运行参数文件写坏时，健康检查要说出来。
+"""策略文件、运行参数文件和 MCP 配置文件写坏时，健康检查要说出来。
 
-两份文件解析失败时沿用上一份能用的配置，起进程时就坏的用内置默认，服务照常跑；不报出来的话，
-人只会看到自定义的规则、参数悄悄不生效。
+这几份文件解析失败时沿用上一份能用的配置，起进程时就坏的用内置默认（MCP 配置一份都没读成过时按没有客户端算），服务照常跑；
+不报出来的话，人只会看到自定义的规则、参数、MCP 工具悄悄不生效。
 """
 from __future__ import annotations
 
@@ -10,9 +10,12 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config_layout  # noqa: E402
+import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from tests.test_operations_features import check, service  # noqa: E402
 
@@ -73,3 +76,43 @@ def test_a_healthy_runtime_adds_no_check(tmp_path: Path) -> None:
     report = asyncio.run(service(tmp_path).diagnose())
 
     assert "运行参数文件" not in _names(report)
+
+
+def _mcp_file(root: Path, text: str) -> Path:
+    path = root / config_layout.MCP_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config_layout.write_config_text(path, text)
+    return path
+
+
+def test_an_mcp_file_broken_while_running_is_reported_as_kept(tmp_path: Path) -> None:
+    path = _mcp_file(tmp_path, "clients:\n  fs:\n    command: npx\n")
+    assert mcp_runtime.config_error(tmp_path) == ""
+    config_layout.write_config_text(path, "clients: [unclosed\n")
+
+    report = asyncio.run(service(tmp_path).diagnose())
+
+    item = check(report, "MCP 配置文件")
+    assert item["status"] == "warning"
+    assert item["detail"].startswith(f"{config_layout.MCP_FILE} 用不了，沿用上一份能用的")
+    assert config_layout.MCP_FILE in item["action"]
+
+
+def test_an_mcp_file_broken_from_the_start_says_there_are_no_clients(tmp_path: Path) -> None:
+    _mcp_file(tmp_path, "clients: [unclosed\n")
+
+    report = asyncio.run(service(tmp_path).diagnose())
+
+    item = check(report, "MCP 配置文件")
+    assert item["status"] == "warning"
+    assert item["detail"].startswith(f"{config_layout.MCP_FILE} 用不了，现在按没有客户端算")
+
+
+@pytest.mark.parametrize("text", [None, "clients:\n  fs:\n    command: npx\n"])
+def test_a_missing_or_healthy_mcp_file_adds_no_check(tmp_path: Path, text: str | None) -> None:
+    if text is not None:
+        _mcp_file(tmp_path, text)
+
+    report = asyncio.run(service(tmp_path).diagnose())
+
+    assert "MCP 配置文件" not in _names(report)

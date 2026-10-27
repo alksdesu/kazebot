@@ -1,6 +1,6 @@
-"""工具目录：supervisor 侧「有哪些工具」的唯一答案。
+"""工具目录：supervisor 侧按注册表的内置、插件、脚本三个来源重建的工具清单，不含 MCP 工具。
 
-真正的注册表只活在 engine worker 进程里，这边按它的三个来源各自重建一遍。
+真正的注册表只活在 engine worker 进程里；MCP 工具要连上服务端才列得出来，只有各个 worker 知道。
 手抄一份名字集合迟早和注册表漂移 —— 界面上少一个工具，等于那个工具没人管得到。
 """
 from __future__ import annotations
