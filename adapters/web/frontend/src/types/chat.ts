@@ -75,8 +75,11 @@ export interface NodeDef {
   name?: string;
   description?: string;
   model?: string;
+  base_url?: string;
   provider?: string;
   delegate_targets?: string[];
+  /** engine 还认的旧 id（yaml 里 aliases 声明、实际生效的那些）：会话、定时任务里记着旧 id 时照样找得到这个节点。 */
+  aliases?: string[];
 }
 
 export interface ApprovalInfo {

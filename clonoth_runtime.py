@@ -411,6 +411,12 @@ def main_session_enabled(config: dict[str, Any]) -> bool:
     return get_bool(config, "engine.child_session.main_session_enabled", True)
 
 
+def default_entry_node_id(workspace_root: Path) -> str:
+    """没带入口节点的消息交给谁：runtime 的 shell.entry_node_id，没写或写成空白时是代码里的默认。"""
+    fallback = DEFAULT_RUNTIME_CONFIG["shell"]["entry_node_id"]
+    return get_str(load_runtime_config(workspace_root), "shell.entry_node_id", fallback).strip() or fallback
+
+
 DEFAULT_TASK_MAX_RUNNING_SECONDS = 3600.0
 _MIN_TASK_MAX_RUNNING_SECONDS = 300.0
 # supervisor 每隔这么久检查一次卡死的 running 任务；dream 要据此留足等待余量，所以放在两边都能导入的地方

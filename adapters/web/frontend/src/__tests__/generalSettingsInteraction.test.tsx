@@ -1,6 +1,6 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useSettingsStore } from '../store/settingsStore';
+import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 
 const mocks = vi.hoisted(() => ({ health: vi.fn(), providers: vi.fn(), verify: vi.fn(), confirm: vi.fn(), disconnect: vi.fn() }));
 vi.mock('../api/supervisorClient', () => ({
@@ -23,13 +23,20 @@ function pending<T>() {
   return { resolve, promise };
 }
 
+const providerTable = (model: string) => ({
+  active_provider: 'openai',
+  providers: { openai: { model, base_url: '', api_key_present: false } },
+  fallbacks: [],
+  registered: ['openai'],
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.health.mockReset().mockResolvedValue({ status: 'ok' });
-  mocks.providers.mockReset().mockResolvedValue({ model: 'fixture-model', base_url: '', api_key_present: false });
+  mocks.providers.mockReset().mockResolvedValue(providerTable('fixture-model'));
   mocks.verify.mockReset();
   mocks.confirm.mockReturnValue(true);
-  useSettingsStore.setState({ adminToken: 'fixture-token', isAuthenticated: true, isConnected: false, availableNodes: [], modelConfig: null, storageWarning: '' });
+  useSettingsStore.setState({ adminToken: 'fixture-token', isAuthenticated: true, isConnected: false, availableNodes: [], modelConfig: null, storageWarning: '', providerTable: null, providerTableRead: UNREAD });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -56,11 +63,42 @@ describe('通用设置', () => {
     mocks.providers.mockReturnValue(data.promise);
     render(<GeneralSettingsPage />);
     fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
-    await act(async () => { data.resolve({ model: 'old-model', base_url: '', api_key_present: false }); });
+    await act(async () => { data.resolve(providerTable('old-model')); });
     const current = useSettingsStore.getState();
     expect(current.adminToken).toBeNull();
     expect(current.modelConfig).toBeNull();
     expect(current.activeNodeId).toBe('');
+    expect(current.providerTable).toBeNull();
+    expect(current.providerTableRead).toEqual(UNREAD);
+  });
+
+  it('退出登录把这次登录读到的东西连同读取状态一起清掉', async () => {
+    useSettingsStore.setState({
+      allNodes: [{ id: 'old.node', type: 'ai' }],
+      availableNodes: [{ id: 'old.node', type: 'ai' }],
+      nodeListRead: LOADED,
+      globalModel: 'old-global',
+      globalConfigRead: LOADED,
+      sessionProviderOverride: { model: 'old-session-model' },
+      sessionProviderOverrideSessionId: 'old-session',
+    });
+    render(<GeneralSettingsPage />);
+    await waitFor(() => expect(useSettingsStore.getState().providerTableRead).toEqual(LOADED));
+
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
+
+    expect(useSettingsStore.getState()).toMatchObject({
+      allNodes: [],
+      availableNodes: [],
+      nodeListRead: UNREAD,
+      globalModel: '',
+      globalConfigRead: UNREAD,
+      providerTable: null,
+      providerTableRead: UNREAD,
+      modelConfig: null,
+      sessionProviderOverride: null,
+      sessionProviderOverrideSessionId: '',
+    });
   });
 
   it('拒绝丢弃草稿时不退出登录', () => {

@@ -223,9 +223,7 @@ const Row = ({
         value={draft.vision}
         width="flex"
       >
-        <option value="auto">
-          {'跟随 ' + draft.type + ' 默认（' + (profiles?.defaultVision?.[draft.type] === false ? '看不了图' : '能看图') + '）'}
-        </option>
+        <option value="auto">{visionDefaultLabel(draft.type, profiles)}</option>
         <option value="yes">能看图</option>
         <option value="no">看不了图</option>
       </Select>
@@ -233,6 +231,13 @@ const Row = ({
     </fieldset>
   </Item>
 );
+
+/** 各格式的默认值没读到、或者里面没有这个格式时，只说跟随默认，不替它说看不看得了图。 */
+function visionDefaultLabel(type: string, profiles: ProviderProfiles | null): string {
+  const vision = profiles?.defaultVision?.[type];
+  if (typeof vision !== 'boolean') return '跟随 ' + type + ' 默认';
+  return '跟随 ' + type + ' 默认（' + (vision ? '能看图' : '看不了图') + '）';
+}
 
 /** 写死了自己渠道的节点不会跟随全局，切换前得让人知道。 */
 const NodeOverrides = ({ nodes }: { nodes: Array<{ id: string; provider: string }> }) => {
@@ -258,7 +263,10 @@ const ProvidersEditor = () => {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [pinned, setPinned] = useState<Draft[]>([]);
   const [overrides, setOverrides] = useState<Array<{ id: string; provider: string }>>([]);
+  const [overridesError, setOverridesError] = useState('');
   const [profiles, setProfiles] = useState<ProviderProfiles | null>(null);
+  const [profilesError, setProfilesError] = useState('');
+  const [hintAttempt, setHintAttempt] = useState(0);
   const [addName, setAddName] = useState('');
   const [addType, setAddType] = useState('');
   const [busy, setBusy] = useState(false);
@@ -280,25 +288,37 @@ const ProvidersEditor = () => {
         if (!request.isCurrent()) return;
         setError(errorMessage(caught));
       }
+    })();
+  }, [requests, token]);
+
+  // 节点表和各格式的默认值只是提示，读不到不挡这一页；但得说出来，不然看着就像没有节点写死渠道、地址也没问题。
+  // 和渠道分开读：重试它们不能把渠道重读一遍，那会冲掉没保存的草稿。
+  useEffect(() => {
+    if (!token) return;
+    const request = requests.begin('hints');
+    setOverridesError('');
+    setProfilesError('');
+    void (async () => {
       try {
         const list = await getNodes(token);
+        if (!Array.isArray(list)) throw new Error('节点表回来的不是列表');
         if (!request.isCurrent()) return;
         setOverrides(
           list
             .map((node) => ({ id: String(node.id || ''), provider: String(node.provider || '') }))
             .filter((node) => node.id && node.provider),
         );
-      } catch {
-        // 提示性信息，取不到就不提示，不该挡住这一页。
+      } catch (caught) {
+        if (request.isCurrent()) setOverridesError(errorMessage(caught));
       }
       try {
         const received = await getProviderProfiles(token);
         if (request.isCurrent()) setProfiles(received);
-      } catch {
-        // 同上：认不出域名就是不提示。
+      } catch (caught) {
+        if (request.isCurrent()) setProfilesError(errorMessage(caught));
       }
     })();
-  }, [requests, token]);
+  }, [requests, token, hintAttempt]);
 
   const storedBy = useMemo(
     () => new Map(pinned.map((draft) => [draft.name, draft])),
@@ -306,6 +326,11 @@ const ProvidersEditor = () => {
   );
   const dirty = drafts.some((draft) => changed(draft, storedBy.get(draft.name)));
   const confirmDiscard = useUnsavedChanges(dirty, '渠道配置还有未保存修改，确定离开或丢弃吗？');
+
+  const hintFailures = [
+    overridesError && '节点表读取失败，写死了自己渠道的节点列不出来：' + overridesError,
+    profilesError && '各格式的默认值读取失败，看不出跟随默认能不能看图，也核对不了地址是不是别家的：' + profilesError,
+  ].filter(Boolean);
 
   const families = data?.registered || [];
   // 名字留空就拿格式名当名字：同一家只开一个时，这和以前的行为一模一样。
@@ -451,6 +476,12 @@ const ProvidersEditor = () => {
         )}
 
         <NodeOverrides nodes={overrides} />
+        {hintFailures.length > 0 && (
+          <ErrorText role="alert">
+            {hintFailures.join('；')}{' '}
+            <Button onClick={() => setHintAttempt((value) => value + 1)} size="sm" tone="quiet">重试</Button>
+          </ErrorText>
+        )}
         {error && <ErrorText>{error}</ErrorText>}
         <SaveBar
           busy={busy}

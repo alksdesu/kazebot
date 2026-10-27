@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore } from '../store/chatStore';
-import { useSettingsStore } from '../store/settingsStore';
+import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 
 const NODES = [{ id: 'ereuna_main', type: 'ai', name: 'EreunaMain', model: 'node-model' }];
 
@@ -42,7 +42,7 @@ function defaultBody(url: string): unknown {
     return OVERRIDES[sid] ?? {};
   }
   if (url.endsWith('/config')) {
-    return { provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' } };
+    return { provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' }, default_entry_node_id: 'ereuna_main' };
   }
   return {};
 }
@@ -71,13 +71,20 @@ beforeEach(() => {
     adminToken: 'test-token',
     isAuthenticated: true,
     availableNodes: [],
+    allNodes: [],
+    nodeListRead: UNREAD,
     activeNodeId: '',
+    activeNodeSessionId: '',
     activeNodeIsOverride: false,
     defaultNodeId: '',
     entryNodeId: '',
     globalModel: '',
     globalBaseUrl: '',
+    globalConfigRead: UNREAD,
+    providerTable: null,
+    providerTableRead: UNREAD,
     sessionProviderOverride: null,
+    sessionProviderOverrideSessionId: '',
     modelConfig: null,
   });
   useChatStore.setState({ connectionStatus: 'open' });
@@ -102,7 +109,7 @@ describe('会话面板的拉取边界', () => {
 
   it('store 里已经有节点清单就不再去拉', async () => {
     // 从别的设置页进来时清单已经填好了，面板没有理由再要一遍。
-    useSettingsStore.setState({ availableNodes: NODES as never });
+    useSettingsStore.setState({ availableNodes: NODES as never, allNodes: NODES as never, nodeListRead: LOADED });
     const { calls } = installFetch();
 
     render(<SessionConfigPanel sessionId="session-1" />);

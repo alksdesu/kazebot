@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 
-import { getActiveNode, getAppConfig, getNodes, getSessionProviderOverride } from '../../api/supervisorClient';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../../store/settingsStore';
-import { filterEntryNodes } from '../../utils/entryNodes';
+import { readActiveNode, readGlobalConfig, readNodeList, readProviderTable, readSessionOverride } from '../../store/settingsReads';
+import { inheritanceSourcesOf, sessionLayerOf, sessionNodeLabel, sessionNodeRowOf, useSettingsStore } from '../../store/settingsStore';
 import { describeEnvRef } from '../../utils/envRef';
+import { inheritedField, type Inherited } from '../../utils/inheritedValue';
 import { Icon, Modal } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
 import { Button } from '../settings/pages/settingsControls';
@@ -22,57 +22,73 @@ interface HeaderProps {
   onExitChildSession?: () => void;
 }
 
+function modelText(model: Inherited): string {
+  if (model.known) return describeEnvRef(model.value) || '跟随默认模型';
+  if (model.status === 'missing') return '节点找不到';
+  return model.status === 'failed' ? '模型没读到' : '读取模型…';
+}
+
 export const Header = ({ title, sessionId, isGenerating, isCancelling = false, onCancel, onReset, onTitleChange, viewingChildNodeId, onExitChildSession }: HeaderProps) => {
-  const {
-    adminToken, availableNodes, activeNodeId, activeNodeSessionId, entryNodeId, globalModel,
-    sessionProviderOverride, sessionProviderOverrideSessionId, setActiveNode, setGlobalConfig,
-    setAvailableNodes, setSessionProviderOverride,
-  } = useSettingsStore();
+  const settings = useSettingsStore();
+  const { adminToken, nodeListRead, globalConfigRead, providerTableRead } = settings;
   const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'title' | null>(null);
   const [draftTitle, setDraftTitle] = useState(title);
+  // 这两路只在 store 里还没有这个会话的那份时才报：会话面板替它读成了，这里的红字自己就该消失
   const [nodeError, setNodeError] = useState('');
+  const [overrideError, setOverrideError] = useState('');
   const [refresh, setRefresh] = useState(0);
   const requests = useRequestGuard();
   const confirmDiscardTitle = useUnsavedChanges(configModalFocus === 'title' && draftTitle.trim() !== title, '对话标题尚未保存，确定放弃修改吗？');
   const sid = sessionId === 'no-session' ? '' : sessionId;
-  const nodeResolved = !sid || activeNodeSessionId === sid;
-  const displayNodeId = nodeResolved ? (activeNodeSessionId === sid ? activeNodeId : '') || entryNodeId : '';
-  const activeNode = availableNodes.find(node => node.id === displayNodeId);
-  const nodeModel = typeof activeNode?.model === 'string' ? activeNode.model : '';
-  const sessionModel = sessionProviderOverrideSessionId === sid && typeof sessionProviderOverride?.model === 'string' ? sessionProviderOverride.model : '';
-  const displayModel = describeEnvRef(sessionModel || nodeModel || globalModel) || '跟随默认模型';
+
+  const node = sessionNodeRowOf(settings, sid);
+  const model = inheritedField(inheritanceSourcesOf(settings, sid, sessionLayerOf(settings, sid, overrideError), nodeError), 'model');
+  const nodeLabel = !node.known ? (nodeError ? '节点没读到' : '读取节点…') : sessionNodeLabel(node) || '选择节点';
+  const modelLabel = modelText(model);
+
+  // 只报挡住了顶栏上这两项的失败：没用上的那几路读不读得到，这里看不出差别；节点表里认不出节点不是读失败，重试也读不出来
+  const failures = new Map<string, string>();
+  if (!node.known && nodeError) failures.set('当前节点', nodeError);
+  if (!model.known && model.status === 'failed') {
+    if (model.source === 'session') failures.set('会话覆盖', overrideError);
+    if (model.source === 'node' && node.known) failures.set('节点清单', nodeListRead.error);
+    if (model.source === 'channel') failures.set('渠道表', providerTableRead.error);
+    if (model.source === 'global') failures.set('全局配置', globalConfigRead.error);
+  }
+  const failureNames = [...failures.keys()].join('、');
+  const failureDetail = [...failures].map(([name, reason]) => `${name}：${reason}`).join('\n');
 
   useEffect(() => { setDraftTitle(title); }, [title]);
   useEffect(() => { setConfigModalFocus(null); }, [sessionId]);
   useEffect(() => {
     const request = requests.begin('session');
     setNodeError('');
+    setOverrideError('');
     if (sid) {
-      getActiveNode(sid).then(result => {
-        if (request.isCurrent()) setActiveNode(result.node_id, result.is_override, result.default_node_id, sid);
-      }).catch(() => { if (request.isCurrent()) setNodeError('节点状态读取失败'); });
+      void readActiveNode(sid, request).then(outcome => {
+        if (outcome && !outcome.ok && request.isCurrent()) setNodeError(outcome.error);
+      });
     }
     if (sid && adminToken) {
-      getSessionProviderOverride(sid, adminToken).then(result => {
-        if (request.isCurrent()) setSessionProviderOverride(result, sid);
-      }).catch(() => { if (request.isCurrent()) setSessionProviderOverride(null, sid); });
+      void readSessionOverride(sid, adminToken, request).then(outcome => {
+        if (outcome && !outcome.ok && request.isCurrent()) setOverrideError(outcome.error);
+      });
     }
     return () => { requests.drop('session'); };
-  }, [requests, sid, adminToken, refresh, setActiveNode, setSessionProviderOverride]);
+  }, [requests, sid, adminToken, refresh]);
   useEffect(() => {
-    const request = requests.begin('config');
-    getAppConfig().then(result => {
-      if (request.isCurrent()) setGlobalConfig(result.openai?.model || '', result.openai?.base_url || '');
-    }).catch(() => {});
-  }, [requests, setGlobalConfig]);
+    void readGlobalConfig(requests.begin('config'));
+  }, [requests, refresh]);
   useEffect(() => {
-    if (availableNodes.length > 0 || !adminToken) return;
-    const request = requests.begin('nodes');
-    getNodes(adminToken).then(nodes => {
-      if (request.isCurrent()) setAvailableNodes(filterEntryNodes(nodes));
-    }).catch(() => {});
+    if (nodeListRead.loaded || !adminToken) return;
+    void readNodeList(adminToken, requests.begin('nodes'));
     return () => { requests.drop('nodes'); };
-  }, [requests, adminToken, availableNodes.length, setAvailableNodes]);
+  }, [requests, adminToken, nodeListRead.loaded, refresh]);
+  useEffect(() => {
+    if (providerTableRead.loaded || !adminToken) return;
+    void readProviderTable(adminToken, requests.begin('providers'));
+    return () => { requests.drop('providers'); };
+  }, [requests, adminToken, providerTableRead.loaded, refresh]);
 
   const closeConfig = () => {
     if (configModalFocus === 'title' ? !confirmDiscardTitle() : !confirmNavigation()) return;
@@ -93,12 +109,12 @@ export const Header = ({ title, sessionId, isGenerating, isCancelling = false, o
         </h2>
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--duties-secondary)]">
           <button className="inline-flex max-w-full items-center gap-1.5 text-left" type="button" onClick={() => setConfigModalFocus('node')} title="切换节点">
-            <Icon name="hub" size={15} /><span className="truncate">{!nodeResolved ? '读取节点…' : activeNode?.name || displayNodeId || '选择节点'}</span>
+            <Icon name="hub" size={15} /><span className="truncate">{nodeLabel}</span>
           </button>
           <button className="inline-flex max-w-full items-center gap-1.5 text-left" type="button" onClick={() => setConfigModalFocus('model')} title="模型配置">
-            <Icon name="model_training" size={15} /><span className="truncate">{displayModel}</span>
+            <Icon name="model_training" size={15} /><span className="truncate">{modelLabel}</span>
           </button>
-          {nodeError && <button type="button" className="text-[var(--duties-danger)] underline" onClick={() => setRefresh(value => value + 1)}>{nodeError}，重试</button>}
+          {failureNames && <button type="button" className="text-[var(--duties-danger)] underline" title={failureDetail} onClick={() => setRefresh(value => value + 1)}>{failureNames}读取失败，重试</button>}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">

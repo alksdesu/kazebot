@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { RequestTicket } from '../../../api/requestGuard';
-import { activeProviderConfig, checkHealth, getProviders, HEALTH_TIMEOUT_MS } from '../../../api/supervisorClient';
+import { checkHealth, HEALTH_TIMEOUT_MS } from '../../../api/supervisorClient';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useChatStore } from '../../../store/chatStore';
+import { readProviderTable } from '../../../store/settingsReads';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { LoginPage } from '../../auth/LoginPage';
 import { Block, Button, PageShell } from './settingsControls';
 
 export const GeneralSettingsPage = () => {
-  const { adminToken, isAuthenticated, isConnected, storageWarning, setConnected, setModelConfig } = useSettingsStore();
+  const { adminToken, isAuthenticated, isConnected, storageWarning, setConnected } = useSettingsStore();
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState('');
   // 健康检查是公开端点，换登录不作废；模型配置跟着登录走。
@@ -43,11 +44,8 @@ export const GeneralSettingsPage = () => {
 
   useEffect(() => {
     if (!adminToken || !isAuthenticated) return;
-    const request = requests.begin('providers');
-    void getProviders(adminToken).then(providers => {
-      if (request.isCurrent()) setModelConfig(activeProviderConfig(providers));
-    }).catch(() => {});
-  }, [requests, adminToken, isAuthenticated, setModelConfig]);
+    void readProviderTable(adminToken, requests.begin('providers'));
+  }, [requests, adminToken, isAuthenticated]);
 
   const handleLogout = () => {
     if (!confirmNavigation()) return;
@@ -56,11 +54,7 @@ export const GeneralSettingsPage = () => {
     const settings = useSettingsStore.getState();
     settings.setAdminToken(null);
     settings.setAuthenticated(false);
-    settings.setAvailableNodes([]);
-    settings.setModelConfig(null);
-    settings.setActiveNode('', false, '');
-    settings.setSessionProviderOverride(null);
-    settings.setGlobalConfig('', '');
+    settings.clearLoginData();
   };
 
   return <PageShell title="通用" description="查看控制台连接，管理当前浏览器的管理员登录。退出登录不会停止机器人或后台任务。">

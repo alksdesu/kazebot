@@ -308,12 +308,42 @@ describe('切换活跃渠道', () => {
     expect(hint.textContent).not.toContain('qq.orchestrator');
   });
 
-  it('取不到节点清单时不提示，但页面照常能用', async () => {
-    vi.mocked(getNodes).mockRejectedValue(new Error('boom'));
+  it('取不到节点清单时说出来，页面照常能用，重试读到了就补上名单', async () => {
+    vi.mocked(getNodes).mockRejectedValueOnce(new Error('boom'));
     render(<ProvidersPage />);
     await ready();
-    expect(screen.queryByText(/写死了自己的渠道/)).toBeNull();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('节点表读取失败');
+    expect(alert.textContent).toContain('boom');
+    expect(screen.queryByText(/这 \d+ 个节点写死了自己的渠道/)).toBeNull();
     expect(rows()).toHaveLength(2);
+
+    fireEvent.click(within(alert).getByRole('button', { name: '重试' }));
+
+    const hint = await screen.findByText(/这 \d+ 个节点写死了自己的渠道/);
+    expect(hint.textContent).toContain('qq.vision');
+    expect(screen.queryByText(/节点表读取失败/)).toBeNull();
+    // 重试只补提示，不重读渠道：重读会把没保存的草稿冲掉
+    expect(getProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it('节点表回来的不是列表也算没读成', async () => {
+    vi.mocked(getNodes).mockResolvedValue({ detail: 'oops' } as any);
+    render(<ProvidersPage />);
+    await ready();
+    expect((await screen.findByRole('alert')).textContent).toContain('节点表回来的不是列表');
+  });
+
+  it('重试提示时不冲掉没保存的草稿', async () => {
+    vi.mocked(getNodes).mockRejectedValueOnce(new Error('boom'));
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.change(within(rowFor('anthropic')).getByLabelText('anthropic 模型'), { target: { value: 'unsaved-model' } });
+
+    fireEvent.click(within(await screen.findByRole('alert')).getByRole('button', { name: '重试' }));
+
+    await screen.findByText(/这 \d+ 个节点写死了自己的渠道/);
+    expect((within(rowFor('anthropic')).getByLabelText('anthropic 模型') as HTMLInputElement).value).toBe('unsaved-model');
   });
 });
 
@@ -324,7 +354,28 @@ describe('这个渠道看不看得了图', () => {
     const picker = within(rowFor('openai')).getByLabelText('openai 读图能力') as HTMLSelectElement;
 
     expect(picker.value).toBe('auto');
-    expect(within(rowFor('openai')).getByText(/跟随 openai 默认（能看图）/)).toBeTruthy();
+    expect(await within(rowFor('openai')).findByText(/跟随 openai 默认（能看图）/)).toBeTruthy();
+  });
+
+  it('各格式的默认值没读到时只说跟随默认，不替它说能看图', async () => {
+    vi.mocked(getProviderProfiles).mockRejectedValue(new Error('401'));
+    render(<ProvidersPage />);
+    await ready();
+
+    expect((await screen.findByRole('alert')).textContent).toContain('各格式的默认值读取失败');
+    const auto = within(within(rowFor('openai')).getByLabelText('openai 读图能力')).getByRole('option', { name: /跟随/ });
+    expect(auto.textContent).toBe('跟随 openai 默认');
+  });
+
+  it('默认值表里没有这个格式时也不替它下结论', async () => {
+    vi.mocked(getProviderProfiles).mockResolvedValue({ ...structuredClone(PROFILES), defaultVision: { anthropic: true } } as any);
+    render(<ProvidersPage />);
+    await ready();
+    // anthropic 那行有了结论，说明默认值表已经到了
+    await within(rowFor('anthropic')).findByText(/跟随 anthropic 默认（能看图）/);
+
+    const auto = within(within(rowFor('openai')).getByLabelText('openai 读图能力')).getByRole('option', { name: /跟随/ });
+    expect(auto.textContent).toBe('跟随 openai 默认');
   });
 
   it('后端说这家默认看不了图就照实显示', async () => {
@@ -341,7 +392,7 @@ describe('这个渠道看不看得了图', () => {
     render(<ProvidersPage />);
     await ready();
 
-    expect(screen.getByText(/跟随 deepseek 默认（看不了图）/)).toBeTruthy();
+    expect(await screen.findByText(/跟随 deepseek 默认（看不了图）/)).toBeTruthy();
   });
 
   it('显式配过就回填成那一档，不会退回自动', async () => {
@@ -392,7 +443,7 @@ describe('地址填成别家的', () => {
     expect(screen.queryByText(/这个地址是/)).toBeNull();
   });
 
-  it('取不到那份清单就不提醒', async () => {
+  it('取不到那份清单就不提醒，但说出核对不了', async () => {
     vi.mocked(getProviderProfiles).mockRejectedValue(new Error('401'));
     render(<ProvidersPage />);
     await ready();
@@ -401,5 +452,6 @@ describe('地址填成别家的', () => {
     });
 
     expect(screen.queryByText(/这个地址是/)).toBeNull();
+    expect((await screen.findByRole('alert')).textContent).toContain('核对不了地址');
   });
 });

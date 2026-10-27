@@ -38,7 +38,7 @@ describe('SessionConfigModal from Header', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/active_node')) return jsonResponse({ node_id: 'ereuna_main', is_override: false, default_node_id: 'ereuna_main' });
-      if (url.endsWith('/config')) return jsonResponse({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' } });
+      if (url.endsWith('/config')) return jsonResponse({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' }, default_entry_node_id: 'ereuna_main' });
       if (url.endsWith('/admin/config/nodes')) return jsonResponse([{ id: 'ereuna_main', type: 'ai', name: 'EreunaMain', model: 'node-model' }]);
       if (url.endsWith('/provider_override')) return jsonResponse({});
       if (url.endsWith('/config/openai/secret')) return jsonResponse({ model: 'global-model', base_url: 'https://global.example/v1', api_key_present: true });

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore } from '../store/chatStore';
-import { useSettingsStore } from '../store/settingsStore';
+import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 import type { NodeDef } from '../types';
 
 const activeNode: NodeDef = {
@@ -44,13 +44,21 @@ function seedStores() {
     adminToken: 'test-token',
     isAuthenticated: true,
     availableNodes: [activeNode],
+    allNodes: [activeNode],
+    nodeListRead: LOADED,
+    // 顶栏已经读到了 session-1 的节点和覆盖（没有覆盖）
     activeNodeId: 'ereuna_main',
+    activeNodeSessionId: 'session-1',
     activeNodeIsOverride: false,
     defaultNodeId: 'ereuna_main',
     entryNodeId: 'ereuna_main',
     globalModel: 'global-model',
     globalBaseUrl: 'https://global.example/v1',
+    globalConfigRead: LOADED,
+    providerTable: null,
+    providerTableRead: UNREAD,
     sessionProviderOverride: null,
+    sessionProviderOverrideSessionId: 'session-1',
     modelConfig: null,
   });
   useChatStore.setState({ connectionStatus: 'open' });
@@ -72,7 +80,7 @@ function stubSupervisorFetch(providersStatus = 200) {
       return responseJson({ model: 'global-model', base_url: 'https://global.example/v1', api_key_present: false });
     }
     if (url.endsWith('/config')) {
-      return responseJson({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' } });
+      return responseJson({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' }, default_entry_node_id: 'ereuna_main' });
     }
     return responseJson({});
   }));
@@ -192,16 +200,36 @@ describe('会话模型候选', () => {
     expect(screen.getByLabelText('供应商')).not.toHaveAttribute('list');
   });
 
-  it('渠道配置拉不到就退成纯输入框，面板其余部分照常', async () => {
+  it('渠道配置拉不到就退成纯输入框并说出来，面板其余部分照常', async () => {
     seedStores();
     stubSupervisorFetch(403);
 
     const { container } = render(<SessionConfigPanel sessionId="session-1" />);
 
-    await waitFor(() => expect(screen.getByText('会话模型')).toBeInTheDocument());
-
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('渠道表读取失败');
     expect(container.querySelector('datalist')).toBeNull();
     expect(modelBox()).not.toHaveAttribute('list');
     expect(screen.getAllByText('（节点：ereuna_main）').length).toBeGreaterThan(0);
+  });
+
+  it('渠道表读成过以后再读不成就沿用那一份，不报失败', async () => {
+    seedStores();
+    const original = useSettingsStore.getState().failProviderTable;
+    const failProviderTable = vi.fn(original);
+    useSettingsStore.setState({ providerTable: PROVIDERS as never, providerTableRead: LOADED, failProviderTable });
+    stubSupervisorFetch(403);
+
+    try {
+      const { container } = render(<SessionConfigPanel sessionId="session-1" />);
+
+      // 等这次重读真的没读成，再看面板有没有把它当成失败
+      await waitFor(() => expect(failProviderTable).toHaveBeenCalled());
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(useSettingsStore.getState().providerTableRead).toEqual(LOADED);
+      expect(optionValues(container)).toEqual(['gpt-4o-mini', 'deepseek-v4-pro', 'claude-sonnet-4-6']);
+    } finally {
+      useSettingsStore.setState({ failProviderTable: original });
+    }
   });
 });

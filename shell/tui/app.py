@@ -14,7 +14,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll, Center
 from textual.widgets import Static, Button, Label
 
-from clonoth_runtime import read_admin_token
+from clonoth_runtime import default_entry_node_id, read_admin_token
 from workspace import resolve_workspace_root
 
 from .styles import DEFAULT_CSS
@@ -221,7 +221,7 @@ class ClonothApp(App):
                 self.entry_node_id = n.id
                 self._entry_node_name = n.name
             else:
-                self.entry_node_id = "bootstrap.shell_orchestrator"
+                self.entry_node_id = default_entry_node_id(self.workspace_root)
                 self._entry_node_name = "默认入口"
             self._activate_chat()
 

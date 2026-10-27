@@ -6,10 +6,11 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ClientSettingsPage, parseNodeList } from '../components/settings/pages/ClientSettingsPage';
+import { ClientSettingsPage } from '../components/settings/pages/ClientSettingsPage';
 import { AgentsSettingsRightPanel, SkillsSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
-import { useSettingsStore } from '../store/settingsStore';
+import { UNREAD, useSettingsStore } from '../store/settingsStore';
+import { rootEntryNodes } from '../utils/entryNodes';
 import type { AdminNode } from '../api/supervisorClient';
 
 function jsonResponse(body: unknown): Response {
@@ -34,6 +35,10 @@ describe('remaining Settings optimizations', () => {
       isAuthenticated: true,
       entryNodeId: '',
       availableNodes: [],
+      allNodes: [],
+      nodeListRead: UNREAD,
+      globalConfigRead: UNREAD,
+      defaultNodeId: '',
       rightPanelOpen: true,
     });
     useSettingsSelectionStore.setState({
@@ -51,9 +56,9 @@ describe('remaining Settings optimizations', () => {
   it('parses only root entry nodes from the real node list', () => {
     // [2026-06-02] Keep the filtering rule independent from the rendered select.
     // Why: several settings surfaces need the same root-entry-node semantics. How:
-    // assert system nodes and delegated children are excluded from parseNodeList.
+    // assert system nodes and delegated children are excluded from rootEntryNodes.
     // Purpose: the Client page does not show internal workers as default entries.
-    expect(parseNodeList(nodeList).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
+    expect(rootEntryNodes(nodeList).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
   });
 
   it('keeps a node that delegates to itself as a root entry', () => {
@@ -64,7 +69,7 @@ describe('remaining Settings optimizations', () => {
       { id: 'bootstrap.code_reviewer', type: 'ai', name: 'Reviewer', description: '审查子节点' },
     ];
 
-    expect(parseNodeList(selfDelegating).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
+    expect(rootEntryNodes(selfDelegating).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
   });
 
   it('leaves templates, examples and internal nodes out and ignores what a template delegates to', () => {
@@ -76,22 +81,15 @@ describe('remaining Settings optimizations', () => {
       { id: 'chat.intent', type: 'ai', name: 'Intent', internal: true },
     ];
 
-    expect(parseNodeList(withTemplates).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
+    expect(rootEntryNodes(withTemplates).map((node) => node.id)).toEqual(['ereuna_main', 'bootstrap.coder']);
   });
 
-  it('renders Client entry-node selection before approval rules and selects the configured node', async () => {
+  it('renders Client entry-node selection before approval rules and fills in the backend default entry when none is chosen', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/v1/admin/config/all-tool-names')) return jsonResponse(['read_file', 'execute_command']);
       if (url.endsWith('/v1/admin/config/nodes')) return jsonResponse(nodeList);
-      if (url.endsWith('/v1/config')) {
-        return jsonResponse({
-          version: 1,
-          provider: 'openai',
-          entry_node_id: 'ereuna_main',
-          openai: { model: 'gpt-test', base_url: 'https://api.example.test/v1', api_key_present: true, api_key: '****' },
-        });
-      }
+      if (url.endsWith('/v1/config')) return jsonResponse({ provider: 'openai', openai: { model: 'gpt-4.1', base_url: '' }, default_entry_node_id: 'bootstrap.coder' });
       return jsonResponse({});
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -104,7 +102,7 @@ describe('remaining Settings optimizations', () => {
 
     expect(entrySection.compareDocumentPosition(titleSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const select = await screen.findByLabelText('入口节点');
-    await waitFor(() => expect(select).toHaveValue('ereuna_main'));
+    await waitFor(() => expect(select).toHaveValue('bootstrap.coder'));
     expect(within(select).getByRole('option', { name: /EreunaMain/ })).toBeInTheDocument();
     expect(within(select).queryByRole('option', { name: /Worker/ })).not.toBeInTheDocument();
     expect(within(select).queryByRole('option', { name: /Compactor/ })).not.toBeInTheDocument();

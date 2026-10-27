@@ -521,6 +521,8 @@ class AppConfigPublic(BaseModel):
     version: int = 1
     provider: str = "openai"
     openai: OpenAIConfigPublic
+    # runtime 的 shell.entry_node_id：网页替用户挑入口时优先挑它
+    default_entry_node_id: str = ""
 
 
 class ProviderConfigPublic(BaseModel):

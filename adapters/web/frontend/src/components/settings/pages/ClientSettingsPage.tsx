@@ -1,41 +1,12 @@
 // 客户端设置：只存 localStorage 的前端偏好，不碰后端配置。
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-import { type AdminNode, getConfig, getNodes } from '../../../api/supervisorClient';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { type TitleGenerationMode, useClientPrefsStore } from '../../../store/clientPrefsStore';
+import { settleEntryNode } from '../../../store/settingsReads';
 import { useSettingsStore } from '../../../store/settingsStore';
-import type { NodeDef } from '../../../types';
-import { isEntryNode } from '../../../utils/entryNodes';
-import { Block, Field, PageShell, Select } from './settingsControls';
-
-export function parseNodeList(nodes: AdminNode[]): AdminNode[] {
-  // [2026-06-02] Parse real Supervisor nodes into selectable entry nodes.
-  // Why: the Client page must not show system nodes or delegated child workers as
-  // default conversation entries. How: collect every delegate_targets reference, then
-  // keep only entry nodes (AI, not system.*, not a template, example or internal node)
-  // that are not referenced as a delegate.
-  // Purpose: the first Client setting presents the actual root entry-point choices.
-  const delegated = new Set<string>();
-  for (const n of nodes) {
-    // Templates and examples are never loaded, so what they delegate to is not anyone's child.
-    if (n.active === false || !n.delegate_targets) continue;
-    for (const t of n.delegate_targets) {
-      // A node that delegates to itself (a coder handing parts to sub-coders) still has no upstream.
-      if (t !== n.id) delegated.add(t);
-    }
-  }
-  return nodes.filter(n => isEntryNode(n) && !delegated.has(n.id));
-}
-
-function configuredEntryNodeId(config: Awaited<ReturnType<typeof getConfig>> | null, storedEntryNodeId: string): string {
-  // [2026-06-02] Prefer the backend's configured entry node when present.
-  // Why: browser localStorage can be stale or empty after a new deployment. How: read
-  // direct, legacy/default, and nested shell entry-node fields from /v1/config, then
-  // fall back to the settings store value. Purpose: the selected option reflects real
-  // Supervisor configuration whenever that endpoint exposes it.
-  return String(config?.entry_node_id || config?.default_entry_node_id || config?.shell?.entry_node_id || storedEntryNodeId || '').trim();
-}
+import { rootEntryNodes } from '../../../utils/entryNodes';
+import { Block, Button, ErrorText, Field, PageShell, Select } from './settingsControls';
 
 const TITLE_OPTIONS: Array<{ value: TitleGenerationMode; label: string; description: string }> = [
   { value: 'auto', label: '由模型生成', description: '在支持此模式时，请助手为对话生成标题。' },
@@ -52,40 +23,28 @@ export const ClientSettingsPage = () => {
     setThinkingDefaultCollapsed,
     setToolResultsDefaultCollapsed,
   } = useClientPrefsStore();
-  const { adminToken, entryNodeId, setEntryNodeId } = useSettingsStore();
-  const [entryNodes, setEntryNodes] = useState<NodeDef[]>([]);
+  const { adminToken, availableNodes, entryNodeId, globalConfigRead, nodeListRead, setEntryNodeId } = useSettingsStore();
+  const [attempt, setAttempt] = useState(0);
   const requests = useRequestGuard();
+  const entryNodes = useMemo(() => rootEntryNodes(availableNodes), [availableNodes]);
+  const listed = nodeListRead.loaded && entryNodes.some((node) => node.id === entryNodeId);
+  const loading = Boolean(adminToken) && !nodeListRead.loaded && !nodeListRead.error;
+  // 存着的入口不在清单里也单独摆一项：没有对得上的选项时浏览器显示第一项，看着像选了它，存的其实还是原来那个
+  const storedLabel = entryNodeId
+    ? `${entryNodeId}${nodeListRead.loaded ? '（不在入口节点列表里）' : ''}`
+    : loading ? '正在加载…' : '（未设置）';
+  // 全局配置只在要替人挑入口时才用得上：存着的入口还在清单里，它读没读到这里看不出差别
+  const defaultEntryError = adminToken && nodeListRead.loaded && !listed ? globalConfigRead.error : '';
 
+  // 每次进来都重读节点表和全局配置；重读不成时沿用读成过的那份，读成过就不报失败。
   useEffect(() => {
-    if (!adminToken) {
-      setEntryNodes([]);
-      return;
-    }
-    const request = requests.begin('nodes');
-    Promise.all([
-      getNodes(adminToken),
-      getConfig().catch(() => null),
-    ])
-      .then(([nodes, config]) => {
-        if (!request.isCurrent()) return;
-        const parsedNodes = parseNodeList(nodes);
-        setEntryNodes(parsedNodes);
-        const configured = configuredEntryNodeId(config, entryNodeId);
-        // [2026-06-02] Sync the selected entry node after loading the real list.
-        // Why: the select should display the backend or store default only when that
-        // id exists in the filtered entry-node list. How: choose the matching id, or
-        // fall back to the first root entry when no stored value exists. Purpose: the
-        // first Client setting never points at a hidden child/system node.
-        if (configured && parsedNodes.some((node) => node.id === configured)) {
-          setEntryNodeId(configured);
-        } else if (!configured && parsedNodes[0]) {
-          setEntryNodeId(parsedNodes[0].id);
-        }
-      })
-      .catch(() => {
-        if (request.isCurrent()) setEntryNodes([]);
-      });
-  }, [requests, adminToken, setEntryNodeId]);
+    if (!adminToken) return;
+    void settleEntryNode(adminToken, requests.begin('nodes'), requests.begin('config'), () => useSettingsStore.getState().entryNodeId);
+    return () => {
+      requests.drop('nodes');
+      requests.drop('config');
+    };
+  }, [requests, adminToken, attempt]);
 
   return (
     <PageShell
@@ -101,12 +60,24 @@ export const ClientSettingsPage = () => {
           value={entryNodeId}
           width="wide"
         >
-          {entryNodes.length === 0 && <option value={entryNodeId}>{entryNodeId || '正在加载…'}</option>}
-          {entryNodes.map((n) => (
+          {!listed && <option value={entryNodeId}>{storedLabel}</option>}
+          {nodeListRead.loaded && entryNodes.map((n) => (
             <option key={n.id} value={n.id}>{n.name || n.id}{n.description ? ` — ${n.description}` : ''}</option>
           ))}
         </Select>
         <p className="mt-2 font-mono text-micro text-[var(--duties-tertiary)]">当前值：{entryNodeId || '（未设置）'}</p>
+        {adminToken && nodeListRead.error && (
+          <ErrorText role="alert">
+            入口节点清单读取失败：{nodeListRead.error}{' '}
+            <Button onClick={() => setAttempt((value) => value + 1)} size="sm" tone="quiet">重试</Button>
+          </ErrorText>
+        )}
+        {defaultEntryError && (
+          <ErrorText role="alert">
+            后端默认入口读取失败：{defaultEntryError}{' '}
+            <Button onClick={() => setAttempt((value) => value + 1)} size="sm" tone="quiet">重试</Button>
+          </ErrorText>
+        )}
       </Block>
 
       <Block frame="boxed" scope="this-browser" title="对话标题">

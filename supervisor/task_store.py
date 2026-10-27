@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from clonoth_runtime import get_str, load_runtime_config, main_session_enabled, parse_bool
+from clonoth_runtime import default_entry_node_id, load_runtime_config, main_session_enabled, parse_bool
 from engine.dispatch_batch import AWAITING_INPUT_KEY, CONTINUE_FROM_KEY
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
@@ -95,8 +95,7 @@ class TaskStoreMixin:
     # ---- 基础工具 ----
 
     def _default_entry_node(self) -> str:
-        cfg = load_runtime_config(self.workspace_root)
-        return get_str(cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip() or "bootstrap.shell_orchestrator"
+        return default_entry_node_id(self.workspace_root)
 
     def _entry_node_pinned(self, payload: dict[str, Any]) -> bool:
         return bool(payload.get("entry_node_pinned")) and bool(str(payload.get("entry_node_id") or "").strip())

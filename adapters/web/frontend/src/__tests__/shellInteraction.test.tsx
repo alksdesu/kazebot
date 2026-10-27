@@ -23,7 +23,7 @@ beforeEach(() => {
   useViewStore.setState({ viewMode: 'chat', activeSettingsTab: 'general' });
   useSettingsStore.setState({ rightPanelOpen: true, adminToken: null, activeNodeId: '', activeNodeSessionId: '', entryNodeId: '', availableNodes: [], sessionProviderOverride: null, sessionProviderOverrideSessionId: '' });
   vi.mocked(api.getActiveNode).mockResolvedValue({ node_id: 'main', is_override: false, default_node_id: 'main' });
-  vi.mocked(api.getAppConfig).mockResolvedValue({ provider: 'openai', openai: {} } as never);
+  vi.mocked(api.getAppConfig).mockResolvedValue({ provider: 'openai', openai: {}, default_entry_node_id: 'main' } as never);
   vi.mocked(api.getSessionProviderOverride).mockResolvedValue({});
   vi.mocked(api.getNodes).mockResolvedValue([]);
 });

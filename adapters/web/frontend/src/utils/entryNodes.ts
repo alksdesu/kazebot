@@ -1,7 +1,7 @@
 // 网页里能选作对话入口、能切过去的节点；不列模板、示例和 internal 节点，跟后端 switch_node 的枚举一致。
 import type { AdminNode } from '../api/supervisorClient';
 
-type EntryNodeFields = Partial<Pick<AdminNode, 'id' | 'type' | 'active' | 'internal' | 'problem'>>;
+type EntryNodeFields = Partial<Pick<AdminNode, 'id' | 'type' | 'active' | 'internal' | 'problem' | 'delegate_targets'>>;
 
 /** 模板、示例（active=false）运行期不当节点，internal 节点回的是给程序看的判定值，系统节点不给人选，节点文件用不了（problem）的 engine 加载不了。 */
 export function isEntryNode(node: EntryNodeFields | null | undefined): boolean {
@@ -18,4 +18,23 @@ export function isEntryNode(node: EntryNodeFields | null | undefined): boolean {
 
 export function filterEntryNodes<T extends EntryNodeFields>(nodes: readonly T[]): T[] {
   return nodes.filter((node) => isEntryNode(node));
+}
+
+/** 入口下拉和新对话默认入口列的根节点，和 engine 给 switch_node 列的那份同一个算法：
+ *  只有能当入口的节点委派出去的才算子节点，委派给自己不算，一个根都没有时全列。 */
+export function rootEntryNodes<T extends EntryNodeFields & { id: string }>(nodes: readonly T[]): T[] {
+  const entries = filterEntryNodes(nodes);
+  const delegated = new Set<string>();
+  for (const node of entries) {
+    for (const target of node.delegate_targets || []) {
+      if (target !== node.id) delegated.add(target);
+    }
+  }
+  const roots = entries.filter((node) => !delegated.has(node.id));
+  return roots.length > 0 ? roots : entries;
+}
+
+/** 替用户挑的入口：后端配的默认入口在根入口里就挑它，不在就挑第一个根入口；一个根入口都没有时是空串。 */
+export function pickEntryNode(roots: readonly { readonly id: string }[], defaultId: string): string {
+  return (roots.find((node) => node.id === defaultId) ?? roots[0])?.id ?? '';
 }

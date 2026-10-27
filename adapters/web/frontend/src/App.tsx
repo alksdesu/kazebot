@@ -13,6 +13,7 @@ import { startPolling } from './utils/polling';
 import { selectVisibleHistory, useChatStore } from './store/chatStore';
 import { selectToolsForMessages } from './store/eventSelectors';
 import { useClientPrefsStore } from './store/clientPrefsStore';
+import { adoptActiveNode } from './store/settingsReads';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore, type ViewMode } from './store/viewStore';
 import type { Attachment } from './types';
@@ -85,13 +86,18 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     if (sessionId) {
       if (settings.activeNodeSessionId === sessionId) nodeId = settings.activeNodeId;
       else {
+        const writes = settings.activeNodeWrites;
         const result = await getActiveNode(sessionId);
         const current = useChatStore.getState();
         if (current.activeConversationId !== id || current.viewingChildSessionId || current.conversations.find(item => item.id === id)?.sessionId !== sessionId) {
           throw new Error('发送前会话已变化，草稿已保留，请确认当前会话后重试。');
         }
         nodeId = result.node_id;
-        useSettingsStore.getState().setActiveNode(result.node_id, result.is_override, result.default_node_id, sessionId);
+        if (!adoptActiveNode(writes, result.node_id, result.is_override, result.default_node_id, sessionId)) {
+          // 读的期间这个会话的节点刚被切过：按切好的那个发
+          const latest = useSettingsStore.getState();
+          if (latest.activeNodeSessionId === sessionId) nodeId = latest.activeNodeId;
+        }
       }
     }
     await sendMessage(text, attachments, nodeId || undefined);

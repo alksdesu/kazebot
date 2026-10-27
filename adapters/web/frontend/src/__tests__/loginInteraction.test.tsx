@@ -2,13 +2,21 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
-  const state = { adminToken: null as string | null, isAuthenticated: false, entryNodeId: '' };
+  const unread = () => ({ loaded: false, error: '' });
+  const state = {
+    adminToken: null as string | null, isAuthenticated: false, entryNodeId: '', availableNodes: [] as unknown[], defaultNodeId: '',
+    nodeListRead: unread(), globalConfigRead: unread(),
+  };
   return {
     state,
     verify: vi.fn(),
     loadNodes: vi.fn().mockResolvedValue(undefined),
     getNodes: vi.fn(),
-    setAvailableNodes: vi.fn(),
+    getAppConfig: vi.fn(),
+    setNodeList: vi.fn(),
+    failNodeList: vi.fn(),
+    setGlobalConfig: vi.fn(),
+    failGlobalConfig: vi.fn(),
     setEntryNodeId: vi.fn(),
     setToken: vi.fn((token: string | null) => { state.adminToken = token; }),
     setAuthenticated: vi.fn((value: boolean) => { state.isAuthenticated = value; }),
@@ -16,16 +24,28 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('../api/supervisorClient', () => ({
-  checkAdminAuth: mocks.verify, verifyAdminAuth: mocks.verify, getNodes: mocks.getNodes,
+  checkAdminAuth: mocks.verify, verifyAdminAuth: mocks.verify, getNodes: mocks.getNodes, getAppConfig: mocks.getAppConfig,
   MOUNT: '', getInstanceDirectory: vi.fn().mockResolvedValue({ current_path: '', instances: [{ label: '主实例', path: '' }] }),
 }));
 vi.mock('../components/auth/loadEntryNodes', () => ({ loadEntryNodes: mocks.loadNodes, TOKEN_SOURCE_HINT: '从服务启动信息中获取管理员令牌。' }));
 vi.mock('../store/settingsStore', () => {
-  const getState = () => ({ ...mocks.state, setAdminToken: mocks.setToken, setAuthenticated: mocks.setAuthenticated, setAvailableNodes: mocks.setAvailableNodes, setEntryNodeId: mocks.setEntryNodeId });
+  const getState = () => ({
+    ...mocks.state,
+    setAdminToken: mocks.setToken,
+    setAuthenticated: mocks.setAuthenticated,
+    setNodeList: mocks.setNodeList,
+    failNodeList: mocks.failNodeList,
+    setGlobalConfig: mocks.setGlobalConfig,
+    failGlobalConfig: mocks.failGlobalConfig,
+    setEntryNodeId: mocks.setEntryNodeId,
+  });
   return { LS_KEY_NODE: 'fixture-node', useSettingsStore: Object.assign(() => getState(), { getState, subscribe: () => () => {} }) };
 });
 
 import { LoginPage } from '../components/auth/LoginPage';
+import { filterEntryNodes } from '../utils/entryNodes';
+
+const appConfig = (defaultEntry: string) => ({ provider: 'openai', openai: { model: '', base_url: '' }, default_entry_node_id: defaultEntry });
 
 function pending<T>() {
   let resolve!: (value: T) => void;
@@ -38,8 +58,29 @@ beforeEach(() => {
   mocks.state.adminToken = null;
   mocks.state.isAuthenticated = false;
   mocks.state.entryNodeId = '';
+  mocks.state.availableNodes = [];
+  mocks.state.defaultNodeId = '';
+  mocks.state.nodeListRead = { loaded: false, error: '' };
+  mocks.state.globalConfigRead = { loaded: false, error: '' };
   mocks.verify.mockReset();
   mocks.getNodes.mockReset();
+  mocks.getAppConfig.mockReset().mockResolvedValue(appConfig(''));
+  // 和真 store 一样：读到的节点表筛出入口清单，读到的全局配置记下默认入口；读成过以后没读成不再记
+  mocks.setNodeList.mockImplementation((nodes: Parameters<typeof filterEntryNodes>[0]) => {
+    mocks.state.availableNodes = filterEntryNodes(nodes);
+    mocks.state.nodeListRead = { loaded: true, error: '' };
+  });
+  mocks.failNodeList.mockImplementation((reason: string) => {
+    if (!mocks.state.nodeListRead.loaded) mocks.state.nodeListRead = { loaded: false, error: reason };
+  });
+  mocks.setGlobalConfig.mockImplementation((_model: string, _baseUrl: string, defaultEntry = '') => {
+    mocks.state.defaultNodeId = defaultEntry;
+    mocks.state.globalConfigRead = { loaded: true, error: '' };
+  });
+  mocks.failGlobalConfig.mockImplementation((reason: string) => {
+    if (!mocks.state.globalConfigRead.loaded) mocks.state.globalConfigRead = { loaded: false, error: reason };
+  });
+  mocks.setEntryNodeId.mockImplementation((id: string) => { mocks.state.entryNodeId = id; });
   window.history.replaceState(null, '', '/web/');
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -187,6 +228,13 @@ describe('认证请求分类', () => {
 });
 
 describe('入口节点加载归属', () => {
+  // 命令审核是 shell 委派下去的子节点，根入口只有 shell 和 coder
+  const ROOTS_AND_CHILD = [
+    { id: 'bootstrap.cmd_reviewer', type: 'ai' },
+    { id: 'bootstrap.shell_orchestrator', type: 'ai', delegate_targets: ['bootstrap.cmd_reviewer'] },
+    { id: 'bootstrap.coder', type: 'ai' },
+  ];
+
   it('身份改变后不应用旧身份的节点列表', async () => {
     const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
     mocks.state.adminToken = 'fixture-old-token';
@@ -196,17 +244,84 @@ describe('入口节点加载归属', () => {
     mocks.state.adminToken = 'fixture-new-token';
     nodes.resolve([{ id: 'old.node', type: 'ai' }]);
     await request;
-    expect(mocks.setAvailableNodes).not.toHaveBeenCalled();
+    expect(mocks.setNodeList).not.toHaveBeenCalled();
+    expect(mocks.failNodeList).not.toHaveBeenCalled();
+    expect(mocks.setGlobalConfig).not.toHaveBeenCalled();
     expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
   });
 
   it('保留正常节点加载并过滤系统节点', async () => {
     const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
     mocks.state.adminToken = 'fixture-token';
-    mocks.getNodes.mockResolvedValue([{ id: 'entry.node', type: 'ai' }, { id: 'system.internal', type: 'ai' }]);
+    const nodes = [{ id: 'entry.node', type: 'ai' }, { id: 'system.internal', type: 'ai' }];
+    mocks.getNodes.mockResolvedValue(nodes);
     await module.loadEntryNodes('fixture-token');
-    expect(mocks.setAvailableNodes).toHaveBeenCalledWith([{ id: 'entry.node', type: 'ai' }]);
+    // 整张表交给 store：入口清单由它筛，查模型要用的全部节点也留在它那里
+    expect(mocks.setNodeList).toHaveBeenCalledWith(nodes);
     expect(mocks.setEntryNodeId).toHaveBeenCalledWith('entry.node');
+  });
+
+  it('别的入口委派下去的子节点不当默认入口，存着的这种入口换成根入口', async () => {
+    // 新装实例的节点表里命令审核排在最前，它是 shell 委派下去的子节点，收到用户消息不该由它接。
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = 'bootstrap.cmd_reviewer';
+    localStorage.removeItem('fixture-node');
+    mocks.getNodes.mockResolvedValue([
+      { id: 'bootstrap.cmd_reviewer', type: 'ai' },
+      { id: 'bootstrap.shell_orchestrator', type: 'ai', delegate_targets: ['bootstrap.cmd_reviewer'] },
+    ]);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setEntryNodeId).toHaveBeenCalledWith('bootstrap.shell_orchestrator');
+  });
+
+  it('存着的根入口原样留着，哪怕后端配的默认入口是别的', async () => {
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = 'bootstrap.coder';
+    localStorage.removeItem('fixture-node');
+    mocks.getAppConfig.mockResolvedValue(appConfig('bootstrap.shell_orchestrator'));
+    mocks.getNodes.mockResolvedValue([
+      { id: 'bootstrap.shell_orchestrator', type: 'ai' },
+      { id: 'bootstrap.coder', type: 'ai', delegate_targets: ['bootstrap.coder'] },
+    ]);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setNodeList).toHaveBeenCalled();
+    expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
+  });
+
+  it('替用户挑入口时，后端配的默认入口在根入口里就挑它', async () => {
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    localStorage.removeItem('fixture-node');
+    mocks.getAppConfig.mockResolvedValue(appConfig('bootstrap.coder'));
+    mocks.getNodes.mockResolvedValue(ROOTS_AND_CHILD);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setEntryNodeId).toHaveBeenCalledWith('bootstrap.coder');
+  });
+
+  it('后端配的默认入口不在根入口里时挑第一个根入口', async () => {
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    localStorage.removeItem('fixture-node');
+    mocks.getAppConfig.mockResolvedValue(appConfig('bootstrap.cmd_reviewer'));
+    mocks.getNodes.mockResolvedValue(ROOTS_AND_CHILD);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setEntryNodeId).toHaveBeenCalledWith('bootstrap.shell_orchestrator');
+  });
+
+  it('全局配置没读成时不替用户挑，也不写入口', async () => {
+    // 入口留空时新对话本来就走后端默认入口，没读到它就挑，挑中的可能不是它
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = 'gone.node';
+    localStorage.removeItem('fixture-node');
+    mocks.getAppConfig.mockRejectedValue(new Error('config 500'));
+    mocks.getNodes.mockResolvedValue(ROOTS_AND_CHILD);
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setNodeList).toHaveBeenCalledWith(ROOTS_AND_CHILD);
+    expect(mocks.failGlobalConfig).toHaveBeenCalledWith('config 500');
+    expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
   });
 
   it('模板、示例和 internal 节点不进入口列表，存着的模板入口换成第一个能用的', async () => {
@@ -216,14 +331,15 @@ describe('入口节点加载归属', () => {
     mocks.state.entryNodeId = '_persistent_agent.template';
     localStorage.removeItem('fixture-node');
     const entry = { id: 'qq.orchestrator', type: 'ai', active: true, internal: false };
-    mocks.getNodes.mockResolvedValue([
+    const nodes = [
       { id: '_persistent_agent.template', type: 'ai', active: false },
       { id: 'qq.orchestrator.example', type: 'ai', active: false },
       { id: 'chat.intent', type: 'ai', active: true, internal: true },
       entry,
-    ]);
+    ];
+    mocks.getNodes.mockResolvedValue(nodes);
     await module.loadEntryNodes('fixture-token');
-    expect(mocks.setAvailableNodes).toHaveBeenCalledWith([entry]);
+    expect(mocks.setNodeList).toHaveBeenCalledWith(nodes);
     expect(mocks.setEntryNodeId).toHaveBeenCalledWith('qq.orchestrator');
   });
 
@@ -235,13 +351,14 @@ describe('入口节点加载归属', () => {
     mocks.state.entryNodeId = 'qq.skill';
     localStorage.removeItem('fixture-node');
     const untyped = { id: 'qq.untyped', type: 'ai', active: true, internal: false, problem: '' };
-    mocks.getNodes.mockResolvedValue([
+    const nodes = [
       { id: 'qq.broken', type: '', active: true, internal: false, problem: 'YAML 读不出来：第 2 行第 24 列：mapping values are not allowed here' },
       { id: 'qq.skill', type: 'ai', active: true, internal: false, problem: 'kind 写的是 skill，节点只认 node' },
       untyped,
-    ]);
+    ];
+    mocks.getNodes.mockResolvedValue(nodes);
     await module.loadEntryNodes('fixture-token');
-    expect(mocks.setAvailableNodes).toHaveBeenCalledWith([untyped]);
+    expect(mocks.setNodeList).toHaveBeenCalledWith(nodes);
     expect(mocks.setEntryNodeId).toHaveBeenCalledWith('qq.untyped');
   });
 
@@ -256,5 +373,18 @@ describe('入口节点加载归属', () => {
     mocks.getNodes.mockRejectedValueOnce(new Error('offline'));
     await module.loadEntryNodes('fixture-token');
     expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
+    // 没读成的原因记进 store，顶栏拿它说话
+    expect(mocks.failNodeList).toHaveBeenCalledWith('offline');
+  });
+
+  it('回来的不是列表也算没读成，不当成一个节点都没有', async () => {
+    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
+    mocks.state.adminToken = 'fixture-token';
+    mocks.state.entryNodeId = 'kept.node';
+    mocks.getNodes.mockResolvedValueOnce({ detail: 'not a list' });
+    await module.loadEntryNodes('fixture-token');
+    expect(mocks.setNodeList).not.toHaveBeenCalled();
+    expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
+    expect(mocks.failNodeList).toHaveBeenCalledWith('节点表回来的不是列表');
   });
 });

@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 import config_layout
-from clonoth_runtime import load_workspace_env
+from clonoth_runtime import default_entry_node_id, load_workspace_env
 from engine.attachments import blocked_file_reject_reason
 from engine.node import entry_node_problem, load_node, missing_node_reason
 from engine.tool_outputs import bounded_for_event
@@ -294,10 +294,15 @@ def create_app(
             workspace_root=str(st.workspace_root),
         )
 
+    def _public_config(config: AppConfigPublic) -> AppConfigPublic:
+        # 渠道来自 models.yaml，默认入口来自 runtime.yaml：回给前端的是拼好的一份
+        st: SupervisorState = app.state.state
+        return config.model_copy(update={"default_entry_node_id": default_entry_node_id(st.workspace_root)})
+
     @app.get("/v1/config", response_model=AppConfigPublic)
     async def get_config() -> AppConfigPublic:
         cs: ConfigStore = app.state.config_store
-        return cs.get_public()
+        return _public_config(cs.get_public())
 
     @app.get("/v1/config/openai", response_model=OpenAIConfigPublic)
     async def get_openai_config_public() -> OpenAIConfigPublic:
@@ -330,7 +335,7 @@ def create_app(
                 "ts": _now().isoformat(),
             },
         )
-        return out
+        return _public_config(out)
 
     @app.post("/v1/config/reload", response_model=ConfigReloadOut)
     async def reload_config(request: Request) -> ConfigReloadOut:
@@ -346,7 +351,7 @@ def create_app(
             type_="config_reloaded",
             payload={"ts": _now().isoformat()},
         )
-        return ConfigReloadOut(ok=True, config=out)
+        return ConfigReloadOut(ok=True, config=_public_config(out))
 
     # ================================================================
     #  Multi-provider config API

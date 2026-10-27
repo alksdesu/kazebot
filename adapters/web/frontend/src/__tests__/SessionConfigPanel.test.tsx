@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore, type ConnectionStatus } from '../store/chatStore';
-import { useSettingsStore } from '../store/settingsStore';
+import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 import type { NodeDef } from '../types';
 
 type TestNodeDef = NodeDef & { base_url?: string; active?: boolean; internal?: boolean };
@@ -36,13 +36,21 @@ function seedStores(override: Record<string, unknown> | null, connectionStatus: 
     isConnected: true,
     entryNodeId: 'ereuna_main',
     availableNodes: [activeNode],
+    allNodes: [activeNode],
+    nodeListRead: LOADED,
     modelConfig: null,
+    // 顶栏已经读到了 session-1 的节点和覆盖：面板一打开就有得显示，不用等自己那一路
     activeNodeId: 'ereuna_main',
+    activeNodeSessionId: 'session-1',
     activeNodeIsOverride: false,
     defaultNodeId: 'ereuna_main',
     globalModel: 'global-model',
     globalBaseUrl: 'https://global.example/v1',
+    globalConfigRead: LOADED,
+    providerTable: null,
+    providerTableRead: UNREAD,
     sessionProviderOverride: override,
+    sessionProviderOverrideSessionId: 'session-1',
     rightPanelOpen: true,
   });
   useChatStore.setState({ connectionStatus });
@@ -66,7 +74,7 @@ function stubSupervisorFetch(override: Record<string, unknown> = {}) {
       return responseJson({ model: 'global-model', base_url: 'https://global.example/v1', api_key_present: false });
     }
     if (url.endsWith('/config')) {
-      return responseJson({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' } });
+      return responseJson({ provider: 'openai', openai: { model: 'global-model', base_url: 'https://global.example/v1' }, default_entry_node_id: 'ereuna_main' });
     }
     return responseJson({});
   }));

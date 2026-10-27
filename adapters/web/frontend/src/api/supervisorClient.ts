@@ -2234,9 +2234,8 @@ export interface AppConfigPublic {
   version?: number;
   provider: string;
   openai: { model: string; base_url: string; api_key_present?: boolean };
-  entry_node_id?: string;
-  default_entry_node_id?: string;
-  shell?: { entry_node_id?: string };
+  /** 后端配的默认入口（runtime 的 shell.entry_node_id）：消息没带入口节点时交给它。 */
+  default_entry_node_id: string;
 }
 
 export async function getConfig(): Promise<AppConfigPublic> {
@@ -2244,7 +2243,7 @@ export async function getConfig(): Promise<AppConfigPublic> {
   return resp.json();
 }
 
-/** getConfig 的旧名，Header 和会话面板还在用。 */
+/** getConfig 的旧名：插件拿到的是整个 api 模块，删了会断插件。 */
 export function getAppConfig(): Promise<AppConfigPublic> {
   return getConfig();
 }
