@@ -700,7 +700,7 @@ def setup(api):
         return {}
 
     monkeypatch.setattr(runner.httpx, 'AsyncClient', BaseClient)
-    monkeypatch.setattr(runner, '_create_llm_http_client', lambda _: BaseClient())
+    monkeypatch.setattr(runner, 'create_llm_http_client', lambda _: BaseClient())
     monkeypatch.setattr(runner, 'ToolRegistry', BaseTools)
     monkeypatch.setattr(runner, 'wait_supervisor', ready)
     monkeypatch.setattr(runner, '_register_engine', ready)

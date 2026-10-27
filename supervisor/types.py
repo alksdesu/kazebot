@@ -472,6 +472,8 @@ class ActiveProviderSecret(OpenAIConfigSecret):
 
     provider: str = "openai"
     channel_name: str = ""
+    # 活跃渠道块里手写的 options 原样给出：跟随主渠道的节点要和地址、密钥从同一份配置拿。
+    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class OpenAIConfigUpdateIn(BaseModel):

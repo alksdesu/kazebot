@@ -280,7 +280,14 @@ class ConfigStore:
                 base_url=_resolve_env_value(cfg.base_url),
                 api_key=_resolve_env_value(cfg.api_key),
                 model=_resolve_env_value(cfg.model),
+                options=self._options_of(name),
             )
+
+    def _options_of(self, name: str) -> dict[str, Any]:
+        """渠道块里手写的 options。${VAR} 不展开，和 Engine 读点名渠道的 options 一个读法。"""
+        block = self._load_raw().get(name)
+        options = block.get("options") if isinstance(block, dict) else None
+        return options if isinstance(options, dict) else {}
 
     def get_openai_public(self) -> OpenAIConfigPublic:
         with self._current():

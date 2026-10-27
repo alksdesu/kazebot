@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 import yaml
 
 import config_layout
@@ -24,6 +23,7 @@ from clonoth_runtime import (
     runtime_config_error,
     stray_platforms_section,
 )
+from engine.model import create_llm_http_client
 from platforms.descriptor import PlatformDescriptor
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
@@ -269,7 +269,7 @@ class OperationsService:
             if test_model and configured:
                 started = time.monotonic()
                 try:
-                    async with httpx.AsyncClient(timeout=20, trust_env=False) as http:
+                    async with create_llm_http_client(20) as http:
                         provider = provider_class(
                             http=http, api_key=secret.api_key, base_url=secret.base_url, model=secret.model,
                             provider_options=self._probe_options(provider_class),

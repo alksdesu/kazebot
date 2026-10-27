@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import inspect
 import json
 import os
 import signal
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from clonoth_runtime import (
-    env_bool,
     env_value,
     fetch_openai_secret,
     get_bool,
@@ -34,7 +33,13 @@ from toolbox.registry import ToolRegistry
 from .inference import run_ai_node
 from .attachments import build_multimodal_content, payload_attachments, screen_attachments
 from .context import RunContext, TaskLease
-from .model import resolve_provider
+from .model import (
+    create_llm_http_client,
+    instantiate_provider,
+    layered_provider_options,
+    llm_request_timeout,
+    resolve_provider,
+)
 from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
 from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
@@ -87,9 +92,15 @@ def _provider_env_prefix(provider_name: str) -> str:
     return provider_name.upper().replace("-", "_")
 
 
-def _provider_endpoint_from_env(provider_name: str) -> str:
+def _provider_env(provider_name: str, suffix: str) -> str:
+    """<PROVIDER>_<suffix> 环境变量的值。
+
+    OpenAI 族的地址密钥只认渠道块和主渠道，不读 OPENAI_*：判有没有配套地址和构造 provider 都走这一个函数，两边才对得上。
+    """
+    if provider_name in _OPENAI_COMPATIBLE_PROVIDERS:
+        return ""
     # 和系统槽位一样认共享密钥文件：共享组里 manage_secret 写进 config/secrets.env 的值不在进程环境里
-    return env_value(f"{_provider_env_prefix(provider_name)}_BASE_URL")
+    return env_value(f"{_provider_env_prefix(provider_name)}_{suffix}")
 
 
 def _provider_init_kwargs(
@@ -101,27 +112,25 @@ def _provider_init_kwargs(
     base_url: str,
     provider_options: dict[str, Any],
     active_provider: str = "",
+    main_channel: str = "",
 ) -> dict[str, Any]:
-    """Build common constructor kwargs for provider classes."""
-    # [provider-registry 2026-05-03] 统一构造 provider 参数。
-    # 原因：runner 不应再按 provider 类型实例化不同类；做法：先组装一个超集 kwargs，
-    # 再由 _instantiate_provider 按构造签名过滤；目的：保留旧 provider 行为，同时支持新插件。
-    # 主渠道地址只在格式对得上时才套用。差一层就会拿着别家的 url 发本家的格式，
-    # 报出来的 404 跟地址毫无关系，排查时根本想不到是渠道串了。
-    borrowed_base_url = base_url if _shares_endpoint_with_main(provider_name, active_provider) else ""
-    if provider_name in _OPENAI_COMPATIBLE_PROVIDERS:
-        resolved_api_key = rp.api_key or api_key
-        resolved_base_url = rp.base_url or borrowed_base_url or None
+    """provider 构造参数的超集，由 instantiate_provider 按构造签名挑着传。
+
+    rp 自己带的地址密钥最优先。本轮用的就是主渠道这一个渠道时，接着用主渠道块给的，<PROVIDER>_* 只补两边都没给的空；
+    别的渠道先看 <PROVIDER>_*，主渠道的密钥最后兜底，主渠道的地址只在请求格式对得上时才借。
+    """
+    same_channel = bool(main_channel) and getattr(rp, "channel_name", "") == main_channel
+    env_api_key = _provider_env(provider_name, "API_KEY")
+    env_base_url = _provider_env(provider_name, "BASE_URL")
+    if same_channel:
+        resolved_api_key = rp.api_key or api_key or env_api_key
+        resolved_base_url = rp.base_url or base_url or env_base_url or None
     else:
-        resolved_api_key = rp.api_key or env_value(f"{_provider_env_prefix(provider_name)}_API_KEY") or api_key
-        # 控制台填的地址走 config.yaml 那一块；少了这层兜底会被丢掉，
-        # provider 静默回落自己的官方域名。
-        resolved_base_url = (
-            rp.base_url
-            or _provider_endpoint_from_env(provider_name)
-            or borrowed_base_url
-            or None
-        )
+        # 主渠道地址只在格式对得上时才套用。差一层就会拿着别家的 url 发本家的格式，
+        # 报出来的 404 跟地址毫无关系，排查时根本想不到是渠道串了。
+        borrowed_base_url = base_url if _shares_endpoint_with_main(provider_name, active_provider) else ""
+        resolved_api_key = rp.api_key or env_api_key or api_key
+        resolved_base_url = rp.base_url or env_base_url or borrowed_base_url or None
     return {
         "http": llm_http,
         "api_key": resolved_api_key,
@@ -131,42 +140,8 @@ def _provider_init_kwargs(
     }
 
 
-def _merge_provider_options(global_options: dict[str, Any], node_options: dict[str, Any]) -> dict[str, Any]:
-    """Merge global and node provider options, with node values taking priority."""
-    # [AutoC 2026-06-01] Why: provider-wide defaults belong in runtime.yaml, but
-    # individual nodes still need to override a nested option such as reasoning
-    # effort. How: recursively copy dict values from the global layer, then overlay
-    # node-level provider_options. Purpose: pass one complete provider_options dict
-    # to provider adapters without mutating runtime or node configuration objects.
-    merged: dict[str, Any] = dict(global_options or {})
-    for key, value in (node_options or {}).items():
-        base_value = merged.get(key)
-        if isinstance(base_value, dict) and isinstance(value, dict):
-            merged[key] = _merge_provider_options(base_value, value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> Any:
-    """Instantiate a provider, passing only kwargs its constructor accepts."""
-    # [provider-registry 2026-05-03] Provider 构造函数目前不完全一致。
-    # 原因：OpenAI 不接收 provider_options，而其他 provider 需要；做法：用签名过滤 kwargs，
-    # 若未来插件声明 **kwargs 则传入完整超集；目的：不强迫 Phase 1 改写所有 provider 构造函数。
-    signature = inspect.signature(provider_cls)
-    parameters = signature.parameters
-    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
-        return provider_cls(**init_kwargs)
-    allowed = {
-        name
-        for name, param in parameters.items()
-        if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
-    }
-    return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
-
-
 def _rooted_provider_name(rp: Any, *, active_provider: str) -> str:
-    """节点声明的 provider 没有配套地址时改用主渠道的那个。
+    """rp 声明的 provider 有配套地址时就是它自己，没有时是主渠道的线格式。
 
     只写 provider、地址却交给 $ENV{} 供给的节点，一旦那几个环境变量为空就剩下一份
     无根声明。照着它发请求等于拿主渠道的地址发另一家的格式，换来一个跟地址毫无
@@ -176,13 +151,32 @@ def _rooted_provider_name(rp: Any, *, active_provider: str) -> str:
     active = str(active_provider or "").strip().lower()
     if not active or _shares_endpoint_with_main(requested, active):
         return requested
-    if rp.base_url or _provider_endpoint_from_env(requested):
+    if rp.base_url or _provider_env(requested, "BASE_URL"):
         return requested
-    print(
-        f"[engine] provider {requested!r} 没有配套 base_url，改用主渠道 {active!r} 发送",
-        flush=True,
-    )
     return active
+
+
+def _send_through_main_channel(
+    rp: Any,
+    *,
+    node_id: str,
+    main_wire: str,
+    main_channel: str,
+    main_options: Mapping[str, Any] | None,
+) -> None:
+    """声明的 provider 没有配套地址，这一轮整套改用主渠道发。
+
+    线格式、渠道名、options 换成主渠道的，声明渠道自己的地址密钥一并清掉：它的 key 不能被发到主渠道的地址。
+    """
+    logger.warning(
+        "节点 %s 的 provider %r 没有配套 base_url，这一轮改用主渠道 %r 发送",
+        node_id, rp.provider_type, main_channel,
+    )
+    rp.provider_type = main_wire
+    rp.channel_name = main_channel
+    rp.channel_options = dict(main_options or {})
+    rp.base_url = None
+    rp.api_key = None
 
 
 class ProviderKeyMissing(RuntimeError):
@@ -201,12 +195,13 @@ def _create_provider_from_registry(
     base_url: str,
     provider_options: dict[str, Any],
     active_provider: str = "",
+    main_channel: str = "",
 ) -> Any:
-    """Resolve and instantiate the configured provider through ProviderRegistry.
+    """Resolve and instantiate the provider rp names through ProviderRegistry.
 
     Raises ProviderKeyMissing when neither the node's channel nor the main channel supplies a key.
     """
-    requested_name = _rooted_provider_name(rp, active_provider=active_provider)
+    requested_name = (rp.provider_type or "openai").strip().lower()
     provider_cls = provider_registry.get(requested_name)
     provider_name = requested_name
     if provider_cls is None:
@@ -228,10 +223,11 @@ def _create_provider_from_registry(
         base_url=base_url,
         provider_options=provider_options,
         active_provider=active_provider,
+        main_channel=main_channel,
     )
     if not init_kwargs.get("api_key"):
         raise ProviderKeyMissing(getattr(rp, "channel_name", "") or provider_name)
-    return _instantiate_provider(provider_cls, init_kwargs)
+    return instantiate_provider(provider_cls, init_kwargs)
 
 
 _NODE_INFO_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -622,11 +618,6 @@ async def _flush_outbox(http: httpx.AsyncClient, supervisor_url: str, workspace_
         logger.warning("async tool result redelivery failed", exc_info=True)
 
 
-def _create_llm_http_client(timeout: float) -> httpx.AsyncClient:
-    trust_env = env_bool("CLONOTH_LLM_TRUST_ENV", False)
-    return httpx.AsyncClient(timeout=timeout, trust_env=trust_env, headers={"User-Agent": "Clonoth"})
-
-
 async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: str = "") -> None:
     wid = worker_id or str(uuid.uuid4())
     generation_id = str(uuid.uuid4())  # Direction 2: unique generation per engine startup
@@ -635,7 +626,6 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     _last_reload_seq = 0
 
     sup_timeout = get_float(runtime_cfg, "engine.http.client_timeout_sec", 60.0, min_value=5.0, max_value=600.0)
-    llm_timeout = get_float(runtime_cfg, "providers.openai.timeout_sec", 600.0, min_value=5.0, max_value=600.0)
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
     max_workers = get_int(runtime_cfg, "engine.max_workers", 4, min_value=1, max_value=32)
     slots = WorkerSlots(
@@ -658,7 +648,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
     async with (
         httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers=_sup_headers) as http,
-        _create_llm_http_client(llm_timeout) as llm_http,
+        create_llm_http_client(llm_request_timeout(runtime_cfg)) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
 
@@ -860,7 +850,7 @@ async def _handle_task(
                 session_id=session_id, session_generation=session_generation,
                 api_key=main.api_key, base_url=main.base_url,
                 default_model=main.model, default_provider=main.provider,
-                default_channel=main.channel_name, lease=lease,
+                default_channel=main.channel_name, default_options=main.options, lease=lease,
             )
         elif kind == "tool":
             result = await _run_tool_task(
@@ -936,26 +926,30 @@ def _resolve_system_model_slot(node: Any) -> str:
 
 
 def _apply_system_slot(ws_root: Path, rp: Any, slot: Any, slot_name: str) -> None:
-    """把系统槽位的配置盖到已解析的渠道上。空字段表示这一项跟随主渠道。"""
+    """把系统槽位的配置盖到已解析的渠道上。空字段表示这一项照节点解析出的。
+
+    provider 可以和节点的一样写渠道名。写了就整套换成那个渠道：线格式、渠道名、options 用它的，
+    地址、密钥按 槽位自己写的 > 渠道块 取，模型按 槽位自己写的 > 渠道块 > 节点解析出的 取。
+    节点解析出的地址密钥不沿用，否则会把别的渠道的 key 发到这个渠道的地址。
+    """
+    if slot.provider:
+        channel = resolve_channel(ws_root, slot.provider)
+        rp.provider_type = channel.wire
+        rp.channel_name = channel.name
+        rp.channel_options = dict(channel.options)
+        rp.model = slot.model or channel.model or rp.model
+        rp.base_url = slot.base_url or channel.base_url or None
+        rp.api_key = slot.api_key or channel.api_key or None
+        return
     for field in ("model", "base_url", "api_key"):
         value = getattr(slot, field, "")
         if value:
             setattr(rp, field, value)
-    if slot.provider:
-        # 槽位的 provider 跟节点的一样，可以是渠道名。只填它不填地址就整块继承过来。
-        channel = resolve_channel(ws_root, slot.provider)
-        rp.provider_type = channel.wire
-        rp.channel_name = channel.name
-        if channel.known:
-            rp.base_url = rp.base_url or channel.base_url or None
-            rp.api_key = rp.api_key or channel.api_key or None
-            rp.model = rp.model or channel.model
-    elif slot.base_url:
+    if slot.base_url:
         # 换中转没事，换家必挂 —— 这一条日志是唯一的线索。
-        print(
-            f"[engine] system slot {slot_name} 换了 base_url 但没指定 provider，"
-            f"仍按 {rp.provider_type or 'openai'} 的格式发",
-            flush=True,
+        logger.warning(
+            "系统槽位 %s 换了 base_url 但没指定 provider，仍按 %s 的格式发",
+            slot_name, rp.provider_type or "openai",
         )
 
 
@@ -1061,9 +1055,11 @@ async def _build_node_provider(
     default_model: str,
     default_provider: str,
     default_channel: str,
+    default_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """按会话覆盖、节点声明、系统槽位和运行配置，解析出这个节点本轮用的 provider。
 
+    default_* 是 Supervisor 给的主渠道，地址、密钥和 options 出自它手上的同一份配置。
     最终渠道和主渠道都给不出 api_key 时抛 ProviderKeyMissing。
     """
     session_provider_override = await _fetch_session_provider_override(http, sup_url, route_session_id)
@@ -1072,35 +1068,34 @@ async def _build_node_provider(
         provider_default_type=default_provider,
         session_override=session_provider_override,
         provider_default_channel=default_channel,
+        provider_default_options=default_options,
     )
-    # 系统节点（压缩/轮摘要）的 model/base_url/api_key 可以单独配在 system_models.<slot>，留空的项跟随主渠道
+    resolved_wire = (rp.provider_type or "openai").strip().lower()
+    # 系统节点（压缩/轮摘要）的 model/base_url/api_key 可以单独配在 system_models.<slot>，留空的项照上面解析出的渠道
     _sys_slot = _resolve_system_model_slot(node)
     if _sys_slot:
-        _apply_system_slot(ws_root, rp, resolve_system_model(
-            ws_root, _sys_slot,
-            default_model=rp.model or default_model,
-            default_base_url="",   # 留空→下方 _create_provider_from_registry 用主渠道 base_url
-            default_api_key="",    # 留空→同上用主渠道 api_key
-        ), _sys_slot)
-    provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
-    global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
-    if not isinstance(global_provider_options, dict):
-        global_provider_options = {}
-    node_provider_options = getattr(node, "provider_options", {}) or {}
-    if not isinstance(node_provider_options, dict):
-        node_provider_options = {}
-    # 三层由宽到窄：runtime.yaml 按线格式定的 < 这个渠道块自己写的 < 节点写的。
-    _po = _merge_provider_options(
-        _merge_provider_options(global_provider_options, rp.channel_options),
-        node_provider_options,
+        _apply_system_slot(ws_root, rp, resolve_system_model(ws_root, _sys_slot), _sys_slot)
+    main_channel = default_channel or default_provider
+    rooted = _rooted_provider_name(rp, active_provider=default_provider)
+    if rooted != (rp.provider_type or "openai").strip().lower():
+        _send_through_main_channel(
+            rp, node_id=node.id, main_wire=rooted, main_channel=main_channel, main_options=default_options,
+        )
+    # 由宽到窄：runtime.yaml 按线格式定的 < 这个渠道块自己写的 < 节点写的。节点那层是照解析出的线格式写的，
+    # 槽位换家、无根改道换了线格式就不带：键名不通用，和备用渠道同一条规则。
+    same_wire = (rp.provider_type or "openai").strip().lower() == resolved_wire
+    provider_options = layered_provider_options(
+        runtime_cfg, rp.provider_type, rp.channel_options,
+        getattr(node, "provider_options", None) if same_wire else None,
     )
     provider = _create_provider_from_registry(
         rp,
         llm_http=llm_http,
         api_key=api_key,
         base_url=base_url,
-        provider_options=_po,
+        provider_options=provider_options,
         active_provider=default_provider,
+        main_channel=main_channel,
     )
     provider.plugin_channel = rp.channel_name
     return provider
@@ -1122,6 +1117,7 @@ async def _run_node_task(
     default_model: str,
     default_provider: str = "openai",
     default_channel: str = "",
+    default_options: Mapping[str, Any] | None = None,
     lease: TaskLease | None = None,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
@@ -1151,6 +1147,7 @@ async def _run_node_task(
             route_session_id=parent_session_id or session_id, runtime_cfg=runtime_cfg,
             api_key=api_key, base_url=base_url, default_model=default_model,
             default_provider=default_provider, default_channel=default_channel,
+            default_options=default_options,
         )
     except ProviderKeyMissing as missing:
         return {"action": "fail", "node_id": node_id, "error": f"渠道 {missing.channel} 的 api_key 未配置。"}

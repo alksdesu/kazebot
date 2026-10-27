@@ -268,6 +268,39 @@ def test_diagnostic_probe_sets_effective_bounded_provider_output(tmp_path, monke
     assert observed[0] is not None and 0 < observed[0] <= 1024
 
 
+@pytest.mark.parametrize("switch,trusted", [(None, False), ("0", False), ("1", True)])
+def test_diagnostic_probe_goes_out_like_a_real_model_request(tmp_path, monkeypatch, switch, trusted):
+    # 诊断和真实请求走的代理、UA 不一样的话，它说通了真实请求照样不通。
+    import supervisor.operations.service as service_module
+    from engine import model
+
+    if switch is None:
+        monkeypatch.delenv("CLONOTH_LLM_TRUST_ENV", raising=False)
+    else:
+        monkeypatch.setenv("CLONOTH_LLM_TRUST_ENV", switch)
+    operations, secret = service(tmp_path)
+    secret.provider = "openai"
+    secret.model = "synthetic-model"
+    clients = []
+
+    def recording(timeout):
+        client = model.create_llm_http_client(timeout)
+        clients.append(client)
+        return client
+
+    async def fake_chat(self, *, messages, tools, **kwargs):
+        return ProviderResponse(ok=True, text="OK")
+
+    monkeypatch.setattr(service_module, "create_llm_http_client", recording)
+    monkeypatch.setattr(registry.get("openai"), "chat", fake_chat)
+    report = asyncio.run(operations.diagnose(test_model=True))
+    assert next(item for item in report["checks"] if item["name"] == "模型响应")["status"] == "passed"
+    assert len(clients) == 1
+    assert clients[0].trust_env is trusted
+    assert clients[0].headers["User-Agent"] == "Clonoth"
+    assert clients[0].is_closed
+
+
 def test_export_scrubs_sensitive_log_filenames_and_url_userinfo(tmp_path):
     operations, secret = service(tmp_path)
     logs = tmp_path / "data/logs"

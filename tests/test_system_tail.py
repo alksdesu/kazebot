@@ -247,7 +247,7 @@ async def test_fallback_gets_the_same_tail_order(tmp_path: Path, monkeypatch) ->
             captured["messages"] = messages
             return ProviderResponse(ok=True, text="done")
 
-    monkeypatch.setattr(fallback_provider, "_load_config", lambda _root: {"fallbacks": [
+    monkeypatch.setattr(fallback_provider, "load_models_config", lambda _root: {"fallbacks": [
         {"provider": "gemini", "base_url": "https://example.test", "api_key": "test", "model": "backup"},
     ]})
     monkeypatch.setattr(fallback_provider, "_create_fallback_provider", lambda **_kwargs: Backup())

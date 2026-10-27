@@ -303,7 +303,7 @@ class TestServingProvider:
             async def chat(self, *, messages, tools):
                 return ProviderResponse(ok=True, text="done", usage={"prompt_tokens": 30, "cache_read_tokens": 0})
 
-        monkeypatch.setattr(fallback_module, "_load_config", lambda _root: {
+        monkeypatch.setattr(fallback_module, "load_models_config", lambda _root: {
             "gemini-中转A": {"type": "gemini", "base_url": "https://relay.test", "api_key": "k", "model": "backup-model"},
             "fallbacks": [{"provider": "gemini-中转A"}],
         })

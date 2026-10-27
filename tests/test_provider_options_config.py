@@ -8,10 +8,13 @@ provider adapters can rely on one combined options dictionary.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import pytest
 import yaml
 
 # Why: the project is tested directly from a source checkout. How: put the
@@ -20,10 +23,13 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from clonoth_runtime import DEFAULT_RUNTIME_CONFIG  # noqa: E402
-from engine.runner import _merge_provider_options  # noqa: E402
+from engine import runner  # noqa: E402
+from engine.model import layered_provider_options, merge_provider_options  # noqa: E402
 from engine.attachments import contains_image_blocks  # noqa: E402
 from engine.builtin import fallback_provider as fallback_module  # noqa: E402
+from engine.context import ServingProvider  # noqa: E402
 from engine.inference import llm_call  # noqa: E402
+from engine.node import Node  # noqa: E402
 
 
 def test_default_openai_provider_declares_options_dict() -> None:
@@ -48,7 +54,7 @@ def test_provider_options_merge_keeps_global_defaults_and_node_overrides() -> No
         "node_only": True,
     }
 
-    merged = _merge_provider_options(global_options, node_options)
+    merged = merge_provider_options(global_options, node_options)
 
     # Why: global provider options provide defaults, while node YAML must still be
     # able to specialize a single nested value. How: merge dictionaries recursively
@@ -62,6 +68,79 @@ def test_provider_options_merge_keeps_global_defaults_and_node_overrides() -> No
     }
     assert global_options["reasoning"]["effort"] == "medium"
     assert node_options["reasoning"] == {"effort": "high"}
+
+
+def test_layered_options_go_from_the_runtime_wire_up_to_the_narrowest_layer() -> None:
+    runtime_cfg = {"providers": {
+        "gemini": {"options": {"thinking_mode": "auto", "safety_threshold": "off", "nested": {"a": 1, "b": 1}}},
+        "openai": {"options": {"temperature": 0.9}},
+    }}
+
+    merged = layered_provider_options(
+        runtime_cfg, "gemini", {"thinking_mode": "on", "nested": {"b": 2}}, None, "不是映射", {"nested": {"c": 3}},
+    )
+
+    assert merged == {"thinking_mode": "on", "safety_threshold": "off", "nested": {"a": 1, "b": 2, "c": 3}}
+    assert runtime_cfg["providers"]["gemini"]["options"]["nested"] == {"a": 1, "b": 1}
+
+
+@pytest.mark.parametrize("runtime_cfg", [None, {}, {"providers": None}, {"providers": {"gemini": "x"}},
+                                         {"providers": {"gemini": {"options": ["x"]}}}])
+def test_a_runtime_layer_that_is_missing_or_malformed_counts_as_empty(runtime_cfg) -> None:
+    assert layered_provider_options(runtime_cfg, "gemini", {"thinking_mode": "on"}) == {"thinking_mode": "on"}
+
+
+class TestTheMainChannelOptionsOnTheRealPath:
+    """跟随主渠道的节点：运行参数[主渠道线格式] < 主渠道块的 options < 节点写的，和点名渠道时一样分层。"""
+
+    MAIN = {
+        "api_key": "sk-main", "base_url": "https://api.deepseek.com", "default_model": "deepseek-v4",
+        "default_provider": "deepseek", "default_channel": "deepseek",
+    }
+    RUNTIME = {"providers": {
+        "deepseek": {"options": {"reasoning_effort": "max", "timeout_sec": 300}},
+        "gemini": {"options": {"safety_threshold": "off"}},
+    }}
+
+    def _build(self, tmp_path, monkeypatch, node, *, models="", default_options=None):
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "models.yaml").write_text(models, encoding="utf-8")
+        created = []
+
+        class _Recorder:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+        monkeypatch.setattr(runner.provider_registry, "get", lambda _name: _Recorder)
+        provider = asyncio.run(runner._build_node_provider(
+            ws_root=tmp_path, node=node, http=None, llm_http=object(), sup_url="http://sup", route_session_id="",
+            runtime_cfg=self.RUNTIME, default_options=default_options, **self.MAIN,
+        ))
+        return provider, created[-1]["provider_options"]
+
+    def test_a_node_following_the_main_channel_gets_its_block_options(self, tmp_path, monkeypatch) -> None:
+        _, options = self._build(
+            tmp_path, monkeypatch, Node(id="n", type="ai", provider_options={"reasoning_effort": "default"}),
+            default_options={"thinking": True, "reasoning_effort": "high"},
+        )
+
+        assert options == {"timeout_sec": 300, "thinking": True, "reasoning_effort": "default"}
+
+    def test_without_main_options_only_the_runtime_and_node_layers_apply(self, tmp_path, monkeypatch) -> None:
+        _, options = self._build(tmp_path, monkeypatch, Node(id="n", type="ai"))
+
+        assert options == {"reasoning_effort": "max", "timeout_sec": 300}
+
+    def test_a_node_naming_another_channel_keeps_to_that_channel(self, tmp_path, monkeypatch) -> None:
+        provider, options = self._build(
+            tmp_path, monkeypatch, Node(id="n", type="ai", provider="relay"),
+            models="relay:\n  type: gemini\n  base_url: https://relay.example/v1\n  api_key: sk-relay\n"
+                   "  options:\n    thinking_mode: \"on\"\n",
+            default_options={"thinking": True},
+        )
+
+        assert provider.plugin_channel == "relay"
+        assert options == {"safety_threshold": "off", "thinking_mode": "on"}
 
 
 _IMAGE_MESSAGES = [
@@ -249,3 +328,98 @@ def test_shared_http_client_is_not_closed() -> None:
     """runner 传进来的是进程级共享连接池，关掉它整个引擎就废了。"""
     asyncio.run(fallback_module._release_fallback_provider(SimpleNamespace()))
     asyncio.run(fallback_module._release_fallback_provider(None))
+
+
+_RELAY_CFG = {
+    "relay": {
+        "type": "openai", "base_url": "https://relay.test/v1", "api_key": "k",
+        "options": {"temperature": 0.2, "top_p": 0.8, "reasoning": {"effort": "high", "summary": "auto"}},
+    },
+}
+_RUNTIME_OPENAI = {"providers": {"openai": {"options": {"max_completion_tokens": 321, "temperature": 1.0}}}}
+
+
+def test_a_fallback_on_the_primary_wire_layers_runtime_block_node_then_entry() -> None:
+    entry = fallback_module._resolve_fallback_entry(
+        {"provider": "relay", "options": {"temperature": 0.7}}, _RELAY_CFG,
+        runtime_cfg=_RUNTIME_OPENAI, node_options={"top_p": 0.5, "max_completion_tokens": 999}, primary_wire="openai",
+    )
+
+    assert entry["options"] == {
+        "max_completion_tokens": 999, "temperature": 0.7, "top_p": 0.5,
+        "reasoning": {"effort": "high", "summary": "auto"},
+    }
+
+
+def test_node_options_stay_behind_when_the_fallback_speaks_another_wire() -> None:
+    # 节点的 provider_options 是照主请求那家写的，换了一家键名不通用。
+    entry = fallback_module._resolve_fallback_entry(
+        {"provider": "relay"}, _RELAY_CFG,
+        runtime_cfg=_RUNTIME_OPENAI, node_options={"top_p": 0.5}, primary_wire="deepseek",
+    )
+
+    assert entry["options"] == {
+        "max_completion_tokens": 321, "temperature": 0.2, "top_p": 0.8,
+        "reasoning": {"effort": "high", "summary": "auto"},
+    }
+
+
+def test_an_unknown_primary_wire_carries_no_node_options() -> None:
+    entry = fallback_module._resolve_fallback_entry({"provider": "relay"}, _RELAY_CFG, node_options={"top_p": 0.5})
+
+    assert entry["options"]["top_p"] == 0.8
+
+
+def test_nested_entry_options_merge_into_the_block() -> None:
+    entry = fallback_module._resolve_fallback_entry(
+        {"provider": "relay", "options": {"reasoning": {"effort": "low"}}}, _RELAY_CFG,
+    )
+
+    assert entry["options"]["reasoning"] == {"effort": "low", "summary": "auto"}
+
+
+def test_the_fallback_goes_out_like_the_primary_path(tmp_path, monkeypatch) -> None:
+    """共用 engine 的模型请求客户端，运行参数、渠道块、节点、条目四层 options 都到请求里，用完不关共用的客户端。"""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "models.yaml").write_text(yaml.safe_dump({
+        "relay": {"type": "openai", "base_url": "https://relay.test/v1", "api_key": "sk-relay", "model": "backup",
+                  "options": {"temperature": 0.2}},
+        "fallbacks": [{"provider": "relay", "options": {"temperature": 0.7}}],
+    }), encoding="utf-8")
+    seen: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        })
+
+    monkeypatch.setattr(llm_call, "_build_messages_for_provider", lambda messages, formatter, provider: messages)
+    monkeypatch.setattr(llm_call, "prepare_messages_for_llm", lambda messages, workspace_root: messages)
+
+    async def run() -> SimpleNamespace:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as shared:
+            ctx = SimpleNamespace(
+                response=SimpleNamespace(ok=False, status_code=502, error="primary failed"),
+                rctx=SimpleNamespace(workspace_root=tmp_path, llm_http=shared, total_usage={}, serving_provider=None),
+                node=SimpleNamespace(id="entry", provider_options={"top_p": 0.5}),
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                provider=SimpleNamespace(model="primary", provider_name="openai"),
+                extra={"loop_state": SimpleNamespace(
+                    formatter=None, runtime_cfg={"providers": {"openai": {"options": {"max_completion_tokens": 321}}}},
+                )},
+            )
+            await fallback_module.FallbackProviderHandler().handle(ctx)
+            assert not shared.is_closed
+            return ctx
+
+    ctx = asyncio.run(run())
+
+    assert ctx.response.ok
+    assert len(seen) == 1
+    assert str(seen[0].url) == "https://relay.test/v1/chat/completions"
+    assert seen[0].headers["authorization"] == "Bearer sk-relay"
+    body = json.loads(seen[0].content)
+    assert (body["model"], body["temperature"], body["top_p"], body["max_completion_tokens"]) == ("backup", 0.7, 0.5, 321)
+    assert ctx.rctx.serving_provider == ServingProvider(model="backup", provider="openai", channel="relay")

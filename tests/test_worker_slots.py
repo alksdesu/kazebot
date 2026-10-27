@@ -370,7 +370,7 @@ class TestWorkerLoop:
             return {}
 
         monkeypatch.setattr(runner.httpx, "AsyncClient", FakeSupervisor)
-        monkeypatch.setattr(runner, "_create_llm_http_client", lambda _timeout: FakeSupervisor())
+        monkeypatch.setattr(runner, "create_llm_http_client", lambda _timeout: FakeSupervisor())
         monkeypatch.setattr(runner, "ToolRegistry", FakeTools)
         monkeypatch.setattr(runner, "wait_supervisor", ready)
         monkeypatch.setattr(runner, "_register_engine", ready)

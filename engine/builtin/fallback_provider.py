@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
-import yaml
-
-import config_layout
-from clonoth_runtime import parse_bool, resolve_channel, resolve_env_ref
+from clonoth_runtime import load_models_config, load_runtime_config, parse_bool, resolve_channel, resolve_env_ref
 from plugin_runtime import PluginExecutionError, plugin_scope
 
 from engine.attachments import contains_image_blocks
@@ -29,6 +27,7 @@ from engine.inference.llm_call import (
     wait_provider_call,
 )
 from engine.inference.llm_outcome import error_kind, should_fallback
+from engine.model import create_llm_http_client, instantiate_provider, layered_provider_options, llm_request_timeout
 from .result import hook_result
 from .usage_tracker import accumulate_usage, note_serving_provider
 
@@ -48,27 +47,21 @@ PLUGIN_META = {
 def _resolve_env_value(value: str | None) -> str:
     """Expand ${VAR} / $ENV{VAR} references against process environment.
 
-    Why: fallback_provider reads config/models.yaml directly via yaml.safe_load and
-    never goes through ConfigStore, so unexpanded placeholders in fallback blocks
+    Why: fallback entries come raw from config/models.yaml (load_models_config) and
+    never go through ConfigStore, so unexpanded placeholders in fallback blocks
     would reach the API verbatim. Purpose: fallback secrets can live in .env.
     """
     return resolve_env_ref((value or "").strip())
 
 
-def _load_config(workspace_root: str | Path) -> dict[str, Any]:
-    """Read full config/models.yaml."""
-    cfg_path = config_layout.models_path(workspace_root)
-    if not cfg_path.exists():
-        return {}
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception as exc:
-        logger.warning("fallback_provider: failed to load config: %s", exc)
-        return {}
-
-
-def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) -> dict[str, Any]:
+def _resolve_fallback_entry(
+    fb_cfg: dict[str, Any],
+    full_cfg: dict[str, Any],
+    *,
+    runtime_cfg: Mapping[str, Any] | None = None,
+    node_options: Mapping[str, Any] | None = None,
+    primary_wire: str = "",
+) -> dict[str, Any]:
     """Resolve a fallback entry by merging with its provider config block.
 
     Expected config layout:
@@ -88,6 +81,10 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     Resolution order for each field (base_url, api_key, model):
       1. Explicit value in fallback entry
       2. Value from the provider config block (e.g. deepseek:)
+
+    options are layered narrow over wide: runtime providers.<wire>.options, the
+    provider config block, the node's provider_options (only when the fallback
+    speaks the same wire as the primary request), then the entry itself.
     """
     channel_name = str(fb_cfg.get("provider") or "openai").strip()
     channel = resolve_channel("", channel_name, config=full_cfg)
@@ -105,10 +102,11 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
 
     # 备选的 provider 类型往往和主渠道不同，参数键名不通用，所以不继承主渠道的
     # options，只从同名 provider 块继承，再让条目自己覆盖。
-    entry_options = fb_cfg.get("options")
-    options = dict(channel.options)
-    if isinstance(entry_options, dict):
-        options.update(entry_options)
+    # 节点的 provider_options 是照主请求的线格式写的，备选也说这个线格式时才带上。
+    same_wire = bool(primary_wire) and channel.wire == primary_wire
+    options = layered_provider_options(
+        runtime_cfg, channel.wire, channel.options, node_options if same_wire else None, fb_cfg.get("options"),
+    )
 
     return {
         # provider 是渠道名，只用来说人话；wire 才是 registry 认的那个 key。
@@ -185,18 +183,17 @@ def _create_fallback_provider(
     base_url: str,
     api_key: str,
     model: str,
-    timeout: float = 600.0,
     provider_options: dict[str, Any] | None = None,
+    http: Any | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
 ) -> Any | None:
-    """Instantiate a provider by type string using ProviderRegistry.
+    """Instantiate a provider by type string using ProviderRegistry, with the same constructor kwargs as the primary path.
 
     Supports any provider registered in providers/__init__.py — no hardcoding.
+    http is the engine's shared LLM client when the caller has one; otherwise a
+    client is built by the same factory and released by _release_fallback_provider.
     """
     try:
-        import inspect
-
-        import httpx
-
         from providers import registry
         provider_cls = registry.get(provider_type)
         if provider_cls is None:
@@ -204,50 +201,17 @@ def _create_fallback_provider(
                            provider_type, registry.list())
             return None
 
-        # [fix 2026-08-04] Why: 不同 provider 的 __init__ 签名并不一致——
-        # 例如 OpenAIProvider 是 keyword-only，要求外部传入 httpx.AsyncClient
-        # 的 `http`，且不接受 `timeout`；而 DeepSeekProvider 接受可选 `http`
-        # 和 `timeout`。旧代码固定传 `timeout` 会让所有 openai 类型的 fallback
-        # 因 "unexpected keyword argument 'timeout'" 创建失败，导致 fallback
-        # 形同虚设（主渠道 900s 超时后无任何备选生效）。
-        # How: 用 inspect 读取目标构造函数接受的参数名，只投递它真正支持的
-        # kwargs；当 provider 需要 `http` 但不接受 `timeout` 时，为它构造一个
-        # 带超时的 httpx.AsyncClient。Purpose: 让 fallback 对任意 provider 通用
-        # 生效，且超时语义不丢失。
-        try:
-            sig_params = inspect.signature(provider_cls.__init__).parameters
-            accepted = set(sig_params.keys())
-            has_var_kw = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
-            )
-        except (TypeError, ValueError):
-            accepted = set()
-            has_var_kw = True  # 无法内省时不做过滤，保持旧行为
-
-        def _wanted(name: str) -> bool:
-            return has_var_kw or name in accepted
-
-        kwargs: dict[str, Any] = {"model": model, "api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-
-        if _wanted("timeout") and timeout:
-            kwargs["timeout"] = timeout
-
-        if _wanted("provider_options") and provider_options:
-            kwargs["provider_options"] = provider_options
-
-        # provider 需要外部注入 http 客户端（如 OpenAIProvider）时，构造一个
-        # 带超时的 AsyncClient。它的生命周期随 provider 释放（此处不显式关闭，
-        # 交由进程退出/GC 回收，fallback provider 为一次性使用）。
         owned_http = None
-        if _wanted("http") and "http" not in kwargs:
-            owned_http = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout or 600.0, connect=10.0)
-            )
-            kwargs["http"] = owned_http
-
-        provider = provider_cls(**kwargs)
+        if http is None:
+            owned_http = create_llm_http_client(llm_request_timeout(runtime_cfg))
+            http = owned_http
+        provider = instantiate_provider(provider_cls, {
+            "http": http,
+            "api_key": api_key,
+            "base_url": base_url or None,
+            "model": model,
+            "provider_options": dict(provider_options or {}),
+        })
         # 这条链路每失败一次就建一个连接池，不还回去就一直攒着。挂在实例上让
         # 调用方能在用完后关掉；共享进来的 client 不带这个标记，也就不会被误关。
         if owned_http is not None:
@@ -294,7 +258,7 @@ class FallbackProviderHandler:
         if not workspace_root:
             return None
 
-        full_cfg = _load_config(workspace_root)
+        full_cfg = load_models_config(workspace_root)
         # [2026-07-16] Why: 系统节点（压缩/轮摘要/读图等）希望能配置与
         # 对话主链不同的备选渠道/模型（例如主链用大模型，压缩用便宜模型）。
         # How: 先按当前节点 id 在 models.yaml 的 node_fallbacks 映射里查专属备选链，
@@ -317,6 +281,13 @@ class FallbackProviderHandler:
         original_model = getattr(original_provider, "model", "unknown")
         step = int(getattr(ctx, "step", 0) or 0)
         _formatter = getattr(_ls, 'formatter', None) if _ls else None
+        # 备用渠道的 provider 和主路径一样构造：同一份运行参数、同一个模型请求客户端
+        runtime_cfg = getattr(_ls, "runtime_cfg", None)
+        if not isinstance(runtime_cfg, dict):
+            runtime_cfg = load_runtime_config(Path(workspace_root))
+        shared_http = getattr(rctx, "llm_http", None)
+        node_options = getattr(_node, "provider_options", None)
+        primary_wire = str(getattr(original_provider, "provider_name", "") or "").strip().lower()
 
         logger.warning(
             "fallback_provider: primary failed (status=%s error=%s model=%s), "
@@ -333,7 +304,9 @@ class FallbackProviderHandler:
         for i, fb_raw in enumerate(fallbacks_raw):
             if not isinstance(fb_raw, dict):
                 continue
-            fb_cfg = _resolve_fallback_entry(fb_raw, full_cfg)
+            fb_cfg = _resolve_fallback_entry(
+                fb_raw, full_cfg, runtime_cfg=runtime_cfg, node_options=node_options, primary_wire=primary_wire,
+            )
             fb_channel = fb_cfg["provider"]
             fb_provider_type = fb_cfg["wire"]
             fb_base_url = fb_cfg["base_url"]
@@ -366,8 +339,9 @@ class FallbackProviderHandler:
                     base_url=fb_base_url,
                     api_key=fb_api_key,
                     model=fb_model,
-                    timeout=getattr(original_provider, "timeout", 600.0),
                     provider_options=fb_cfg.get("options"),
+                    http=shared_http,
+                    runtime_cfg=runtime_cfg,
                 )
                 if fb_provider is None:
                     logger.warning(

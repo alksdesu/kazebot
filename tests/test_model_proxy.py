@@ -8,10 +8,19 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 
-from engine import runner
+import supervisor.admin_api as admin_api
+from engine import model
 from engine.builtin.fallback_provider import _create_fallback_provider, _release_fallback_provider
 from providers.openai import OpenAIProvider
+from supervisor.api import create_app
+from supervisor.config_store import ConfigStore
+from supervisor.eventlog import EventLog
+from supervisor.policy import PolicyEngine
+from supervisor.state import SupervisorState
 from toolbox._common import safe_subprocess_env
+
+# 模型请求客户端的超时取运行参数 providers.openai.timeout_sec，最短 5 秒。
+_RUNTIME = {"providers": {"openai": {"timeout_sec": 5.0}}}
 
 
 @pytest.fixture(autouse=True)
@@ -35,13 +44,62 @@ def test_model_proxy_is_explicitly_enabled(monkeypatch, value, expected):
         seen.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(runner.httpx, "AsyncClient", make_client)
-    assert runner._create_llm_http_client(42.0) is sentinel
+    monkeypatch.setattr(model.httpx, "AsyncClient", make_client)
+    assert model.create_llm_http_client(42.0) is sentinel
     assert seen == {
         "timeout": 42.0,
         "trust_env": expected,
         "headers": {"User-Agent": "Clonoth"},
     }
+
+
+@pytest.mark.parametrize("runtime_cfg,expected", [
+    ({}, 600.0),
+    (None, 600.0),
+    ({"providers": {"openai": {"timeout_sec": 120}}}, 120.0),
+    ({"providers": {"openai": {"timeout_sec": 1}}}, 5.0),
+    ({"providers": {"openai": {"timeout_sec": 9000}}}, 600.0),
+    ({"providers": {"openai": {"timeout_sec": "abc"}}}, 600.0),
+])
+def test_the_request_timeout_comes_from_the_runtime_config(runtime_cfg, expected):
+    assert model.llm_request_timeout(runtime_cfg) == expected
+
+
+def test_a_fallback_built_without_a_shared_client_gets_the_same_one(monkeypatch):
+    # 备用渠道自建的客户端和主路径同一个配法：代理开关、UA、超时都一样。
+    monkeypatch.setenv("CLONOTH_LLM_TRUST_ENV", "1")
+
+    async def run():
+        provider = _create_fallback_provider(
+            provider_type="openai", base_url="https://backup.invalid/v1",
+            api_key="test-key", model="test-model", runtime_cfg={"providers": {"openai": {"timeout_sec": 30}}},
+        )
+        assert provider is not None
+        client = provider._fallback_owned_http
+        try:
+            assert client.trust_env is True
+            assert client.headers["User-Agent"] == "Clonoth"
+            assert client.timeout == httpx.Timeout(30.0)
+        finally:
+            await _release_fallback_provider(provider)
+        assert client.is_closed
+
+    asyncio.run(run())
+
+
+def test_a_fallback_reuses_the_shared_client_and_leaves_it_open():
+    async def run():
+        async with model.create_llm_http_client(5.0) as shared:
+            provider = _create_fallback_provider(
+                provider_type="openai", base_url="https://backup.invalid/v1",
+                api_key="test-key", model="test-model", http=shared,
+            )
+            assert provider is not None
+            assert not hasattr(provider, "_fallback_owned_http")
+            await _release_fallback_provider(provider)
+            assert not shared.is_closed
+
+    asyncio.run(run())
 
 
 @asynccontextmanager
@@ -108,12 +166,12 @@ def set_proxy(monkeypatch, port):
 @asynccontextmanager
 async def model_provider(kind, base_url):
     if kind == "primary":
-        async with runner._create_llm_http_client(3.0) as client:
+        async with model.create_llm_http_client(model.llm_request_timeout(_RUNTIME)) as client:
             yield OpenAIProvider(http=client, api_key="test-key", base_url=base_url, model="test-model")
     else:
         provider = _create_fallback_provider(
             provider_type="openai", base_url=base_url,
-            api_key="test-key", model="test-model", timeout=3.0,
+            api_key="test-key", model="test-model", runtime_cfg=_RUNTIME,
         )
         assert provider is not None
         try:
@@ -181,22 +239,64 @@ def test_disabled_model_proxy_keeps_direct_path(monkeypatch):
             monkeypatch.setenv("CLONOTH_LLM_TRUST_ENV", "0")
             monkeypatch.setenv("NO_PROXY", "")
             monkeypatch.setenv("no_proxy", "")
-            async with runner._create_llm_http_client(3.0) as client:
+            async with model.create_llm_http_client(model.llm_request_timeout(_RUNTIME)) as client:
                 result = await client.get(f"http://127.0.0.1:{port}/models")
             assert result.status_code == 200
             assert received[0]["line"] == "GET /models HTTP/1.1"
     asyncio.run(run())
 
 
-def test_model_catalog_inherits_proxy(monkeypatch):
+def test_disabled_model_proxy_keeps_the_fallback_direct_too(monkeypatch):
+    # 代理开关对备用渠道一样生效：不然主路径直连、备用走代理，同一个地址一边通一边不通。
+    async def run():
+        async with fake_endpoint() as (port, received):
+            set_proxy(monkeypatch, 1)
+            monkeypatch.setenv("CLONOTH_LLM_TRUST_ENV", "0")
+            monkeypatch.setenv("NO_PROXY", "")
+            monkeypatch.setenv("no_proxy", "")
+            async with model_provider("fallback", f"http://127.0.0.1:{port}/v1") as provider:
+                result = await provider.chat(messages=[{"role": "user", "content": "test"}], tools=None)
+            assert result.ok, result.error
+            assert received[0]["line"] == "POST /v1/chat/completions HTTP/1.1"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("trust", ["1", "0"])
+def test_the_console_model_catalog_follows_the_proxy_switch(monkeypatch, tmp_path, trust):
+    # 拉模型列表和发模型请求用同一个客户端：开关关着时列表也直连，不会一边拉得到、一边发不出去
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "catalog-token")
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    (tmp_path / "config").mkdir()
+    app = create_app(
+        state=SupervisorState(
+            workspace_root=tmp_path,
+            eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="catalog"),
+            policy=PolicyEngine(workspace_root=tmp_path),
+        ),
+        process_manager=None,
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
+    )
+
     async def run():
         async with fake_endpoint() as (port, received):
             set_proxy(monkeypatch, port)
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                result = await client.get("http://catalog.invalid/v1/models")
-            assert result.json()["data"][0]["id"] == "test-model"
-            assert received[0]["line"] == "GET http://catalog.invalid/v1/models HTTP/1.1"
-    asyncio.run(run())
+            monkeypatch.setenv("CLONOTH_LLM_TRUST_ENV", trust)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/v1/config/providers/openai/models",
+                    json={"base_url": "http://catalog.invalid/v1", "api_key": "test-key"},
+                    headers={"Authorization": "Bearer catalog-token"},
+                )
+            return response, received
+
+    response, received = asyncio.run(run())
+    if trust == "1":
+        assert response.status_code == 200, response.text
+        assert received[0]["line"] == "GET http://catalog.invalid/v1/models HTTP/1.1"
+    else:
+        assert response.status_code == 502
+        assert received == []
 
 
 def test_tools_inherit_proxy_without_api_keys(monkeypatch):

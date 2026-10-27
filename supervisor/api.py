@@ -465,7 +465,7 @@ def create_app(
     ) -> dict[str, Any]:
         """问上游这个渠道有哪些模型。密钥只出不进：不回显、不进错误信息。"""
         verify_admin_token(request)
-        import httpx
+        from engine.model import create_llm_http_client
         from providers import registry as provider_registry
 
         cs: ConfigStore = app.state.config_store
@@ -489,7 +489,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"{name} 没有列模型的接口，模型名请手填")
         url, headers = target
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            # 和发模型请求同一个客户端工厂：代理开关、UA 跟着走，拉得到列表的渠道才真发得出请求
+            async with create_llm_http_client(15.0) as client:
                 resp = await client.get(url, headers=headers)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"连不上 {url}：{exc}") from exc

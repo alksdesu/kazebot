@@ -550,11 +550,14 @@ class MainChannel:
     model: str = ""
     provider: str = "openai"
     channel_name: str = ""
+    # 渠道块里手写的 options，和地址、密钥出自 Supervisor 手上同一份配置。
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
     if not isinstance(data, dict):
         return MainChannel()
+    raw_options = data.get("options")
     return MainChannel(
         api_key=resolve_env_ref(str(data.get("api_key") or "").strip()),
         base_url=resolve_env_ref(str(data.get("base_url") or "").strip()),
@@ -562,6 +565,8 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
         # 老 supervisor 不回这个字段，回落 openai 即改动前的行为。
         provider=str(data.get("provider") or "").strip().lower() or "openai",
         channel_name=str(data.get("channel_name") or "").strip(),
+        # 老 supervisor 也不回 options，按渠道块没写算；${VAR} 不展开，和点名渠道的 options 一样原样用。
+        options=dict(raw_options) if isinstance(raw_options, dict) else {},
     )
 
 
@@ -681,10 +686,74 @@ def novelai_available(workspace_root: Path) -> bool:
         return False
 
 
-def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
-    """模型渠道配置 config/models.yaml。"""
-    data = load_yaml_dict(config_layout.models_path(workspace_root))
-    return data if isinstance(data, dict) else {}
+class _ModelsConfigUnusable(ValueError):
+    """config/models.yaml 这一版读不了、解析不了，或者顶层不是映射。"""
+
+
+@dataclass(frozen=True)
+class _ModelsConfigVersion:
+    """config/models.yaml 按某一版文件读出来的样子。这一版用不了时 data 留着上一份能用的，没有就是空的。"""
+
+    stamp: tuple[int, int, int] | None
+    data: dict[str, Any]
+
+
+_MODELS_CONFIG: dict[str, _ModelsConfigVersion] = {}
+_MODELS_CONFIG_LOCK = threading.Lock()
+
+
+def _parse_models_config(path: Path) -> dict[str, Any] | None:
+    """这一版文件的内容，空的按空配置算，文件这会儿不在了是 None。读不了、解析不了、顶层不是映射抛 _ModelsConfigUnusable。"""
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _ModelsConfigUnusable(f"读不了：{exc}") from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise _ModelsConfigUnusable(f"YAML 解析失败：{exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise _ModelsConfigUnusable("顶层必须是映射（key: value）")
+    return data
+
+
+def _models_config_version(path: Path) -> _ModelsConfigVersion:
+    """按 file_stamp 认出改动。新的那一版用不了时记一次日志、沿用上一份读成的，一份都没读成过就按空配置算。"""
+    stamp = config_layout.file_stamp(path)
+    key = str(path)
+    with _MODELS_CONFIG_LOCK:
+        cached = _MODELS_CONFIG.get(key)
+        if cached is not None and cached.stamp == stamp:
+            return cached
+        try:
+            data = None if stamp is None else _parse_models_config(path)
+        except _ModelsConfigUnusable as exc:
+            kept = cached.data if cached is not None else {}
+            if kept:
+                _log.warning("%s 用不了，沿用上一份能用的：%s", config_layout.MODELS_FILE, exc)
+            else:
+                _log.warning(
+                    "%s 用不了，按空配置算，点名渠道、系统槽位和备选链在修好之前都不生效：%s",
+                    config_layout.MODELS_FILE, exc,
+                )
+            version = _ModelsConfigVersion(stamp, kept)
+        else:
+            # 文件不在是没配渠道，不是写坏，不沿用上一份。
+            version = _ModelsConfigVersion(None, {}) if data is None else _ModelsConfigVersion(stamp, data)
+        _MODELS_CONFIG[key] = version
+        return version
+
+
+def load_models_config(workspace_root: Path | str) -> dict[str, Any]:
+    """模型渠道配置 config/models.yaml，给调用方一份自己的副本。
+
+    运行中写坏时沿用这个进程上一份读成的：Supervisor 给主渠道的那份也停在上一份，点名渠道、系统槽位和备选链才不会单独没了。
+    """
+    return copy.deepcopy(_models_config_version(config_layout.models_path(workspace_root)).data)
 
 
 def load_platform_secrets(workspace_root: Path | str) -> dict[str, Any]:
@@ -695,7 +764,7 @@ def load_platform_secrets(workspace_root: Path | str) -> dict[str, Any]:
 
 def stray_platforms_section(workspace_root: Path | str) -> bool:
     """模型配置里还写着 platforms 段：照改造前的文档配的，那一段现在谁也不读。"""
-    return config_layout.LEGACY_PLATFORMS_KEY in _load_config_yaml(Path(workspace_root))
+    return config_layout.LEGACY_PLATFORMS_KEY in load_models_config(workspace_root)
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +818,7 @@ def resolve_channel(
     if isinstance(config, dict):
         data = config
     elif workspace_root:
-        data = _load_config_yaml(Path(workspace_root))
+        data = load_models_config(workspace_root)
     else:
         data = {}
     block = data.get(requested)
@@ -929,7 +998,7 @@ def resolve_system_model(
     prefix = _SYSTEM_MODEL_ENV_PREFIX.get(slot, "")
 
     block: dict[str, Any] = {}
-    cfg = _load_config_yaml(workspace_root)
+    cfg = load_models_config(workspace_root)
     sm = cfg.get("system_models")
     if isinstance(sm, dict):
         raw_block = sm.get(slot)

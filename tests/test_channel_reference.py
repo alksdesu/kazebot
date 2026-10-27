@@ -4,8 +4,12 @@
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,10 +17,15 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from clonoth_runtime import resolve_channel  # noqa: E402
+import clonoth_runtime  # noqa: E402
+import config_layout  # noqa: E402
+from clonoth_runtime import load_models_config, resolve_channel, resolve_system_model  # noqa: E402
+from engine.builtin import fallback_provider as fallback_module  # noqa: E402
 from engine.builtin.fallback_provider import _resolve_fallback_entry  # noqa: E402
+from engine.inference import llm_call  # noqa: E402
 from engine.model import resolve_provider  # noqa: E402
 from engine.node import Node, load_node  # noqa: E402
+from providers.base import ProviderResponse  # noqa: E402
 
 CONFIG = """version: 1
 provider: openai
@@ -241,3 +250,194 @@ class TestFallbackEntries:
         assert entry["wire"] == "gemini"
         assert entry["base_url"] == ""
         assert entry["api_key"] == ""
+
+
+BROKEN = "gemini-中转A: [oops\n"
+FALLBACK_CONFIG = CONFIG + """fallbacks:
+  - provider: gemini-中转A
+system_models:
+  intent:
+    provider: gemini-官方
+    model: gemini-3-flash-lite
+"""
+
+
+def _save(path: Path, text: str) -> None:
+    # 照生产里的保存路径写：同目录临时文件替换，每次换 inode，同一个时钟刻度里连写两次也认得出来。
+    config_layout.write_config_text(path, text)
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == clonoth_runtime._log.name and r.levelno == logging.WARNING]
+
+
+@pytest.fixture
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(clonoth_runtime, "_MODELS_CONFIG", {})
+    config_layout.models_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
+class TestTheEngineCopyOfTheModelsFile:
+    """Supervisor 给主渠道的那份配置在文件写坏时停在上一份能用的，engine 自己读的这份也得一样，不然两边各用各的。"""
+
+    def test_a_broken_rewrite_keeps_the_last_good_copy(self, workspace: Path, caplog) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert resolve_channel(workspace, "gemini-中转A").known
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(path, BROKEN)
+            channel = resolve_channel(workspace, "gemini-中转A")
+
+        assert (channel.wire, channel.base_url) == ("gemini", "https://relay-a.example/v1")
+        assert len(_warnings(caplog)) == 1
+        assert "沿用上一份能用的" in _warnings(caplog)[0]
+
+    def test_a_top_level_that_is_not_a_mapping_counts_as_broken(self, workspace: Path) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert load_models_config(workspace)["deepseek"]["model"] == "deepseek-v4"
+
+        _save(path, "- gemini-中转A\n- deepseek\n")
+
+        assert load_models_config(workspace)["deepseek"]["model"] == "deepseek-v4"
+
+    def test_fixing_the_file_takes_effect_again(self, workspace: Path) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert resolve_channel(workspace, "gemini-中转A").known
+        _save(path, BROKEN)
+        assert resolve_channel(workspace, "gemini-中转A").base_url == "https://relay-a.example/v1"
+
+        _save(path, CONFIG.replace("https://relay-a.example/v1", "https://relay-b.example/v1"))
+
+        assert resolve_channel(workspace, "gemini-中转A").base_url == "https://relay-b.example/v1"
+
+    def test_a_file_broken_from_the_start_counts_as_empty(self, workspace: Path, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(config_layout.models_path(workspace), BROKEN)
+            assert load_models_config(workspace) == {}
+            assert not resolve_channel(workspace, "gemini-中转A").known
+
+        assert len(_warnings(caplog)) == 1
+        assert "按空配置算" in _warnings(caplog)[0]
+
+    def test_each_broken_version_is_reported_once(self, workspace: Path, caplog) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        load_models_config(workspace)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(path, BROKEN)
+            for _ in range(3):
+                resolve_channel(workspace, "gemini-中转A")
+                resolve_system_model(workspace, "intent")
+            assert len(_warnings(caplog)) == 1
+
+            _save(path, "deepseek: [oops, again\n")
+            load_models_config(workspace)
+            load_models_config(workspace)
+
+        assert len(_warnings(caplog)) == 2
+        # 连着坏两版，沿用的仍是最后一份能用的。
+        assert load_models_config(workspace)["deepseek"]["model"] == "deepseek-v4"
+
+    def test_a_missing_file_counts_as_empty_even_after_a_good_read(self, workspace: Path, caplog) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert load_models_config(workspace)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            path.unlink()
+            assert load_models_config(workspace) == {}
+
+        assert _warnings(caplog) == []
+
+    def test_an_empty_file_is_an_empty_config(self, workspace: Path, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            _save(config_layout.models_path(workspace), "")
+            assert load_models_config(workspace) == {}
+
+        assert _warnings(caplog) == []
+
+    def test_callers_get_their_own_copy(self, workspace: Path) -> None:
+        _save(config_layout.models_path(workspace), CONFIG)
+        load_models_config(workspace)["带参数的"]["options"]["thinking"] = False
+
+        assert load_models_config(workspace)["带参数的"]["options"] == {"thinking": True}
+        assert resolve_channel(workspace, "带参数的").options == {"thinking": True}
+
+    def test_a_same_tick_replacement_is_noticed(self, workspace: Path) -> None:
+        # 共享组里别的实例在同一个时钟刻度里写进等长内容：修改时间和大小都一样，只剩 inode 认得出来。
+        path = config_layout.models_path(workspace)
+        _save(path, CONFIG)
+        assert resolve_channel(workspace, "deepseek").model == "deepseek-v4"
+        before = path.stat()
+
+        _save(path, CONFIG.replace("deepseek-v4", "deepseek-v9"))
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        assert (path.stat().st_mtime_ns, path.stat().st_size) == (before.st_mtime_ns, before.st_size)
+        assert resolve_channel(workspace, "deepseek").model == "deepseek-v9"
+
+
+class TestABrokenRewriteMidRun:
+    """文件运行中写坏时，点名渠道、系统槽位、备选链都还照上一份能用的走，不会单独没了。"""
+
+    def _break_after_a_good_read(self, workspace: Path) -> None:
+        path = config_layout.models_path(workspace)
+        _save(path, FALLBACK_CONFIG)
+        load_models_config(workspace)
+        _save(path, BROKEN)
+
+    def test_a_node_naming_a_channel_still_resolves(self, workspace: Path) -> None:
+        self._break_after_a_good_read(workspace)
+
+        rp = resolve_provider(workspace, Node(id="n", name="n", type="ai", provider="gemini-中转A"), "gpt-5.4")
+
+        assert (rp.provider_type, rp.base_url, rp.api_key) == ("gemini", "https://relay-a.example/v1", "sk-relay-a")
+
+    def test_a_system_slot_still_resolves(self, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        for suffix in ("MODEL", "BASE_URL", "API_KEY", "PROVIDER"):
+            monkeypatch.delenv(f"CLONOTH_INTENT_{suffix}", raising=False)
+        monkeypatch.delenv("CLONOTH_WORKSPACE", raising=False)
+        monkeypatch.delenv("ONEBOT_WORKSPACE_ROOT", raising=False)
+        self._break_after_a_good_read(workspace)
+
+        slot = resolve_system_model(workspace, "intent")
+
+        assert (slot.provider, slot.model) == ("gemini-官方", "gemini-3-flash-lite")
+
+    def test_the_fallback_chain_still_runs(self, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._break_after_a_good_read(workspace)
+        created: list[dict] = []
+
+        class _Backup:
+            name = "gemini"
+            model = "gemini-3-pro"
+
+            async def chat(self, *, messages, tools):
+                return ProviderResponse(ok=True, text="done")
+
+        def create(**kwargs):
+            created.append(kwargs)
+            return _Backup()
+
+        monkeypatch.setattr(fallback_module, "_create_fallback_provider", create)
+        monkeypatch.setattr(llm_call, "_build_messages_for_provider", lambda messages, formatter, provider: messages)
+        monkeypatch.setattr(llm_call, "prepare_messages_for_llm", lambda messages, workspace_root: messages)
+        ctx = SimpleNamespace(
+            response=ProviderResponse(ok=False, error="primary down", status_code=502, error_kind="server"),
+            rctx=SimpleNamespace(workspace_root=workspace, total_usage={}, serving_provider=None),
+            node=SimpleNamespace(id="entry"), messages=[{"role": "user", "content": "hi"}], tools=[],
+            provider=SimpleNamespace(model="primary-model", name="deepseek"),
+            extra={"loop_state": SimpleNamespace(formatter=None)},
+        )
+
+        asyncio.run(fallback_module.FallbackProviderHandler().handle(ctx))
+
+        assert ctx.response.ok
+        assert [(c["provider_type"], c["base_url"], c["api_key"]) for c in created] == [
+            ("gemini", "https://relay-a.example/v1", "sk-relay-a"),
+        ]
