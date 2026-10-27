@@ -16,7 +16,7 @@ from clonoth_runtime import parse_bool
 
 from .. import file_state
 from .._common import request_guard, resolve_under_allowed_roots
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from ..edit_journal import EditJournal, JournalCorrupt, JournalEntry, JournalScope, TaskJournal, inside_journal
 from ..file_state import _path_key
 from ..syntax_check import command_path
@@ -286,7 +286,7 @@ def _default_task(tasks: list[TaskJournal], current_task: str) -> tuple[TaskJour
 
 
 def _targets(
-    task: TaskJournal, requested: list[str] | None, workspace_root: Path,
+    task: TaskJournal, requested: list[str] | None, workspace_root: Path, project_root: Path,
 ) -> tuple[list[JournalEntry], list[str], list[str]]:
     """要撤的条目（后改的在前），以及 paths 里这个任务没改过的、已经撤过的。解析路径要读策略文件，放线程里调。"""
     open_entries = [entry for entry in task.entries if entry.undone is None]
@@ -298,7 +298,7 @@ def _targets(
     for raw in requested:
         keys: set[str] = set()
         with contextlib.suppress(ValueError, OSError):
-            keys.add(_path_key(resolve_under_allowed_roots(workspace_root, raw)))
+            keys.add(_path_key(resolve_under_allowed_roots(workspace_root, raw, project_root=project_root)))
         matched = [entry for entry in task.entries if entry.display == raw or _path_key(Path(entry.path)) in keys]
         if not matched:
             missing.append(raw)
@@ -439,7 +439,7 @@ def _guard_parameters(ctx: ToolContext, task: TaskJournal, entry: JournalEntry, 
     if plan.forced:
         preview += "，会盖掉之后的改动"
     return {
-        "path": command_path(ctx.workspace_root, Path(entry.path)),
+        "path": command_path(project_root_of(ctx), Path(entry.path)),
         "content_preview": preview,
         "content_len": size,
         "tool_name": "undo_edits",
@@ -603,7 +603,9 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         if task is None:
             return refusal or _error(_nothing_left(tasks))
 
-    entries, missing, settled = await asyncio.to_thread(_targets, task, requested, ctx.workspace_root)
+    entries, missing, settled = await asyncio.to_thread(
+        _targets, task, requested, ctx.workspace_root, project_root_of(ctx),
+    )
     if not entries:
         if requested is None:
             return _error(f"{_task_label(task, scope.task_id)}的改动都已经撤销过了", taskId=task.task_id)

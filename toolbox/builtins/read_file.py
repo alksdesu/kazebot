@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .. import file_state
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import request_guard, resolve_under_allowed_roots
 from ..hashline import hashline_enabled, hashline_prefix
 from ..text_files import decode_text, normalize_newlines, split_lines
@@ -329,7 +329,7 @@ async def _read_single_file(
         return _error_section(path_str, str(err.get("error", "denied")))
 
     try:
-        p = resolve_under_allowed_roots(ctx.workspace_root, path_str)
+        p = resolve_under_allowed_roots(ctx.workspace_root, path_str, project_root=project_root_of(ctx))
     except ValueError as exc:
         return _error_section(path_str, str(exc))
 

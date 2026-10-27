@@ -11,7 +11,7 @@ from typing import Any
 
 from clonoth_runtime import parse_bool
 
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import request_guard, resolve_and_classify, guard_external_read
 from ..ignore_rules import DEFAULT_IGNORED_DIRS
 
@@ -145,10 +145,11 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     ignore_dirs = _NO_IGNORED_DIRS if parse_bool(args.get("include_ignored"), False) else _DEFAULT_IGNORE_DIRS
 
     # 工作区外的路径整批只送审一次。
+    project_root = project_root_of(ctx)
     _external_paths: list[str] = []
     for _dp in dir_paths:
         try:
-            _resolved, _is_ext = resolve_and_classify(ctx.workspace_root, _dp)
+            _resolved, _is_ext = resolve_and_classify(ctx.workspace_root, _dp, project_root=project_root)
             if _is_ext:
                 _external_paths.append(_dp)
         except ValueError:
@@ -181,7 +182,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 })
                 continue
         try:
-            p, _ext = resolve_and_classify(ctx.workspace_root, dir_path)
+            p, _ext = resolve_and_classify(ctx.workspace_root, dir_path, project_root=project_root)
         except ValueError as exc:
             results.append({
                 "path": dir_path, "success": False, "error": str(exc),

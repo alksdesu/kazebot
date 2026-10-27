@@ -377,10 +377,12 @@ def safe_subprocess_env() -> dict[str, str]:
     return env
 
 
-def display_namer(root: Path, workspace_root: Path) -> Callable[[str], str]:
-    """root 下的相对路径（/ 分隔，空串是 root 本身）在结果里怎么写：工作区里的写工作区相对路径，工作区外的写绝对路径。"""
-    # root 已经解析到底；共享组配置、多开实例的代码目录经受信链接通到工作区外，只算一次它在工作区里叫什么。
-    base = config_layout.workspace_logical_path(workspace_root, root)
+def display_namer(root: Path, project_root: Path) -> Callable[[str], str]:
+    """root 下的相对路径（/ 分隔，空串是 root 本身）在结果里怎么写：项目根里的写项目根相对路径，之外的写绝对路径。
+
+    模型拿结果里的相对路径再调文件工具时，那边也按项目根解析。"""
+    # root 已经解析到底；共享组配置、多开实例的代码目录经受信链接通到外面，只算一次它在项目根里叫什么。
+    base = config_layout.workspace_logical_path(project_root, root)
 
     def name(walk_rel: str) -> str:
         if base is None:
@@ -411,25 +413,34 @@ def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
     )
 
 
-def resolve_and_classify(workspace_root: Path, path_str: str) -> tuple[Path, bool]:
+def resolve_and_classify(
+    workspace_root: Path, path_str: str, *, project_root: Path | None = None,
+) -> tuple[Path, bool]:
     """Resolve path and classify as internal (False) or external (True).
+
+    Relative paths resolve under project_root when given, else under workspace_root;
+    extra_roots always come from the instance policy under workspace_root.
 
     Returns (resolved_path, is_external).
     Raises ValueError for invalid or escaping relative paths.
     """
     extra_roots = _load_allowed_extra_roots(workspace_root)
-    resolved, display, is_external = classify_path(workspace_root, extra_roots, path_str)
+    resolved, display, is_external = classify_path(
+        workspace_root, extra_roots, path_str, project_root=project_root,
+    )
     if resolved is None:
         raise ValueError(display)
     return resolved, is_external
 
 
-def resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
-    """Resolve path under workspace_root or policy-configured extra_roots.
+def resolve_under_allowed_roots(
+    workspace_root: Path, path_str: str, *, project_root: Path | None = None,
+) -> Path:
+    """Resolve path under workspace_root, project_root or policy-configured extra_roots.
 
     Allows untrusted external absolute paths (policy layer enforces approval).
     """
-    resolved, _is_external = resolve_and_classify(workspace_root, path_str)
+    resolved, _is_external = resolve_and_classify(workspace_root, path_str, project_root=project_root)
     return resolved
 
 

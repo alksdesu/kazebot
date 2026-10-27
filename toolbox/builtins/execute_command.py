@@ -6,7 +6,7 @@ from typing import Any
 
 from clonoth_runtime import get_float, get_int, load_runtime_config
 
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import fit_output, join_outputs, request_guard, run_process, safe_subprocess_env
 
 # 每一路输出留开头和结尾各这么多字节，中间的边读边扔；超长输出交给 engine 落盘，模型按需翻页
@@ -79,7 +79,7 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
-            cwd=str(ctx.workspace_root),
+            cwd=str(project_root_of(ctx)),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

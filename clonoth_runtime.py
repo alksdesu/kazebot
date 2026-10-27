@@ -918,18 +918,24 @@ def classify_path(
     workspace_root: Path,
     extra_roots: list[Path],
     path_str: str,
+    *,
+    project_root: Path | None = None,
 ) -> tuple[Path | None, str, bool]:
     """Resolve and classify a filesystem path.
+
+    Relative paths resolve under project_root when it is given, otherwise under workspace_root.
 
     Returns (resolved, display_path, is_external):
       - resolved: resolved Path, or None if invalid
       - display_path: workspace-relative posix for workspace paths,
+                      project-relative posix for paths only under project_root,
                       absolute posix for external, or error message if invalid
-      - is_external: True for absolute paths outside workspace + extra_roots
+      - is_external: True for absolute paths outside workspace + project_root + extra_roots
     """
+    base = workspace_root if project_root is None else project_root
     try:
         raw = Path(path_str)
-        p = raw.resolve() if raw.is_absolute() else (workspace_root / path_str).resolve()
+        p = raw.resolve() if raw.is_absolute() else (base / path_str).resolve()
     except Exception as e:
         return None, f"invalid path: {e}", False
 
@@ -940,6 +946,12 @@ def classify_path(
     logical = config_layout.workspace_logical_path(workspace_root, p)
     if logical is not None:
         return p, logical, False
+
+    # Tier 1b: 项目根不是工作区时排在工作区之后，工作区里的东西不管从哪个根走到都按工作区里的名字判
+    if project_root is not None and Path(project_root) != Path(workspace_root):
+        logical = config_layout.workspace_logical_path(project_root, p)
+        if logical is not None:
+            return p, logical, False
 
     # Tier 2: trusted extra_roots
     for r in extras:

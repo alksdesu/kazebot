@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from toolbox.context import ToolContext
+from toolbox.context import ToolContext, project_root_of
 from toolbox.registry import ToolRegistry
 from providers.base import BaseProvider
 from ..node import Node
@@ -265,6 +265,7 @@ def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext
         run_id=ls.rctx.task_id or ls.run_id or ls.node.id,
         worker_id=ls.rctx.worker_id,
         workspace_root=ls.rctx.workspace_root,
+        project_root=project_root_of(ls.rctx),
         http=ls.rctx.http,
         registry=ls.registry,
         task_id=ls.rctx.task_id,

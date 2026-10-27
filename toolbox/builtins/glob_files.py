@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import display_namer, guard_external_read, request_guard, resolve_and_classify
 from ..ignore_rules import DEFAULT_IGNORED_DIRS, MAX_WALK_FILES, GlobError, glob_regex, walk_files
 
@@ -62,10 +62,10 @@ def _skip_dir(name: str) -> bool:
 
 
 def _collect(
-    root: Path, matches: Callable[[str], bool], workspace_root: Path,
+    root: Path, matches: Callable[[str], bool], project_root: Path,
 ) -> tuple[list[str], bool]:
     """(按修改时间倒序的全部命中, 是否走到上限停下)。修改时间相同的按遍历顺序。"""
-    name = display_namer(root, workspace_root)
+    name = display_namer(root, project_root)
     found: list[tuple[int, int, str]] = []
     walked = 0
     for entry, walk_rel in walk_files(root, gitignore=True, skip_dir=_skip_dir):
@@ -116,8 +116,9 @@ async def glob_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     except ValueError as exc:
         return _error_response(str(exc), path=rel_path)
 
+    project_root = project_root_of(ctx)
     try:
-        root, is_external = resolve_and_classify(ctx.workspace_root, rel_path)
+        root, is_external = resolve_and_classify(ctx.workspace_root, rel_path, project_root=project_root)
     except ValueError as exc:
         return _error_response(str(exc), path=rel_path)
 
@@ -138,7 +139,7 @@ async def glob_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not root.is_dir():
         return _error_response("Not a directory", path=rel_path)
 
-    found, limited = await asyncio.to_thread(_collect, root, matches, ctx.workspace_root)
+    found, limited = await asyncio.to_thread(_collect, root, matches, project_root)
     shown = found[:max_results]
     data: dict[str, Any] = {
         "result": _result_text(pattern, rel_path, shown, len(found), limited),

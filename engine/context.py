@@ -57,6 +57,8 @@ class RunContext:
     worker_id: str
     http: httpx.AsyncClient
     llm_http: httpx.AsyncClient
+    # 文件工具、命令和项目说明按它找文件；实例数据和配置仍按 workspace_root 找。没给就是 workspace_root
+    project_root: Path | None = None
     # [Fork/Merge 2026-05-12] parent_session_id separates event routing from runtime storage.
     # Why: entry tasks now run on a branch session, but SDK adapters know the
     # user-facing conversation_key through the parent session. How: keep
@@ -93,6 +95,10 @@ class RunContext:
     current_llm_request_id: str = ""
     llm_request_index: int = 0
     lease: TaskLease | None = None
+
+    def __post_init__(self) -> None:
+        if not self.project_root:
+            self.project_root = self.workspace_root
 
     @property
     def claim_id(self) -> str:

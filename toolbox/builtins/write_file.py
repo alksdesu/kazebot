@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import edit_journal, file_state
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import request_guard, resolve_under_allowed_roots
 from ..syntax_check import run_edit_checks
 from ..text_files import NEW_FILE, TextLayout, encode_text
@@ -72,7 +72,7 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     content = _content_text(args["content"])
 
     try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path)
+        resolved = resolve_under_allowed_roots(ctx.workspace_root, path, project_root=project_root_of(ctx))
     except ValueError as exc:
         return _error_response(str(exc), path=path)
     if edit_journal.inside_journal(ctx.workspace_root, resolved):

@@ -48,6 +48,7 @@ from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_out
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
 from .interrupted_calls import INTERRUPTED_RESUME_TYPE, append_interrupted_results
+from .project_root import task_project_root
 from .run_budget import (
     AUTO_CONTINUE_KEY,
     STEP_COUNT_RESULT_KEY,
@@ -1123,6 +1124,7 @@ async def _run_node_task(
         workspace_root=ws_root, supervisor_url=sup_url,
         session_id=session_id, worker_id=worker_id,
         http=http, llm_http=llm_http,
+        project_root=task_project_root(input_data, ws_root, task_id=task_id),
         api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
@@ -1467,6 +1469,7 @@ async def _run_tool_task(
     kctx = ToolContext(
         supervisor_url=sup_url, session_id=session_id, run_id=task_id,
         worker_id=worker_id, workspace_root=ws_root, http=http,
+        project_root=task_project_root(input_data, ws_root, task_id=task_id),
         registry=registry, task_id=task_id,
         session_generation=session_generation,
         parent_session_id=parent_session_id,

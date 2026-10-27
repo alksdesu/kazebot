@@ -18,6 +18,7 @@ import config_layout
 from clonoth_runtime import classify_path, load_policy_config, parse_bool, parse_extra_roots
 from engine.inference.loop_state import build_tool_context
 from engine.tool_step import tool_outcome
+from toolbox.context import project_root_of
 
 from .result import hook_result
 
@@ -144,7 +145,7 @@ def _argument_paths(name: str, arguments: dict[str, Any]) -> list[str]:
         prefix = _pattern_directory(arguments.get("pattern"))
         if not prefix:
             return [base]
-        # glob 的 pattern 相对 path；search_in_files 的 pattern 和工作区相对路径比，不能再拼到 path 后面
+        # glob 的 pattern 相对 path；search_in_files 的 pattern 和项目根相对路径比，不能再拼到 path 后面
         return [base, prefix if name == "search_in_files" else posixpath.join(base, prefix)]
     return [_text(arguments.get("path"))]
 
@@ -201,24 +202,24 @@ class _Walk:
 
     resolved: Path
     chain: list[tuple[Path, str]]
-    inside_workspace: bool
+    inside_project: bool
 
 
-def _walk_up(workspace_root: Path, extra_roots: list[Path], raw: str) -> _Walk | None:
-    """不在允许根目录（工作区或 policy 的 extra_roots）里的返回 None。"""
-    resolved, _display, is_external = classify_path(workspace_root, extra_roots, raw)
+def _walk_up(workspace_root: Path, extra_roots: list[Path], raw: str, project_root: Path) -> _Walk | None:
+    """不在允许根目录（项目根或 policy 的 extra_roots）里的返回 None。"""
+    resolved, _display, is_external = classify_path(workspace_root, extra_roots, raw, project_root=project_root)
     if resolved is None or is_external:
         return None
     is_dir = resolved.is_dir()
-    logical = config_layout.workspace_logical_path(workspace_root, resolved)
+    logical = config_layout.workspace_logical_path(project_root, resolved)
     if logical is not None:
-        # 按工作区里的名字往上走：经受信链接通到外面的目录也停在工作区根
+        # 按项目根里的名字往上走：经受信链接通到外面的目录也停在项目根
         relative = PurePosixPath(logical)
         parts = (relative if is_dir else relative.parent).parts
         chain = []
         for depth in range(len(parts), -1, -1):
             name = PurePosixPath(*parts[:depth]).as_posix() if depth else ""
-            chain.append((Path(workspace_root) / name if name else Path(workspace_root), name))
+            chain.append((project_root / name if name else project_root, name))
         return _Walk(resolved, chain, True)
     roots = [root for root in extra_roots if resolved == root or root in resolved.parents]
     if not roots:
@@ -244,23 +245,33 @@ def _candidates_in(walk: _Walk) -> Iterator[Candidate]:
                 key = _file_key(path)
             except OSError:
                 continue
-            if walk.inside_workspace:
+            if walk.inside_project:
                 display = f"{label}/{name}" if label else name
             else:
                 display = path.as_posix()
             yield Candidate(key=key, path=path, display=display, directory=label)
 
 
-def discover(workspace_root: Path, pending: list[tuple[str, bool]], handled: set[str]) -> tuple[list[str], list[Candidate]]:
-    """返回 (直接点名过的说明文件, 还没定过的候选)。模型自己读写过的那份不再另外加载。"""
+def discover(
+    workspace_root: Path,
+    pending: list[tuple[str, bool]],
+    handled: set[str],
+    *,
+    project_root: Path | None = None,
+) -> tuple[list[str], list[Candidate]]:
+    """返回 (直接点名过的说明文件, 还没定过的候选)。模型自己读写过的那份不再另外加载。
+
+    往上最多找到项目根（没给就是工作区根）；policy 和它的 extra_roots 照旧从工作区根的配置读。
+    """
     workspace_root = Path(workspace_root)
+    project = Path(project_root) if project_root else workspace_root
     policy = load_policy_config(workspace_root)
     extra_roots = parse_extra_roots(workspace_root, policy.get("extra_roots"))
     walks: list[_Walk] = []
     direct: list[str] = []
     for raw, named in pending:
         try:
-            walk = _walk_up(workspace_root, extra_roots, raw)
+            walk = _walk_up(workspace_root, extra_roots, raw, project)
             if walk is None:
                 continue
             walks.append(walk)
@@ -347,7 +358,9 @@ async def _read_verdict(ls: Any, display: str) -> str | None:
 
 
 async def _load(ls: Any, state: TaskState, pending: list[tuple[str, bool]]) -> list[Block]:
-    direct, candidates = await asyncio.to_thread(discover, ls.rctx.workspace_root, pending, set(state.handled))
+    direct, candidates = await asyncio.to_thread(
+        discover, ls.rctx.workspace_root, pending, set(state.handled), project_root=project_root_of(ls.rctx),
+    )
     state.handled.update(direct)
     blocks: list[Block] = []
     for candidate in candidates:

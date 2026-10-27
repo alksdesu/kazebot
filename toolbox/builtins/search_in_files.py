@@ -21,7 +21,7 @@ from typing import Any
 from clonoth_runtime import get_int, load_runtime_config, parse_bool
 
 from .. import edit_journal, file_state
-from ..context import ToolContext
+from ..context import ToolContext, project_root_of
 from .._common import (
     display_namer,
     guard_external_read,
@@ -198,19 +198,21 @@ class _Request:
 class _Collector:
     """Python 这一路：按 os.walk 的顺序给出要搜的文件 (Path, 显示路径)。
 
-    For paths under *workspace*, the display path is workspace-relative; under extra_roots it is absolute.
+    For paths under *project_root*, the display path is project-relative; under extra_roots it is absolute.
     遍历超过 MAX_WALK_FILES 个文件就停，limited 写明原因；读多少个、多少字节的上限由 _Reader 管，两条路一样。"""
 
-    def __init__(self, root: Path, pattern: str, max_file_size: int, workspace: Path, *, gitignore: bool = True) -> None:
+    def __init__(
+        self, root: Path, pattern: str, max_file_size: int, project_root: Path, *, gitignore: bool = True,
+    ) -> None:
         self.root = root
         self.pattern = pattern
         self.max_file_size = max_file_size
-        self.workspace = workspace
+        self.project_root = project_root
         self.gitignore = gitignore
         self.limited = ""
 
     def __iter__(self) -> Iterator[tuple[Path, str]]:
-        name = display_namer(self.root, self.workspace)
+        name = display_namer(self.root, self.project_root)
         if self.root.is_file():
             # 直接点名的单个文件不看 pattern、跳过名单和 .gitignore
             try:
@@ -240,10 +242,10 @@ class _Collector:
 
 
 def _collect_files(
-    root: Path, pattern: str, max_file_size: int, workspace: Path, *, gitignore: bool = True,
+    root: Path, pattern: str, max_file_size: int, project_root: Path, *, gitignore: bool = True,
 ) -> _Collector:
     """Iterable of (Path, display path) for the files to search under *root*, in os.walk order."""
-    return _Collector(root, pattern, max_file_size, workspace, gitignore=gitignore)
+    return _Collector(root, pattern, max_file_size, project_root, gitignore=gitignore)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +405,7 @@ async def _ripgrep_candidates(binary: str, root: Path, request: _Request, ctx: A
         limited = f"ripgrep 跑了 {_RG_TIMEOUT_SEC:g} 秒还没搜完，只用了已经找到的文件"
     elif run.overflow:
         limited = "ripgrep 找到的文件太多，只用了前一部分"
-    name = display_namer(root, ctx.workspace_root)
+    name = display_namer(root, project_root_of(ctx))
     found: list[tuple[tuple[tuple[int, str], ...], Path, str]] = []
     for raw in _parse_ripgrep_paths(run.stdout, cut_short=run.overflow or run.timed_out):
         path = Path(raw)
@@ -426,7 +428,7 @@ async def _find_candidates(root: Path, request: _Request, ctx: Any) -> _Candidat
             if listing is not None:
                 return listing
     collector = _collect_files(
-        root, request.pattern, request.max_file_size, ctx.workspace_root, gitignore=not request.include_ignored,
+        root, request.pattern, request.max_file_size, project_root_of(ctx), gitignore=not request.include_ignored,
     )
     return _Candidates(collector, "python")
 
@@ -892,7 +894,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     )
 
     try:
-        root, is_ext = resolve_and_classify(ctx.workspace_root, rel_path)
+        root, is_ext = resolve_and_classify(ctx.workspace_root, rel_path, project_root=project_root_of(ctx))
     except ValueError as exc:
         return _error_response(str(exc))
     if not root.exists():

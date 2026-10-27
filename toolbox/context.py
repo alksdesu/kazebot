@@ -19,6 +19,12 @@ _RENEW_TIMEOUT_SEC = 5.0
 _FILE_EDITS_TIMEOUT_SEC = 10.0
 
 
+def project_root_of(ctx: Any) -> Path:
+    """ToolContext、RunContext 或替身上的项目根；没有这一项或是空的，就是它的 workspace_root。"""
+    root = getattr(ctx, "project_root", None)
+    return root if root else getattr(ctx, "workspace_root", None)
+
+
 @dataclass
 class ToolContext:
     supervisor_url: str
@@ -42,6 +48,12 @@ class ToolContext:
     platform_auth: dict[str, Any] | None = None
     # 续租和查取消都带上它：任务被回收、改由别处重领后，旧的执行方才问得出自己已经出局。
     claim_id: str = ""
+    # 文件工具、命令按它解析相对路径和定 cwd；data/、config/ 这些实例的东西仍在 workspace_root 下
+    project_root: Path | None = None
+
+    def __post_init__(self) -> None:
+        if not self.project_root:
+            self.project_root = self.workspace_root
 
     def route_session_id(self) -> str:
         """Return the user-visible session for supervisor API calls."""

@@ -23,6 +23,7 @@ import config_layout
 from clonoth_runtime import load_runtime_config
 
 from ._common import fit_output, join_outputs, request_guard, run_process, safe_subprocess_env
+from .context import project_root_of
 from .text_files import BOM, normalize_newlines
 
 logger = logging.getLogger(__name__)
@@ -284,12 +285,12 @@ def glob_matches(rel_path: str, pattern: str) -> bool:
     return pattern.startswith("**/") and fnmatch.fnmatchcase(rel_path, pattern[3:])
 
 
-def command_path(workspace_root: Path, resolved: Path) -> str:
-    """{path} 换成的路径：工作区里的写相对路径（命令在工作区根下跑），之外的写绝对路径；一律用 /。
+def command_path(project_root: Path, resolved: Path) -> str:
+    """{path} 换成的路径：项目根里的写相对路径（命令在项目根下跑），之外的写绝对路径；一律用 /。
 
     策略按命令文本里出现的路径判敏感路径，写成这个样子它才认得出 config/nodes/ 之类的前缀。
     """
-    logical = config_layout.workspace_logical_path(workspace_root, resolved)
+    logical = config_layout.workspace_logical_path(project_root, resolved)
     return logical if logical is not None else resolved.as_posix()
 
 
@@ -316,7 +317,7 @@ async def _run_command(ctx: Any, spec: CheckCommand, rendered: str, *, tool_name
     try:
         proc = await asyncio.create_subprocess_shell(
             rendered,
-            cwd=str(ctx.workspace_root),
+            cwd=str(project_root_of(ctx)),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -357,7 +358,7 @@ async def run_external_checks(ctx: Any, resolved: Path, *, tool_name: str) -> li
     commands = configured_commands(runtime_cfg)
     if not commands:
         return []
-    rel_path = command_path(ctx.workspace_root, resolved)
+    rel_path = command_path(project_root_of(ctx), resolved)
     matched = [spec for spec in commands if glob_matches(rel_path, spec.glob)]
     quoted = quote_path(rel_path)
     results: list[CommandResult] = []
