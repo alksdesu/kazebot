@@ -2,36 +2,30 @@ from __future__ import annotations
 
 from typing import Any
 
-from toolbox.feature_client import request
+from toolbox.feature_client import feature_tool, request
 
 
+@feature_tool
 async def create_reminder(args: dict, ctx: Any) -> dict:
-    try:
-        data = await request(ctx, "POST", "/v1/reminders", body=args)
-        return {"ok": True, "data": {"result": f"提醒 {data['id']} 已设定：{data['due_at']}。送达后可完成或延后。", "reminder": data}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    data = await request(ctx, "POST", "/v1/reminders", body=args)
+    return {"ok": True, "data": {"result": f"提醒 {data['id']} 已设定：{data['due_at']}。送达后可完成或延后。", "reminder": data}}
 
 
+@feature_tool
 async def list_reminders(args: dict, ctx: Any) -> dict:
-    try:
-        data = await request(ctx, "GET", "/v1/reminders")
-        return {"ok": True, "data": {"result": "本人的提醒", **data}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    data = await request(ctx, "GET", "/v1/reminders")
+    return {"ok": True, "data": {"result": "本人的提醒", **data}}
 
 
+@feature_tool
 async def update_reminder(args: dict, ctx: Any) -> dict:
-    try:
-        reminder_id = str(args.get("reminder_id") or "")
-        action = str(args.get("action") or "")
-        if action not in {"complete", "snooze", "cancel"}:
-            raise ValueError("无效提醒操作")
-        body = {key: value for key, value in args.items() if key not in {"reminder_id", "action"}}
-        data = await request(ctx, "POST", f"/v1/reminders/{reminder_id}/{action}", body=body)
-        return {"ok": True, "data": {"result": f"提醒 {reminder_id} 已更新", "reminder": data}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    reminder_id = str(args.get("reminder_id") or "")
+    action = str(args.get("action") or "")
+    if action not in {"complete", "snooze", "cancel"}:
+        raise ValueError("无效提醒操作")
+    body = {key: value for key, value in args.items() if key not in {"reminder_id", "action"}}
+    data = await request(ctx, "POST", f"/v1/reminders/{reminder_id}/{action}", body=body)
+    return {"ok": True, "data": {"result": f"提醒 {reminder_id} 已更新", "reminder": data}}
 
 
 def register_tools(registry: Any) -> None:

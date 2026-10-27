@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from urllib.parse import quote
 
-from ..feature_client import request
+from ..feature_client import feature_tool, request
 
 
 def _id(args, key):
@@ -21,6 +21,7 @@ def _result(data, *, attachments=None):
     return response
 
 
+@feature_tool
 async def document(args, ctx):
     action = args.get("action", "list")
     if action == "list":
@@ -36,6 +37,7 @@ async def document(args, ctx):
     return _result(data)
 
 
+@feature_tool
 async def chat_search(args, ctx):
     if args.get("message_ref"):
         data = await request(ctx, "GET", f"/v1/materials/journal/messages/{_id(args, 'message_ref')}")
@@ -47,6 +49,7 @@ async def chat_search(args, ctx):
     return _result(data)
 
 
+@feature_tool
 async def structure(args, ctx):
     action = args.get("action", "draft")
     if action == "draft":
@@ -60,6 +63,7 @@ async def structure(args, ctx):
     return _result(data)
 
 
+@feature_tool
 async def image_versions(args, ctx):
     action = args.get("action", "list")
     if action == "list":
@@ -77,6 +81,7 @@ async def image_versions(args, ctx):
     return _result(data)
 
 
+@feature_tool
 async def generate(args, ctx):
     action = args.get("action", "generate")
     attachments = None

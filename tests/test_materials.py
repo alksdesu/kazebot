@@ -19,9 +19,12 @@ from fastapi import FastAPI
 from clonoth_runtime import switch_refusal
 from engine.materials import MaterialError, MaterialService
 from engine.materials.integration import begin_image_generation, persist_generated_images
+from engine.tool_step import TOOL_ERROR, ToolOutcome, result_to_raw, tool_outcome
 from supervisor.feature_auth import FeatureActor
 from supervisor.materials_api import MaterialRuntime, create_router
 import supervisor.admin_api as admin_api
+from toolbox.builtins import materials
+from toolbox.registry import ToolRegistry
 
 
 @pytest.fixture()
@@ -246,6 +249,7 @@ def test_integration_reserves_once_per_call_and_preserves_real_result_on_archive
             assert result["ok"] is True
             assert result["data"]["attachments"]
             assert result["data"]["materials_status"] == "archive_failed"
+            assert result["data"]["materials_error"] == "FeatureRequestError: archive unavailable"
             assert "不要再次付费" in result["data"]["result"]
 
     asyncio.run(exercise())
@@ -294,6 +298,90 @@ def test_finished_origin_can_complete_only_its_reserved_image_operation(api_stat
             assert (await http.post(f"/v1/materials/image-operations/{operation.json()['id']}/complete", json=body)).status_code == 403
 
     asyncio.run(exercise())
+
+
+def material_tools_context(http):
+    return SimpleNamespace(http=http, supervisor_url="http://test", task_id="task", tool_call_id="call-1")
+
+
+async def received_image(state, http, name="received.png"):
+    from PIL import Image
+    path = state.workspace_root / "data" / "attachments" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 48), "red").save(path)
+    relative = path.relative_to(state.workspace_root).as_posix()
+    state.tasks["task"].input["attachments"].append({"path": relative})
+    registered = await materials.document({"action": "register", "path": relative, "name": name}, material_tools_context(http))
+    assert registered["ok"] is True
+    return registered["data"]["value"]
+
+
+def test_material_tools_hand_back_why_supervisor_refused(api_state, monkeypatch):
+    app, state = api_state
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("synthetic crash")
+
+    async def exercise():
+        # 应用异常不抛回客户端，才拿得到 supervisor 那份纯文本 500
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"Authorization": "Bearer materials-test"}) as http:
+            ctx = material_tools_context(http)
+            image = await received_image(state, http)
+            no_fields = await materials.structure({"action": "draft", "source_id": image["id"], "kind": "table", "fields": []}, ctx)
+            foreign = await materials.document({"action": "register", "path": "data/attachments/other.png"}, ctx)
+            monkeypatch.setattr(state.materials, "list_sources", crash)
+            crashed = await materials.document({"action": "list"}, ctx)
+        return no_fields, foreign, crashed
+
+    no_fields, foreign, crashed = asyncio.run(exercise())
+    for result, reason in [
+        (no_fields, "请提供 1–500 个识别字段。（invalid_input，HTTP 400）"),
+        (foreign, "该路径不属于本任务实际收到的附件，请由用户重新上传。"),
+        (crashed, "supervisor 回了 HTTP 500"),
+    ]:
+        assert result == {"ok": False, "error": reason, "data": {"result": f"ERROR: {reason}"}}
+
+
+def test_model_reads_why_an_extraction_was_refused(api_state):
+    app, state = api_state
+    registry = ToolRegistry(workspace_root=state.workspace_root, tools_dir=state.workspace_root / "tools")
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer materials-test"}) as http:
+            image = await received_image(state, http)
+            return await registry.execute(name="materials_structure", arguments={"action": "draft", "source_id": image["id"], "kind": "table", "fields": [
+                {"id": "price", "label": "金额", "value": "120", "bbox": [0, 0, 2, 1]},
+            ]}, ctx=material_tools_context(http))
+
+    result = asyncio.run(exercise())
+    reason = "定位框须为 0–1 范围的 [左,上,右,下]。（invalid_input，HTTP 400）"
+    assert tool_outcome(result) == ToolOutcome(TOOL_ERROR, reason)
+    assert result_to_raw("materials_structure", result) == ("text", f"ERROR: {reason}")
+
+
+def test_model_reads_why_an_image_generation_was_not_reserved(tmp_path):
+    generated = []
+
+    async def handler(request):
+        return httpx.Response(409, json={"detail": {"code": "version_conflict", "message": "参考版本与当前版本有变化，请刷新后再开始生图。"}})
+
+    async def generate(args, ctx):
+        generated.append(args)
+        return {"ok": True, "data": {"result": "generated"}}
+
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools")
+    registry.register_builtin_tool("gpt_image_2", "synthetic image tool", {"type": "object", "properties": {}}, generate)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            ctx = SimpleNamespace(http=http, task_id="t", tool_call_id="c1", supervisor_url="http://test")
+            return await registry.execute(name="gpt_image_2", arguments={"prompt": "test", "material_artifact_id": "a_1"}, ctx=ctx)
+
+    result = asyncio.run(exercise())
+    assert result["ok"] is False
+    assert result["error"] == "图像版本登记失败，尚未调用生图服务：参考版本与当前版本有变化，请刷新后再开始生图。（version_conflict，HTTP 409）"
+    assert generated == []
 
 
 @pytest.mark.parametrize("format", ["pdf", "docx", "xlsx", "pptx"])

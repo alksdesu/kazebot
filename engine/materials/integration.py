@@ -7,6 +7,7 @@ from typing import Any
 
 from engine.attachments import payload_attachments
 from engine.tool_step import tool_outcome
+from toolbox.feature_client import request
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +23,15 @@ async def begin_image_generation(ctx: Any, name: str, arguments: dict) -> dict |
     call_id = getattr(ctx, "tool_call_id", "")
     if isinstance(previous, dict) and previous.get("tool_name") == name and previous.get("tool_call_id") == call_id and previous.get("fingerprint") == fingerprint:
         return previous
-    response = await ctx.http.post(
-        f"{ctx.supervisor_url.rstrip('/')}/v1/materials/image-operations",
-        headers={"X-Clonoth-Task-Id": ctx.task_id},
-        json={"tool_name": name, "tool_call_id": getattr(ctx, "tool_call_id", ""),
+    reserved = await request(
+        ctx, "POST", "/v1/materials/image-operations",
+        body={"tool_name": name, "tool_call_id": getattr(ctx, "tool_call_id", ""),
               "image_paths": arguments.get("image_paths") or [], "artifact_id": arguments.get("material_artifact_id"),
               "base_version": arguments.get("material_base_version"), "expected_version": arguments.get("material_expected_version"),
               "parameters": {key: arguments[key] for key in GENERATION_FIELDS if key in arguments},
               "instruction": str(arguments.get("prompt") or "")[:4000]}, timeout=20,
     )
-    response.raise_for_status()
-    operation = {**response.json(), "tool_name": name, "tool_call_id": call_id, "fingerprint": fingerprint}
+    operation = {**reserved, "tool_name": name, "tool_call_id": call_id, "fingerprint": fingerprint}
     ctx._material_image_operation = operation
     return operation
 
@@ -49,14 +48,11 @@ async def persist_generated_images(ctx: Any, name: str, arguments: dict, result:
         operation = operation or getattr(ctx, "_material_image_operation", None)
         if not operation:
             raise RuntimeError("No image operation was reserved before generation")
-        response = await ctx.http.post(
-            f"{ctx.supervisor_url.rstrip('/')}/v1/materials/image-operations/{operation['id']}/complete",
-            headers={"X-Clonoth-Task-Id": ctx.task_id},
-            json={"attachments": images, "result_metadata": {key: data[key] for key in GENERATION_FIELDS if key in data}},
+        recorded = await request(
+            ctx, "POST", f"/v1/materials/image-operations/{operation['id']}/complete",
+            body={"attachments": images, "result_metadata": {key: data[key] for key in GENERATION_FIELDS if key in data}},
             timeout=120,
         )
-        response.raise_for_status()
-        recorded = response.json()
         data["material_versions"] = recorded["versions"]
         data["materials_status"] = "archived"
         for image, version in zip(images, recorded["versions"]):

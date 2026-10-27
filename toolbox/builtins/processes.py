@@ -10,6 +10,7 @@ from typing import Any
 from clonoth_runtime import get_float, load_runtime_config
 
 from .._common import request_guard
+from ..feature_client import refusal_reason
 
 log = logging.getLogger(__name__)
 
@@ -40,16 +41,6 @@ def _failure(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message, "data": {"result": f"ERROR: {message}"}}
 
 
-def _detail(response: Any) -> str:
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict) and body.get("detail"):
-        return str(body["detail"])
-    return f"supervisor 回了 HTTP {response.status_code}"
-
-
 async def _call(
     ctx: Any,
     method: str,
@@ -68,7 +59,7 @@ async def _call(
     except Exception as exc:
         raise _ProcessToolError(f"连不上 supervisor：{type(exc).__name__}: {exc}") from None
     if response.status_code >= 400:
-        raise _ProcessToolError(_detail(response))
+        raise _ProcessToolError(refusal_reason(response))
     data = response.json()
     if not isinstance(data, dict):
         raise _ProcessToolError("supervisor 回的不是 JSON 对象")

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from toolbox.feature_client import request
+from toolbox.feature_client import feature_tool, request
 
 
+@feature_tool
 async def community(args, ctx):
     operation = str(args.get("operation") or "list")
     if operation == "list":

@@ -2,35 +2,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from toolbox.feature_client import request
+from toolbox.feature_client import feature_tool, request
 
 
+@feature_tool
 async def draft_execution_plan(args: dict[str, Any], ctx: Any) -> dict:
-    try:
-        plan = await request(ctx, "POST", "/v1/execution/plans", body=args)
-        return {"ok": True, "data": {"result": f"计划 {plan['id']} 已生成草稿，等待用户确认版本 {plan['revision']} 后执行。", "plan": plan}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    plan = await request(ctx, "POST", "/v1/execution/plans", body=args)
+    return {"ok": True, "data": {"result": f"计划 {plan['id']} 已生成草稿，等待用户确认版本 {plan['revision']} 后执行。", "plan": plan}}
 
 
+@feature_tool
 async def inspect_execution_plan(args: dict[str, Any], ctx: Any) -> dict:
-    try:
-        plan_id = str(args.get("plan_id") or "")
-        path = f"/v1/execution/plans/{plan_id}" if plan_id else "/v1/execution/plans"
-        data = await request(ctx, "GET", path)
-        return {"ok": True, "data": {"result": "执行计划状态", **data}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    plan_id = str(args.get("plan_id") or "")
+    path = f"/v1/execution/plans/{plan_id}" if plan_id else "/v1/execution/plans"
+    data = await request(ctx, "GET", path)
+    return {"ok": True, "data": {"result": "执行计划状态", **data}}
 
 
+@feature_tool
 async def revise_execution_plan(args: dict[str, Any], ctx: Any) -> dict:
-    try:
-        body = dict(args)
-        plan_id = str(body.pop("plan_id"))
-        data = await request(ctx, "PATCH", f"/v1/execution/plans/{plan_id}", body=body)
-        return {"ok": True, "data": {"result": f"计划 {plan_id} 已修改，需要用户确认新版本。", "plan": data}}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {"result": str(exc)}}
+    body = dict(args)
+    plan_id = str(body.pop("plan_id"))
+    data = await request(ctx, "PATCH", f"/v1/execution/plans/{plan_id}", body=body)
+    return {"ok": True, "data": {"result": f"计划 {plan_id} 已修改，需要用户确认新版本。", "plan": data}}
 
 
 def register_tools(registry: Any) -> None:

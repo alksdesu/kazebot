@@ -8,6 +8,7 @@ from clonoth_runtime import SwitchValueError, switch_arg
 from engine.worktree_report import MERGE_TOOL, file_line
 
 from .._common import request_guard
+from ..feature_client import refusal_reason
 
 log = logging.getLogger(__name__)
 
@@ -28,16 +29,6 @@ def _failure(message: str, **data: Any) -> dict[str, Any]:
     return {"ok": False, "error": message, "data": {"result": f"ERROR: {message}", **data}}
 
 
-def _detail(response: Any) -> str:
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict) and body.get("detail"):
-        return str(body["detail"])
-    return f"supervisor 回了 HTTP {response.status_code}"
-
-
 async def _call(ctx: Any, path: str, body: dict[str, Any], *, timeout: float = _HTTP_TIMEOUT_SEC) -> dict[str, Any]:
     try:
         response = await ctx.http.request(
@@ -46,7 +37,7 @@ async def _call(ctx: Any, path: str, body: dict[str, Any], *, timeout: float = _
     except Exception as exc:
         raise _MergeToolError(f"连不上 supervisor：{type(exc).__name__}: {exc}") from None
     if response.status_code >= 400:
-        raise _MergeToolError(_detail(response))
+        raise _MergeToolError(refusal_reason(response))
     data = response.json()
     if not isinstance(data, dict):
         raise _MergeToolError("supervisor 回的不是 JSON 对象")
