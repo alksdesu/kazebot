@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -272,6 +273,75 @@ class TestABrokenFile:
         assert store.get_openai_secret().model == "m-fixed"
         store.upsert_provider("alpha", base_url="https://alpha.example", model="m-a", wire="openai")
         assert "alpha" in store.get_providers_public()["providers"]
+
+
+class TestBrokenBeforeItWasEverRead:
+    """起进程时文件就是坏的：手上是内置默认，不是「上一份」。说成上一份，人会以为自己配的渠道还在生效。"""
+
+    @BROKEN_FILES
+    def test_the_built_in_default_is_in_use_and_named(
+        self, tmp_path: Path, broken: str, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = _write(tmp_path / "config" / "models.yaml", broken)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.config_store"):
+            store = ConfigStore(path=path, workspace_root=tmp_path)
+
+        secret = store.get_openai_secret()
+        assert (secret.provider, secret.base_url, secret.model, secret.api_key) == (
+            "openai", "https://api.openai.com/v1", "gpt-4o-mini", "",
+        )
+        error = store.load_error
+        assert error.startswith("config/models.yaml 用不了，现在用的是内置默认：")
+        assert "主渠道 openai（https://api.openai.com/v1，模型 gpt-4o-mini，没有 api_key）" in error
+        assert "文件里配的渠道在修好之前都不生效" in error
+        assert "上一份" not in error
+        assert "现在用的是内置默认" in caplog.text and "上一份" not in caplog.text
+
+    def test_a_file_that_cannot_be_read_is_named_the_same_way(self, tmp_path: Path) -> None:
+        # 该放文件的地方是个目录：读的时候抛 OSError，不是解析失败
+        path = tmp_path / "config" / "models.yaml"
+        path.mkdir(parents=True)
+
+        store = ConfigStore(path=path, workspace_root=tmp_path)
+
+        assert store.load_error.startswith("config/models.yaml 用不了，现在用的是内置默认：")
+        assert "读不了" in store.load_error
+        assert store.get_openai_secret().model == "gpt-4o-mini"
+
+    @BROKEN_FILES
+    def test_channel_edits_stay_refused(self, tmp_path: Path, broken: str) -> None:
+        path = _write(tmp_path / "config" / "models.yaml", broken)
+        store = ConfigStore(path=path, workspace_root=tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(ConfigUnreadable) as caught:
+            store.upsert_provider("alpha", model="m", wire="openai")
+
+        assert "原文编辑器" in str(caught.value)
+        assert path.read_bytes() == before
+
+    @BROKEN_FILES
+    def test_breaking_it_after_a_good_read_names_the_last_good_one(self, store: ConfigStore, models: Path, broken: str) -> None:
+        models.write_text(broken, encoding="utf-8")
+
+        error = store.load_error
+        assert error.startswith("config/models.yaml 用不了，继续用上一份能用的配置：")
+        assert "内置默认" not in error
+        assert store.get_openai_secret().model == "m-alpha"
+
+    @BROKEN_FILES
+    def test_once_it_has_been_fixed_a_later_break_keeps_that_version(self, tmp_path: Path, broken: str) -> None:
+        path = _write(tmp_path / "config" / "models.yaml", broken)
+        store = ConfigStore(path=path, workspace_root=tmp_path)
+        assert "内置默认" in store.load_error
+
+        path.write_text(HAND_WRITTEN, encoding="utf-8")
+        assert store.load_error == ""
+        path.write_text(f"{broken}# 又写坏了\n", encoding="utf-8")
+
+        assert store.load_error.startswith("config/models.yaml 用不了，继续用上一份能用的配置：")
+        assert store.get_openai_secret().model == "m-alpha"
 
 
 class TestTheApiReportsABrokenFileAsFourHundred:

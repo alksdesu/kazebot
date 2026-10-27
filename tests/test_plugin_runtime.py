@@ -385,6 +385,7 @@ def test_invalid_shared_settings_retain_last_applied_generation(root):
     manager.heartbeat()
     status = manager.status()
     assert status["configuration_error"]["phase"] == "configuration"
+    assert status["configuration_error"]["message"] == "Plugin settings could not be read; retaining the last applied generation"
     assert status["applied_generation"] == initial["applied_generation"]
     assert status["desired_generation"].startswith("invalid:")
     versions = manager.acquire({})
@@ -393,3 +394,16 @@ def test_invalid_shared_settings_retain_last_applied_generation(root):
     (root / "config" / "plugins.yaml").unlink()
     install(root, source)
     assert manager.status()["configuration_error"] is None
+
+
+def test_settings_broken_before_anything_was_applied_say_no_plugin_is_loaded(root):
+    # 起进程时设置就读不了：手上没有任何一版，说「保留上一版」会让人以为插件在跑
+    (root / "config" / "plugins").mkdir(parents=True)
+    (root / "config" / "plugins" / "sample.py").write_text("def setup(api):\n    pass\n", encoding="utf-8")
+    (root / "config" / "plugins.yaml").write_text("plugins: [invalid: yaml", encoding="utf-8")
+
+    status = get_manager(root).status()
+
+    assert status["applied_generation"] == ""
+    assert status["configuration_error"]["message"] == "Plugin settings could not be read; no plugin is loaded until they are fixed"
+    assert get_manager(root).acquire({}) == []

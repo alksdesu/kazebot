@@ -136,7 +136,7 @@ def test_fleet_status_uses_the_live_convention_and_applied_fingerprint(tmp_path)
     assert status == {
         "id": "qq", "display_name": "QQ · NapCat", "published": True, "adapter_online": True,
         "connected": True, "account": "10001", "heartbeat_age": status["heartbeat_age"], "backlog": 8,
-        "config_applied": True, "config_path_mismatch": False, "parse_error": "",
+        "config_applied": True, "config_path_mismatch": False, "config_from_file": True, "parse_error": "",
     }
     assert 0 <= status["heartbeat_age"] < 60
     live["published_at"] = time.time() - 120
@@ -157,6 +157,7 @@ def test_status_lists_only_the_platform_this_instance_runs(tmp_path, monkeypatch
     assert [row["id"] for row in rows] == ["qq"]
     assert [row["id"] for row in switched] == ["plainchat"]
     assert switched[0]["published"] is False and switched[0]["config_applied"] is None
+    assert switched[0]["config_from_file"] is None
 
 
 def test_a_platform_that_never_published_is_a_failure(tmp_path):
@@ -234,6 +235,21 @@ def test_a_broken_config_file_is_reported(tmp_path):
     publish(tmp_path, published_at=time.time(), connected=True, parse_error=None)
     report = asyncio.run(service(tmp_path).diagnose())
     assert not any(item["name"] == "QQ · NapCat 配置文件" for item in report["checks"])
+
+
+@pytest.mark.parametrize("loaded, from_file, detail", [
+    ({"exists": True, "mtime_ns": 1, "size": 1}, True, "配置文件读不懂，bot 还在用上一份能读的"),
+    # 起来时文件就是坏的、或此前一直不存在：bot 手上没有这份文件的任何一版，按空文件在跑
+    ({"exists": False, "mtime_ns": 0, "size": 0}, False, "配置文件读不懂，bot 现在按空文件算，各项落到全局设置、.env 和默认值"),
+], ids=["kept-last-good", "treated-empty"])
+def test_a_broken_config_file_says_what_the_bot_is_running_on(tmp_path, loaded, from_file, detail):
+    publish(tmp_path, published_at=time.time(), connected=True, parse_error="ParserError: line 1", loaded=loaded)
+
+    report = asyncio.run(service(tmp_path).diagnose())
+
+    assert qq_status(service(tmp_path))["config_from_file"] is from_file
+    found = check(report, "QQ · NapCat 配置文件")
+    assert (found["status"], found["detail"]) == ("failed", detail)
 
 
 def test_diagnostics_reports_missing_material_dependencies_without_stopping_other_checks(tmp_path):

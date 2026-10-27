@@ -79,6 +79,10 @@ def platform_health(workspace_root: Path, platform: PlatformDescriptor) -> dict[
             status.fresh and not mismatch and status.config_loaded == file_fingerprint(path)
         ),
         "config_path_mismatch": mismatch,
+        # bot 的值出自这份文件的某一版；False 是一版都没采纳（起来时就是坏的，或此前一直不存在），按空文件算。
+        "config_from_file": None if path is None or status.config_loaded is None else (
+            status.config_loaded.get("exists") is True
+        ),
         "parse_error": status.parse_error,
     }
 
@@ -150,7 +154,7 @@ def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str
         "stale": status.stale,
         # 「已生效」的判据是 bot 跑着的那份值确实来自当前这个文件版本。
         # 不能拿 state["file"] 比 —— 那是 bot 看到的文件指纹，文件写坏时它照样等于
-        # 当前文件，而 bot 用的还是上一份配置。
+        # 当前文件，而 bot 用的是上一份配置，一版都没读成过时按空文件算。
         "applied": state.get("loaded") == fingerprint,
         "file": fingerprint,
         "state": state,

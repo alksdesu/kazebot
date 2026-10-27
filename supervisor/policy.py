@@ -603,6 +603,10 @@ class PolicyEngine:
         self._cfg_hash = ""
         # 文件现在有什么问题；空串表示生效的就是文件里那份。
         self._load_error = ""
+        # 文件读成过没有。一次都没读成时生效的是下面的内置默认，说成「上一份」会让人以为自定义的 deny 还在管用。
+        self._adopted = False
+        # 读不了的那一版已经记过日志：读不了时不记指纹、每次都重试，日志得另外去重。
+        self._unreadable_stamp: tuple[int, int, int] | None = None
         # 重读和导出都在锁里：交给编辑器的内容和指纹必须出自同一版文件。
         self._lock = threading.RLock()
 
@@ -691,10 +695,11 @@ class PolicyEngine:
         stamp = config_layout.file_stamp(self._policy_path)
         with self._lock:
             if stamp is None:
-                # 文件被删了：规则照旧用上一份，指纹记成「不存在」，编辑器保存时把它重新建出来。
+                # 文件被删了：规则照旧用手上那份，指纹记成「不存在」，编辑器保存时把它重新建出来。
                 self._cfg_hash = ""
                 self._cached_stamp = None
-                self._load_error = f"{self._policy_name} 不见了，沿用上一份策略；在控制台保存一次就会重新建出来"
+                kept = "沿用上一份策略" if self._adopted else "生效的是内置默认策略"
+                self._load_error = f"{self._policy_name} 不见了，{kept}；在控制台保存一次就会重新建出来"
                 return
 
             if not force and stamp == self._cached_stamp:
@@ -702,8 +707,14 @@ class PolicyEngine:
 
             try:
                 raw = self._policy_path.read_bytes()
-            except OSError:
+            except OSError as exc:
+                # 不记指纹：权限、占用这类问题常常一会儿就好，下一次照样重读。
+                self._load_error = f"{self._policy_name} 读不了，{self._fallback_note_locked()}：{exc}"
+                if stamp != self._unreadable_stamp:
+                    self._unreadable_stamp = stamp
+                    _log.warning("%s", self._load_error)
                 return
+            self._unreadable_stamp = None
             self._cached_stamp = stamp
             # 写坏了指纹也按这一版算：编辑器拿生效的那份存一次，坏文件就被盖掉了。
             self._cfg_hash = config_layout.bytes_hash(raw)
@@ -712,7 +723,7 @@ class PolicyEngine:
                 cfg = _validate_policy_dict(data)
             except ValueError as exc:
                 # 不退回内置默认：写坏一个字，自定义的 deny 规则就会静默消失。
-                self._load_error = f"{self._policy_name} 用不了，沿用上一份能用的策略：{exc}"
+                self._load_error = f"{self._policy_name} 用不了，{self._fallback_note_locked()}：{exc}"
                 _log.warning("%s", self._load_error)
                 return
             unknown = _unknown_policy_keys(data)
@@ -720,7 +731,14 @@ class PolicyEngine:
             if unknown:
                 _log.warning("%s", self._load_error)
             self._cfg = cfg
+            self._adopted = True
             self._compile()
+
+    def _fallback_note_locked(self) -> str:
+        """文件用不了时生效的是哪份：读成过就是上一份，一次都没读成是内置默认。"""
+        if self._adopted:
+            return "沿用上一份能用的策略"
+        return "生效的是内置默认策略，文件里自定义的规则（包括 deny）在修好之前都不生效"
 
     def _compile_rules(self, section: dict[str, Any]) -> tuple[SafetyLevel, list[tuple[str, SafetyLevel, str]]]:
         default_s = str(section.get("default", "deny"))

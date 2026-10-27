@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as api from '../api/supervisorClient';
-import type { ConfigSource, ConsoleSchema, FeatureAdoption, FeaturesLiveState } from '../api/supervisorClient';
+import type { ConfigFileFingerprint, ConfigSource, ConsoleSchema, FeatureAdoption, FeaturesLiveState } from '../api/supervisorClient';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { getSettingsTab } from '../components/settings/settingsTabs';
 import { FEATURES_SCOPE } from '../console/configScope';
@@ -43,10 +43,11 @@ const PLATFORMS: FeatureAdoption[] = [
   { id: 'discord', display_name: 'Discord', published: false, applied: false },
 ];
 
-const featuresLive = ({ parseError = '', platforms = PLATFORMS, sources = {} }: {
+const featuresLive = ({ parseError = '', platforms = PLATFORMS, sources = {}, loaded = { exists: true, mtime_ns: 1, size: 1 } }: {
   parseError?: string;
   platforms?: FeatureAdoption[];
   sources?: Record<string, ConfigSource>;
+  loaded?: ConfigFileFingerprint;
 } = {}): FeaturesLiveState => ({
   published: true,
   applied: true,
@@ -62,6 +63,7 @@ const featuresLive = ({ parseError = '', platforms = PLATFORMS, sources = {} }: 
     },
     paths: PATHS,
     sources,
+    loaded,
     parse_error: parseError,
   },
 });
@@ -145,7 +147,19 @@ describe('全局默认页', () => {
     configStore(FEATURES_SCOPE).setState({ live: featuresLive({ parseError: 'line 3: bad indent' }) });
     render(<DefaultsTab />);
 
-    expect(screen.getByText(/全局设置解析失败：line 3: bad indent/)).toBeInTheDocument();
+    expect(screen.getByText(/全局设置解析失败：line 3: bad indent/)).toHaveTextContent('bot 仍在用上一份有效内容');
+  });
+
+  it('全局文件一版都没读成过时说按空文件算，不说上一份', () => {
+    // 起来时文件就是坏的：生效值落到平台自己的设置、.env 和默认值，文件里的值一个都没生效。
+    configStore(FEATURES_SCOPE).setState({
+      live: featuresLive({ parseError: 'line 3: bad indent', loaded: { exists: false, mtime_ns: 0, size: 0 } }),
+    });
+    render(<DefaultsTab />);
+
+    const alert = screen.getByText(/全局设置解析失败：line 3: bad indent/);
+    expect(alert).toHaveTextContent('现在按空文件算');
+    expect(alert).not.toHaveTextContent('上一份');
   });
 
   it('第一次读全局设置时说一声', () => {

@@ -69,7 +69,7 @@ def _parse_models_text(text: str) -> dict[str, Any]:
 
 
 def check_models_text(text: str) -> list[str]:
-    """原文编辑器保存前的校验，和运行期读文件是同一套：这里不过的，存下去运行期也只能沿用上一份。"""
+    """原文编辑器保存前的校验，和运行期读文件是同一套：这里不过的，存下去运行期也读不进去。"""
     try:
         AppConfigSecret.model_validate(_parse_models_text(text))
     except ValidationError as exc:
@@ -105,11 +105,14 @@ class ConfigStore:
         self._root = Path(workspace_root) if workspace_root is not None else path.parent.parent
         self._lock = threading.RLock()
         self._config: AppConfigSecret = AppConfigSecret()
-        # 最近一次解析成功的原文，读接口都从这里取；文件写坏时它和 _config 一起停在上一份能用的配置上。
+        # 最近一次解析成功的原文，读接口都从这里取；文件写坏时它和 _config 一起停在上一份能用的配置上，
+        # 一份都没读成过时就是这里的内置默认。
         self._raw: dict[str, Any] = dict(_EMPTY_CONFIG)
         # 已经按哪个文件版本读过，None 是文件不存在。
         self._stamp: tuple[int, int, int] | None = None
         self._error = ""
+        # 文件读成过没有。起进程时就是坏的，手上用的是内置默认，说成「上一份」会让人以为自己配的渠道还在生效。
+        self._adopted = False
 
         self._ensure_file()
         self.reload()
@@ -127,14 +130,14 @@ class ConfigStore:
         return _parse_models_text(text)
 
     def _load_locked(self) -> None:
-        """按文件现状重读，从不写回。解析不了或字段不合法时留着上一份能用的，文件原样不动，等人去修。"""
+        """按文件现状重读，从不写回。解析不了或字段不合法时留着手上那份（上一份能用的，或者内置默认），文件原样不动，等人去修。"""
         stamp = config_layout.file_stamp(self.path)
         try:
             data = self._read_file()
             config = AppConfigSecret.model_validate(data)
         except (ConfigUnreadable, ValidationError) as exc:
             if stamp != self._stamp or not self._error:
-                _log.warning("%s 用不了，继续用上一份能用的配置：%s", config_layout.MODELS_FILE, exc)
+                _log.warning("%s 用不了，%s：%s", config_layout.MODELS_FILE, self._fallback_note_locked(), exc)
             self._stamp = stamp
             self._error = str(exc)
             return
@@ -142,6 +145,18 @@ class ConfigStore:
         self._config = config
         self._stamp = stamp
         self._error = ""
+        self._adopted = True
+
+    def _fallback_note_locked(self) -> str:
+        """文件用不了时手上那份是什么。只看已经装好的 _config，不能经过 _current：它会回头调 _load_locked。"""
+        if self._adopted:
+            return "继续用上一份能用的配置"
+        openai = self._config.openai
+        key = "有 api_key" if openai.api_key.strip() else "没有 api_key"
+        return (
+            f"现在用的是内置默认：主渠道 {self._config.provider}（{openai.base_url}，模型 {openai.model}，{key}），"
+            "文件里配的渠道在修好之前都不生效"
+        )
 
     @contextlib.contextmanager
     def _current(self) -> Iterator[None]:
@@ -158,9 +173,11 @@ class ConfigStore:
 
     @property
     def load_error(self) -> str:
-        """文件现在为什么用不了；空串表示用的就是文件里那份。"""
+        """文件现在为什么用不了、手上用的是哪份；空串表示用的就是文件里那份。"""
         with self._current():
-            return self._error
+            if not self._error:
+                return ""
+            return f"{config_layout.MODELS_FILE} 用不了，{self._fallback_note_locked()}：{self._error}"
 
     def get_secret(self) -> AppConfigSecret:
         with self._current():

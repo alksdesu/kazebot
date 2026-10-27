@@ -72,7 +72,7 @@ def platform_adoption(
     seen = defaults.get("config_path")
     if not same_file(seen, path):
         return {**entry, "applied": False, "reason": f"bot 读的是另一份全局文件：{seen}"}
-    # 和平台那边一样比 loaded：文件写坏时 bot 看到的指纹等于当前文件，用的却还是上一份。
+    # 和平台那边一样比 loaded：文件写坏时 bot 看到的指纹等于当前文件，用的却是上一份，一版都没读成过时按空文件算。
     return {**entry, "applied": defaults.get("loaded") == current}
 
 

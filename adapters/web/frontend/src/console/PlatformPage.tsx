@@ -1,7 +1,7 @@
 // 平台页：固定状态栏 + 连接卡 + 折叠分区。分区和字段来自后端 schema，展开状态只存在这台浏览器里。
 import { useEffect, type ReactNode } from 'react';
 
-import type { ConsoleSchema, ConsoleSectionSchema } from '../api/supervisorClient';
+import type { ConfigFileFingerprint, ConsoleSchema, ConsoleSectionSchema } from '../api/supervisorClient';
 import {
   Button,
   Empty,
@@ -36,13 +36,20 @@ interface BarState {
   text: string;
 }
 
+/** 文件写坏时 bot 手上的值还出自它的某一版；一版都没采纳过（起来时就坏、或此前一直不存在）就是按空文件在跑。 */
+function keepsLastGoodFile(live: { state?: { loaded?: ConfigFileFingerprint } } | null): boolean {
+  return live?.state?.loaded?.exists !== false;
+}
+
 /** pip 反映 bot 那边的生效状态，「N 项待应用」反映浏览器里还没应用的改动 —— 两个不同维度。 */
 function barState(
-  live: { published: boolean; stale?: boolean; applied?: boolean } | null,
+  live: { published: boolean; stale?: boolean; applied?: boolean; state?: { loaded?: ConfigFileFingerprint } } | null,
   parseError: string,
   confirmation: Confirmation | null,
 ): BarState {
-  if (parseError) return { tone: 'halt', text: '配置有语法错误，bot 仍在用上一份' };
+  if (parseError) {
+    return { tone: 'halt', text: keepsLastGoodFile(live) ? '配置有语法错误，bot 仍在用上一份' : '配置有语法错误，bot 按空文件在跑' };
+  }
   if (live?.published && live.stale) return { tone: 'halt', text: 'bot 心跳已中断' };
   // 写完到 bot 换上之间 applied 必然为假，这时亮红灯像是出了错。
   if (live?.published && confirmation === 'waiting') return { tone: 'idle', text: '已写入，等 bot 确认生效…' };
@@ -166,7 +173,9 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
       {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       {parseError && (
         <ErrorText role="alert">
-          平台配置解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
+          平台配置解析失败：{parseError}。
+          {keepsLastGoodFile(live) ? 'bot 仍在用上一份有效配置。' : 'bot 手上没有这份文件能用的版本，现在按空文件算，各项落到全局设置、.env 和默认值。'}
+          请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
       {/* 「bot 还没上报」说的是整页为什么空着，得排在连接卡前面先交代。 */}

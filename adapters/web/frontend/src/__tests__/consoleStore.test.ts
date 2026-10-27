@@ -1216,6 +1216,14 @@ describe('生效状态条', () => {
     });
   });
 
+  // 起来时文件就是坏的：bot 手上没有哪一版，说「仍在用上一份」会让人以为文件里的值还在生效。
+  it('一版都没采纳过时说按空文件在跑', () => {
+    const neverAdopted = live({ applied: false, state: { loaded: { exists: false, mtime_ns: 0, size: 0 } } });
+    expect(barState(neverAdopted, 'line 3: bad indent', null)).toEqual({
+      tone: 'halt', text: '配置有语法错误，bot 按空文件在跑',
+    });
+  });
+
   it('bot 没上报时是灰的，不是红的', () => {
     expect(barState(null, '', null)).toEqual({ tone: 'idle', text: '等待 bot 上报' });
     expect(barState(null, '', 'waiting')).toEqual({ tone: 'idle', text: '等待 bot 上报' });

@@ -23,6 +23,7 @@ if str(_ROOT) not in sys.path:
 import clonoth_runtime  # noqa: E402
 import config_layout  # noqa: E402
 from adapters.onebot import account_ops  # noqa: E402
+from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.operations.service import OperationsService  # noqa: E402
 from toolbox.builtins.manage_secret import manage_secret  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
@@ -636,10 +637,10 @@ class TestTheNapCatUrlComesFromTheSameFile:
 #  诊断
 # ---------------------------------------------------------------------------
 
-def _ops(root: Path) -> OperationsService:
+def _ops(root: Path, store: ConfigStore | None = None) -> OperationsService:
     return OperationsService(SimpleNamespace(
         workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
-        feature_config_store=None,
+        feature_config_store=store,
     ))
 
 
@@ -660,19 +661,33 @@ class TestDiagnosticsSecrets:
 
 
 class TestDiagnoseReportsABrokenModelConfig:
-    def _checks(self, root: Path) -> dict[str, dict[str, Any]]:
-        report = asyncio.run(_ops(root).diagnose())
+    def _checks(self, root: Path, store: ConfigStore | None = None) -> dict[str, dict[str, Any]]:
+        report = asyncio.run(_ops(root, store).diagnose())
         return {check["name"]: check for check in report["checks"]}
 
-    def test_a_broken_file_becomes_a_warning(self, tmp_path: Path) -> None:
+    def test_a_file_broken_from_the_start_says_the_built_in_default_is_in_use(self, tmp_path: Path) -> None:
+        # 文件从没读成过，主渠道是内置默认：说成「上一份」会让人以为自己配的渠道还在生效
         root = _workspace(tmp_path)
         config_layout.models_path(root).write_text("openai: [1, 2\n", encoding="utf-8")
 
         check = self._checks(root)["模型配置文件"]
 
         assert check["status"] == "warning"
-        assert "上一份能用的配置" in check["detail"]
+        assert "现在用的是内置默认" in check["detail"] and "上一份" not in check["detail"]
         assert config_layout.MODELS_FILE in check["action"]
+
+    def test_a_file_broken_while_running_says_the_last_good_one_is_kept(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path)
+        path = config_layout.models_path(root)
+        path.write_text("version: 1\nprovider: openai\nopenai:\n  model: m-good\n", encoding="utf-8")
+        store = ConfigStore(path=path, workspace_root=root)
+        path.write_text("openai: [1, 2\n", encoding="utf-8")
+
+        check = self._checks(root, store)["模型配置文件"]
+
+        assert check["status"] == "warning"
+        assert "继续用上一份能用的配置" in check["detail"] and "内置默认" not in check["detail"]
+        assert store.get_openai_secret().model == "m-good"
 
     def test_a_readable_file_raises_no_such_check(self, tmp_path: Path) -> None:
         root = _workspace(tmp_path)

@@ -1721,6 +1721,10 @@ export interface ConfigLiveState {
     /** 等着处理的消息条数。 */
     backlog?: number;
     config_path?: string;
+    /** 磁盘上这份文件的指纹。 */
+    file?: ConfigFileFingerprint;
+    /** 生效值出自哪一版文件；exists=false 是一版都没采纳，按空文件算。 */
+    loaded?: ConfigFileFingerprint;
     parse_error?: string;
     /** 这份快照是哪一层：global 或 platform。 */
     layer?: string;

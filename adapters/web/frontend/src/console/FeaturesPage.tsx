@@ -104,6 +104,8 @@ const FeaturesPageBody = () => {
   }, [adminToken, loadSchema]);
 
   const parseError = String(live?.state?.parse_error || '');
+  // 一版都没采纳过（起来时就坏、或此前一直不存在）时生效值按空文件算，说「上一份」会让人以为文件里的值还在生效。
+  const keepsLastGood = live?.state?.loaded?.exists !== false;
   const platforms = (live as FeaturesLiveState | null)?.platforms || [];
 
   return (
@@ -111,7 +113,9 @@ const FeaturesPageBody = () => {
       {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       {parseError && (
         <ErrorText role="alert">
-          全局设置解析失败：{parseError}。bot 仍在用上一份有效内容。请先修复原文件语法；本页不会覆盖损坏文件。
+          全局设置解析失败：{parseError}。
+          {keepsLastGood ? 'bot 仍在用上一份有效内容。' : '手上没有这份文件能用的版本，现在按空文件算，各项落到平台自己的设置、.env 和默认值。'}
+          请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
       {loading && !live ? <Empty>正在读取全局设置…</Empty> : live && <Adoption platforms={platforms} />}

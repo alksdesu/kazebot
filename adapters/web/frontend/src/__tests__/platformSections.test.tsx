@@ -364,6 +364,25 @@ describe('页头的交代', () => {
     ]);
   });
 
+  it('文件一版都没读成过时，状态条和解析失败都说按空文件在跑', () => {
+    // bot 起来时文件就是坏的，生效值落到全局设置、.env 和默认值，没有「上一份」可沿用。
+    const broken = live();
+    platformConsoleStore('qq').setState({
+      live: {
+        ...broken,
+        applied: false,
+        state: { ...broken.state!, parse_error: 'line 3: bad indent', loaded: { exists: false, mtime_ns: 0, size: 0 } },
+      },
+    });
+    render(<PlatformTab />);
+
+    expect(screen.getByText('配置有语法错误，bot 按空文件在跑')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert').map((node) => node.textContent)).toEqual([
+      '平台配置解析失败：line 3: bad indent。bot 手上没有这份文件能用的版本，现在按空文件算，各项落到全局设置、.env 和默认值。请先修复原文件语法；本页不会覆盖损坏文件。',
+    ]);
+    expect(screen.queryByText(/仍在用上一份/)).toBeNull();
+  });
+
   it('「bot 还没上报」排在连接卡前面，先交代整页为什么空着', () => {
     platformConsoleStore('qq').setState({ live: { published: false, file: { exists: false, mtime_ns: 0, size: 0 } } });
     render(<PlatformTab />);

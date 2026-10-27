@@ -306,7 +306,11 @@ class PluginManager:
         except Exception as exc:
             with self._lock:
                 self._configuration_error = _diagnostic("configuration", exc)
-                self._configuration_error["message"] = "Plugin settings could not be read; retaining the last applied generation"
+                self._configuration_error["message"] = (
+                    "Plugin settings could not be read; retaining the last applied generation"
+                    if self.applied_generation
+                    else "Plugin settings could not be read; no plugin is loaded until they are fixed"
+                )
                 self.desired_generation = "invalid:" + hashlib.sha256(repr(stamps).encode()).hexdigest()
                 self._file_versions = stamps
                 self._write_status_locked()

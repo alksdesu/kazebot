@@ -189,7 +189,12 @@ class OperationsService:
         if health["config_path_mismatch"]:
             add(f"{name} 配置路径", "failed", "Supervisor 与 bot 用的配置文件不同", _mismatch_action(platform))
         if health["parse_error"]:
-            add(f"{name} 配置文件", "failed", "配置文件读不懂，bot 还在用上一份能读的", "到平台页修正 YAML 语法后重新检查")
+            kept = (
+                "bot 现在按空文件算，各项落到全局设置、.env 和默认值"
+                if health["config_from_file"] is False
+                else "bot 还在用上一份能读的"
+            )
+            add(f"{name} 配置文件", "failed", f"配置文件读不懂，{kept}", "到平台页修正 YAML 语法后重新检查")
 
     def _layout_check(self, add: Any) -> None:
         layout = config_layout.layout_status(self.root)
@@ -250,10 +255,10 @@ class OperationsService:
             store = getattr(self.state, "feature_config_store", None) or ConfigStore(
                 path=config_layout.models_path(self.root), workspace_root=self.root,
             )
-            if store.load_error:
-                # 文件写坏了不影响运行：一直用着上一份能用的配置，但之后在控制台改渠道会被拒。
-                add("模型配置文件", "warning", f"{store.load_error}，现在用的是上一份能用的配置",
-                    f"在原文编辑器里修好 {config_layout.MODELS_FILE}")
+            models_error = store.load_error
+            if models_error:
+                # 只算提醒：手上那份照用（上一份还是内置默认 load_error 里写着），修好之前在控制台改渠道会被拒。
+                add("模型配置文件", "warning", models_error, f"在原文编辑器里修好 {config_layout.MODELS_FILE}")
             secret = store.get_openai_secret()
             protected = (*self._configured_secrets(), secret.api_key)
             provider_class = registry.get(secret.provider)

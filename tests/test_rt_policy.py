@@ -1,6 +1,7 @@
-"""策略的底线：装着明文密钥的配置读写至少要审批，清单只认 config_layout 那一份；写坏的策略文件沿用上一份并说出来。"""
+"""策略的底线：装着明文密钥的配置读写至少要审批，清单只认 config_layout 那一份；写坏的策略文件沿用上一份（一次都没读成就是内置默认）并说出来。"""
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -132,6 +133,71 @@ class TestABrokenPolicyFile:
 
         assert engine.evaluate_read_file(path=".env").safety_level == SafetyLevel.deny
         assert engine.load_error
+
+    def test_a_file_broken_at_startup_says_the_built_in_default_is_in_effect(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 一次都没读成：自定义的 deny 一条都没生效，说成「上一份」会让人以为它们还在管用
+        with caplog.at_level(logging.WARNING, logger="supervisor.policy"):
+            engine = _policy(tmp_path, "read_file:\n  default: [this is broken\n")
+
+        error = engine.load_error
+        assert error.startswith("config/policy.yaml 用不了，生效的是内置默认策略")
+        assert "包括 deny" in error and "上一份" not in error
+        assert "生效的是内置默认策略" in caplog.text and "上一份" not in caplog.text
+
+    def test_breaking_it_while_running_says_the_last_good_one(self, tmp_path: Path) -> None:
+        engine = _policy(tmp_path, _PERMISSIVE)
+
+        _rewrite(tmp_path, "read_file:\n  default: [this is broken\n")
+
+        error = engine.load_error
+        assert error.startswith("config/policy.yaml 用不了，沿用上一份能用的策略")
+        assert "内置默认" not in error
+        assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.auto
+
+    def test_a_file_missing_at_startup_that_could_not_be_created_says_the_default_is_in_effect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(PolicyEngine, "_ensure_policy_file_exists", lambda self: None)
+
+        engine = PolicyEngine(workspace_root=tmp_path)
+
+        assert engine.load_error == "config/policy.yaml 不见了，生效的是内置默认策略；在控制台保存一次就会重新建出来"
+        assert engine.evaluate_read_file(path=".env").safety_level == SafetyLevel.deny
+
+    def test_a_file_deleted_while_running_keeps_the_last_policy(self, tmp_path: Path) -> None:
+        engine = _policy(tmp_path, _PERMISSIVE)
+
+        config_layout.policy_path(tmp_path).unlink()
+
+        assert engine.load_error == "config/policy.yaml 不见了，沿用上一份策略；在控制台保存一次就会重新建出来"
+        assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.auto
+
+    def test_a_file_that_cannot_be_read_is_reported_and_logged_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 该放文件的地方是个目录：读的时候抛 OSError，这一支不报的话诊断会说一切正常
+        config_layout.policy_path(tmp_path).mkdir(parents=True)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.policy"):
+            engine = PolicyEngine(workspace_root=tmp_path)
+            first = engine.load_error
+            second = engine.load_error
+
+        assert first == second
+        assert first.startswith("config/policy.yaml 读不了，生效的是内置默认策略")
+        assert caplog.text.count("读不了") == 1
+        assert engine.evaluate_read_file(path=".env").safety_level == SafetyLevel.deny
+
+    def test_a_file_that_becomes_unreadable_after_a_good_read_keeps_the_last_policy(self, tmp_path: Path) -> None:
+        engine = _policy(tmp_path, _PERMISSIVE)
+        path = config_layout.policy_path(tmp_path)
+        path.unlink()
+        path.mkdir()
+
+        assert engine.load_error.startswith("config/policy.yaml 读不了，沿用上一份能用的策略")
+        assert engine.evaluate_read_file(path="notes.txt").safety_level == SafetyLevel.auto
 
     def test_keys_nobody_reads_are_applied_and_named(self, tmp_path: Path) -> None:
         engine = _policy(tmp_path, _PERMISSIVE + "write_flie:\n  default: deny\n")

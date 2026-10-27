@@ -460,8 +460,13 @@ class LiveConfig:
             # 保留上一份有效配置而不是回落到默认值：群白名单空 = 全群静默，
             # 管理员名单空 = 审批全拒 —— 写坏一个字符不该等于把 bot 关掉。
             # stamp 照旧记下，否则每次读都重试解析同一个坏文件、刷满日志。
-            logger.error("%s is unusable (%s); keeping the previous configuration", path.name, error)
             had_valid = cache.valid and cache.path == key
+            # 上一回采纳的是「文件不存在」时手上本来就是空文档，说「留着上一份」会让人以为文件里的值还在生效。
+            kept = had_valid and cache.values_stamp != _MISSING_STAMP
+            logger.error(
+                "%s is unusable (%s); %s", path.name, error,
+                "keeping the previous configuration" if kept else "treating it as an empty file until it is fixed",
+            )
             cache.path = key
             cache.stamp = stamp
             cache.error = error
@@ -481,7 +486,7 @@ class LiveConfig:
         cache.valid = True
 
     def _reload_if_changed(self) -> Mapping[str, Any]:
-        """按文件指纹判断要不要重解析；解析失败保留上一份有效配置。全局那层换了文档也要重算。"""
+        """按文件指纹判断要不要重解析；解析失败保留上一份有效配置，一版都没采纳过就按空文件算。全局那层换了文档也要重算。"""
         # 先在锁外拿全局那层：两把锁不嵌套，谁先谁后都不会死锁。
         defaults_document, defaults_generation = (
             self.defaults.adopted_document() if self.defaults is not None else (None, None)
@@ -507,7 +512,7 @@ class LiveConfig:
             return self._cache.values, self._cache.sources
 
     def adopted_document(self) -> tuple[Mapping[str, Any], int]:
-        """当前采纳的文档和第几次采纳。别的层拿它当默认值；文件写坏时给的是上一份有效的。"""
+        """当前采纳的文档和第几次采纳。别的层拿它当默认值；文件写坏时给的是上一份有效的，一版都没采纳过时是空文档。"""
         self._reload_if_changed()
         with self._cache_lock:
             return self._cache.document, self._cache.generation

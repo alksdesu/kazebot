@@ -391,6 +391,48 @@ class TestFailClosed:
 
         assert "chat.yaml is unusable" in caplog.text
 
+    def test_a_file_broken_from_the_start_is_logged_as_treated_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 一版都没采纳过：手上是空文档，说「留着上一份」会让人以为文件里的值在生效
+        config = _config(tmp_path / "chat.yaml")
+        _write(config, "feature: [unclosed\n")
+
+        with caplog.at_level(logging.ERROR, logger="adapters._shared.live_config"):
+            assert config.live.limit == 3
+
+        assert "chat.yaml is unusable" in caplog.text
+        assert "treating it as an empty file until it is fixed" in caplog.text
+        assert "keeping the previous configuration" not in caplog.text
+        assert config.state_payload()["loaded"]["exists"] is False
+
+    def test_a_file_broken_after_a_good_read_says_the_previous_values_are_kept(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _config(tmp_path / "chat.yaml")
+        _write(config, "feature:\n  limit: 6\n")
+        assert config.live.limit == 6
+
+        _write(config, "feature: [unclosed\n")
+        with caplog.at_level(logging.ERROR, logger="adapters._shared.live_config"):
+            assert config.live.limit == 6
+
+        assert "keeping the previous configuration" in caplog.text
+        assert config.state_payload()["loaded"]["exists"] is True
+
+    def test_a_file_written_broken_where_there_was_none_is_still_treated_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _config(tmp_path / "chat.yaml")
+        assert config.live.limit == 3
+
+        _write(config, "feature: [unclosed\n")
+        with caplog.at_level(logging.ERROR, logger="adapters._shared.live_config"):
+            assert config.live.limit == 3
+
+        assert "treating it as an empty file until it is fixed" in caplog.text
+        assert config.state_payload()["loaded"]["exists"] is False
+
 
 class TestResolved:
     """值和来源一起取：只拿到值的话，分不清是运营者亲手写的还是默认值。"""
