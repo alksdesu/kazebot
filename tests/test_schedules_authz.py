@@ -297,6 +297,90 @@ async def test_a_non_admin_cannot_schedule_every_minute(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cron", [
+    "0-59 * * * *",
+    "0-4 * * * *",
+    "0-2,30-31 * * * *",
+    "10,0-3 * * * *",
+    "*/4 * * * *",
+    "0,4,8,12,16 * * * *",
+])
+async def test_a_non_admin_cannot_spell_every_minute_another_way(tmp_path: Path, cron: str) -> None:
+    # 区间和逗号都按 cron_match 实际命中的分钟数算：0-59 就是每分钟一次
+    workspace = _workspace(tmp_path)
+
+    result = await create_schedule({"id": "spam", "cron": cron, "text": "hi"}, _Ctx(workspace, platform_auth=_MEMBER, safety="auto"))
+
+    assert result["ok"] is False
+    assert "admin-only" in result["error"]
+    assert _ids(workspace) == ["nightly_backup"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cron", [
+    "0-3 * * * *",
+    "0,1,2,3 * * * *",
+    "0-1,30-31 * * * *",
+    "*/5 * * * *",
+    "0,5,10,15,20 * * * *",
+    "*/7 * * * *",
+])
+async def test_a_non_admin_may_schedule_right_at_the_limits(tmp_path: Path, cron: str) -> None:
+    # 一小时 4 次以内怎么排都行，再多就得两次之间隔开至少 5 分钟；*/7 跨小时那一段只隔 4 分钟，不算
+    workspace = _workspace(tmp_path)
+
+    result = await create_schedule({"id": "edge", "cron": cron, "text": "hi"}, _Ctx(workspace, platform_auth=_MEMBER, safety="auto"))
+
+    assert result["ok"] is True
+    assert _ids(workspace) == ["nightly_backup", "edge"]
+
+
+_EVERYONE = pytest.mark.parametrize("platform_auth", [_ADMIN, _MEMBER], ids=["admin", "member"])
+
+
+@pytest.mark.asyncio
+@_EVERYONE
+@pytest.mark.parametrize("cron,term", [
+    ("0-59/5 * * * *", "0-59/5"),
+    ("7,0-59/5 * * * *", "0-59/5"),
+    ("*/5,7 * * * *", "*/5,7"),
+    ("60 * * * *", "60"),
+    ("50-10 * * * *", "50-10"),
+    ("0 24 * * *", "24"),
+    ("0 9-17/2 * * *", "9-17/2"),
+    ("0 9 0 * *", "0"),
+    ("0 9 * 13 *", "13"),
+    ("0 9 * * MON", "MON"),
+    ("0 9 * * 8", "8"),
+    ("0 9 , * *", ","),
+])
+async def test_a_term_that_never_matches_is_refused(
+    tmp_path: Path, platform_auth: dict[str, Any], cron: str, term: str,
+) -> None:
+    # cron_match 认不出或够不着的项一次都不会命中：建出来的任务到点不响，模型却会告诉用户设好了
+    workspace = _workspace(tmp_path)
+
+    result = await create_schedule({"id": "dead", "cron": cron, "text": "hi"}, _Ctx(workspace, platform_auth=platform_auth, safety="auto"))
+
+    assert result["ok"] is False
+    assert f"{term} in the" in result["error"]
+    assert _ids(workspace) == ["nightly_backup"]
+
+
+@pytest.mark.asyncio
+@_EVERYONE
+@pytest.mark.parametrize("cron", ["0 9 * * 7", "0 9 * * 0-7", "0,30, 9 * * *", "0 */24 * * *"])
+async def test_terms_that_can_match_are_not_refused(
+    tmp_path: Path, platform_auth: dict[str, Any], cron: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+
+    result = await create_schedule({"id": "fine", "cron": cron, "text": "hi"}, _Ctx(workspace, platform_auth=platform_auth, safety="auto"))
+
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_a_non_admin_cannot_overwrite_someone_elses_schedule(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     await create_schedule(

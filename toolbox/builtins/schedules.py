@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from clonoth_runtime import SwitchValueError, switch_arg
+from engine.cron import CRON_FIELDS, field_values, unmatched_terms
 from platforms.registry import is_platform_conversation
 from platforms.sources import classify_source_name, is_external_platform
 
@@ -81,18 +82,32 @@ def _originating_conversation_key(ctx: ToolContext) -> str:
     return ""
 
 
-def _minute_field_is_too_frequent(cron_expr: str) -> bool:
-    """非管理员不得建每分钟级的任务：一条 `* * * * *` 就是永久刷屏 + 每分钟一个 task。"""
-    minute = cron_expr.split()[0].strip()
-    if minute == "*":
-        return True
-    if minute.startswith("*/"):
-        try:
-            return int(minute[2:]) < _MIN_INTERVAL_MINUTES
-        except ValueError:
-            return True
-    # 逗号列出十几个分钟点同样是高频，按点数判。
-    return len([p for p in minute.split(",") if p.strip()]) > _MAX_MINUTE_POINTS
+def _unmatched_terms_refusal(fields: list[str]) -> str:
+    """cron_match 永远跳过的项：任务看着建好了，到点却不响。返回拒绝原因，没有就是空串。"""
+    dead = [
+        f"{term} in the {name} field matches nothing in {low}-{high}"
+        for (name, low, high), field in zip(CRON_FIELDS, fields)
+        for term in unmatched_terms(field, low, high)
+    ]
+    if not dead:
+        return ""
+    return f"cron {'; '.join(dead)}: a field is * or */n on its own, or comma-separated numbers and a-b ranges"
+
+
+def _frequency_refusal(minute_field: str) -> str:
+    """非管理员不得建每分钟级的任务：一条 `* * * * *` 就是永久刷屏 + 每分钟一个 task。返回拒绝原因，放行时是空串。"""
+    minutes = sorted(field_values(minute_field, 0, 59))
+    if len(minutes) <= _MAX_MINUTE_POINTS:
+        return ""
+    # 跨小时的那一段不比，不然 */7 也会被拒：:56 之后下一次是下一小时的 :00
+    closest = min(later - earlier for earlier, later in zip(minutes, minutes[1:]))
+    if closest >= _MIN_INTERVAL_MINUTES:
+        return ""
+    return (
+        f"schedules more frequent than every {_MIN_INTERVAL_MINUTES} minutes are admin-only: "
+        f"minute field {minute_field} runs {len(minutes)} times an hour, {closest} minute(s) apart at the closest; "
+        f"more than {_MAX_MINUTE_POINTS} runs an hour need at least {_MIN_INTERVAL_MINUTES} minutes between them"
+    )
 
 
 def _resolve_schedule_conversation_key(args: dict[str, Any], ctx: ToolContext, sid: str) -> str:
@@ -129,6 +144,9 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     parts = cron_expr.split()
     if len(parts) != 5:
         return _err("cron must be 5 fields: minute hour day month weekday")
+    refusal = _unmatched_terms_refusal(parts)
+    if refusal:
+        return _err(refusal)
 
     stype = str(args.get("type") or "message").strip()
     if stype not in ("message", "script"):
@@ -167,10 +185,9 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
             return _err("only Clonoth admins may pin an entry node or workflow on a schedule")
         if stype == "script":
             return _err("only Clonoth admins may create script schedules")
-        if _minute_field_is_too_frequent(cron_expr):
-            return _err(
-                f"schedules more frequent than every {_MIN_INTERVAL_MINUTES} minutes are admin-only"
-            )
+        refusal = _frequency_refusal(parts[0])
+        if refusal:
+            return _err(refusal)
         prior = existing.get(sid)
         if prior is not None and str(prior.get("created_by") or "") != creator:
             return _err(f"schedule {sid} belongs to someone else")

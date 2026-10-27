@@ -5,41 +5,62 @@ supervisor 的用户定时任务与 engine 的 dream / data_cleanup 共用这一
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
+from functools import partial
 
-__all__ = ["cron_match"]
+__all__ = ["CRON_FIELDS", "cron_match", "field_values", "unmatched_terms"]
+
+# 各段的名字和 cron_match 会拿来比的取值范围；周几的 7 也是周日
+CRON_FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31), ("month", 1, 12), ("weekday", 0, 7))
+
+
+def _match_step(step_text: str, value: int) -> bool:
+    try:
+        step = int(step_text)
+    except ValueError:
+        return False
+    return step > 0 and value % step == 0
+
+
+def _match_part(part: str, value: int) -> bool:
+    try:
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            return int(lo) <= value <= int(hi)
+        return int(part) == value
+    except ValueError:
+        return False
+
+
+def _terms(field: str) -> list[tuple[str, Callable[[int], bool]]]:
+    """一段拆成各自匹配的项：* 和 */step 只认整段写，逗号列表里的每一项只认单个数或 a-b 区间。"""
+    field = field.strip()
+    if field == "*":
+        return [(field, lambda _value: True)]
+    if field.startswith("*/"):
+        return [(field, partial(_match_step, field[2:]))]
+    parts = [part.strip() for part in field.split(",")]
+    return [(part, partial(_match_part, part)) for part in parts]
 
 
 def _match_field(field: str, value: int) -> bool:
     """判断 cron 单个字段是否匹配。支持 * / , - 和 */step。"""
-    field = field.strip()
-    if field == "*":
-        return True
+    return any(match(value) for _term, match in _terms(field))
 
-    if field.startswith("*/"):
-        try:
-            step = int(field[2:])
-            return step > 0 and value % step == 0
-        except ValueError:
-            return False
 
-    for part in field.split(","):
-        part = part.strip()
-        if "-" in part:
-            try:
-                lo, hi = part.split("-", 1)
-                if int(lo) <= value <= int(hi):
-                    return True
-            except ValueError:
-                continue
-        else:
-            try:
-                if int(part) == value:
-                    return True
-            except ValueError:
-                continue
+def field_values(field: str, low: int, high: int) -> frozenset[int]:
+    """这一段在 [low, high] 里会命中的值，和 cron_match 走同一份解析。"""
+    return frozenset(value for value in range(low, high + 1) if _match_field(field, value))
 
-    return False
+
+def unmatched_terms(field: str, low: int, high: int) -> list[str]:
+    """这一段里在 [low, high] 一个值也命中不了的项，比如 0-59/5 这种认不出的写法、越界的数；多写的逗号留下的空项不算，整段只有逗号时给整段。"""
+    span = range(low, high + 1)
+    terms = [(term, match) for term, match in _terms(field) if term]
+    if not terms:
+        return [field]
+    return [term for term, match in terms if not any(match(value) for value in span)]
 
 
 def _match_weekday(field: str, dt: datetime) -> bool:

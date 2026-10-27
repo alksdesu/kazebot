@@ -1053,7 +1053,13 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "id": {"type": "string", "description": "unique schedule id"},
-                        "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
+                        "cron": {
+                            "type": "string",
+                            "description": (
+                                "5-field cron: minute hour day month weekday (UTC); a field is * or */n on its own, "
+                                "or comma-separated numbers and a-b ranges"
+                            ),
+                        },
                         "text": {"type": "string", "description": "message text injected as inbound (for message type); prefix text (for script type)"},
                         "type": {"type": "string", "enum": ["message", "script"], "description": "schedule type: message (default) or script"},
                         "command": {"type": "string", "description": "shell command to run (required for script type)"},
