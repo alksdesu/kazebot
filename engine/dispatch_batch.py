@@ -29,7 +29,6 @@ CONTEXT_MODES = (*OWN_SESSION_MODES, "accumulate")
 # supervisor 拒收异步委派的入站：要沿用的会话不能派是 409，context_mode 写错是 422，detail 是给模型看的原因
 INBOUND_CONFLICT_STATUS = 409
 INBOUND_BAD_MODE_STATUS = 422
-INBOUND_REFUSAL_STATUSES = (INBOUND_CONFLICT_STATUS, INBOUND_BAD_MODE_STATUS)
 
 # dispatch 动作的 dispatch_input 带这个键：不派新的子任务，挂起调用方等这些异步委派
 AWAIT_KEY = "await_dispatches"

@@ -98,6 +98,22 @@ def test_a_failed_switch_keeps_the_turn_on_the_current_node(tmp_path: Path, monk
     assert result["tool_call_id"] == "sw" and "切换节点失败" in result["content"]
 
 
+@pytest.mark.parametrize("response, reason", [
+    (_Response(500, {"detail": "unavailable"}), "unavailable"),
+    (_Response(409, {"detail": {"code": "busy", "message": "会话正在切换"}}), "会话正在切换（busy，HTTP 409）"),
+    (_Response(503, None), "supervisor 回了 HTTP 503"),
+], ids=["string", "structured", "no-detail"])
+def test_a_refused_switch_names_the_supervisors_reason(
+    tmp_path: Path, monkeypatch, response: _Response, reason: str,
+) -> None:
+    monkeypatch.setattr(pseudo_handlers, "_persist_ctx", lambda *_args: "ctx")
+    state, _events = _loop_state(tmp_path, post=AsyncMock(return_value=response))
+
+    _handle(state, ToolCall(id="sw", name="switch_node", arguments={"target": "helper", "text": "bye"}))
+
+    assert f"切换节点失败（{reason}）" in state.messages[-1]["content"]
+
+
 def test_a_successful_switch_finishes_the_turn(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(pseudo_handlers, "_persist_ctx", lambda *_args: "ctx")
     post = AsyncMock(return_value=_Response(200, {"ok": True}))

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import SwitchValueError, parse_bool, switch_arg, switch_refusal
+from clonoth_sdk.refusals import refusal_reason
 
 from .resume_builder import _select_attachments
 from .attachment_access import RefusedAttachment, screen_model_attachment_paths
@@ -22,7 +23,6 @@ from ..dispatch_batch import (
     AWAIT_ALL,
     AWAIT_MODES,
     CONTINUE_FROM_KEY,
-    INBOUND_REFUSAL_STATUSES,
     ISOLATION_KEY,
     ISOLATION_WORKTREE,
     ITEM_TIMEOUT_KEY,
@@ -154,11 +154,7 @@ def _http_failure(response: Any) -> str:
     status = getattr(response, "status_code", None)
     if not isinstance(status, int) or 200 <= status < 300:
         return ""
-    try:
-        detail = response.json().get("detail")
-    except Exception:
-        detail = None
-    return f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+    return refusal_reason(response)
 
 
 def _refusal_note(refused: list[RefusedAttachment]) -> str:
@@ -840,11 +836,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
                 target, _dispatch_resp.json(), isolation=request.isolation_fields(),
             )
         else:
-            dispatch_result = {
-                "success": False,
-                "error": _inbound_refusal(_dispatch_resp)
-                or f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
-            }
+            dispatch_result = {"success": False, "error": refusal_reason(_dispatch_resp)}
     except Exception as e:
         dispatch_result = {"success": False, "error": str(e)}
     if dispatch_result.get("success") and args.get(ITEM_TIMEOUT_KEY) not in (None, ""):
@@ -855,17 +847,6 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         dispatch_result["refused_attachments"] = [item.as_dict() for item in refused_attachments]
     _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(dispatch_result, ensure_ascii=False))
     return None
-
-
-def _inbound_refusal(response: Any) -> str:
-    """supervisor 拒收这次异步委派时给模型看的原因；别的失败给空串。"""
-    if getattr(response, "status_code", None) not in INBOUND_REFUSAL_STATUSES:
-        return ""
-    try:
-        detail = response.json().get("detail")
-    except Exception:
-        return ""
-    return detail.strip() if isinstance(detail, str) else ""
 
 
 def _runtime_session_id(ls: _LoopState) -> str:

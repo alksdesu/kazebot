@@ -413,8 +413,13 @@ class TestContinueFrom:
     @pytest.mark.parametrize("http,refusal", [
         pytest.param(_supervisor(body={"ok": False, "message": "子会话已经不在了"}), "子会话已经不在了", id="refused"),
         pytest.param(_supervisor(body={"ok": False}), "continue_from 被拒绝。", id="refused-without-a-reason"),
+        pytest.param(_supervisor(status=500, body={"detail": "boom"}), "continue_from 核对失败：boom", id="http-error"),
         pytest.param(
-            _supervisor(status=500, body={"detail": "boom"}), "continue_from 核对失败：HTTP 500: boom", id="http-error",
+            _supervisor(status=409, body={"detail": {"code": "busy", "message": "子 agent 正忙"}}),
+            "continue_from 核对失败：子 agent 正忙（busy，HTTP 409）", id="structured-detail",
+        ),
+        pytest.param(
+            _supervisor(status=502, body=None), "continue_from 核对失败：supervisor 回了 HTTP 502", id="no-detail",
         ),
         pytest.param(
             _supervisor(error=RuntimeError("down")), "continue_from 核对失败：RuntimeError: down", id="unreachable",

@@ -5,10 +5,10 @@ import logging
 from typing import Any
 
 from clonoth_runtime import SwitchValueError, switch_arg
+from clonoth_sdk.refusals import refusal_reason
 from engine.worktree_report import MERGE_TOOL, file_line
 
 from .._common import request_guard
-from ..feature_client import refusal_reason
 
 log = logging.getLogger(__name__)
 

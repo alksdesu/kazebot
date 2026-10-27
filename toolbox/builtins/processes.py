@@ -8,9 +8,9 @@ import time
 from typing import Any
 
 from clonoth_runtime import get_float, load_runtime_config
+from clonoth_sdk.refusals import refusal_reason
 
 from .._common import request_guard
-from ..feature_client import refusal_reason
 
 log = logging.getLogger(__name__)
 

@@ -436,7 +436,7 @@ class TestListAndCancelTools:
         _run(ls, call("list_dispatches", {}, call_id="l"))
 
         assert _payload(ls, "l") == {
-            "success": False, "error": "查询异步委派失败：HTTP 404: caller task not found or not active",
+            "success": False, "error": "查询异步委派失败：caller task not found or not active",
         }
 
     @pytest.mark.parametrize("body, message", [

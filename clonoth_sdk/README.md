@@ -116,6 +116,7 @@ asyncio.run(router.run())
 | `config.py` | `BotConfig` — configuration dataclass injected into router and client |
 | `types.py` | `Event`, `InboundResult`, `RunningTask`, `HealthInfo`, `OpenAIConfig` — API response types |
 | `approval.py` | `ApprovalTracker` (dedup), `classify_path` / `is_external_operation` (path classification), `auto_approve` (retry logic) |
+| `refusals.py` | `refusal_reason` / `refusal_detail` / `error_detail` — the reason the Supervisor gives when it refuses a request, read the same way by the engine, the tools and the adapters |
 
 ## SDK Boundary
 

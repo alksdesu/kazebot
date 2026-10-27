@@ -217,15 +217,17 @@ class TestEngineShowsTheSupervisorsReason:
 
         assert _payload(ls, "a1") == {"success": False, "error": reason}
 
-    def test_other_failures_keep_the_status_and_the_body(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_other_failures_hand_over_what_the_supervisor_said(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         ls = _loop(tmp_path, monkeypatch)
         ls.rctx.http = _supervisor(_response({"detail": "boom"}, 500))
 
         _run(ls, _async())
 
-        assert _payload(ls, "a1") == {"success": False, "error": 'inbound API 返回 500: {"detail": "boom"}'}
+        assert _payload(ls, "a1") == {"success": False, "error": "boom"}
 
-    def test_a_validation_error_list_is_not_taken_for_a_reason(
+    def test_a_validation_error_list_is_spelled_out_by_field(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         body = {"detail": [{"loc": ["body", "text"], "msg": "Field required"}]}
@@ -234,7 +236,9 @@ class TestEngineShowsTheSupervisorsReason:
 
         _run(ls, _async())
 
-        assert _payload(ls, "a1")["error"].startswith(f"inbound API 返回 {INBOUND_BAD_MODE_STATUS}: ")
+        assert _payload(ls, "a1") == {
+            "success": False, "error": f"text：Field required（HTTP {INBOUND_BAD_MODE_STATUS}）",
+        }
 
 
 # ---- supervisor 一侧 ----
