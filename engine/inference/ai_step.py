@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
+from toolbox.approval_wait import relay_approval_waits, report_approval_waits_to
+from toolbox.builtins.execute_command import command_timeout
 from toolbox.registry import ToolRegistry
 from toolbox.tool_names import is_pseudo_tool_name
 
@@ -853,7 +855,7 @@ async def _handle_tool_calls(
 # ---------------------------------------------------------------------------
 #  异步工具后台执行器 / 自适应转异步辅助
 #  spec 标了 async_mode 的工具在后台跑；execute_command 同步跑超过阈值也转到后台。
-#  两条路都经 async_tool_result 把结果注入回会话，模型当轮先拿到占位结果。
+#  两条路都把结果交回 supervisor，由它按发起任务定交给哪个会话、哪个节点；模型当轮先拿到占位结果。
 # ---------------------------------------------------------------------------
 
 
@@ -875,11 +877,11 @@ def _execute_command_async_upgrade_threshold(
     tool_args: dict[str, Any],
     runtime_cfg: dict[str, Any] | None,
 ) -> float | None:
-    """返回 execute_command 的自适应转异步阈值秒数；不适用时返回 None。"""
-    # [2026-07-14] Why: execute_command 自身的 timeout_sec 仍是硬性
-    # 终止上限，但引擎可以更早停止等待。How: 仅对 execute_command 生效，取
-    # min(threshold, timeout*0.8)，并跳过 timeout 太接近阈值的调用。Purpose: 慢命令
-    # 在后台继续运行而无需改变工具调用语法。
+    """返回 execute_command 的自适应转异步阈值秒数；不适用时返回 None。
+
+    命令自己的 timeout_sec（和工具里一样夹过上下限）仍是硬上限，引擎只是早一点不再干等：
+    取 min(阈值, 时限的 80%)，时限离阈值太近的不转。
+    """
     if str(tool_name or "") != "execute_command":
         return None
     cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
@@ -892,18 +894,7 @@ def _execute_command_async_upgrade_threshold(
         min_value=0.01,
         max_value=3600.0,
     )
-    default_timeout_sec = get_float(
-        cfg,
-        "meta.execute_command.default_timeout_sec",
-        90.0,
-        min_value=1.0,
-        max_value=3600.0,
-    )
-    timeout_raw = (tool_args or {}).get("timeout_sec")
-    try:
-        timeout_sec = float(timeout_raw) if timeout_raw is not None else float(default_timeout_sec)
-    except Exception:
-        timeout_sec = float(default_timeout_sec)
+    timeout_sec = command_timeout(cfg, (tool_args or {}).get("timeout_sec"))
     if timeout_sec <= threshold_sec + 1.0:
         return None
     effective = min(float(threshold_sec), float(timeout_sec) * 0.8)
@@ -931,6 +922,11 @@ async def _execute_registry_tool_with_span(
 
 
 _background_tasks: set[asyncio.Task] = set()
+# 同步委派的子节点收不了新消息，supervisor 会把结果交给派它出来的节点
+_ASYNC_RESULT_ARRIVAL = (
+    "Its result will arrive later as a new message, to this node or, "
+    "if this node cannot receive messages, to the node that dispatched it."
+)
 
 
 def _spawn_background(coroutine: Any, *, name: str) -> asyncio.Task:
@@ -962,7 +958,7 @@ async def _run_async_tool(
     tool_ctx: ToolContext,
     **delivery_kwargs: Any,
 ) -> None:
-    """后台执行声明了 async_mode 的工具，结果走 async_tool_result 回传。"""
+    """后台执行声明了 async_mode 的工具，结果交回 supervisor。"""
     try:
         result = await _execute_registry_tool_with_span(registry, tool_name, tool_args, tool_ctx, async_call=True)
     except Exception as e:
@@ -1067,6 +1063,17 @@ def _adopt_resumed_attachments(ls: _LoopState, resume_data: dict[str, Any]) -> N
             ls.tool_produced_attachments.append(attachment)
 
 
+def _async_failure_detail(result: Any, error: str) -> str:
+    """失败结果里比那一行报错多出来的内容（超时、取消前已经读到的输出）一起交回；没有多出来的就是报错本身。"""
+    data = result.get("data") if isinstance(result, dict) else None
+    rendered = str(data.get("result") or "").strip() if isinstance(data, dict) else ""
+    if rendered.upper().startswith("ERROR:"):
+        rendered = rendered[6:].strip()
+    if error and rendered.startswith(error) and len(rendered) > len(error):
+        return rendered
+    return error
+
+
 async def _async_result_message(
     *,
     registry: ToolRegistry,
@@ -1091,7 +1098,8 @@ async def _async_result_message(
         return _async_failure_message(tool_name, async_tool_id, shown), failure, []
     outcome = tool_outcome(result)
     if not outcome.ok:
-        shown = await _context_tool_text(workspace_root, session_id, tool_name, outcome.error, limits)
+        detail = _async_failure_detail(result, outcome.error)
+        shown = await _context_tool_text(workspace_root, session_id, tool_name, detail, limits)
         return _async_failure_message(tool_name, async_tool_id, shown, elapsed), outcome.error, []
     summary = summarize_result(tool_name, result, args=tool_args)
     _fmt, raw = result_to_raw(tool_name, result, tool_spec=registry.get_spec(tool_name))
@@ -1120,8 +1128,12 @@ async def _run_async_deliver(
     error: Exception | None = None,
     workspace_root: Any = None,
 ) -> None:
-    """整形、记账并回传一个异步工具结果。session_id 是面向用户的路由会话，分支任务传父会话。"""
+    """整形、记账并回传一个异步工具结果。
+
+    session_id 是发起任务面向用户的会话（分支任务传父会话），超长结果存在它名下；交给哪个会话由 supervisor 按 task_id 定。
+    """
     elapsed = time.monotonic() - started_at
+    cancelled = error is None and tool_outcome(result).status == TOOL_CANCELLED
     try:
         message, failure_error, attachments = await _async_result_message(
             registry=registry, tool_name=tool_name, tool_args=tool_args, async_tool_id=async_tool_id,
@@ -1149,6 +1161,7 @@ async def _run_async_deliver(
         node_id=str(node_id or ""),
         failure_error=failure_error,
         attachments=attachments,
+        cancelled=cancelled,
     )
     await deliver_async_result(http, supervisor_url, session_id, payload, workspace_root=workspace_root)
 
@@ -1444,7 +1457,10 @@ async def _async_started_entry(
 
 
 async def _start_async_tool(ls: _LoopState, rtc: dict[str, Any], tool_ctx: ToolContext) -> dict[str, Any]:
-    """spec 标了 async_mode 的工具放到后台跑，结果经 async_tool_result 回传，当轮先交占位结果。"""
+    """spec 标了 async_mode 的工具放到后台跑，结果之后作为新消息交回，当轮先交占位结果。
+
+    后台那份工具上下文一开始就按发起任务认取消：本任务挂起再恢复、领取 id 换了，它照样跑。
+    """
     name = rtc["name"]
     args = rtc["arguments"]
     async_ctx = _snapshot_tool_context(tool_ctx)
@@ -1470,30 +1486,33 @@ async def _start_async_tool(ls: _LoopState, rtc: dict[str, Any], tool_ctx: ToolC
         "started_at": started_at,
         "task_id": ls.rctx.task_id,
     }
-    _spawn_background(
-        _run_async_tool(
-            registry=ls.registry,
-            tool_name=name,
-            tool_args=args,
-            tool_ctx=async_ctx,
-            http=ls.rctx.http,
-            supervisor_url=ls.rctx.supervisor_url,
-            task_id=ls.rctx.task_id,
-            # 回传要落到 SDK 看得见的父会话，入口分支只装运行期历史
-            session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-            async_tool_id=async_id,
-            started_at=started_at,
-            node_id=ls.node.id,
-            workspace_root=ls.rctx.workspace_root,
-        ),
-        name=f"async_tool_{name}_{async_id}",
-    )
+    async_ctx.detached = True
+    # 后台协程会继承这里的上下文：它在后台等审批时本任务并没有在等，不能报给本任务的名额
+    with report_approval_waits_to(None):
+        _spawn_background(
+            _run_async_tool(
+                registry=ls.registry,
+                tool_name=name,
+                tool_args=args,
+                tool_ctx=async_ctx,
+                http=ls.rctx.http,
+                supervisor_url=ls.rctx.supervisor_url,
+                task_id=ls.rctx.task_id,
+                # 结果里的超长输出存在面向用户的会话名下（入口分支只装运行期历史）；交给谁由 supervisor 按发起任务定
+                session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
+                async_tool_id=async_id,
+                started_at=started_at,
+                node_id=ls.node.id,
+                workspace_root=ls.rctx.workspace_root,
+            ),
+            name=f"async_tool_{name}_{async_id}",
+        )
     # 发起成功就算满足 finish_requires_tool：结果回传进的是新任务，模型在那边只需播报，不然 finish 会被反复拒绝
     ls.succeeded_real_tools.add(name)
     return await _async_started_entry(
         ls, rtc,
-        summary=f"异步执行已启动 (id: {async_id})，结果将通过 preempt 自动回传",
-        placeholder=f'⏳ Async tool "{name}" started (id: {async_id}). Result will be delivered via preempt when ready.',
+        summary=f"异步执行已启动 (id: {async_id})，结果之后作为新消息交回",
+        placeholder=f'⏳ Async tool "{name}" started (id: {async_id}). {_ASYNC_RESULT_ARRIVAL}',
         started_at=started_at,
         progress="异步执行已启动",
     )
@@ -1505,16 +1524,27 @@ async def _execute_with_async_upgrade(
     """execute_command 照常执行、只等到阈值；到点没跑完就把还在跑的任务转后台，命令不重跑。
 
     返回 (结果, None)；转了后台返回 (None, 占位结果条目)。命令自己的 timeout_sec 仍是硬上限。
+    转后台那一刻起：命令按发起任务认取消，本任务挂起再恢复不会把它杀掉；它再等审批也不算本任务在等，
+    那一刻还没等完的审批交还本任务的名额。
     """
     name = rtc["name"]
     args = rtc["arguments"]
-    exec_task = asyncio.create_task(
-        _execute_registry_tool_with_span(ls.registry, name, args, _snapshot_tool_context(tool_ctx)),
-        name=f"execute_command_adaptive_{str(rtc.get('id') or '')[:24] or 'call'}",
-    )
-    done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))
+    exec_ctx = _snapshot_tool_context(tool_ctx)
+    with relay_approval_waits() as approval_relay:
+        exec_task = asyncio.create_task(
+            _execute_registry_tool_with_span(ls.registry, name, args, exec_ctx),
+            name=f"execute_command_adaptive_{str(rtc.get('id') or '')[:24] or 'call'}",
+        )
+    try:
+        done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))
+    except asyncio.CancelledError:
+        # 本轮被打断时命令还没交给后台：跟着一起停，不能留一个没人收结果的子进程
+        exec_task.cancel()
+        raise
     if exec_task in done:
         return exec_task.result(), None
+    approval_relay.detach()
+    exec_ctx.detached = True
     _cleanup_async_tracker()
     async_id = uuid.uuid4().hex[:8]
     _async_tool_tasks[async_id] = {
@@ -1524,29 +1554,30 @@ async def _execute_with_async_upgrade(
         "task_id": ls.rctx.task_id,
         "upgraded_from": "sync_timeout",
     }
-    _spawn_background(
-        _deliver_started_async_task(
-            exec_task,
-            registry=ls.registry,
-            http=ls.rctx.http,
-            supervisor_url=ls.rctx.supervisor_url,
-            task_id=ls.rctx.task_id,
-            session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-            tool_name=name,
-            tool_args=args,
-            async_tool_id=async_id,
-            started_at=started_at,
-            node_id=ls.node.id,
-            workspace_root=ls.rctx.workspace_root,
-        ),
-        name=f"async_upgrade_{name}_{async_id}",
-    )
+    with report_approval_waits_to(None):
+        _spawn_background(
+            _deliver_started_async_task(
+                exec_task,
+                registry=ls.registry,
+                http=ls.rctx.http,
+                supervisor_url=ls.rctx.supervisor_url,
+                task_id=ls.rctx.task_id,
+                session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
+                tool_name=name,
+                tool_args=args,
+                async_tool_id=async_id,
+                started_at=started_at,
+                node_id=ls.node.id,
+                workspace_root=ls.rctx.workspace_root,
+            ),
+            name=f"async_upgrade_{name}_{async_id}",
+        )
     entry = await _async_started_entry(
         ls, rtc,
-        summary=f"执行超过 {threshold:.1f}s，已自动转为异步 (id: {async_id})，结果将通过 preempt 自动回传",
+        summary=f"执行超过 {threshold:.1f}s，已自动转为异步 (id: {async_id})，结果之后作为新消息交回",
         placeholder=(
-            f'⏳ Tool "{name}" exceeded {threshold:.1f}s and was '
-            f'auto-upgraded to async (id: {async_id}). Result will be delivered via preempt when ready.'
+            f'⏳ Tool "{name}" exceeded {threshold:.1f}s and was auto-upgraded to async (id: {async_id}). '
+            f"It keeps running in the background, also while this task waits for a sub-agent. {_ASYNC_RESULT_ARRIVAL}"
         ),
         started_at=started_at,
         progress="已自动转为异步执行",

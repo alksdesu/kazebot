@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -12,6 +13,7 @@ import config_layout
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
 from platforms.protection import secret_env_names
 
+from . import process_tree
 from .context import ToolContext
 
 
@@ -23,24 +25,60 @@ OUTPUT_HEAD_SHARE = 0.4
 
 
 def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
-    """Kill the entire process group to avoid orphaned children holding pipes.
+    """Kill the process and everything it started, without waiting.
 
     proc.kill() only kills the direct child (shell); grandchildren (e.g. a PM2 daemon)
     inherit the pipe fds and keep the reader waiting for EOF. Processes are started with
-    start_new_session=True so os.killpg takes the whole tree down.
+    start_new_session=True, so on POSIX the child's pid is its process group id. On Windows
+    taskkill /T walks the tree from the still-running shell in a background thread, with a
+    handle held so the pid cannot be reused meanwhile.
     """
-    killpg = getattr(os, "killpg", None)
-    if killpg is not None:
-        try:
-            killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    if os.name == "nt":
+        pinned = _pin_running(proc)
+        if pinned is None:
+            _kill_direct(proc)
             return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    # 没有进程组可杀（Windows）或者 killpg 失败：退而只杀直接子进程。
+        threading.Thread(target=pinned.kill_tree_and_close, name="kill-process-tree", daemon=True).start()
+        return
+    _kill_posix_group(proc)
+
+
+async def terminate_process_tree(proc: "asyncio.subprocess.Process") -> None:
+    """Like kill_process_group, but on Windows waits until taskkill has finished."""
+    if os.name == "nt":
+        pinned = _pin_running(proc)
+        if pinned is not None:
+            # 句柄由线程停完之后自己放：这里被取消了也不会提前放掉 PID
+            await asyncio.to_thread(pinned.kill_tree_and_close)
+        _kill_direct(proc)
+        return
+    _kill_posix_group(proc)
+
+
+def _kill_posix_group(proc: "asyncio.subprocess.Process") -> None:
+    try:
+        # 组号就是子进程的 pid；getpgid 在子进程已被收走、pid 换了人时会查到别人的组
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    _kill_direct(proc)
+
+
+def _kill_direct(proc: "asyncio.subprocess.Process") -> None:
     try:
         proc.kill()
     except (ProcessLookupError, OSError):
         pass
+
+
+def _pin_running(proc: "asyncio.subprocess.Process") -> "process_tree.PinnedProcess | None":
+    if proc.returncode is not None:
+        return None
+    try:
+        return process_tree.pin(proc.pid)
+    except OSError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -315,7 +353,7 @@ async def run_process(
     deadline = loop.time() + max(float(timeout_sec), 0.0)
 
     async def stop(**flags: bool) -> ProcessOutcome:
-        kill_process_group(proc)
+        await terminate_process_tree(proc)
         try:
             stdout, stderr = await asyncio.wait_for(asyncio.shield(finished), timeout=_KILL_GRACE_SEC)
         except Exception:

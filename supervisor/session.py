@@ -871,6 +871,9 @@ class SessionMixin:
             if execution is not None:
                 for sid in session_ids:
                     execution.cancel_for_session(sid)
+            processes = getattr(self, "processes", None)
+            if processes is not None:
+                processes.stop_for_sessions(session_ids)
             self._session_store.on_session_reset(old_session_id)
             now = _now()
             for sid in session_ids:

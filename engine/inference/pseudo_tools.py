@@ -692,11 +692,9 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
 #  工具 spec 相关
 # ---------------------------------------------------------------------------
 
-# [2026-04-23] 异步工具提示：当 spec 中 async_mode=True 时，在 description 末尾追加说明，
-# 告知模型该工具为后台执行、结果通过 preempt 自动回传。从 commit 7d10197 恢复。
 _ASYNC_TOOL_HINT = (
-    "\n\n⚡ This is an async tool. Execution runs in background; "
-    "result will be delivered automatically via preempt when ready. "
+    "\n\n⚡ This is an async tool. It runs in the background and its result arrives later as a new message, "
+    "to this node or, if this node cannot receive messages, to the node that dispatched it. "
     "You can continue working or finish — no need to wait."
 )
 

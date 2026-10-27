@@ -4,7 +4,10 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
-from . import community, execution, file_claims, materials_api, operations, reminders, sticker_tagging
+from . import (
+    async_tools, community, execution, file_claims, materials_api, operations, processes, reminders,
+    sticker_tagging,
+)
 from .sticker_api import close_stores
 
 logger = logging.getLogger(__name__)
@@ -15,15 +18,16 @@ def register_features(app, state, process_manager, config_store, features_config
     state.feature_config_store = config_store
     state.execution = execution.ExecutionService(state)
     state.reminders = reminders.ReminderService(state)
+    state.processes = processes.ProcessService(state)
     state.sticker_tagging = sticker_tagging.StickerTaggingService(state.workspace_root, features_config)
     host = getattr(state, "plugin_host", None)
     if host is not None:
-        for name in ("execution", "reminders"):
+        for name in ("execution", "reminders", "processes"):
             setattr(state, name, host.register_base(name, getattr(state, name), managed=True))
         for name, service in (("state", state), ("config_store", config_store), ("process_manager", process_manager),
                               ("eventlog", state.eventlog), ("hooks", state.hook_registry)):
             host.register_base(name, service)
-    for module in (execution, reminders, community, materials_api, operations, file_claims):
+    for module in (execution, reminders, community, materials_api, operations, file_claims, processes, async_tools):
         app.include_router(module.create_router(state))
 
 
@@ -31,7 +35,12 @@ def register_features(app, state, process_manager, config_store, features_config
 async def feature_lifespan(app):
     state = app.state.state
     host = getattr(state, "plugin_host", None)
-    services = () if host is not None else (state.execution, state.reminders)
+    # 不经 register_features 搭起来的状态（测试替身之类）里没有 processes
+    services = () if host is not None else tuple(
+        service
+        for service in (state.execution, state.reminders, getattr(state, "processes", None))
+        if service is not None
+    )
     started = []
     try:
         for service in services:

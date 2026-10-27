@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,8 @@ from .approval_wait import waiting_for_approval
 
 # 工具按 0.2s 轮询取消，单次查询不能被无响应的 supervisor 拖住；超时当作没取消，下一轮再问。
 _CANCEL_PROBE_TIMEOUT_SEC = 2.0
+# 转到后台的工具一跑就是几分钟到一小时，隔这么久才真去问一次，其余时候沿用上次的答案
+_DETACHED_PROBE_INTERVAL_SEC = 2.0
 # 等审批期间引擎心跳仍在跑，这里的续租只是兜底，所以间隔放宽、租期放长。
 _APPROVAL_RENEW_INTERVAL_SEC = 30.0
 _APPROVAL_RENEW_LEASE_SEC = 300.0
@@ -52,6 +54,10 @@ class ToolContext:
     claim_id: str = ""
     # 文件工具、命令按它解析相对路径和定 cwd；data/、config/ 这些实例的东西仍在 workspace_root 下
     project_root: Path | None = None
+    # 转到后台的工具挂起恢复后领取 id 就换了：置上后取消只看发起任务被取消、失败或会话重置，等审批也不替任务续租
+    detached: bool = False
+    _detached_checked_at: float = field(default=float("-inf"), init=False, repr=False, compare=False)
+    _detached_cancelled: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.project_root:
@@ -132,6 +138,8 @@ class ToolContext:
         return self._file_edits_reply(r, "scope")
 
     async def check_cancelled(self) -> bool:
+        if self.detached and self.task_id:
+            return await self._check_detached_cancelled()
         try:
             if self.task_id:
                 extra: dict[str, Any] = {"params": {"claim_id": self.claim_id}} if self.claim_id else {}
@@ -151,6 +159,31 @@ class ToolContext:
         except Exception:
             pass
         return False
+
+    async def _check_detached_cancelled(self) -> bool:
+        """后台工具的取消判定：发起任务被取消、失败或会话被重置才算，挂起恢复不算。问不到时当作没取消。"""
+        if self._detached_cancelled:
+            return True
+        now = time.monotonic()
+        if now - self._detached_checked_at < _DETACHED_PROBE_INTERVAL_SEC:
+            return False
+        self._detached_checked_at = now
+        try:
+            r = await self.http.get(
+                f"{self.supervisor_url}/v1/async_tools/{self.task_id}/cancelled",
+                params={"session_id": self.route_session_id()},
+                timeout=_CANCEL_PROBE_TIMEOUT_SEC,
+            )
+            if r.status_code in (404, 405):
+                # 还没有这个接口的 supervisor：退回按任务问，只是不带领取 id
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled", timeout=_CANCEL_PROBE_TIMEOUT_SEC,
+                )
+            if r.status_code == 200:
+                self._detached_cancelled = bool(r.json().get("cancelled", False))
+        except Exception:
+            pass
+        return self._detached_cancelled
 
     async def renew_lease(self, lease_sec: float) -> bool | None:
         """续租本任务。False 表示 supervisor 明确回绝了这次领取，None 表示这轮没问到结果。"""
@@ -226,7 +259,7 @@ class ToolContext:
                     "comment": timeout_comment,
                 }
             now = time.monotonic()
-            if self.task_id and now - last_renew >= _APPROVAL_RENEW_INTERVAL_SEC:
+            if self.task_id and not self.detached and now - last_renew >= _APPROVAL_RENEW_INTERVAL_SEC:
                 last_renew = now
                 if await self.renew_lease(_APPROVAL_RENEW_LEASE_SEC) is False:
                     return {"approval_id": approval_id, "status": "cancelled", "reason": "task claim is no longer held"}

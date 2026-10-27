@@ -53,8 +53,50 @@ def test_transient_failures_are_retried_until_delivered(tmp_path: Path) -> None:
     assert asyncio.run(deliver_async_result(http, "http://sup", "session", _payload(), workspace_root=tmp_path)) is True
 
     assert len(http.calls) == 3
-    assert http.calls[0][0] == "http://sup/v1/sessions/session/async_tool_result"
+    assert http.calls[0][0] == "http://sup/v1/async_tools/results"
+    assert http.calls[0][1] == {**_payload(), "session_id": "session"}
     assert _queued(tmp_path) == []
+
+
+@pytest.mark.parametrize("missing", [404, 405])
+def test_a_supervisor_without_the_task_route_gets_it_by_session(tmp_path: Path, missing: int) -> None:
+    http = _Http(missing, 200)
+
+    assert asyncio.run(deliver_async_result(http, "http://sup", "session", _payload(), workspace_root=tmp_path)) is True
+
+    assert [url for url, _body in http.calls] == [
+        "http://sup/v1/async_tools/results", "http://sup/v1/sessions/session/async_tool_result",
+    ]
+    assert http.calls[1][1] == _payload()
+
+
+def test_an_old_supervisor_that_no_longer_knows_the_session_rejects_it(tmp_path: Path) -> None:
+    http = _Http(404, 404)
+
+    assert asyncio.run(deliver_async_result(http, "http://sup", "session", _payload(), workspace_root=tmp_path)) is False
+
+    assert len(http.calls) == 2
+    assert _queued(tmp_path) == []
+
+
+def test_a_flush_to_an_older_supervisor_also_falls_back(tmp_path: Path) -> None:
+    _queue(tmp_path, "kept")
+    http = _Http(404, 200)
+
+    assert asyncio.run(flush_async_result_outbox(http, "http://sup", tmp_path)) == 1
+
+    assert http.calls[1][0] == "http://sup/v1/sessions/session/async_tool_result"
+    assert _queued(tmp_path) == []
+
+
+def test_only_a_cancelled_result_carries_the_flag() -> None:
+    plain = build_async_result_payload(message="m", tool_name="t", task_id="task", node_id="n", failure_error="boom")
+    cancelled = build_async_result_payload(
+        message="m", tool_name="t", task_id="task", node_id="n", failure_error="task cancelled", cancelled=True,
+    )
+
+    assert "cancelled" not in plain and plain["success"] is False
+    assert cancelled["cancelled"] is True and cancelled["success"] is False
 
 
 def test_a_rejected_result_is_not_retried_or_queued(tmp_path: Path) -> None:
@@ -160,3 +202,4 @@ def test_a_cancelled_async_tool_is_reported_as_a_failure(tmp_path: Path) -> None
     ))
     body = http.calls[0][1]
     assert body["success"] is False and body["error"] == "task cancelled"
+    assert body["cancelled"] is True

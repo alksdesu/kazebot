@@ -141,12 +141,13 @@ routing:
 meta:
   execute_command:
     default_timeout_sec: 90.0
+    min_timeout_sec: 1.0       # 模型传的 timeout_sec 夹到这两个数之间（0 和负数按默认值）；超时连同子孙进程一起杀，已读到的输出照样带回
+    max_timeout_sec: 3600.0
     # 模型没传 max_output_chars 时按多少字截（开头约 40%、结尾约 60%）；0 = 不截，超长的由 engine 落盘、只给预览
     max_output_chars: 0
-    # [2026-07-14] shell 命令超过模型等待预算时应在
-    # execute_command 自身的 timeout_sec 下继续运行，而不阻塞推理循环。
-    # ai_step 最多等待 threshold_sec（封顶为 timeout_sec 的 80%），随后仅
-    # 把 execute_command 转为异步交付，结果通过 async_tool_result / preempt 回传。
+    # 命令跑过 threshold_sec（且不超过它 timeout_sec 的 80%）还没完，engine 就不再干等，命令转到后台接着跑到它自己的时限。
+    # 结果作为新消息交回发起命令的节点；发起的是收不了新消息的子节点时，交给派它出来的节点。
+    # 发起任务挂起再恢复不影响它，任务被取消、失败或会话被重置时才停。
     async_upgrade:
       enabled: true
       threshold_sec: 60
@@ -226,6 +227,21 @@ supervisor:
     shell_new_console: false
     engine_workers: 2
     spawn_shell_cli: false    # supervisor 启动时顺带拉起 shell；环境变量 CLONOTH_SPAWN_SHELL_CLI 优先
+
+# start_process 起的常驻进程：由 supervisor 持有，归属会话（连同它派出去的子 agent）而不是任务，
+# 任务结束、挂起恢复、engine 重启都不影响；会话重置或已不在、supervisor 退出时停掉。
+# 输出写在 data/processes/<会话>/<id>.log，写满轮转成 .log.1、.log.2……
+processes:
+  max_per_session: 4              # 一个会话同时最多几个（1-64）
+  max_total: 16                   # 整个实例同时最多几个（1-256）
+  idle_timeout_minutes: 60        # 这么久没人读输出（read_process_output、查状态）就停掉（0 = 不按空闲停）
+  default_max_runtime_sec: 14400  # 没传 max_runtime_sec 时最多跑多久（不超过下一项）
+  max_runtime_cap_sec: 86400      # max_runtime_sec 的上限（60-2592000）
+  ready_timeout_sec: 60           # 给了 ready_pattern 时默认等多久（1-600）；等不到进程照样留着
+  log_max_bytes: 4194304          # 一段日志写满这么多字节就轮转（65536-268435456）
+  log_keep_files: 2               # 轮转下来的旧段留几段（0-20）
+  exited_retention_minutes: 60    # 进程结束后记录和日志再留多久，期间还读得到（0-10080）
+  stop_grace_sec: 5               # 停的时候先 TERM，等这么多秒还没退出再 KILL（0-60；Windows 上直接 taskkill /T /F）
 
 # write_file / apply_diff 写盘成功之后，按 glob 匹配改动的文件再跑的检查命令（.py/.json/.yaml/.toml 的语法检查另外内置）。
 # 每条命令和 execute_command 走同一套审批；{path} 换成工作区里的相对路径，已按 shell 转义。

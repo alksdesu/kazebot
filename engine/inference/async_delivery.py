@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 _RETRY_DELAYS_SEC = (1.0, 4.0, 15.0)
 _TRANSIENT_STATUS = frozenset({408, 425, 429})
+# 按任务交结果的接口不会因为业务原因回这两个码：回了就是 supervisor 还没有这个接口
+_MISSING_ROUTE_STATUS = frozenset({404, 405})
 _OUTBOX_MAX_AGE_SEC = 24 * 3600
 _FLUSH_LOCK_NAME = ".flush.lock"
 # 文件名按它排序补投；同一时钟刻度里写下的几条靠序号保住先后（Windows 上 time_ns 的刻度有十几毫秒）
@@ -38,8 +40,9 @@ def build_async_result_payload(
     node_id: str,
     failure_error: str = "",
     attachments: list[str] | None = None,
+    cancelled: bool = False,
 ) -> dict[str, Any]:
-    """所有异步路径共用的 async_tool_result 请求体。"""
+    """所有异步路径共用的结果请求体。cancelled：工具是因为发起任务被取消才停的，supervisor 不再转交。"""
     payload: dict[str, Any] = {
         "message": str(message or ""),
         "tool_name": str(tool_name or ""),
@@ -49,6 +52,8 @@ def build_async_result_payload(
     }
     if failure_error:
         payload["error"] = str(failure_error)
+    if cancelled:
+        payload["cancelled"] = True
     if attachments:
         payload["attachment_paths"] = list(attachments)
     return payload
@@ -70,21 +75,34 @@ def outbox_dir(workspace_root: Path | str) -> Path:
     return Path(workspace_root) / "data" / "async_tool_outbox"
 
 
-def _result_url(supervisor_url: str, session_id: str) -> str:
+def _results_url(supervisor_url: str) -> str:
+    return f"{supervisor_url}/v1/async_tools/results"
+
+
+def _session_result_url(supervisor_url: str, session_id: str) -> str:
+    """按会话交结果的旧接口，给还没有按任务交结果接口的 supervisor。"""
     return f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result"
 
 
-async def _post_once(http: Any, url: str, payload: dict[str, Any]) -> tuple[str, str]:
+async def _post_once(http: Any, url: str, payload: dict[str, Any]) -> tuple[str, str, int | None]:
     try:
         response = await http.post(url, json=payload)
     except Exception as error:
-        return _TRANSIENT, f"{type(error).__name__}: {error}"
+        return _TRANSIENT, f"{type(error).__name__}: {error}", None
     status = getattr(response, "status_code", None)
     if not isinstance(status, int) or 200 <= status < 300:
-        return _DELIVERED, ""
+        return _DELIVERED, "", status if isinstance(status, int) else None
     if status >= 500 or status in _TRANSIENT_STATUS:
-        return _TRANSIENT, f"HTTP {status}"
-    return _REJECTED, f"HTTP {status}"
+        return _TRANSIENT, f"HTTP {status}", status
+    return _REJECTED, f"HTTP {status}", status
+
+
+async def _post_result(http: Any, supervisor_url: str, session_id: str, payload: dict[str, Any]) -> tuple[str, str]:
+    """交给按任务交结果的接口，落点由 supervisor 按发起任务定；它还没有这个接口时退回按会话交。"""
+    outcome, detail, status = await _post_once(http, _results_url(supervisor_url), {**payload, "session_id": session_id})
+    if status in _MISSING_ROUTE_STATUS:
+        outcome, detail, _status = await _post_once(http, _session_result_url(supervisor_url, session_id), payload)
+    return outcome, detail
 
 
 def _write_outbox(workspace_root: Path, session_id: str, payload: dict[str, Any]) -> Path:
@@ -114,13 +132,12 @@ async def deliver_async_result(
     workspace_root: Path | str | None = None,
 ) -> bool:
     """送达返回 True。被拒绝、或重试完仍送不到而转进待补投目录时返回 False。"""
-    url = _result_url(supervisor_url, session_id)
     tool_name = payload.get("tool_name", "")
     detail = ""
     for delay in (0.0, *_RETRY_DELAYS_SEC):
         if delay:
             await asyncio.sleep(delay)
-        outcome, detail = await _post_once(http, url, payload)
+        outcome, detail = await _post_result(http, supervisor_url, session_id, payload)
         if outcome == _DELIVERED:
             return True
         if outcome == _REJECTED:
@@ -190,7 +207,7 @@ async def flush_async_result_outbox(http: Any, supervisor_url: str, workspace_ro
                 )
                 await asyncio.to_thread(_remove, path)
                 continue
-            outcome, detail = await _post_once(http, _result_url(supervisor_url, session_id), payload)
+            outcome, detail = await _post_result(http, supervisor_url, session_id, payload)
             if outcome == _TRANSIENT:
                 break
             if outcome == _REJECTED:

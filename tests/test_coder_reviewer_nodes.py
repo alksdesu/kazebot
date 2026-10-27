@@ -27,7 +27,8 @@ CODER = "bootstrap.coder"
 REVIEWER = "bootstrap.code_reviewer"
 CODER_TOOLS = {
     "read_file", "list_dir", "search_in_files", "glob", "write_file", "apply_diff", "undo_edits",
-    "execute_command", "search_context_archive", "read_context_archive", "get_context_window",
+    "execute_command", "start_process", "read_process_output", "stop_process", "list_processes",
+    "search_context_archive", "read_context_archive", "get_context_window",
     "web_search", "read_web", "read_image",
 }
 REVIEWER_TOOLS = {

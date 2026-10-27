@@ -842,16 +842,22 @@ class ToolRegistry:
                 "meta.execute_command.max_output_chars). With max_output_chars the output is cut to about that many "
                 f"characters: about {_HEAD_PERCENT}% from the start and {100 - _HEAD_PERCENT}% from the end, where errors and "
                 "summaries usually are, with a note in between. timeout_sec (default meta.execute_command.default_timeout_sec, "
-                "90) is a hard limit that kills the command. When timeout_sec is longer than about a minute, the engine stops "
-                "waiting after about 60 seconds (meta.execute_command.async_upgrade): the command keeps running in the "
-                "background and its result arrives later as a new message.",
+                "90; kept within meta.execute_command.min_timeout_sec and max_timeout_sec, 1-3600) is a hard limit: the "
+                "command and everything it started are killed, and the output received until then comes back with the "
+                "error. When timeout_sec is longer than about a minute, the engine stops waiting after about 60 seconds "
+                "(meta.execute_command.async_upgrade): the command keeps running in the background, also while this task "
+                "waits for a sub-agent, and its result arrives later as a new message, to this node or, if this node "
+                "cannot receive messages, to the node that dispatched it. For servers, watchers and other processes that "
+                "should keep running, use start_process instead.",
                 {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Command line, run by the system shell in workspace root."},
                         "timeout_sec": {
                             "type": "number",
-                            "description": "Hard time limit in seconds; the command is killed when it is reached. Default 90.",
+                            "description": "Hard time limit in seconds; the command is killed when it is reached. "
+                            "Default 90; values outside 1-3600 (configurable) are moved to the nearest bound, 0 or "
+                            "less means the default.",
                         },
                         "max_output_chars": {
                             "type": "integer",
@@ -1106,8 +1112,8 @@ class ToolRegistry:
         for name, desc, schema, func, *extra in builtins:
             self.register_builtin_tool(name, desc, schema, func, extra[0] if extra else None)
 
-        from .builtins import community, context_archive, execution_plans, materials, reminders
-        for module in (community, context_archive, execution_plans, materials, reminders):
+        from .builtins import community, context_archive, execution_plans, materials, processes, reminders
+        for module in (community, context_archive, execution_plans, materials, processes, reminders):
             module.register_tools(self)
 
     def reload(self) -> int:

@@ -40,6 +40,7 @@ from engine.dispatch_batch import (
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.run_budget import STEPS_USED_KEY, reported_step_count, steps_used
+from engine.tool_outputs import mentioned_refs
 
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
@@ -50,6 +51,20 @@ log = logging.getLogger(__name__)
 _TASK_END_ACTIONS = frozenset({"finish", "ask", "fail", "cancelled", "preempted"})
 # 和 engine/inference/pseudo_tools.py 的 NO_REPLY_MARKER 一致；在这里导入 engine.inference 会把整个推理循环拉进来
 OUTBOUND_NO_REPLY = "no_reply"
+# 异步工具结果沿派发链往上找落点最多走几层，防着坏数据里的环
+_ASYNC_RESULT_MAX_HOPS = 16
+
+
+@dataclass(frozen=True)
+class AsyncResultHome:
+    """异步工具结果的落点：交到哪个会话、由哪个节点接；回到 agent 会话时带着派发记录，接着做完还能交回发起方。"""
+
+    session_id: str
+    node_id: str = ""
+    dispatch_origin: dict[str, Any] | None = None
+    context_mode: str = ""
+    guide_task_id: str = ""
+    note: str = ""
 
 
 class BranchFinalizeDeferred(RuntimeError):
@@ -2336,19 +2351,21 @@ class TaskRouterMixin:
         return True
 
     def _async_result_origin_guard_locked(
-        self, session_id: str, task_id: str,
+        self, session_id: str, task_id: str, *, cancelled: bool = False,
     ) -> dict[str, Any] | None:
-        """Drop late async results before they can create a new inbound task."""
+        """Drop late async results before they can create a new inbound task.
+
+        发起任务的记录被定期清理掉了不算丢弃的理由，落回投递时给的会话；工具调用本身被取消了，交回来的结果一律不要。
+        """
         if session_id in self._cancelled_sessions:
             return {"ok": True, "strategy": "dropped", "reason": "session_cancelled"}
-        if not task_id:
-            return None
-
-        origin = self.tasks.get(task_id)
-        if origin is None:
-            return {"ok": True, "strategy": "dropped", "reason": "origin_not_found"}
-        if origin.cancel_requested or origin.status == TaskStatus.cancelled:
+        origin = self.tasks.get(task_id) if task_id else None
+        if origin is not None and (origin.cancel_requested or origin.status == TaskStatus.cancelled):
             return {"ok": True, "strategy": "dropped", "reason": "origin_cancelled"}
+        if cancelled:
+            return {"ok": True, "strategy": "dropped", "reason": "cancelled"}
+        if origin is None:
+            return None
 
         route_session_id = self._route_session_id_for_task_locked(origin) or session_id
         if route_session_id != session_id:
@@ -2375,116 +2392,251 @@ class TaskRouterMixin:
         tool_name: str = "",
         success: bool | None = None,
         error: str = "",
+        cancelled: bool = False,
     ) -> dict[str, Any]:
-        """注入异步工具结果到 session，并创建新的 inbound 分支。
+        """把异步工具结果交回发起它的节点所在的会话，在那里新建一个入口任务；成功的媒体结果直接发出去。
 
-        [Fork/Merge 2026-05-12] 旧的 running/suspended 自动 preempt 回退被移除。
-        原因：新架构要求只有 adapter 显式 preempt API 才能抢占任务。
-        做法：异步工具结果统一创建 inbound。目的：保持入口分支并发运行。
+        session_id 是 engine 投递时给的会话，结果里的超长输出存在它名下；落点在哪见 _async_result_home_locked。
+        落点换了会话时，先在锁外把引用到的超长输出复制过去，那边的任务才读得回来。
         """
+        event_task_id = str(task_id or "").strip()
         with self._lock:
-            session_info = self.sessions.get(session_id)
-            if not session_info:
-                return {"ok": False, "error": "session not found"}
-
-            result_atts = list(attachments or [])
-            event_node_id = str(node_id or "").strip()
-            event_task_id = str(task_id or "").strip()
-            guard_result = self._async_result_origin_guard_locked(session_id, event_task_id)
-            if guard_result is not None:
-                log.warning(
-                    "async tool result dropped: session=%s task=%s reason=%s",
-                    session_id[:12], event_task_id[:12], guard_result["reason"],
-                )
-                return guard_result
-
-            # Successful media tools keep the existing direct-outbound fast path.
-            # A failed result must deliver its failure text/metadata instead of
-            # silently sending any incidental attachment and dropping the error.
-            if result_atts and success is not False:
-                payload: dict[str, Any] = {
-                    "text": "",
-                    "attachments": [{"path": p} for p in result_atts],
-                    "message_type": "async_tool_attachment",
-                    "action_type": "async_tool_attachment",
-                }
-                if event_node_id:
-                    payload["node_id"] = event_node_id
-                if event_task_id:
-                    payload["task_id"] = event_task_id
-                    origin = self.tasks.get(event_task_id)
-                    hints = ((origin.input.get("task_context") or {}).get("route_hints") or {}) if origin else {}
-                    for key in ("delivery_purpose", "reply_message_id"):
-                        if key in hints:
-                            payload[key] = hints[key]
-                tool = str(tool_name or "").strip()
-                if tool:
-                    payload["tool_name"] = tool
-                conv_key = session_info.conversation_key
-                if conv_key:
-                    payload["conversation_key"] = conv_key
-                evt = self.eventlog.append(
-                    session_id=session_id,
-                    component="supervisor",
-                    type_="outbound_message",
-                    payload=payload,
-                )
-                try:
-                    self._apply_outbound_message(
-                        seq=int(evt.get("seq", 0) or 0),
-                        session_id=session_id,
-                        payload=payload,
+            _outcome, planned = self._plan_async_result_locked(session_id, event_task_id, cancelled=cancelled)
+        if planned is not None and planned.session_id != session_id:
+            self._adopt_async_result_refs(session_id, planned.session_id, text)
+        with self._lock:
+            outcome, home = self._plan_async_result_locked(session_id, event_task_id, cancelled=cancelled)
+            if home is None:
+                if outcome.get("strategy") == "dropped":
+                    log.warning(
+                        "async tool result dropped: session=%s task=%s reason=%s",
+                        session_id[:12], event_task_id[:12], outcome["reason"],
                     )
-                except Exception as exc:
-                    log.warning("async tool attachment outbound apply failed: %s", exc)
-                return {"ok": True, "strategy": "outbound_attachment"}
+                return outcome
+            if home.session_id != session_id and (planned is None or planned.session_id != home.session_id):
+                # 两次规划之间落点变了：在锁里补一次，这种情况很少
+                self._adopt_async_result_refs(session_id, home.session_id, text)
+            return self._deliver_async_result_locked(
+                home, text=text, attachments=attachments, node_id=str(node_id or "").strip(),
+                task_id=event_task_id, tool_name=str(tool_name or "").strip(), success=success, error=error,
+            )
 
-            # [Fork/Merge 2026-05-12] 外部异步结果注入不再自动 preempt。
-            # 原因：preempt 语义收窄为 adapter 显式请求；内部注入应像普通 inbound 一样
-            # fork 新分支。做法：删除 running/suspended 自动抢占路径。目的：避免新 inbound
-            # 破坏正在运行的入口分支。
+    def _plan_async_result_locked(
+        self, session_id: str, task_id: str, *, cancelled: bool,
+    ) -> tuple[dict[str, Any], "AsyncResultHome | None"]:
+        """(不交时的回复, 落点)：落点为 None 时回复说明为什么不交。"""
+        guard_result = self._async_result_origin_guard_locked(session_id, task_id, cancelled=cancelled)
+        if guard_result is not None:
+            return guard_result, None
+        origin = self.tasks.get(task_id) if task_id else None
+        home = self._async_result_home_locked(session_id, origin)
+        if home is not None:
+            return {}, home
+        if origin is None:
+            return {"ok": False, "error": "session not found"}, None
+        return {"ok": True, "strategy": "dropped", "reason": "home_gone"}, None
 
-            # ---- 创建 inbound → 新 branch task ----
-            conv_key = session_info.conversation_key
-            channel = session_info.channel
-            msg_id = f"async_tool_result:{session_id}"
+    def _async_result_home_locked(self, session_id: str, origin: Task | None) -> "AsyncResultHome | None":
+        """异步工具结果交给谁。发起它的节点自己还收得到消息就交给它，收不到就往上交给派它出来的一方。
 
-            payload = {
-                "channel": channel,
-                "conversation_key": conv_key,
-                "message_id": msg_id,
-                "text": text,
+        - 入口任务：它面向用户的会话，指定由它自己的节点接；
+        - 同步委派的子节点没有收消息的会话：沿 caller 交给这条同步链最上面的任务；
+        - 异步委派的子节点：accumulate 的 agent 会话一直留着，在那里由它接着做，带上派发记录，做完照常交回发起方；
+          其余的（fresh、fork 用完即删）交给派它出来的任务；
+        - 发起任务的记录已被清理：交给投递时给的会话，节点由会话自己定。
+        """
+        if origin is None:
+            return AsyncResultHome(session_id) if session_id in self.sessions else None
+        hops: list[Task] = []
+        current = origin
+        seen: set[str] = set()
+        for _ in range(_ASYNC_RESULT_MAX_HOPS):
+            if current.task_id in seen:
+                break
+            seen.add(current.task_id)
+            caller_id = str(current.caller_task_id or "").strip()
+            if caller_id:
+                caller = self.tasks.get(caller_id)
+                if caller is None:
+                    route = self._route_session_id_for_task_locked(current) or current.session_id
+                    if not self._async_result_session_usable_locked(route, current.session_generation):
+                        return None
+                    return AsyncResultHome(route, note=self._async_result_note_locked(origin, [*hops, current]))
+                hops.append(current)
+                current = caller
+                continue
+            route = self._route_session_id_for_task_locked(current) or current.session_id
+            dispatch = current.input.get("_dispatch_origin")
+            if not isinstance(dispatch, dict) or not dispatch:
+                if not self._async_result_session_usable_locked(route, current.session_generation):
+                    return None
+                regular = current.kind == TaskKind.node and not current.input.get("_system_task")
+                return AsyncResultHome(
+                    route,
+                    node_id=str(current.node_id or "") if regular else "",
+                    guide_task_id=current.task_id,
+                    note=self._async_result_note_locked(origin, hops),
+                )
+            mode = str(dispatch.get("context_mode") or current.input.get("dispatch_context_mode") or "").strip()
+            if mode == "accumulate" and self._async_result_session_usable_locked(route, current.session_generation):
+                return AsyncResultHome(
+                    route,
+                    node_id=str(current.node_id or ""),
+                    dispatch_origin={key: value for key, value in dispatch.items() if key != CONTINUE_FROM_KEY},
+                    context_mode=mode,
+                    guide_task_id=current.task_id,
+                    note=self._async_result_note_locked(origin, hops),
+                )
+            hops.append(current)
+            dispatcher = self.tasks.get(str(dispatch.get("caller_task_id") or "").strip())
+            if dispatcher is not None:
+                current = dispatcher
+                continue
+            parent = str(dispatch.get("parent_session_id") or "").strip()
+            if not self._async_result_session_usable_locked(parent, dispatch.get("parent_session_generation")):
+                return None
+            return AsyncResultHome(
+                parent,
+                node_id=str(dispatch.get("caller_node_id") or "").strip(),
+                note=self._async_result_note_locked(origin, hops),
+            )
+        log.warning("async tool result of task %s: dispatch chain too deep or cyclic", origin.task_id[:12])
+        return None
+
+    def _async_result_session_usable_locked(self, session_id: str, generation: Any) -> bool:
+        if not session_id or session_id not in self.sessions or session_id in self._cancelled_sessions:
+            return False
+        expected = self._to_positive_int(generation)
+        current = self._current_session_generation_locked(session_id)
+        return not (expected and current and expected != current)
+
+    def _async_result_note_locked(self, origin: Task, hops: list[Task]) -> str:
+        """结果没交给发起它的节点时，在末尾说明是谁发起的；接在末尾，开头的状态行照旧给 finish_guard 认。"""
+        if not hops:
+            return ""
+        ended = self._task_terminal(origin)
+        note = (
+            f'\n\n[Note] This tool call was made by sub-agent "{origin.node_id or "?"}" (task {origin.task_id[:8]}), '
+            f"which {'has already finished' if ended else 'is still running'}. It cannot receive new messages, "
+            "so the result is delivered to you."
+        )
+        if ended:
+            fields = child_retention.continue_fields_locked(self, origin)
+            if fields.get("continuable") and fields.get("handle"):
+                note += f' To hand the result back to it, dispatch to it again with continue_from="{fields["handle"]}".'
+        return note
+
+    def _adopt_async_result_refs(self, source_session_id: str, target_session_id: str, text: str) -> int:
+        refs = mentioned_refs(text)
+        if not refs or not source_session_id or source_session_id == target_session_id:
+            return 0
+        return child_retention.adopt(
+            self.workspace_root,
+            child_retention.RefAdoption(source_session_id, target_session_id, tuple(refs)),
+        )
+
+    def _deliver_async_result_locked(
+        self,
+        home: "AsyncResultHome",
+        *,
+        text: str,
+        attachments: list | None,
+        node_id: str,
+        task_id: str,
+        tool_name: str,
+        success: bool | None,
+        error: str,
+    ) -> dict[str, Any]:
+        target_session_id = home.session_id
+        session_info = self.sessions.get(target_session_id)
+        if not session_info:
+            return {"ok": False, "error": "session not found"}
+        result_atts = list(attachments or [])
+
+        # Successful media tools keep the existing direct-outbound fast path.
+        # A failed result must deliver its failure text/metadata instead of
+        # silently sending any incidental attachment and dropping the error.
+        if result_atts and success is not False:
+            payload: dict[str, Any] = {
+                "text": "",
+                "attachments": [{"path": p} for p in result_atts],
+                "message_type": "async_tool_attachment",
+                "action_type": "async_tool_attachment",
             }
-            if event_node_id:
-                payload["node_id"] = event_node_id
-            if event_task_id:
-                payload["task_id"] = event_task_id
-            tool = str(tool_name or "").strip()
-            if tool:
-                payload["tool_name"] = tool
-            if success is not None:
-                payload["route_hints"] = {
-                    "async_tool_success": success,
-                    "async_tool_failed": not success,
-                    "async_tool_name": tool,
-                    "async_tool_error": str(error)[:1000] if error else "",
-                }
-            output_guide = self._inherited_output_guide_locked(event_task_id)
-            if output_guide:
-                payload[OUTPUT_GUIDE_KEY] = output_guide
-
+            if node_id:
+                payload["node_id"] = node_id
+            if task_id:
+                payload["task_id"] = task_id
+                origin = self.tasks.get(task_id)
+                hints = ((origin.input.get("task_context") or {}).get("route_hints") or {}) if origin else {}
+                for key in ("delivery_purpose", "reply_message_id"):
+                    if key in hints:
+                        payload[key] = hints[key]
+            if tool_name:
+                payload["tool_name"] = tool_name
+            conv_key = session_info.conversation_key
+            if conv_key:
+                payload["conversation_key"] = conv_key
             evt = self.eventlog.append(
-                session_id=session_id,
+                session_id=target_session_id,
                 component="supervisor",
-                type_="inbound_message",
+                type_="outbound_message",
                 payload=payload,
             )
-            seq = int(evt.get("seq", 0))
-            self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
-            self._create_entry_task_for_inbound_locked(
-                inbound_seq=seq, session_id=session_id, payload=payload,
-            )
-            return {"ok": True, "strategy": "inbound"}
+            try:
+                self._apply_outbound_message(
+                    seq=int(evt.get("seq", 0) or 0),
+                    session_id=target_session_id,
+                    payload=payload,
+                )
+            except Exception as exc:
+                log.warning("async tool attachment outbound apply failed: %s", exc)
+            return {"ok": True, "strategy": "outbound_attachment"}
+
+        payload = {
+            "channel": session_info.channel,
+            "conversation_key": session_info.conversation_key,
+            "message_id": f"async_tool_result:{target_session_id}",
+            "text": f"{text}{home.note}",
+        }
+        if node_id:
+            payload["node_id"] = node_id
+        if task_id:
+            payload["task_id"] = task_id
+        if tool_name:
+            payload["tool_name"] = tool_name
+        if success is not None:
+            payload["route_hints"] = {
+                "async_tool_success": success,
+                "async_tool_failed": not success,
+                "async_tool_name": tool_name,
+                "async_tool_error": str(error)[:1000] if error else "",
+            }
+        if home.node_id:
+            payload["entry_node_id"] = home.node_id
+            # 会话被 switch_node 改过入口也照样交给发起的节点
+            if home.dispatch_origin is None:
+                payload["entry_node_pinned"] = True
+        if home.dispatch_origin is not None:
+            payload["dispatch_origin"] = dict(home.dispatch_origin)
+            if home.context_mode:
+                payload["dispatch_context_mode"] = home.context_mode
+        output_guide = self._inherited_output_guide_locked(home.guide_task_id or task_id)
+        if output_guide:
+            payload[OUTPUT_GUIDE_KEY] = output_guide
+
+        evt = self.eventlog.append(
+            session_id=target_session_id,
+            component="supervisor",
+            type_="inbound_message",
+            payload=payload,
+        )
+        seq = int(evt.get("seq", 0))
+        self._apply_inbound_message(seq=seq, session_id=target_session_id, payload=payload)
+        self._create_entry_task_for_inbound_locked(
+            inbound_seq=seq, session_id=target_session_id, payload=payload,
+        )
+        return {"ok": True, "strategy": "inbound"}
 
     def _inherited_output_guide_locked(self, task_id: Any) -> dict[str, Any] | None:
         """转述结果的那一轮沿用发起任务的输出说明：回的还是同一个平台上的同一个会话。"""

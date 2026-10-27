@@ -210,6 +210,8 @@ write_file:
 #   标记 sensitive，使管理员任务不再自动放行、必须弹审批亲自确认；
 #   非管理员的 execute_command 本就被整体拒绝，普通命令（如 curl 纯读取网页不落盘）
 #   仍可对管理员免审批直接执行。
+# start_process 起的常驻进程也按这一节判（同一套规则、白名单和授权），审批卡的工具名是
+#   start_process、原因写明「常驻进程」：批下去的命令会在后台一直跑，直到被停掉。
 execute_command:
   default: approval_required
   deny_patterns:
