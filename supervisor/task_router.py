@@ -30,7 +30,9 @@ from engine.compact import COMPACT_SUMMARY_PREFIX
 from engine.dispatch_batch import (
     AWAITING_INPUT_KEY,
     CONTINUE_FROM_KEY,
+    ISOLATION_KEY,
     MAX_DISPATCH_BATCH_ITEMS,
+    REPO_KEY,
     DispatchTimeouts,
     await_request,
     batch_item_attachments,
@@ -43,6 +45,13 @@ from engine.run_budget import STEPS_USED_KEY, reported_step_count, steps_used
 from engine.tool_outputs import mentioned_refs
 
 from .types import RouteStatus, Task, TaskKind, TaskStatus
+from .worktrees import NO_ISOLATION, service_of as worktree_service_of
+from .worktrees.keys import (
+    CALLER_WORKTREE_KEY,
+    CHILD_WORKTREE_PAYLOAD_KEY,
+    OUTCOME_WORKER_KEY,
+    WORKTREE_FROM_KEY,
+)
 
 
 log = logging.getLogger(__name__)
@@ -1236,6 +1245,18 @@ class TaskRouterMixin:
                 ),
             )
             return
+        worktrees = worktree_service_of(self)
+        if worktrees.needs_outcome_locked(task) and not task.input.get(OUTCOME_WORKER_KEY):
+            # 隔离副本的主人收尾：diff 要在锁外算，从 _route_completed_task 那条路走一遍，算完再回来路由
+            task.input[OUTCOME_WORKER_KEY] = True
+            threading.Thread(
+                target=self._route_completed_task,
+                args=(task,),
+                daemon=True,
+                name=f"worktree-route-{task.task_id[:8]}",
+            ).start()
+            return
+        worktrees.task_ended_locked(task)
 
         log.info(
             "routing completed task",
@@ -1505,6 +1526,7 @@ class TaskRouterMixin:
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
         dispatch_batch = action.get("dispatch_batch")
+        worktrees = worktree_service_of(self)
 
         # 标记父 task 正在等待压缩 dispatch
         compact_target_session_id = ""
@@ -1590,6 +1612,9 @@ class TaskRouterMixin:
                     if delivery_key:
                         _tool_input["_dispatch_delivery_id"] = delivery_key
                     _tool_input.update(item_deadline)
+                    # 独立工具任务跟着调用方在同一个隔离副本里跑
+                    _tool_plan = worktrees.plan_child_locked(caller=task)
+                    worktrees.apply_plan(_tool_input, _tool_plan)
                     child = self._create_task_locked(
                         session_id=task.session_id,
                         session_generation=task.session_generation,
@@ -1602,6 +1627,7 @@ class TaskRouterMixin:
                         batch_id=batch_id,
                         batch_index=idx,
                     )
+                    worktrees.register_child_locked(child, _tool_plan)
                 else:
                     _continue_handle = parse_handle(batch_item_continue_from(item))
                     _continued: dict[str, Any] = {}
@@ -1620,6 +1646,18 @@ class TaskRouterMixin:
                             )
                             created_child_ids.append(refused.task_id)
                             continue
+                    _plan = worktrees.plan_child_locked(
+                        caller=task,
+                        request=item,
+                        continued_task_id=str(_continued.get("task_id") or "") if _continued else "",
+                    )
+                    if _plan.refused:
+                        refused = self._create_refused_batch_child_locked(
+                            task, item, target=item_target, batch_id=batch_id, index=idx,
+                            delivery_key=delivery_key, error=_plan.error,
+                        )
+                        created_child_ids.append(refused.task_id)
+                        continue
                     _batch_ctx_mode = str(_continued.get("context_mode") or "").strip() or self._resolve_dispatch_context_mode(
                         item_target, item.get("context_mode")
                     )
@@ -1670,6 +1708,7 @@ class TaskRouterMixin:
                     if delivery_key:
                         _batch_input["_dispatch_delivery_id"] = delivery_key
                     _batch_input.update(item_deadline)
+                    worktrees.apply_plan(_batch_input, _plan)
 
                     child = self._create_task_locked(
                         session_id=task.session_id,
@@ -1683,6 +1722,7 @@ class TaskRouterMixin:
                         batch_id=batch_id,
                         batch_index=idx,
                     )
+                    worktrees.register_child_locked(child, _plan)
                 created_child_ids.append(child.task_id)
                 async_dispatches.watch_item_locked(self, child)
             if not created_child_ids:
@@ -1693,6 +1733,17 @@ class TaskRouterMixin:
         if not created_child_ids and target and reused_single is not None:
             created_child_ids.append(reused_single.task_id)
         elif not created_child_ids and target:
+            # 压缩这类系统子任务不碰文件，不跟着进隔离副本
+            _single_plan = (
+                NO_ISOLATION if compact_request is not None
+                else worktrees.plan_child_locked(caller=task, request=dispatch_input)
+            )
+            if _single_plan.refused:
+                log.warning("dispatch of task %s refused: %s", task.task_id[:12], _single_plan.error)
+                # 只改判这次完成的结果，外层接着按失败路由
+                self._apply_failure_locked(task, _single_plan.error)
+                self._event_task_snapshot("task_completed", task, component="supervisor")
+                return
             # [AutoC 2026-07-09] Why: compact dispatch 等系统任务已显式传 context_mode；
             # 其余单节点委派未传时按 target persistent 推导（persistent→accumulate，
             # 否则 fresh），避免普通节点默认持久化。
@@ -1730,6 +1781,7 @@ class TaskRouterMixin:
                 _single_input["fork_from_session_id"] = _dispatch_session_id
             if delivery_key:
                 _single_input["_dispatch_delivery_id"] = delivery_key
+            worktrees.apply_plan(_single_input, _single_plan)
 
             child = self._create_task_locked(
                 session_id=_dispatch_session_id,
@@ -1741,6 +1793,7 @@ class TaskRouterMixin:
                 source_inbound_seq=task.source_inbound_seq,
                 caller_task_id=task.task_id,
             )
+            worktrees.register_child_locked(child, _single_plan)
             created_child_ids.append(child.task_id)
 
         # ---- 挂起当前 task ----
@@ -1871,6 +1924,7 @@ class TaskRouterMixin:
                 "type": "child_preempted",
                 "child_node_id": str(task.node_id or ""),
                 "context_ref": context_ref,
+                **worktree_service_of(self).result_fields_locked(task),
             }, action_type="preempted")
         else:
             async_dispatches.settle_locked(self, task)
@@ -1895,6 +1949,7 @@ class TaskRouterMixin:
             # from finish without a separate route implementation yet.
             "action_type": action_type,
             **child_retention.continue_fields_locked(self, task),
+            **worktree_service_of(self).result_fields_locked(task),
         }
         # 用户会话里直接跑的任务到点收尾：交付时说明接下来自动接着做还是停在这里
         plan = auto_continue.plan_locked(self, task, result, action_type)
@@ -1911,6 +1966,7 @@ class TaskRouterMixin:
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": error,
             **child_retention.continue_fields_locked(self, task),
+            **worktree_service_of(self).result_fields_locked(task),
         }, {"text": f"[错误] {error}"}, action_type="fail")
 
     # ------------------------------------------------------------------ #
@@ -1924,13 +1980,13 @@ class TaskRouterMixin:
             return "cancelled"
         return str((task.result or {}).get("action") or "").strip()
 
-    @staticmethod
-    def _child_cancelled_resume_data(task: Task) -> dict[str, Any]:
+    def _child_cancelled_resume_data(self, task: Task) -> dict[str, Any]:
         return {
             "type": "child_cancelled",
             "child_task_id": task.task_id,
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": "child task cancelled",
+            **worktree_service_of(self).result_fields_locked(task),
         }
 
     def _caller_can_resume_locked(self, caller: Task) -> bool:
@@ -2042,6 +2098,7 @@ class TaskRouterMixin:
             entry["error"] = str(t.result.get("error") or "")
         if t.input.get(async_dispatches.ITEM_TIMED_OUT_KEY):
             entry["timed_out"] = True
+        entry.update(worktree_service_of(self).result_fields_locked(t))
 
         atts = tr.get("attachments")
         if isinstance(atts, list):
@@ -2052,6 +2109,8 @@ class TaskRouterMixin:
         """supervisor 直接终结的取消：收束分支、拆临时会话，并像正常完成一样结算调用方。"""
         release_if_ended_locked(self, task)
         async_dispatches.release_if_ended_locked(self, task)
+        # 取消的子任务的隔离副本按放弃处理，删目录交给清理线程，不在取消这条路上做
+        worktree_service_of(self).task_ended_locked(task)
         if finalize_branch:
             self._schedule_cancelled_task_teardown_locked(task)
         if not (task.caller_task_id or "").strip():
@@ -2326,6 +2385,13 @@ class TaskRouterMixin:
             payload["child_continuable"] = bool(continue_fields.get("continuable"))
             if continue_fields.get("wrapup"):
                 payload["child_wrapup"] = continue_fields["wrapup"]
+        child_worktree = worktree_service_of(self).result_fields_locked(task).get("worktree")
+        if child_worktree:
+            payload[CHILD_WORKTREE_PAYLOAD_KEY] = child_worktree
+        # 派它出去的任务在隔离副本里：结果回到那个会话，接手的这一轮接着在那个副本里做
+        caller_worktree = task.input.get(CALLER_WORKTREE_KEY)
+        if isinstance(caller_worktree, dict) and caller_worktree.get("worktree"):
+            payload[WORKTREE_FROM_KEY] = dict(caller_worktree)
 
         callback_delivery_id = (
             f"{task.delivery_id}:caller-resume" if task.delivery_id else ""
@@ -2482,7 +2548,11 @@ class TaskRouterMixin:
                 return AsyncResultHome(
                     route,
                     node_id=str(current.node_id or ""),
-                    dispatch_origin={key: value for key, value in dispatch.items() if key != CONTINUE_FROM_KEY},
+                    # 接着做的那一轮沿用原来的隔离副本（交付时按 guide_task_id 带上），不再要求另建一个
+                    dispatch_origin={
+                        key: value for key, value in dispatch.items()
+                        if key not in (CONTINUE_FROM_KEY, ISOLATION_KEY, REPO_KEY)
+                    },
                     context_mode=mode,
                     guide_task_id=current.task_id,
                     note=self._async_result_note_locked(origin, hops),
@@ -2624,6 +2694,10 @@ class TaskRouterMixin:
         output_guide = self._inherited_output_guide_locked(home.guide_task_id or task_id)
         if output_guide:
             payload[OUTPUT_GUIDE_KEY] = output_guide
+        # 落点的节点在隔离副本里时，接手的这一轮接着在同一个副本里做
+        home_worktree = worktree_service_of(self).caller_record_locked(self.tasks.get(home.guide_task_id))
+        if home_worktree is not None:
+            payload[WORKTREE_FROM_KEY] = home_worktree
 
         evt = self.eventlog.append(
             session_id=target_session_id,
@@ -3053,6 +3127,7 @@ class TaskRouterMixin:
 
         算不出来就什么也不留，路由时退回锁内现算，结果一致。
         """
+        self._prepare_worktree_outcome(task)
         self._adopt_child_outputs(task)
         try:
             with self._lock:
@@ -3083,6 +3158,16 @@ class TaskRouterMixin:
                 "route I/O preparation failed; routing computes it under the lock",
                 extra={"task_id": task.task_id},
             )
+
+    def _prepare_worktree_outcome(self, task: Task) -> None:
+        """隔离副本的主人收尾：锁外算 diff。算不成也留一份写明原因的结果，接下来锁里的路由不会再为它另起线程。"""
+        worktrees = worktree_service_of(self)
+        try:
+            worktrees.prepare_outcome(task)
+        except Exception as exc:
+            log.exception("computing the worktree outcome failed", extra={"task_id": task.task_id})
+            with self._lock:
+                worktrees.record_outcome_failure_locked(task, f"{type(exc).__name__}: {exc}")
 
     def _adopt_child_outputs(self, task: Task) -> None:
         """路由前在锁外复制子任务引用的超长输出；路由时锁内再走一遍只剩逐个确认已经在了。"""

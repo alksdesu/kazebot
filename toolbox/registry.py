@@ -21,6 +21,7 @@ from . import edit_journal
 from ._common import OUTPUT_HEAD_SHARE, ProcessOutcome, run_process
 from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
+from .context import project_origin_of
 from . import mcp_runtime
 from .builtins.execute_command import CAPTURE_HEAD_BYTES, CAPTURE_TAIL_BYTES, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS
 from .builtins.glob_files import DEFAULT_MAX_RESULTS as _GLOB_DEFAULT_RESULTS
@@ -274,7 +275,7 @@ def _script_tool_env(ctx: Any) -> dict[str, str]:
     current ToolContext must never inherit a stale provider call from the Engine.
     ``run_id`` is intentionally excluded because it can span multiple tool calls.
     """
-    env = _safe_subprocess_env()
+    env = _safe_subprocess_env(project_origin=project_origin_of(ctx))
     for key in list(env):
         if key.upper() in _SCRIPT_IDENTITY_ENV_KEYS:
             env.pop(key, None)
@@ -1112,8 +1113,8 @@ class ToolRegistry:
         for name, desc, schema, func, *extra in builtins:
             self.register_builtin_tool(name, desc, schema, func, extra[0] if extra else None)
 
-        from .builtins import community, context_archive, execution_plans, materials, processes, reminders
-        for module in (community, context_archive, execution_plans, materials, processes, reminders):
+        from .builtins import community, context_archive, execution_plans, materials, processes, reminders, worktrees
+        for module in (community, context_archive, execution_plans, materials, processes, reminders, worktrees):
             module.register_tools(self)
 
     def reload(self) -> int:

@@ -403,7 +403,7 @@ _CONTEXT_FIELDS = {
     "supervisor_url", "session_id", "run_id", "worker_id", "workspace_root", "http", "registry",
     "task_id", "session_generation", "parent_session_id", "conversation_key",
     "approval_poll_interval_sec", "approval_timeout_sec", "tool_call_id", "node_id", "platform_auth",
-    "claim_id", "project_root", "detached",
+    "claim_id", "project_root", "project_origin", "detached",
 }
 
 
@@ -443,8 +443,21 @@ def test_build_tool_context_fills_every_field_from_the_run_context(tmp_path: Pat
     assert ctx.claim_id == ""
     # 这个替身 rctx 没有 project_root：项目根就是工作区根
     assert ctx.project_root is tmp_path
+    # 不是隔离在 worktree 里的任务
+    assert ctx.project_origin is None
     # 只有转到后台的那份快照才置 detached
     assert ctx.detached is False
+
+
+def test_build_tool_context_carries_the_worktree_origin(tmp_path: Path) -> None:
+    worktree, origin = tmp_path / "wt", tmp_path / "repo"
+    ls = _loop_state(tmp_path)
+    ls.rctx.project_root = worktree
+    ls.rctx.project_origin = origin
+
+    ctx = build_tool_context(ls)
+
+    assert ctx.project_root == worktree and ctx.project_origin == origin
 
 
 def test_build_tool_context_carries_the_task_claim(tmp_path: Path) -> None:

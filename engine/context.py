@@ -59,6 +59,8 @@ class RunContext:
     llm_http: httpx.AsyncClient
     # 文件工具、命令和项目说明按它找文件；实例数据和配置仍按 workspace_root 找。没给就是 workspace_root
     project_root: Path | None = None
+    # 隔离在 git worktree 里的任务：项目根在原仓库里对应的目录。不是隔离任务为 None
+    project_origin: Path | None = None
     # [Fork/Merge 2026-05-12] parent_session_id separates event routing from runtime storage.
     # Why: entry tasks now run on a branch session, but SDK adapters know the
     # user-facing conversation_key through the parent session. How: keep

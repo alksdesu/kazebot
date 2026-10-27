@@ -29,6 +29,12 @@ def project_root_of(ctx: Any) -> Path:
     return root if root else getattr(ctx, "workspace_root", None)
 
 
+def project_origin_of(ctx: Any) -> Path | None:
+    """隔离在 git worktree 里的任务，项目根在原仓库里对应的目录；不是隔离任务给 None。"""
+    origin = getattr(ctx, "project_origin", None)
+    return Path(origin) if origin else None
+
+
 @dataclass
 class ToolContext:
     supervisor_url: str
@@ -54,6 +60,8 @@ class ToolContext:
     claim_id: str = ""
     # 文件工具、命令按它解析相对路径和定 cwd；data/、config/ 这些实例的东西仍在 workspace_root 下
     project_root: Path | None = None
+    # 隔离任务的项目根在原仓库里对应的目录：判路径时副本里的文件按它的同名位置算
+    project_origin: Path | None = None
     # 转到后台的工具挂起恢复后领取 id 就换了：置上后取消只看发起任务被取消、失败或会话重置，等审批也不替任务续租
     detached: bool = False
     _detached_checked_at: float = field(default=float("-inf"), init=False, repr=False, compare=False)

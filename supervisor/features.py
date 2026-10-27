@@ -6,7 +6,7 @@ import logging
 
 from . import (
     async_tools, community, execution, file_claims, materials_api, operations, processes, reminders,
-    sticker_tagging,
+    sticker_tagging, worktrees,
 )
 from .sticker_api import close_stores
 
@@ -19,6 +19,7 @@ def register_features(app, state, process_manager, config_store, features_config
     state.execution = execution.ExecutionService(state)
     state.reminders = reminders.ReminderService(state)
     state.processes = processes.ProcessService(state)
+    state.worktrees = worktrees.service_of(state)
     state.sticker_tagging = sticker_tagging.StickerTaggingService(state.workspace_root, features_config)
     host = getattr(state, "plugin_host", None)
     if host is not None:
@@ -27,7 +28,9 @@ def register_features(app, state, process_manager, config_store, features_config
         for name, service in (("state", state), ("config_store", config_store), ("process_manager", process_manager),
                               ("eventlog", state.eventlog), ("hooks", state.hook_registry)):
             host.register_base(name, service)
-    for module in (execution, reminders, community, materials_api, operations, file_claims, processes, async_tools):
+    for module in (
+        execution, reminders, community, materials_api, operations, file_claims, processes, async_tools, worktrees,
+    ):
         app.include_router(module.create_router(state))
 
 
@@ -41,7 +44,10 @@ async def feature_lifespan(app):
         for service in (state.execution, state.reminders, getattr(state, "processes", None))
         if service is not None
     )
+    # 隔离副本不归插件宿主管：清理时要停常驻进程，排在别的服务都起来之后，关的时候最先关
+    worktree_service = getattr(state, "worktrees", None)
     started = []
+    worktrees_started = False
     try:
         for service in services:
             service.start()
@@ -49,8 +55,16 @@ async def feature_lifespan(app):
         state.sticker_tagging.start()
         if host is not None:
             await host.start()
+        if worktree_service is not None:
+            await asyncio.to_thread(worktree_service.start)
+            worktrees_started = True
         yield
     finally:
+        if worktrees_started:
+            try:
+                await asyncio.to_thread(worktree_service.close)
+            except Exception:
+                logger.exception("Worktree service shutdown failed")
         if host is not None:
             await host.stop()
         try:

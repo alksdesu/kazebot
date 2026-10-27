@@ -533,8 +533,8 @@ class EditJournal:
             self._save_manifest(task_dir, manifest)
             return entry["id"], True, _note_of(entry)
 
-    def finish(self, scope: JournalScope, entry_id: int, stamp: file_state.Stamp) -> JournalNote:
-        """写盘成功之后记下新内容的哈希。"""
+    def finish(self, scope: JournalScope, entry_id: int, stamp: file_state.Stamp | None) -> JournalNote:
+        """写盘成功之后记下新内容的哈希；stamp 为 None 表示这次是把文件删了。"""
         task_dir = self.task_dir(scope.session, scope.task_id)
         with self._locked(task_dir.parent.name):
             manifest = self._load_manifest(task_dir)
@@ -542,9 +542,12 @@ class EditJournal:
             if entry is None:
                 raise JournalCorrupt("编辑日志里找不到这次改动的记录")
             now = time.time()
-            entry["post"] = {
-                "exists": True, "sha256": stamp.sha256, "size": stamp.size, "mtime_ns": stamp.mtime_ns, "at": now,
-            }
+            if stamp is None:
+                entry["post"] = {"exists": False, "at": now}
+            else:
+                entry["post"] = {
+                    "exists": True, "sha256": stamp.sha256, "size": stamp.size, "mtime_ns": stamp.mtime_ns, "at": now,
+                }
             entry["writes"] = _as_int(entry.get("writes")) + 1
             manifest["last_write_at"] = now
             self._save_manifest(task_dir, manifest)
@@ -733,7 +736,11 @@ class PendingEdit:
     def note(self) -> JournalNote:
         return self._note
 
-    def record_post_image(self, stamp: file_state.Stamp) -> JournalNote:
+    def record_deletion(self) -> JournalNote:
+        """这次改动把文件删掉了：撤销时按原文件放回去。"""
+        return self.record_post_image(None)
+
+    def record_post_image(self, stamp: file_state.Stamp | None) -> JournalNote:
         if self._journal is None or self._entry_id is None:
             return self._note
         try:

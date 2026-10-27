@@ -914,21 +914,48 @@ def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
     return out
 
 
+def _inside_root(path: Path, root: Path | None) -> Path | None:
+    """path 在 root 里时给出相对 root 的部分（root 本身是 "."），不在给 None。"""
+    if root is None:
+        return None
+    try:
+        return path.relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _classify_mapped(workspace_root: Path, extras: list[Path], mapped: Path) -> tuple[str, bool]:
+    """隔离副本里的路径换成原仓库里同一位置之后，按工作区、extra_roots、外部的次序判出显示名和是否外部。"""
+    logical = config_layout.workspace_logical_path(workspace_root, mapped)
+    if logical is not None:
+        return logical, False
+    for r in extras:
+        if mapped == r or r in mapped.parents:
+            return mapped.as_posix(), False
+    return mapped.as_posix(), True
+
+
 def classify_path(
     workspace_root: Path,
     extra_roots: list[Path],
     path_str: str,
     *,
     project_root: Path | None = None,
+    project_origin: Path | None = None,
+    foreign_root: Path | None = None,
 ) -> tuple[Path | None, str, bool]:
     """Resolve and classify a filesystem path.
 
     Relative paths resolve under project_root when it is given, otherwise under workspace_root.
+    project_origin is given for a task isolated in a git worktree: paths under project_root are judged
+    as the same place under project_origin. Paths under foreign_root (where every worktree lives) that
+    are not the task's own count as external, or invalid when written relative.
 
     Returns (resolved, display_path, is_external):
       - resolved: resolved Path, or None if invalid
       - display_path: workspace-relative posix for workspace paths,
                       project-relative posix for paths only under project_root,
+                      the mapped name for paths in the task's own worktree,
                       absolute posix for external, or error message if invalid
       - is_external: True for absolute paths outside workspace + project_root + extra_roots
     """
@@ -941,6 +968,19 @@ def classify_path(
 
     # Ensure roots are resolved for reliable comparison
     extras = [r.resolve() for r in extra_roots]
+
+    # 本任务的隔离副本：按原仓库里同一位置判，策略规则照常匹配
+    if project_origin is not None:
+        own = _inside_root(p, project_root)
+        if own is not None:
+            display, external = _classify_mapped(workspace_root, extras, Path(project_origin) / own)
+            return p, display, external
+
+    # 别的任务的隔离副本一律是外部
+    if _inside_root(p, foreign_root) is not None:
+        if raw.is_absolute():
+            return p, p.as_posix(), True
+        return None, "path escapes workspace root", False
 
     # Tier 1: workspace。多开实例的代码目录、共享表情包库和共享组配置经受信链接通到外面，照样按工作区里的名字判。
     logical = config_layout.workspace_logical_path(workspace_root, p)

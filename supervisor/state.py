@@ -33,7 +33,7 @@ from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
 from . import branch_recovery, child_retention
-from .policy import ApprovalGrantSettings, PolicyEngine
+from .policy import ApprovalGrantSettings, PathScope, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
 from .task_requeue import (
@@ -59,9 +59,12 @@ from .types import (
     TaskKind,
     TaskStatus,
 )
+from .worktrees import service_of as worktree_service_of
 
 # 没人定案、由系统按拒绝收掉的审批附言以 auto-denied 结尾，toolbox 的审批超时也是；适配器据此显示成「已失效」。
 ORPHANED_APPROVAL_COMMENT = "task ended before a decision; auto-denied"
+# 这几种操作带路径或命令，按任务所在的隔离副本判
+_PATH_SCOPED_OPS = frozenset({"read_file", "write_file", "execute_command"})
 
 
 @dataclass(frozen=True)
@@ -579,7 +582,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "task_created", "task_started", "task_completed", "task_cancelled",
             "task_cancel_requested", "task_requeued", "task_suspended",
             "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
-            "task_context_compacted",
+            "task_context_compacted", "task_worktree_ready",
         }
         snapshots: dict[str, dict[str, Any]] = {}
         order: list[str] = []
@@ -1015,7 +1018,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "task_created", "task_started", "task_completed", "task_cancelled",
                 "task_cancel_requested", "task_requeued", "task_suspended",
                 "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
-                "task_context_compacted",
+                "task_context_compacted", "task_worktree_ready",
             }:
                 self._apply_task_snapshot(payload)
             elif et == "context_reset":
@@ -1866,6 +1869,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         record_audit: bool,
     ) -> _OperationVerdict:
         """按任务身份判定一次操作；record_audit 为假时定时任务拒绝和授权放行都不记事件。"""
+        worktrees = worktree_service_of(self)
         with self._lock:
             task = self.tasks.get(task_id) if task_id else None
             conv_key, channel = self._authorizing_origin_locked(session_id, task)
@@ -1875,6 +1879,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             else:
                 caller_auth = parameters.get("platform_auth")
                 platform_auth = dict(caller_auth) if isinstance(caller_auth, dict) else {}
+            isolation_keys = worktrees.isolation_keys_locked(task)
         # 授权只认任务上记的身份：没有任务时 platform_auth 是调用方自报的。
         grant_identity = GrantIdentity.from_auth(platform_auth) if task is not None else None
         if task_id and ("platform_auth" in parameters or platform_auth):
@@ -1893,7 +1898,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if verdict is not None:
                 return _OperationVerdict(verdict)
 
-        decision = self.policy.evaluate(op=op, parameters=parameters)
+        # 路径和命令按任务所在的隔离副本判：副本里的路径按原仓库里同一位置的规则走
+        scope = worktrees.path_scope(isolation_keys) if op in _PATH_SCOPED_OPS else None
+        decision = self.policy.evaluate(op=op, parameters=parameters, scope=scope)
         if decision.safety_level == SafetyLevel.auto:
             return _decided(SafetyLevel.auto, decision.reason)
         # [AutoC 2026-06-04] Why: hard policy denials must not be converted into
@@ -1949,7 +1956,40 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         )
         if granted is not None:
             return _OperationVerdict(granted)
-        return _OperationVerdict(None, reason=decision.reason, details=parameters)
+        return _OperationVerdict(
+            None, reason=decision.reason, details=self._approval_details(parameters, scope, decision.reason),
+        )
+
+    def _approval_details(
+        self, parameters: dict[str, Any], scope: PathScope | None, policy_reason: str,
+    ) -> dict[str, Any]:
+        """记进审批的参数。隔离副本里的操作和一次写多个文件的操作，路径换成原仓库里的名字；
+        隔离副本里的操作再写明是哪个副本、副本里的原路径是什么。其余原样记。"""
+        if scope is None or (not scope.isolated and not isinstance(parameters.get("paths"), list)):
+            return parameters
+        details = dict(parameters)
+        raw_path = details.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            shown = self.policy.logical_path(raw_path, scope)
+            if shown and shown != raw_path:
+                details["path"] = shown
+                if scope.isolated:
+                    details["worktree_path"] = raw_path
+        raw_paths = details.get("paths")
+        if isinstance(raw_paths, list):
+            details["paths"] = [
+                (self.policy.logical_path(item, scope) or item) if isinstance(item, str) else item
+                for item in raw_paths
+            ]
+        if scope.isolated:
+            details["isolated_copy"] = {
+                "worktree": scope.worktree,
+                "path": scope.project_root.as_posix() if scope.project_root is not None else "",
+                "origin": scope.project_origin.as_posix() if scope.project_origin is not None else "",
+            }
+            reason = str(details.get("reason") or "").strip() or policy_reason
+            details["reason"] = f"在隔离副本 {scope.worktree} 里：{reason}"
+        return details
 
     def _approval_grant_verdict(
         self,

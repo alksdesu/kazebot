@@ -63,6 +63,15 @@ engine:
     # 灰度切换开关；如出现回归，将此值改为 false 即可回退。
     main_session_enabled: true
 
+  # 委派时要求隔离（isolation: worktree）的子任务在自己的 git worktree 里做：收尾算出 diff 交给父节点，父节点用 merge_worktree 合回或放弃
+  worktree:
+    root: ""                   # 副本放哪（相对路径按工作区根算）；空 = 多开放数据根下的 worktrees/，单实例放工作区旁边的 <工作区目录名>-worktrees/；不能和工作区重叠
+    retain_grace_hours: 0      # 收尾后没合回的副本，派它的任务结束后再留这么多小时就清理（清理前存一份补丁）；0 = 跟 child_session.retain_grace_hours 走
+    merge_instances: []        # 多开时只有这里点名的实例 id 能合回工作区所在的仓库，其余实例只产出补丁；单实例不受限，外部仓库只看审批
+    link_dirs: []              # 建好副本后从原仓库链过去的目录（仓库根下的相对路径，如 node_modules）；Windows 用目录联接，删副本前先拆掉；默认不链
+    inline_diff_chars: 6000    # 交回父节点的结果里内联多少字符的 diff，多出的看补丁文件（0-200000）
+    tombstone_days: 7          # 清理掉的副本在登记里再记几天，补丁文件也留到那时（1-365）
+
   retry:
     max_retries: 3             # LLM 调用失败时最大重试次数（0 = 不重试）
     initial_delay_sec: 1.0     # 首次重试等待秒数

@@ -16,7 +16,7 @@ from clonoth_runtime import parse_bool
 
 from .. import file_state
 from .._common import request_guard, resolve_under_allowed_roots
-from ..context import ToolContext, project_root_of
+from ..context import ToolContext, project_origin_of, project_root_of
 from ..edit_journal import EditJournal, JournalCorrupt, JournalEntry, JournalScope, TaskJournal, inside_journal
 from ..file_state import _path_key
 from ..syntax_check import command_path
@@ -144,7 +144,12 @@ def _task_status(task: TaskJournal) -> str:
 
 
 def _entry_line(entry: JournalEntry) -> str:
-    how = f"{entry.tool} 新建" if entry.created else entry.tool
+    if entry.created:
+        how = f"{entry.tool} 新建"
+    elif entry.post is not None and not entry.post.exists:
+        how = f"{entry.tool} 删除"
+    else:
+        how = entry.tool
     if entry.writes > 1:
         how += f"，写了 {entry.writes} 次"
     return f"{entry.display}（{how}）{_entry_status(entry)}"
@@ -286,7 +291,11 @@ def _default_task(tasks: list[TaskJournal], current_task: str) -> tuple[TaskJour
 
 
 def _targets(
-    task: TaskJournal, requested: list[str] | None, workspace_root: Path, project_root: Path,
+    task: TaskJournal,
+    requested: list[str] | None,
+    workspace_root: Path,
+    project_root: Path,
+    project_origin: Path | None = None,
 ) -> tuple[list[JournalEntry], list[str], list[str]]:
     """要撤的条目（后改的在前），以及 paths 里这个任务没改过的、已经撤过的。解析路径要读策略文件，放线程里调。"""
     open_entries = [entry for entry in task.entries if entry.undone is None]
@@ -298,7 +307,9 @@ def _targets(
     for raw in requested:
         keys: set[str] = set()
         with contextlib.suppress(ValueError, OSError):
-            keys.add(_path_key(resolve_under_allowed_roots(workspace_root, raw, project_root=project_root)))
+            keys.add(_path_key(resolve_under_allowed_roots(
+                workspace_root, raw, project_root=project_root, project_origin=project_origin,
+            )))
         matched = [entry for entry in task.entries if entry.display == raw or _path_key(Path(entry.path)) in keys]
         if not matched:
             missing.append(raw)
@@ -604,7 +615,7 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             return refusal or _error(_nothing_left(tasks))
 
     entries, missing, settled = await asyncio.to_thread(
-        _targets, task, requested, ctx.workspace_root, project_root_of(ctx),
+        _targets, task, requested, ctx.workspace_root, project_root_of(ctx), project_origin_of(ctx),
     )
     if not entries:
         if requested is None:

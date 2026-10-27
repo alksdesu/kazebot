@@ -23,7 +23,7 @@ import config_layout
 from clonoth_runtime import load_runtime_config
 
 from ._common import fit_output, join_outputs, request_guard, run_process, safe_subprocess_env
-from .context import project_root_of
+from .context import project_origin_of, project_root_of
 from .text_files import BOM, normalize_newlines
 
 logger = logging.getLogger(__name__)
@@ -321,7 +321,7 @@ async def _run_command(ctx: Any, spec: CheckCommand, rendered: str, *, tool_name
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=safe_subprocess_env(),
+            env=safe_subprocess_env(project_origin=project_origin_of(ctx)),
             # 独立进程组：超时或取消时整棵进程树一起杀
             start_new_session=True,
         )

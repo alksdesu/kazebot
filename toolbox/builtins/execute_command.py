@@ -6,7 +6,7 @@ from typing import Any
 
 from clonoth_runtime import get_float, get_int, load_runtime_config
 
-from ..context import ToolContext, project_root_of
+from ..context import ToolContext, project_origin_of, project_root_of
 from .._common import ProcessOutcome, fit_output, join_outputs, request_guard, run_process, safe_subprocess_env
 
 # 每一路输出留开头和结尾各这么多字节，中间的边读边扔；超长输出交给 engine 落盘，模型按需翻页
@@ -106,7 +106,7 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=safe_subprocess_env(),
+            env=safe_subprocess_env(project_origin=project_origin_of(ctx)),
             # 独立进程组：超时或取消时整棵进程树一起杀，孙进程攥着管道也不会把等待卡死。
             start_new_session=True,
         )

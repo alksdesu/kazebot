@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..context import ToolContext, project_root_of
+from ..context import ToolContext, project_origin_of, project_root_of
 from .._common import display_namer, guard_external_read, request_guard, resolve_and_classify
 from ..ignore_rules import DEFAULT_IGNORED_DIRS, MAX_WALK_FILES, GlobError, glob_regex, walk_files
 
@@ -118,7 +118,9 @@ async def glob_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     project_root = project_root_of(ctx)
     try:
-        root, is_external = resolve_and_classify(ctx.workspace_root, rel_path, project_root=project_root)
+        root, is_external = resolve_and_classify(
+            ctx.workspace_root, rel_path, project_root=project_root, project_origin=project_origin_of(ctx),
+        )
     except ValueError as exc:
         return _error_response(str(exc), path=rel_path)
 

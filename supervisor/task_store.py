@@ -12,6 +12,7 @@ from clonoth_runtime import get_str, load_runtime_config, main_session_enabled, 
 from engine.dispatch_batch import AWAITING_INPUT_KEY, CONTINUE_FROM_KEY
 from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
+from engine.project_root import INBOUND_CHILD_WORKTREE_KEY
 from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
@@ -31,6 +32,14 @@ from .types import (
     TaskKind,
     TaskStatus,
     output_guide_payload,
+)
+from .worktrees import service_of as worktree_service_of
+from .worktrees.keys import (
+    CALLER_WORKTREE_KEY,
+    CHILD_WORKTREE_PAYLOAD_KEY,
+    SNAPSHOT_INPUT_KEYS as WORKTREE_SNAPSHOT_INPUT_KEYS,
+    WORKTREE_FROM_KEY,
+    WORKTREE_PENDING_KEY,
 )
 
 
@@ -291,6 +300,7 @@ class TaskStoreMixin:
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
                     "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
                     "context_ref", STEPS_USED_KEY, REQUEUE_MARK, AWAITING_INPUT_KEY,
+                    *WORKTREE_SNAPSHOT_INPUT_KEYS,
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -754,8 +764,27 @@ class TaskStoreMixin:
             _inbound_child_wrapup = str(payload.get("child_wrapup") or "").strip()
             if _inbound_child_wrapup:
                 inbound_metadata["inbound_child_wrapup"] = _inbound_child_wrapup
+        _inbound_child_worktree = payload.get(CHILD_WORKTREE_PAYLOAD_KEY)
+        if isinstance(_inbound_child_worktree, dict) and _inbound_child_worktree.get("id"):
+            inbound_metadata[INBOUND_CHILD_WORKTREE_KEY] = dict(_inbound_child_worktree)
         # 自动续跑的那一轮带着续跑链：第几轮、链从哪一刻起算寿命、上一段留下的待办
         _auto_continue = chain_input(payload.get("auto_continue"))
+        _worktrees = worktree_service_of(self)
+        # 新任务落在哪个隔离副本：异步委派按派发项和派发方算；结果回到原会话、自动续跑接着用上一段的副本
+        _worktree_source = payload.get(WORKTREE_FROM_KEY) if isinstance(payload.get(WORKTREE_FROM_KEY), dict) else None
+        if _worktree_source is None and _auto_continue is not None:
+            _worktree_source = _worktrees.caller_record_locked(self.tasks.get(_auto_continue["previous_task_id"]))
+        _dispatcher_id = str(_dispatch_origin.get("caller_task_id") or "").strip() if _dispatch_origin else ""
+        _dispatcher = self.tasks.get(_dispatcher_id) if _dispatcher_id else None
+        _continued_ref = parse_handle(_dispatch_origin.get(CONTINUE_FROM_KEY)) if _dispatch_origin else None
+        _worktree_plan = _worktrees.plan_child_locked(
+            caller=_dispatcher,
+            request=_dispatch_origin or None,
+            continued_task_id=_continued_ref.task_id if _continued_ref is not None else "",
+            source=_worktree_source,
+            requested_by=_dispatcher_id,
+        )
+        _dispatcher_worktree = _worktrees.caller_record_locked(_dispatcher)
 
         # task_created 快照一产生就包含 SDK 路由所需字段。
         if _dispatch_origin:
@@ -764,61 +793,65 @@ class TaskStoreMixin:
             if _dispatch_parent_conv_key:
                 _dispatch_origin.setdefault("parent_conversation_key", _dispatch_parent_conv_key)
 
+        _entry_input: dict[str, Any] = {
+            "instruction": text,
+            "context_ref": last_ctx_ref,
+            "switched_from": default_node if session_override else "",
+            "resume_data": {},
+            "use_context": use_context,
+            "_system_task": bool(payload.get("_system_task", False)),
+            "schedule_id": str(payload.get("schedule_id") or ""),
+            "active_tasks_summary": active_tasks_summary,
+            "attachments": attachments or [],
+            "parent_session_id": session_id,
+            "branch_session_id": branch_session_id,
+            "base_count": branch_base_count,
+            "base_last_id": str(fork_meta.get("base_last_id") or ""),
+            "fork_copied": int(fork_meta.get("copied") or 0),
+            "task_context": {
+                "conversation_key": str(payload.get("conversation_key") or ""),
+                "channel": str(payload.get("channel") or ""),
+                "message_id": str(payload.get("message_id") or ""),
+                "entry_node_id": entry_node,
+                "session_id": branch_session_id,
+                "parent_session_id": session_id,
+                "branch_session_id": branch_session_id,
+                "base_count": branch_base_count,
+                "session_generation": generation,
+                "is_system_task": bool(payload.get("_system_task", False)),
+                "switched_from": default_node if session_override else "",
+                "use_context": use_context,
+                "platform_auth": platform_auth,
+                "route_hints": route_hints,
+                # knowledge_inject 从 rctx.task_context 读它，决定这轮要不要
+                # 按人加载某些人的跨会话记忆档案。
+                "memory_hints": memory_hints,
+                # 平台输出说明，引擎渲染进提示词的缓存前缀和动态区，不写进对话历史。
+                **({OUTPUT_GUIDE_KEY: output_guide} if output_guide else {}),
+                # 本任务第一次请求拿到实测比值之前，engine 按这段对话上一次的实测估 token
+                **({"chars_per_token": round(session_ratio, 4)} if session_ratio is not None else {}),
+                # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
+                # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
+                # 怎么改：把 dispatch 上下文模式和父频道 route key 写入
+                # task_context。目的：子 session 映射和审批归属判断使用结构化字段。
+                "dispatch_context_mode": _dispatch_context_mode,
+                "parent_conversation_key": _dispatch_parent_conv_key,
+                "route_conversation_key": _dispatch_parent_conv_key,
+            },
+            "dispatch_context_mode": _dispatch_context_mode,
+            "_dispatch_origin": _dispatch_origin,
+            **inbound_metadata,
+            **({AUTO_CONTINUE_KEY: _auto_continue} if _auto_continue is not None else {}),
+        }
+        _worktrees.apply_plan(_entry_input, _worktree_plan)
+        if _dispatcher_worktree is not None:
+            _entry_input[CALLER_WORKTREE_KEY] = _dispatcher_worktree
         task = self._create_task_locked(
             session_id=branch_session_id,
             session_generation=generation,
             kind=TaskKind.node,
             node_id=entry_node,
-            input_data={
-                "instruction": text,
-                "context_ref": last_ctx_ref,
-                "switched_from": default_node if session_override else "",
-                "resume_data": {},
-                "use_context": use_context,
-                "_system_task": bool(payload.get("_system_task", False)),
-                "schedule_id": str(payload.get("schedule_id") or ""),
-                "active_tasks_summary": active_tasks_summary,
-                "attachments": attachments or [],
-                "parent_session_id": session_id,
-                "branch_session_id": branch_session_id,
-                "base_count": branch_base_count,
-                "base_last_id": str(fork_meta.get("base_last_id") or ""),
-                "fork_copied": int(fork_meta.get("copied") or 0),
-                "task_context": {
-                    "conversation_key": str(payload.get("conversation_key") or ""),
-                    "channel": str(payload.get("channel") or ""),
-                    "message_id": str(payload.get("message_id") or ""),
-                    "entry_node_id": entry_node,
-                    "session_id": branch_session_id,
-                    "parent_session_id": session_id,
-                    "branch_session_id": branch_session_id,
-                    "base_count": branch_base_count,
-                    "session_generation": generation,
-                    "is_system_task": bool(payload.get("_system_task", False)),
-                    "switched_from": default_node if session_override else "",
-                    "use_context": use_context,
-                    "platform_auth": platform_auth,
-                    "route_hints": route_hints,
-                    # knowledge_inject 从 rctx.task_context 读它，决定这轮要不要
-                    # 按人加载某些人的跨会话记忆档案。
-                    "memory_hints": memory_hints,
-                    # 平台输出说明，引擎渲染进提示词的缓存前缀和动态区，不写进对话历史。
-                    **({OUTPUT_GUIDE_KEY: output_guide} if output_guide else {}),
-                    # 本任务第一次请求拿到实测比值之前，engine 按这段对话上一次的实测估 token
-                    **({"chars_per_token": round(session_ratio, 4)} if session_ratio is not None else {}),
-                    # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
-                    # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
-                    # 怎么改：把 dispatch 上下文模式和父频道 route key 写入
-                    # task_context。目的：子 session 映射和审批归属判断使用结构化字段。
-                    "dispatch_context_mode": _dispatch_context_mode,
-                    "parent_conversation_key": _dispatch_parent_conv_key,
-                    "route_conversation_key": _dispatch_parent_conv_key,
-                },
-                "dispatch_context_mode": _dispatch_context_mode,
-                "_dispatch_origin": _dispatch_origin,
-                **inbound_metadata,
-                **({AUTO_CONTINUE_KEY: _auto_continue} if _auto_continue is not None else {}),
-            },
+            input_data=_entry_input,
             continuation={},
             source_inbound_seq=inbound_seq,
             caller_task_id=None,
@@ -834,6 +867,11 @@ class TaskStoreMixin:
         # 兼容。目的：回调注入与 SDK 路由读取同一份结构化元数据。
         if isinstance(_dispatch_origin, dict) and _dispatch_origin:
             task.input["_caller_node_id"] = str(_dispatch_origin.get("caller_node_id") or "")
+        if _worktree_plan.refused:
+            # repo 不能建副本、或要接着用的副本正被别的任务用着：任务照常建出来再判失败，结果按异步委派的路子交回派发方
+            self._fail_task_locked(task, error=_worktree_plan.error)
+        else:
+            _worktrees.register_child_locked(task, _worktree_plan)
         # Emit transient inbound_accepted so Bot can advance watermark
         self.eventlog.append(
             session_id=session_id,
@@ -1292,6 +1330,9 @@ class TaskStoreMixin:
                 self._cancel_task_locked(task, now)
                 continue
             if task.lease_expires_at and task.lease_expires_at > now:
+                continue
+            # 隔离副本还没建好：不能领走，否则就在原仓库里跑了；也不占它那一道的排头
+            if isinstance(task.input.get(WORKTREE_PENDING_KEY), dict):
                 continue
             if task.lane in heads:
                 continue

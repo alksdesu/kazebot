@@ -13,6 +13,7 @@ from ..attachments import build_multimodal_content, payload_attachments
 from ..conversation_store import MessageType
 from ..interrupted_calls import INTERRUPTED_RESUME_TYPE
 from ..run_budget import WRAPUP_TIME
+from ..worktree_report import worktree_lines
 from .loop_state import TOOL_RESULT_ATTACHMENT_TYPE
 
 
@@ -206,6 +207,7 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
     if earlier:
         lines.append(earlier)
     lines.extend(_continue_lines(entry, node))
+    lines.extend(worktree_lines(entry.get("worktree")))
 
     meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}
     resume_type = _BATCH_NODE_RESUME_TYPES.get(status)
@@ -237,6 +239,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             lines.append("结果：")
             lines.append(text)
         lines.extend(_continue_lines(resume_data, from_node))
+        lines.extend(worktree_lines(resume_data.get("worktree")))
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
             return [_child_message(build_multimodal_content(content_text, child_atts), from_node)]
@@ -255,20 +258,24 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             content = f"下游节点 {from_node} 需要补充信息。"
         else:
             content = "下游节点需要补充信息。"
-        return [_child_message(content, from_node)]
+        return [_child_message("\n".join([content, *worktree_lines(resume_data.get("worktree"))]), from_node)]
 
     # v2: child_failed
     if rtype == "child_failed":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         error = str(resume_data.get("error") or "未知错误")
         prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
-        return [_child_message("\n".join([f"{prefix}{error}", *_continue_lines(resume_data, from_node)]), from_node)]
+        return [_child_message("\n".join([
+            f"{prefix}{error}",
+            *_continue_lines(resume_data, from_node),
+            *worktree_lines(resume_data.get("worktree")),
+        ]), from_node)]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
-        return [_child_message(text, from_node)]
+        return [_child_message("\n".join([text, *worktree_lines(resume_data.get("worktree"))]), from_node)]
 
     # v2: child_preempted
     if rtype == "child_preempted":
@@ -277,7 +284,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
         if ctx_ref:
             prefix += f"（context_ref: {ctx_ref}）"
-        return [_child_message(prefix, from_node)]
+        return [_child_message("\n".join([prefix, *worktree_lines(resume_data.get("worktree"))]), from_node)]
 
     # 服务重启打断后重排的任务：缺结果的工具调用 runner 已补成「中断，结果未知」，这里只提醒先核对再接着做
     if rtype == INTERRUPTED_RESUME_TYPE:

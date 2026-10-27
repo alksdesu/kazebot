@@ -21,7 +21,7 @@ from typing import Any
 from clonoth_runtime import get_int, load_runtime_config, parse_bool
 
 from .. import edit_journal, file_state
-from ..context import ToolContext, project_root_of
+from ..context import ToolContext, project_origin_of, project_root_of
 from .._common import (
     display_namer,
     guard_external_read,
@@ -894,7 +894,9 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     )
 
     try:
-        root, is_ext = resolve_and_classify(ctx.workspace_root, rel_path, project_root=project_root_of(ctx))
+        root, is_ext = resolve_and_classify(
+            ctx.workspace_root, rel_path, project_root=project_root_of(ctx), project_origin=project_origin_of(ctx),
+        )
     except ValueError as exc:
         return _error_response(str(exc))
     if not root.exists():

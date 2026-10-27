@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, Awaitable, Callable
 
 import config_layout
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
+from engine.project_root import foreign_worktrees_root
 from platforms.protection import secret_env_names
 
 from . import process_tree
@@ -389,17 +391,31 @@ _SENSITIVE_ENV_KEYS_UPPER = {
 }
 
 
-def safe_subprocess_env() -> dict[str, str]:
+# 隔离任务里起的命令看这两个变量找原仓库和它的虚拟环境：worktree 里没有 .venv、node_modules 和被忽略的文件
+ORIGIN_ROOT_ENV = "CLONOTH_ORIGIN_ROOT"
+ORIGIN_VENV_ENV = "CLONOTH_ORIGIN_VENV"
+_ISOLATION_ENV_KEYS_UPPER = frozenset({ORIGIN_ROOT_ENV, ORIGIN_VENV_ENV})
+_VENV_DIR_NAMES = (".venv", "venv")
+# 往上找虚拟环境最多走几层；到了有 .git 的那一层（仓库根）就停
+_VENV_SEARCH_DEPTH = 8
+
+
+def safe_subprocess_env(*, project_origin: Path | str | None = None) -> dict[str, str]:
     """Return a subprocess env with common secret variables stripped.
 
     This is not a complete security boundary, but it meaningfully reduces
-    accidental leakage from command execution.
+    accidental leakage from command execution. Every child process a tool, an edit
+    check or a resident process starts gets its env here; project_origin is given for
+    a task isolated in a git worktree (see isolation_env).
     """
     env = os.environ.copy()
     platform_secrets = secret_env_names()
     for k in list(env.keys()):
         ku = k.upper()
 
+        if ku in _ISOLATION_ENV_KEYS_UPPER:
+            env.pop(k, None)
+            continue
         if ku == "NOVELAI_API_KEY":
             continue
         if ku in _SENSITIVE_ENV_KEYS_UPPER:
@@ -412,6 +428,55 @@ def safe_subprocess_env() -> dict[str, str]:
         if ku in platform_secrets:
             env.pop(k, None)
             continue
+    env.update(isolation_env(project_origin))
+    return env
+
+
+def _venv_in(directory: Path) -> Path | None:
+    for name in _VENV_DIR_NAMES:
+        candidate = directory / name
+        if (candidate / "pyvenv.cfg").is_file():
+            return candidate
+    return None
+
+
+def origin_venv(origin: Path | str) -> Path | None:
+    """原仓库的虚拟环境：从项目根对应的目录往上找到仓库根为止，找不到时，本进程跑在这个仓库里的虚拟环境上就用它。"""
+    try:
+        start = Path(origin).resolve()
+    except (OSError, RuntimeError):
+        return None
+    top: Path | None = None
+    current = start
+    for _ in range(_VENV_SEARCH_DEPTH):
+        found = _venv_in(current)
+        if found is not None:
+            return found
+        if (current / ".git").exists():
+            top = current
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    if sys.prefix == sys.base_prefix:
+        return None
+    try:
+        own = Path(sys.prefix).resolve()
+    except (OSError, RuntimeError):
+        return None
+    boundary = top or start
+    return own if own == boundary or boundary in own.parents else None
+
+
+def isolation_env(project_origin: Path | str | None) -> dict[str, str]:
+    """隔离任务子进程多带的环境变量：原仓库里对应项目根的目录，以及原仓库的虚拟环境（找得到时）。不是隔离任务给空表。"""
+    if not project_origin:
+        return {}
+    origin = Path(project_origin)
+    env = {ORIGIN_ROOT_ENV: str(origin)}
+    venv = origin_venv(origin)
+    if venv is not None:
+        env[ORIGIN_VENV_ENV] = str(venv)
     return env
 
 
@@ -451,20 +516,36 @@ def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
     )
 
 
+def _foreign_worktrees_root(workspace_root: Path) -> Path | None:
+    try:
+        return foreign_worktrees_root(workspace_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def resolve_and_classify(
-    workspace_root: Path, path_str: str, *, project_root: Path | None = None,
+    workspace_root: Path,
+    path_str: str,
+    *,
+    project_root: Path | None = None,
+    project_origin: Path | None = None,
 ) -> tuple[Path, bool]:
     """Resolve path and classify as internal (False) or external (True).
 
     Relative paths resolve under project_root when given, else under workspace_root;
-    extra_roots always come from the instance policy under workspace_root.
+    extra_roots always come from the instance policy under workspace_root. A task isolated
+    in a git worktree passes project_origin: its files are judged as the same place in the
+    original repository, the way the supervisor judges them. Other tasks' worktrees are external.
 
     Returns (resolved_path, is_external).
     Raises ValueError for invalid or escaping relative paths.
     """
     extra_roots = _load_allowed_extra_roots(workspace_root)
     resolved, display, is_external = classify_path(
-        workspace_root, extra_roots, path_str, project_root=project_root,
+        workspace_root, extra_roots, path_str,
+        project_root=project_root,
+        project_origin=project_origin,
+        foreign_root=_foreign_worktrees_root(workspace_root),
     )
     if resolved is None:
         raise ValueError(display)
@@ -472,13 +553,19 @@ def resolve_and_classify(
 
 
 def resolve_under_allowed_roots(
-    workspace_root: Path, path_str: str, *, project_root: Path | None = None,
+    workspace_root: Path,
+    path_str: str,
+    *,
+    project_root: Path | None = None,
+    project_origin: Path | None = None,
 ) -> Path:
     """Resolve path under workspace_root, project_root or policy-configured extra_roots.
 
     Allows untrusted external absolute paths (policy layer enforces approval).
     """
-    resolved, _is_external = resolve_and_classify(workspace_root, path_str, project_root=project_root)
+    resolved, _is_external = resolve_and_classify(
+        workspace_root, path_str, project_root=project_root, project_origin=project_origin,
+    )
     return resolved
 
 

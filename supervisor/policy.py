@@ -5,6 +5,7 @@ import copy
 import fnmatch
 import ipaddress
 import logging
+import os
 import re
 import shlex
 import threading
@@ -33,6 +34,29 @@ class PolicyDecision:
     # 重启、动 config/nodes、data 等敏感操作仍需人工确认。sensitive=True 表示
     # 本决策命中了显式敏感规则(而非默认放行或普通命令)，即使是管理员也不免审批。
     sensitive: bool = False
+
+
+@dataclass(frozen=True)
+class PathScope:
+    """按哪个任务判路径。
+
+    隔离在 git worktree 里的任务带 worktree（登记号）、project_root（副本里的项目根）和 project_origin（它在原仓库里
+    对应的目录）：副本里的路径按原仓库里同一位置判。foreign_root 是放全部副本的目录，不是本任务的一律算外部。
+    mappings 是各个副本目录到原仓库目录的对照，命令文本里出现副本的绝对路径时换成原仓库的路径再查敏感路径。
+    invalid 非空表示这个任务登记的副本已经用不了，跟路径有关的操作一律拒绝。
+    """
+
+    project_root: Path | None = None
+    project_origin: Path | None = None
+    foreign_root: Path | None = None
+    origin_repo: Path | None = None
+    worktree: str = ""
+    mappings: tuple[tuple[Path, Path], ...] = ()
+    invalid: str = ""
+
+    @property
+    def isolated(self) -> bool:
+        return bool(self.worktree)
 
 
 APPROVAL_GRANT_DEFAULT_MINUTES = 30
@@ -151,6 +175,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "data/mcp_clients.yaml", "decision": "approval_required", "reason": "mcp stdio clients execute local commands"},
                 {"pattern": "data/platform_secrets.yaml", "decision": "deny", "reason": "platform tokens are the instance identity"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
+                # 清理按它删目录：改了它就能让 supervisor 去删别的地方
+                {"pattern": "data/worktrees.json", "decision": "deny", "reason": "the worktree registry is written by the supervisor only"},
                 {"pattern": "data/schedules.yaml", "decision": "approval_required", "reason": "schedule changes require approval"},
                 {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
                 {"pattern": "supervisor/**", "decision": "approval_required", "reason": "supervisor source changes require approval"},
@@ -251,6 +277,59 @@ def _path_text_pattern(literal: str) -> re.Pattern[str] | None:
         return None
     tail = "" if token.endswith("/") else r"(?![\w])"
     return re.compile(r"(?<![\w.\-])" + re.escape(token) + tail, re.IGNORECASE)
+
+
+# 目录名后面接着的那一段路径：到空白、引号或命令分隔符为止
+_PATH_TAIL = r"(?P<tail>(?:[\\/][^\s\"'`|;&<>()]*)?)"
+
+
+def _root_pattern(root: Path) -> re.Pattern[str] | None:
+    """命令文本里一个目录连同它后面那段路径的各种写法：\\ 或 / 分隔，Windows 上盘符还可能写成 /e 这样的 MSYS 形式。"""
+    parts = [part for part in root.as_posix().split("/") if part]
+    if not parts:
+        return None
+    pieces: list[str] = []
+    first = parts[0]
+    if re.fullmatch(r"[A-Za-z]:", first):
+        pieces.append(rf"(?:{re.escape(first)}|/{re.escape(first[0].lower())})")
+        rest = parts[1:]
+    else:
+        pieces.append("/" + re.escape(first))
+        rest = parts[1:]
+    body = pieces[0] + "".join(r"[\\/]+" + re.escape(part) for part in rest)
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.compile(r"(?<![\w.\-])" + body + r"(?=[\\/]|$|[^\w.\-])" + _PATH_TAIL, flags)
+
+
+def map_worktree_paths(text: str, mappings: tuple[tuple[Path, Path], ...]) -> str:
+    """命令文本里出现的隔离副本绝对路径换成原仓库里同一位置的路径，换过的那段统一写成 / 分隔；没有出现时原样返回。"""
+    mapped = text
+    for worktree, origin in mappings:
+        pattern = _root_pattern(worktree)
+        if pattern is None:
+            continue
+        replacement = origin.as_posix().rstrip("/")
+        # 敏感路径的规则按 / 分隔写，副本路径后面那段一起换成 / 才对得上
+        mapped = pattern.sub(lambda match: replacement + match.group("tail").replace("\\", "/"), mapped)
+    return mapped
+
+
+def _inside(path: Path, root: Path | None) -> bool:
+    if root is None:
+        return False
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _path_list(raw: Any) -> list[str] | None:
+    """write_file 的 paths：一串路径字符串。写得不对返回 None。"""
+    if not isinstance(raw, list) or not raw:
+        return None
+    paths = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    return paths if len(paths) == len(raw) else None
 
 
 def _to_safety_level(s: str) -> SafetyLevel:
@@ -770,8 +849,51 @@ class PolicyEngine:
             floor.append((name, level, reason))
         return floor
 
-    def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
-        return classify_path(self._root, self._extra_roots, path_str)
+    def extra_roots(self) -> list[Path]:
+        """当前生效的 extra_roots，解析到底。"""
+        self._reload_if_needed()
+        return list(self._extra_roots)
+
+    def _resolve_relpath(
+        self, path_str: str, scope: PathScope | None = None, *, in_project: bool = True,
+    ) -> tuple[Path | None, str, bool]:
+        if scope is None:
+            return classify_path(self._root, self._extra_roots, path_str)
+        if scope.isolated and in_project:
+            return classify_path(
+                self._root, self._extra_roots, path_str,
+                project_root=scope.project_root,
+                project_origin=scope.project_origin,
+                foreign_root=scope.foreign_root,
+            )
+        return classify_path(self._root, self._extra_roots, path_str, foreign_root=scope.foreign_root)
+
+    def _readings(self, path_str: str, scope: PathScope | None) -> list[tuple[Path | None, str, bool]]:
+        """一个路径按哪几种读法判。隔离任务写的相对路径按副本和工作区各解析一次，两边都要过。"""
+        first = self._resolve_relpath(path_str, scope)
+        try:
+            absolute = Path(path_str).is_absolute()
+        except (TypeError, ValueError):
+            absolute = False
+        if scope is None or not scope.isolated or absolute:
+            return [first]
+        return [first, self._resolve_relpath(path_str, scope, in_project=False)]
+
+    def logical_path(self, path_str: str, scope: PathScope | None = None) -> str:
+        """审批卡上显示的路径：隔离副本里的按原仓库里的名字写；路径无效时给空串。"""
+        self._reload_if_needed()
+        resolved, display, _external = self._resolve_relpath(path_str, scope)
+        return display if resolved is not None else ""
+
+    @staticmethod
+    def _strictest(decisions: list[PolicyDecision]) -> PolicyDecision:
+        """几种判法里最严的那个；一样严时带敏感标记的算数。"""
+        chosen = decisions[0]
+        for decision in decisions[1:]:
+            stricter = _STRICTNESS[decision.safety_level] - _STRICTNESS[chosen.safety_level]
+            if stricter > 0 or (stricter == 0 and decision.sensitive and not chosen.sensitive):
+                chosen = decision
+        return chosen
 
     @staticmethod
     def _first_match(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
@@ -796,40 +918,86 @@ class PolicyEngine:
                 chosen = decision
         return chosen if chosen is not None else PolicyDecision(default, "default policy")
 
-    def evaluate_read_file(self, *, path: str) -> PolicyDecision:
-        self._reload_if_needed()
-        resolved, rel, is_external = self._resolve_relpath(path)
+    def _file_decision(
+        self, reading: tuple[Path | None, str, bool], rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel,
+    ) -> PolicyDecision:
+        resolved, rel, is_external = reading
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
-        default = self._read_default
         if is_external:
             # 工作区外部路径视为敏感，即使是管理员任务也需人工确认。
-            dec = self._match_rules(rel, self._read_rules, SafetyLevel.approval_required)
+            dec = self._match_rules(rel, rules, SafetyLevel.approval_required)
             if dec.safety_level == SafetyLevel.approval_required:
                 return PolicyDecision(dec.safety_level, dec.reason, sensitive=True)
             return dec
-        return self._match_rules(rel, self._read_rules, default)
+        return self._match_rules(rel, rules, default)
 
-    def evaluate_write_file(self, *, path: str) -> PolicyDecision:
+    def evaluate_read_file(self, *, path: str, scope: PathScope | None = None) -> PolicyDecision:
         self._reload_if_needed()
-        resolved, rel, is_external = self._resolve_relpath(path)
-        if resolved is None:
-            return PolicyDecision(SafetyLevel.deny, rel)
-        default = self._write_default
-        if is_external:
-            # 工作区外部路径视为敏感，即使是管理员任务也需人工确认。
-            dec = self._match_rules(rel, self._write_rules, SafetyLevel.approval_required)
-            if dec.safety_level == SafetyLevel.approval_required:
-                return PolicyDecision(dec.safety_level, dec.reason, sensitive=True)
-            return dec
-        return self._match_rules(rel, self._write_rules, default)
+        if scope is not None and scope.invalid:
+            return PolicyDecision(SafetyLevel.deny, scope.invalid)
+        return self._strictest([
+            self._file_decision(reading, self._read_rules, self._read_default)
+            for reading in self._readings(path, scope)
+        ])
 
-    def evaluate_execute_command(self, *, command: str) -> PolicyDecision:
+    @staticmethod
+    def _origin_write_guard(
+        readings: list[tuple[Path | None, str, bool]], scope: PathScope | None,
+    ) -> PolicyDecision | None:
+        """隔离任务绕开自己的副本、直接改原仓库里的文件：至少要人确认。"""
+        if scope is None or not scope.isolated or scope.origin_repo is None:
+            return None
+        for resolved, _rel, _external in readings:
+            if resolved is None or _inside(resolved, scope.project_root):
+                continue
+            if _inside(resolved, scope.origin_repo):
+                return PolicyDecision(
+                    SafetyLevel.approval_required,
+                    f"隔离任务要直接改原仓库 {scope.origin_repo.as_posix()} 里的文件，不是它隔离副本里的那份",
+                    sensitive=True,
+                )
+        return None
+
+    def evaluate_write_file(self, *, path: str, scope: PathScope | None = None) -> PolicyDecision:
+        self._reload_if_needed()
+        if scope is not None and scope.invalid:
+            return PolicyDecision(SafetyLevel.deny, scope.invalid)
+        readings = self._readings(path, scope)
+        decisions = [self._file_decision(reading, self._write_rules, self._write_default) for reading in readings]
+        # 只看工具真正会写到的那个位置：相对路径按工作区再判一遍是为了套更严的规则，写的仍是副本里的文件
+        guard = self._origin_write_guard(readings[:1], scope)
+        if guard is not None:
+            decisions.append(guard)
+        return self._strictest(decisions)
+
+    def evaluate_write_paths(self, *, paths: list[str], scope: PathScope | None = None) -> PolicyDecision:
+        """一次写好几个文件（比如合回隔离副本）：逐个按 write_file 的规则判，取最严的，理由前面写上是哪个文件。"""
+        if not paths:
+            return PolicyDecision(SafetyLevel.deny, "没有给出要写的文件")
+        judged = [(path, self.evaluate_write_file(path=path, scope=scope)) for path in paths]
+        decision = self._strictest([item for _path, item in judged])
+        if len(judged) == 1:
+            return decision
+        deciding = next(path for path, item in judged if item is decision)
+        shown = self.logical_path(deciding, scope) or deciding
+        return PolicyDecision(decision.safety_level, f"{shown}: {decision.reason}", sensitive=decision.sensitive)
+
+    def evaluate_execute_command(self, *, command: str, scope: PathScope | None = None) -> PolicyDecision:
         self._reload_if_needed()
         cmd = command.strip()
         if not cmd:
             return PolicyDecision(SafetyLevel.deny, "empty command")
+        if scope is not None and scope.invalid:
+            return PolicyDecision(SafetyLevel.deny, scope.invalid)
+        texts = [cmd]
+        if scope is not None and scope.mappings:
+            mapped = map_worktree_paths(cmd, scope.mappings)
+            if mapped != cmd:
+                texts.append(mapped)
+        return self._strictest([self._command_decision(text) for text in texts])
 
+    def _command_decision(self, cmd: str) -> PolicyDecision:
         for pat in self._deny_command_patterns:
             if pat.search(cmd):
                 return PolicyDecision(SafetyLevel.deny, f"command denied by pattern: {pat.pattern}")
@@ -947,13 +1115,18 @@ class PolicyEngine:
         # 重启服务属于危险操作，即使是管理员任务也保持审批。
         return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval", sensitive=True)
 
-    def evaluate(self, *, op: str, parameters: dict[str, Any]) -> PolicyDecision:
+    def evaluate(self, *, op: str, parameters: dict[str, Any], scope: PathScope | None = None) -> PolicyDecision:
         if op == "read_file":
-            return self.evaluate_read_file(path=str(parameters.get("path", "")))
+            return self.evaluate_read_file(path=str(parameters.get("path", "")), scope=scope)
         if op == "write_file":
-            return self.evaluate_write_file(path=str(parameters.get("path", "")))
+            if "paths" in parameters:
+                paths = _path_list(parameters.get("paths"))
+                if paths is None:
+                    return PolicyDecision(SafetyLevel.deny, "paths 要是一串非空的文件路径")
+                return self.evaluate_write_paths(paths=paths, scope=scope)
+            return self.evaluate_write_file(path=str(parameters.get("path", "")), scope=scope)
         if op == "execute_command":
-            return self.evaluate_execute_command(command=str(parameters.get("command", "")))
+            return self.evaluate_execute_command(command=str(parameters.get("command", "")), scope=scope)
         if op == "restart":
             return self.evaluate_restart(target=str(parameters.get("target", "")))
         return PolicyDecision(SafetyLevel.deny, f"unknown op: {op}")

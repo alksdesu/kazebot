@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_float, get_int, load_runtime_config
-from engine.project_root import PROJECT_ROOT_KEY, task_project_root
+from engine.project_root import (
+    PROJECT_ORIGIN_KEY,
+    PROJECT_ROOT_KEY,
+    WORKTREE_KEY,
+    isolation_error,
+    task_project_origin,
+    task_project_root,
+)
 from engine.tool_outputs import MAX_PATTERN_CHARS, session_dir_name, tool_output_limits
 from toolbox._common import safe_subprocess_env
 
@@ -161,13 +168,16 @@ def _ready_hit(regex: re.Pattern[str], line: str) -> bool:
 
 @dataclass(frozen=True)
 class _Scope:
-    """调用方任务的身份：owner 是它会话家族的根会话，origin 是它自己面向用户的会话。"""
+    """调用方任务的身份：owner 是它会话家族的根会话，origin 是它自己面向用户的会话。
+
+    placement 是任务 input 里定项目根的那几项（项目根、隔离副本和它对应的原仓库），在锁外再解析成目录。
+    """
 
     task_id: str
     owner: str
     origin: str
     node_id: str
-    project_root: Any
+    placement: dict[str, Any]
     live: bool
     owner_alive: bool
 
@@ -204,6 +214,8 @@ class _Proc:
     started_mono: float = field(default_factory=time.monotonic)
     last_read: float = field(default_factory=time.monotonic)
     reader: threading.Thread | None = None
+    # 起它的任务隔离在 git worktree 里时，worktree 对应的原仓库目录：进程环境变量据此指回原仓库
+    project_origin: str = ""
 
     @property
     def meta_path(self) -> Path:
@@ -301,12 +313,14 @@ class ProcessService:
             raise ProcessError(409, "发起的任务已经结束，不能再起常驻进程")
         if not scope.owner_alive:
             raise ProcessError(409, "这个任务所在的会话不能持有常驻进程")
+        problem = isolation_error(scope.placement)
+        if problem:
+            # 隔离任务退回工作区根就成了直接在原仓库里跑
+            raise ProcessError(409, f"{problem}，不能起常驻进程")
         limits = self._limits()
         runtime = self._runtime(max_runtime_sec, limits)
-        cwd = task_project_root(
-            {PROJECT_ROOT_KEY: scope.project_root} if scope.project_root is not None else {},
-            self.root, task_id=scope.task_id,
-        )
+        cwd = task_project_root(scope.placement, self.root, task_id=scope.task_id)
+        origin = task_project_origin(scope.placement)
         process_id = f"p_{uuid.uuid4().hex[:10]}"
         proc = _Proc(
             id=process_id,
@@ -326,6 +340,7 @@ class ProcessService:
                 max_bytes=limits.log_max_bytes, keep_files=limits.log_keep_files,
             ),
             regex=regex,
+            project_origin=str(origin) if origin is not None else "",
         )
         with self._lock:
             if self._closing:
@@ -654,6 +669,7 @@ class ProcessService:
                 ready_at=data.get("ready_at") if isinstance(data.get("ready_at"), (int, float)) else None,
                 ready_line=data.get("ready_line") if isinstance(data.get("ready_line"), int) else None,
                 eof=True,
+                project_origin=str(data.get("project_origin") or ""),
             )
         except (TypeError, ValueError):
             log.warning("malformed resident process record %s, removed", path)
@@ -706,7 +722,11 @@ class ProcessService:
                 owner=owner,
                 origin=origin,
                 node_id=str(task.node_id or ""),
-                project_root=task_input.get(PROJECT_ROOT_KEY),
+                placement={
+                    key: task_input[key]
+                    for key in (PROJECT_ROOT_KEY, PROJECT_ORIGIN_KEY, WORKTREE_KEY)
+                    if task_input.get(key) is not None
+                },
                 live=not state._task_terminal(task),
                 owner_alive=owner in state.sessions,
             )
@@ -742,7 +762,8 @@ class ProcessService:
     def _spawn(self, proc: _Proc) -> None:
         with proc.lock:
             proc.log.open()
-        popen = osproc.spawn(proc.command, cwd=Path(proc.cwd), env=safe_subprocess_env(), tag=proc.tag)
+        env = safe_subprocess_env(project_origin=proc.project_origin or None)
+        popen = osproc.spawn(proc.command, cwd=Path(proc.cwd), env=env, tag=proc.tag)
         started = osproc.fingerprint(popen.pid, include_exited=True) or ""
         reader = threading.Thread(target=self._pump, args=(proc,), name=f"process-{proc.id}", daemon=True)
         with proc.lock:
@@ -913,6 +934,7 @@ class ProcessService:
             "ended_at": proc.ended_at,
             "stop_reason": proc.stop_reason,
             "log": proc.log.record(),
+            "project_origin": proc.project_origin,
         }
 
     def _write_meta_locked(self, proc: _Proc) -> None:
@@ -948,6 +970,7 @@ class ProcessService:
             "status": proc.status,
             "command": proc.command if len(proc.command) <= _LIST_COMMAND_CHARS else f"{proc.command[:_LIST_COMMAND_CHARS]}…",
             "cwd": proc.cwd,
+            "project_origin": proc.project_origin,
             "session_id": proc.session_id,
             "origin_session_id": proc.origin_session_id,
             "task_id": proc.task_id,

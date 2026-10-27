@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from .. import edit_journal, file_state
 from .._common import request_guard, resolve_under_allowed_roots
-from ..context import project_root_of
+from ..context import project_origin_of, project_root_of
 from ..hashline import hashline_enabled, hashline_prefix
 from ..text_files import TextLayout, decode_text, encode_text, normalize_newlines, split_lines
 from .read_file import LinePrefix, number_prefix, render_lines
@@ -84,7 +84,9 @@ def guard_error_response(err: dict[str, Any], path: str, *, what: str, **cancel_
 def journal_target_refusal(ctx: Any, path: str) -> dict[str, Any] | None:
     """要改的文件落在编辑日志目录里就直接拒，不必先为它弹审批卡。"""
     try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path, project_root=project_root_of(ctx))
+        resolved = resolve_under_allowed_roots(
+            ctx.workspace_root, path, project_root=project_root_of(ctx), project_origin=project_origin_of(ctx),
+        )
     except ValueError:
         return None
     if edit_journal.inside_journal(ctx.workspace_root, resolved):
@@ -119,7 +121,9 @@ async def guard_and_resolve(
     if refusal is not None:
         raise EditRefused(refusal)
     try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path, project_root=project_root_of(ctx))
+        resolved = resolve_under_allowed_roots(
+            ctx.workspace_root, path, project_root=project_root_of(ctx), project_origin=project_origin_of(ctx),
+        )
     except ValueError as exc:
         raise EditRefused(edit_error_response(str(exc), path)) from None
     grant = await claim_or_refuse(ctx, resolved, path)

@@ -17,6 +17,11 @@ MAX_ITEM_ATTACHMENTS = 32
 CONTINUE_FROM_KEY = "continue_from"
 # 批次项最多等几秒：到点没做完的那一项按失败交回，其余照常收齐
 ITEM_TIMEOUT_KEY = "timeout_sec"
+# 委派项要不要隔离：值是 ISOLATION_WORKTREE 时子任务在自己的 git worktree 里做；批次项、dispatch_input、dispatch_origin 都用这两个键
+ISOLATION_KEY = "isolation"
+ISOLATION_WORKTREE = "worktree"
+# 要隔离的仓库：绝对路径，不写就是工作区所在的仓库
+REPO_KEY = "repo"
 
 # dispatch 动作的 dispatch_input 带这个键：不派新的子任务，挂起调用方等这些异步委派
 AWAIT_KEY = "await_dispatches"
@@ -130,6 +135,22 @@ def await_request(action: Any) -> AwaitRequest | None:
         timeout_sec=parse_timeout_sec(raw.get("timeout_sec")),
         call_id=str(raw.get("call_id") or "").strip(),
     )
+
+
+def dispatch_isolation(item: Any) -> str:
+    """委派项要的隔离方式：要 worktree 给 ISOLATION_WORKTREE，没写或写了别的给空串。"""
+    if not isinstance(item, dict):
+        return ""
+    raw = item.get(ISOLATION_KEY)
+    return ISOLATION_WORKTREE if isinstance(raw, str) and raw.strip().lower() == ISOLATION_WORKTREE else ""
+
+
+def dispatch_repo(item: Any) -> str:
+    """委派项写的 repo，去掉首尾空白；没写或不是字符串给空串。"""
+    if not isinstance(item, dict):
+        return ""
+    raw = item.get(REPO_KEY)
+    return raw.strip() if isinstance(raw, str) else ""
 
 
 def batch_item_continue_from(item: Any) -> str:

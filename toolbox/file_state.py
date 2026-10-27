@@ -14,7 +14,7 @@ import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from file_lock import exclusive_lock
 
@@ -423,6 +423,20 @@ def edit_lock(path: Path, workspace_root: Path | str) -> Iterator[None]:
     # exclusive_lock 按默认权限建缺的目录，编辑日志目录得抢在它前面按私有权限建好
     (Path(workspace_root) / JOURNAL_DIR).mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
     with exclusive_lock(edit_lock_path(path, workspace_root)):
+        yield
+
+
+@contextlib.contextmanager
+def edit_locks(paths: Iterable[Path], workspace_root: Path | str) -> Iterator[None]:
+    """一次改好几个文件时拿齐它们的锁：同一把条带锁只拿一次，按锁文件排序拿，两个多文件操作不会互相等。
+
+    和 edit_lock 一样只在线程里拿，持锁期间不能 await，也不能再套着拿 edit_lock。
+    """
+    (Path(workspace_root) / JOURNAL_DIR).mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    lock_paths = sorted({edit_lock_path(Path(path), workspace_root) for path in paths}, key=lambda item: item.name)
+    with contextlib.ExitStack() as stack:
+        for lock_path in lock_paths:
+            stack.enter_context(exclusive_lock(lock_path))
         yield
 
 

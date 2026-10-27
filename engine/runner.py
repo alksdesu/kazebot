@@ -48,7 +48,7 @@ from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_out
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
 from .interrupted_calls import INTERRUPTED_RESUME_TYPE, append_interrupted_results
-from .project_root import task_project_root
+from .project_root import INBOUND_CHILD_WORKTREE_KEY, isolation_error, task_project_origin, task_project_root
 from .run_budget import (
     AUTO_CONTINUE_KEY,
     STEP_COUNT_RESULT_KEY,
@@ -58,6 +58,7 @@ from .run_budget import (
     wrapup_time_ratio,
 )
 from .worker_slots import MAX_ACTIVE_CEILING, WorkerSlots
+from .worktree_report import worktree_brief, worktree_lines
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
 
@@ -1138,6 +1139,10 @@ async def _run_node_task(
     node = load_node(ws_root, node_id)
     if node is None:
         return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
+    isolation_problem = isolation_error(input_data)
+    if isolation_problem:
+        logger.warning("task %s refused: %s", task_id, isolation_problem)
+        return {"action": "fail", "node_id": node_id, "error": isolation_problem}
 
     runtime_cfg = load_runtime_config(ws_root)
     # 先把渠道定下来再动历史：key 按节点最终落到的渠道判，缺了直接失败，不留下分叉了一半的子会话
@@ -1156,6 +1161,7 @@ async def _run_node_task(
         session_id=session_id, worker_id=worker_id,
         http=http, llm_http=llm_http,
         project_root=task_project_root(input_data, ws_root, task_id=task_id),
+        project_origin=task_project_origin(input_data),
         api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
@@ -1341,6 +1347,9 @@ async def _run_node_task(
         _inbound_child_status = str(input_data.get("inbound_child_status") or "").strip()
         if _inbound_child_status:
             _inbound_meta["child_status"] = _inbound_child_status
+        _inbound_worktree = worktree_brief(input_data.get(INBOUND_CHILD_WORKTREE_KEY))
+        if _inbound_worktree:
+            _inbound_meta["child_worktree"] = _inbound_worktree
         _async_tool_status = async_result_tool_status(rctx.task_context)
         if _async_tool_status:
             _inbound_meta["tool_status"] = _async_tool_status
@@ -1367,6 +1376,7 @@ async def _run_node_task(
         _prefix_parts.extend(_dispatch_handle_lines(input_data, _inbound_child_handle, _inbound_node_id))
         if _inbound_summary:
             _prefix_parts.append(f"Summary: {_inbound_summary}")
+        _prefix_parts.extend(worktree_lines(input_data.get(INBOUND_CHILD_WORKTREE_KEY)))
         _prefix_parts.append(f"{_body_label}:\n{instruction}")
         instruction = "\n".join(_prefix_parts)
 
@@ -1500,11 +1510,19 @@ async def _run_tool_task(
     # Purpose: tool-task approvals, progress, and session-scoped built-ins avoid
     # temporary branch sessions.
     parent_session_id = str(input_data.get("parent_session_id") or "").strip()
+    isolation_problem = isolation_error(input_data)
+    if isolation_problem:
+        logger.warning("tool task %s refused: %s", task_id, isolation_problem)
+        return {
+            "action": "fail", "node_id": tool_name, "error": isolation_problem,
+            "summary": f"拒绝执行：{isolation_problem}",
+        }
     _task_ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
     kctx = ToolContext(
         supervisor_url=sup_url, session_id=session_id, run_id=task_id,
         worker_id=worker_id, workspace_root=ws_root, http=http,
         project_root=task_project_root(input_data, ws_root, task_id=task_id),
+        project_origin=task_project_origin(input_data),
         registry=registry, task_id=task_id,
         session_generation=session_generation,
         parent_session_id=parent_session_id,
