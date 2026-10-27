@@ -52,6 +52,8 @@ _MAX_RUNNING = 3600.0
 
 # tests/ 之外的代码只有 clonoth_runtime 该读这个变量，别处再读一次就会各有各的默认值。
 _TIME_LIMIT_ENV = "CLONOTH_TASK_MAX_RUNNING_SECONDS"
+# 只列名字、不读值：platforms/protection 靠这份登记判出它只认进程环境，manage_secret 才不往共享密钥文件里写。
+_NAME_REGISTRIES = {"platforms/protection.py"}
 _SKIP_DIRS = {".venv", "__pycache__", "_research", "tests", "node_modules", ".git", ".claude"}
 
 
@@ -78,7 +80,7 @@ def test_only_clonoth_runtime_reads_the_time_limit_env() -> None:
     offenders: list[str] = []
     for path in _ROOT.rglob("*.py"):
         rel = path.relative_to(_ROOT)
-        if any(part in _SKIP_DIRS for part in rel.parts) or rel.as_posix() == "clonoth_runtime.py":
+        if any(part in _SKIP_DIRS for part in rel.parts) or rel.as_posix() in {"clonoth_runtime.py", *_NAME_REGISTRIES}:
             continue
         try:
             text = path.read_text(encoding="utf-8")
