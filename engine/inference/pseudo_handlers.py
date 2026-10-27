@@ -733,6 +733,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     委派是一条带 dispatch_origin 回调信息的 inbound（POST /v1/inbound）：子节点在自己的 agent: 会话里跑，
     和用户消息共用会话、入口分支和对话存储；做完后结果作为新消息注入回发起方会话。
     """
+    # wait 写了认不出的值也会走到这里：按异步派出去的话，想等结果的调用方拿到的只是一个句柄
+    if _wait_flag(args) is None:
+        _emit_pseudo_tool_result(ls, pseudo_call, _wait_refusal(_wait_value_refusal(args.get("wait"))))
+        return None
     request, refusal = await _resolve_dispatch_request(ls, args, pseudo_call)
     if request is None:
         _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
@@ -920,12 +924,26 @@ _EMPTY_INSTRUCTION = "没有派出：instruction 不能为空，写清楚要目�
 _BAD_ITEM_TIMEOUT = "没有派出：timeout_sec 要填正数秒数；不想限时就不填。"
 
 
+def _wait_flag(arguments: Any) -> bool | None:
+    """委派调用写的 wait：没写（缺省、null、空串）是 False，认得出的开关照读，认不出的给 None。"""
+    raw = arguments.get("wait") if isinstance(arguments, dict) else None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return False
+    return parse_bool(raw)
+
+
+def _wait_value_refusal(raw: Any) -> str:
+    return (
+        f"没有派出：wait 只能是 true 或 false，收到的是 {_short(json.dumps(raw, ensure_ascii=False, default=str), 40)}；"
+        "要等结果就填 true，不等就填 false 或不填。"
+    )
+
+
 def is_wait_dispatch(call: Any) -> bool:
     """带 wait=true 的委派调用：不当场派出，等本轮其它调用跑完再成批同步派出。"""
     if not _dispatch_target_from_tool_name(str(getattr(call, "name", "") or "")):
         return False
-    arguments = getattr(call, "arguments", None)
-    return isinstance(arguments, dict) and bool(parse_bool(arguments.get("wait"), False))
+    return _wait_flag(getattr(call, "arguments", None)) is True
 
 
 def is_await_dispatch(call: Any) -> bool:

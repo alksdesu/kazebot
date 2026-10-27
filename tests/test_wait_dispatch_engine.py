@@ -307,6 +307,81 @@ class TestRefusals:
         assert results_for(ls.messages, "w1")[0]["content"] == _FINAL_STEP_REJECT_MESSAGE.format(tool="dispatch_to_scout")
 
 
+def _bad_wait(raw: Any) -> str:
+    return (
+        f"没有派出：wait 只能是 true 或 false，收到的是 {json.dumps(raw, ensure_ascii=False)}；"
+        "要等结果就填 true，不等就填 false 或不填。"
+    )
+
+
+class TestWaitValues:
+    @pytest.mark.parametrize("raw", ["sync", "是", "wait", 2, 1.5, ["true"], {"on": True}])
+    def test_a_value_that_is_not_a_switch_is_refused_instead_of_going_out_async(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: Any,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = _http_ok()
+
+        action = _run(ls, call("dispatch_to_scout", {"instruction": "go", "wait": raw}, call_id="w1"))
+
+        assert action is None
+        assert ls.rctx.http.post.await_count == 0
+        assert _payload(ls, "w1") == {"success": False, "error": _bad_wait(raw)}
+        assert answered_once(ls.messages)
+
+    @pytest.mark.parametrize("raw", [None, "", "  ", False, "false", "No", 0])
+    def test_unset_or_false_still_goes_out_async(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: Any,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = _http_ok()
+
+        action = _run(ls, call("dispatch_to_scout", {"instruction": "go", "wait": raw}, call_id="a1"))
+
+        assert action is None
+        assert ls.rctx.http.post.await_count == 1
+        assert _payload(ls, "a1")["success"] is True
+
+    @pytest.mark.parametrize("raw", [True, "TRUE", " on "])
+    def test_other_spellings_of_true_still_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: Any,
+    ) -> None:
+        # 文本工具格式解出来的参数全是字符串，"true" 这类写法得照常认
+        ls, _registry = _loop(tmp_path, monkeypatch)
+
+        action = _run(ls, call("dispatch_to_scout", {"instruction": "go", "wait": raw}, call_id="w1"))
+
+        assert action is not None and action.action == ACTION_DISPATCH
+        assert [item["call_id"] for item in action.dispatch_batch] == ["w1"]
+
+    def test_a_refused_value_leaves_the_rest_of_the_round_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = _http_ok()
+
+        action = _run(
+            ls,
+            call("dispatch_to_helper", {"instruction": "later"}, call_id="a1"),
+            call("dispatch_to_scout", {"instruction": "go", "wait": "同步"}, call_id="x1"),
+            _wait("scout", call_id="w1"),
+        )
+
+        assert [item["call_id"] for item in action.dispatch_batch] == ["w1"]
+        assert ls.rctx.http.post.await_count == 1
+        assert _payload(ls, "x1") == {"success": False, "error": _bad_wait("同步")}
+        assert _answer_order(ls) == ["a1", "x1", "w1"]
+        assert answered_once(ls.messages)
+
+    def test_a_long_value_is_cut_in_the_reason(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = _http_ok()
+
+        _run(ls, call("dispatch_to_scout", {"instruction": "go", "wait": "x" * 200}, call_id="w1"))
+
+        assert f'收到的是 "{"x" * 39}...<truncated>；' in _payload(ls, "w1")["error"]
+
+
 class TestAttachments:
     def test_screened_attachments_ride_in_the_batch_item(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         image = tmp_path / "data" / "attachments" / "a.png"
