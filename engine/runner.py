@@ -42,7 +42,7 @@ from .inference.message_model import apply_reasoning_content
 from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
-from .node import Node, load_node, node_file, node_files
+from .node import Node, internal_node, load_node, node_file, node_files
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
@@ -318,7 +318,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             continue
         # internal 节点不进枚举：它们回的是给程序看的判定值，被 AI switch 过去
         # 就会有人在群里收到一句 "no|群友之间在对话"。
-        if bool((n.extra or {}).get("internal")):
+        if internal_node(n):
             continue
         seen_ids.add(n.id)
         all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})

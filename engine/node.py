@@ -325,3 +325,8 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         persistent=persistent,
         extra=extra,
     )
+
+
+def internal_node(node: Node) -> bool:
+    """internal 节点回的是给程序看的判定值，switch_node 枚举和终端界面的入口列表都不列它；手写的 "no"、"false" 也算关。"""
+    return bool(parse_bool((node.extra or {}).get("internal"), False))

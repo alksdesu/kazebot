@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from engine.node import load_node, node_files
+from engine.node import internal_node, load_node, node_files
 
 
 @dataclass
@@ -26,7 +26,7 @@ def scan_nodes(workspace_root: Path) -> list[NodeInfo]:
         if node is None or node.id in seen_ids:
             continue
         # internal 节点回的是给程序看的判定值，选它当入口只会收到 "no|群友之间在对话" 这种话
-        if (node.extra or {}).get("internal"):
+        if internal_node(node):
             continue
         seen_ids.add(node.id)
         result.append(NodeInfo(

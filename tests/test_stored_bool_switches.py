@@ -28,6 +28,8 @@ from engine.data_cleanup import _memory_entry_expired  # noqa: E402
 from engine.memory_namespace import conversation_namespace  # noqa: E402
 from engine.node import Node, load_node  # noqa: E402
 from engine.prompt import assemble_prompt  # noqa: E402
+from engine.runner import _discover_switchable_nodes  # noqa: E402
+from shell.tui.services.node_scanner import scan_nodes  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from toolbox import mcp_runtime  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
@@ -81,6 +83,19 @@ class TestNodeFile:
         node = load_node(tmp_path, "worker")
 
         assert node is not None and node.persistent is default_off
+
+    @pytest.mark.parametrize("raw,default_off,_default_on", _CASES)
+    def test_internal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, default_off: bool, _default_on: bool,
+    ) -> None:
+        # 挡住仓库自带的 defaults/nodes，节点表里只剩这一个
+        monkeypatch.setattr(config_layout, "CODE_ROOT", tmp_path)
+        _write(config_layout.nodes_dir(tmp_path) / "judge.yaml", f"id: judge\ntype: ai\nprompt: hi\ninternal: {raw}\n")
+
+        switchable = {row["id"] for row in _discover_switchable_nodes(tmp_path, "someone.else")}
+        entries = {node.id for node in scan_nodes(tmp_path)}
+
+        assert switchable == entries == (set() if default_off else {"judge"})
 
     @pytest.mark.parametrize("raw,_default_off,default_on", _CASES)
     def test_prompt_block_enabled(self, tmp_path: Path, raw: str, _default_off: bool, default_on: bool) -> None:
