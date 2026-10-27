@@ -84,7 +84,8 @@ from platforms.descriptor import (
 from platforms.ids import normalize_id
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 from platforms.registry import platform_data_dir, platform_state_path
-from stickers.collect import sticker_root, store_path
+from stickers import files as sticker_files
+from stickers.collect import store_path
 from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
 
@@ -436,10 +437,11 @@ class FakeChatAdapter:
 
     def sticker_file(self, row: Sticker) -> Path | None:
         """按图片声明判断发不发得出去：落在库外的路径、空文件、超过大小上限的都不发。"""
-        root = sticker_root(self.workspace).resolve()
-        path = (self.workspace / row.rel_path).resolve()
+        path = sticker_files.sticker_file(self.workspace, row.rel_path)
+        if path is None:
+            return None
         try:
-            return path if path.is_relative_to(root) and _image_fits(path.stat().st_size) else None
+            return path if _image_fits(path.stat().st_size) else None
         except OSError:
             return None
 
