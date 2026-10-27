@@ -2323,8 +2323,8 @@ async def run_ai_node(
     delegate_targets = list(_delegation.targets)
     _isolating = list(_delegation.isolating)
     tool_specs = _filter_tool_specs(node, _registry_specs)
-    # 跑不通的生图工具（gpt_image_2 / gemini_image）从可用工具列表里彻底移除，
-    # 杜绝「未配置却被误调用、调完 404」。
+    # 确定没配的生图工具（gpt_image_2 / gemini_image）从可用工具列表里彻底移除，
+    # 杜绝「未配置却被误调用、调完 404」；判断不了的留着，让工具报出原因。
     try:
         from ..builtin.image_gen_gating import disabled_image_tools, IMAGE_GEN_TOOLS
         _disabled_img = disabled_image_tools(rctx.workspace_root)

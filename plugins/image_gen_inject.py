@@ -11,15 +11,12 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Mapping
-
-import config_layout
+from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
 _TARGET_NODE_ID = "draw.image_gen"
 _PLACEHOLDER = "<<IMAGE_TOOLS_AVAILABILITY>>"
-_SLOT_BY_TOOL = {"gpt_image_2": "image_gpt", "gemini_image": "image_gemini"}
 _TOOL_BLURB = {
     "gpt_image_2": "写实/照片/图片编辑/精确分辨率生图",
     "gemini_image": "二次元/插画/风格化/按宽高比生图",
@@ -31,34 +28,27 @@ _CONDITION_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
-def _available_tools(root: Path) -> dict[str, bool]:
+# 告警过、至今还在的「判断不了」原因：每一步都会重新判一遍，同一个原因只记一次，好了再犯再记。
+_warned_problems: set[str] = set()
+
+
+def _tool_statuses(root: Path) -> dict[str, Any]:
+    """每个生图工具的 ImageToolStatus，按 clonoth_runtime.IMAGE_TOOL_SLOTS 的顺序。"""
     try:
-        from clonoth_runtime import image_tool_available
+        from clonoth_runtime import IMAGE_TOOL_SLOTS, image_tool_status
     except Exception as exc:  # noqa: BLE001
         logger.warning("image_gen_inject: 取不到渠道判定，提示词保持原样: %s", exc)
         return {}
-    return {tool: image_tool_available(root, tool) for tool in _SLOT_BY_TOOL}
+    return {tool: image_tool_status(root, tool) for tool in IMAGE_TOOL_SLOTS}
 
 
 def _read_default_channel(root: Path) -> str:
-    """控制台选的默认生图工具。只在配了多个渠道时才有意义。"""
+    """控制台选的默认生图工具。只在配了多个渠道时才有意义；和可用性判断读同一份 models.yaml。"""
     try:
-        import yaml  # type: ignore
-    except Exception:
+        from clonoth_runtime import image_default_channel
+    except Exception:  # noqa: BLE001
         return ""
-    path = config_layout.models_path(root)
-    if not path.exists():
-        return ""
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("image_gen_inject: 读取 models.yaml 失败: %s", exc)
-        return ""
-    block = data.get("image_gen") if isinstance(data, dict) else None
-    if not isinstance(block, dict):
-        return ""
-    name = str(block.get("default_channel") or "").strip()
-    return name if name in _SLOT_BY_TOOL else ""
+    return image_default_channel(root)
 
 
 def build_flags(available: Mapping[str, bool]) -> dict[str, bool]:
@@ -104,6 +94,23 @@ def build_availability_text(available: Mapping[str, bool], default_channel: str 
     return "\n".join(lines)
 
 
+def build_unjudgeable_text(possible: Mapping[str, bool], problems: Sequence[str]) -> str:
+    """有生图渠道判断不了时的说明。不能说成没配：照常调用，让工具自己报出原因。"""
+    lines = ["【生图渠道】现在判断不了哪些生图渠道能用：%s。" % "；".join(problems)]
+    for tool in (tool for tool, ok in possible.items() if ok):
+        lines.append("- `%s`：%s。" % (tool, _TOOL_BLURB.get(tool, "生图")))
+    lines.append("照常调用上面的工具。工具报错时把它给的原因如实告诉用户，不要换着工具反复重试。")
+    return "\n".join(lines)
+
+
+def _warn_unjudgeable(problems: Sequence[str]) -> None:
+    _warned_problems.intersection_update(problems)
+    for problem in problems:
+        if problem not in _warned_problems:
+            _warned_problems.add(problem)
+            logger.warning("image_gen_inject: 判断不了生图渠道，相关段落照常发出：%s", problem)
+
+
 def _rewrite(text: str, availability: str, flags: Mapping[str, bool]) -> str:
     return render_conditions(text.replace(_PLACEHOLDER, availability), flags)
 
@@ -127,12 +134,19 @@ class ImageGenAvailabilityInjector:
             return None
         root = Path(workspace_root)
 
-        available = _available_tools(root)
-        if not available:
+        statuses = _tool_statuses(root)
+        if not statuses:
             # 判定本身失败了。这时说"一个都没配"是在撒谎，原样发出去让工具自己报错。
             return None
-        flags = build_flags(available)
-        availability = build_availability_text(available, _read_default_channel(root))
+        # 判断不了的和能用的一样留着：只有确定没配的才连文档一起拿掉
+        possible = {tool: status.available or bool(status.problem) for tool, status in statuses.items()}
+        problems = sorted({status.problem for status in statuses.values() if status.problem})
+        flags = build_flags(possible)
+        _warn_unjudgeable(problems)
+        if problems:
+            availability = build_unjudgeable_text(possible, problems)
+        else:
+            availability = build_availability_text(possible, _read_default_channel(root))
 
         replaced = False
         for message in ctx.messages:
@@ -162,7 +176,11 @@ class ImageGenAvailabilityInjector:
 
         logger.info(
             "image_gen_inject: 裁剪生图提示词 %s node=%s",
-            " ".join("%s=%s" % (tool, ok) for tool, ok in available.items()), _TARGET_NODE_ID,
+            " ".join(
+                "%s=%s" % (tool, "unknown" if status.problem else status.available)
+                for tool, status in statuses.items()
+            ),
+            _TARGET_NODE_ID,
         )
         return _hook_result(modified=True)
 

@@ -75,6 +75,12 @@ if __name__ == "__main__":
                 return True
         return False
 
+    def x_search_configured(dotenv: dict[str, str]) -> bool:
+        # 和 x_search 取密钥的规则一致：OPENAI_API_KEY 只发给 XAI_BASE_URL 指的中转站，不发去 api.x.ai
+        if has_config_key(dotenv, "XAI_API_KEY"):
+            return True
+        return has_config_key(dotenv, "XAI_BASE_URL") and has_config_key(dotenv, "OPENAI_API_KEY")
+
     def extract_text(value: Any) -> str:
         if isinstance(value, str):
             return value.strip()
@@ -171,7 +177,7 @@ if __name__ == "__main__":
         # 点名要 X 的问题直接走 X：主模型的联网搜索覆盖不到站内帖子。
         lower_query = query.lower()
         wants_x = any(token in lower_query for token in ["twitter", "tweet", "tweets", "x 上", "x上", "推特", "推文"])
-        if wants_x and has_config_key(dotenv, "XAI_API_KEY", "OPENAI_API_KEY"):
+        if wants_x and x_search_configured(dotenv):
             return "x"
         return "auto"
 

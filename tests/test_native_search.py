@@ -246,6 +246,66 @@ class TestDispatchRefusesBeforeSpending:
         assert out["ok"] is False
         assert "api_key" in out["error"]
 
+    def test_an_unreadable_models_file_is_reported_before_any_request(self, tmp_path: Path, upstream) -> None:
+        # 读不了就不知道该打哪、带哪把密钥，凭空猜一条发出去就是一次白花的计费请求。
+        server = upstream(REPLIES["openai"])
+        config = CONFIG.format(provider="openai", base_url=server.base_url).replace(
+            "api_key: sk-test", "api_key: [sk-test",
+        )
+        out = _run(_workspace(tmp_path, config))
+
+        assert out["ok"] is False
+        assert out["error"].startswith("config/models.yaml 读不了")
+        assert "sk-test" not in out["error"]
+        assert server.seen == []
+
+
+def _slot(*lines: str) -> str:
+    return "\n".join(["system_models:", "  native_search:", *("    " + line for line in lines), ""])
+
+
+class TestASlotWithItsOwnAddress:
+    """槽位自己指了地址：地址、格式和密钥是绑死的一组，主渠道那两样都不跟过去。"""
+
+    def test_the_main_key_is_never_sent_to_it(self, tmp_path: Path, upstream) -> None:
+        server = upstream(REPLIES["openai"])
+        config = CONFIG.format(provider="gemini", base_url="https://main.example") + _slot(
+            f"base_url: {server.base_url}/v1",
+        )
+
+        out = _run(_workspace(tmp_path, config))
+
+        assert out["ok"] is False
+        assert "主渠道的密钥不会发到别的地址去" in out["error"]
+        assert "CLONOTH_NATIVE_SEARCH_API_KEY" in out["error"]
+        assert server.seen == []
+
+    def test_with_its_own_key_it_speaks_openai(self, tmp_path: Path, upstream) -> None:
+        # 主渠道是 gemini，槽位又没点名是哪家：按中转站的最小公约数 OpenAI 格式发。
+        server = upstream(REPLIES["openai"])
+        config = CONFIG.format(provider="gemini", base_url="https://main.example") + _slot(
+            f"base_url: {server.base_url}/v1", "api_key: sk-slot",
+        )
+
+        out = _run(_workspace(tmp_path, config))
+
+        assert out["ok"] is True, out
+        assert [sent["path"] for sent in server.seen] == ["/v1/chat/completions"]
+        assert server.seen[0]["headers"]["authorization"] == "Bearer sk-slot"
+        assert "sk-test" not in json.dumps(server.seen[0])
+
+    def test_it_may_name_a_channel_for_its_key_and_wire(self, tmp_path: Path, upstream) -> None:
+        server = upstream(REPLIES["openai-responses"])
+        config = CONFIG.format(provider="gemini", base_url="https://main.example") + "\n".join([
+            "relay:", "  type: openai-responses", "  api_key: sk-relay", "",
+        ]) + _slot("provider: relay", f"base_url: {server.base_url}/v1")
+
+        out = _run(_workspace(tmp_path, config))
+
+        assert out["ok"] is True, out
+        assert [sent["path"] for sent in server.seen] == ["/v1/responses"]
+        assert server.seen[0]["headers"]["authorization"] == "Bearer sk-relay"
+
 
 class TestTheWireComesFromTheProvider:
     @pytest.mark.parametrize(("provider", "wire"), [

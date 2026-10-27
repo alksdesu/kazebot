@@ -18,9 +18,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 import config_layout
+from tools._channel import read_yaml_document
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +33,17 @@ _MAX_INJECT_CHARACTERS = 8
 
 
 def _load_character_tags(workspace_root: Path) -> list[dict[str, Any]]:
-    """读取实例的 config/drawtools/character_tags.yaml（不存在则回退仓库的 example）。"""
+    """读取实例的 config/drawtools/character_tags.yaml（不存在则回退仓库的 example）。
+
+    写坏了沿用这个进程上一次读成的那份；一次都没读成过就按没有角色算。同一版坏文件只告警一次。
+    """
     path = config_layout.drawtools_effective(workspace_root, "character_tags.yaml")
-    if not path.is_file():
-        return []
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("draw_character_inject: 读取角色库失败: %s", exc)
-        return []
-    chars = data.get("characters") if isinstance(data, dict) else []
+    data = read_yaml_document(
+        path,
+        label=config_layout.logical_path(workspace_root, path),
+        unread_note="这个进程还没读成过，按没有角色算",
+    ).data
+    chars = data.get("characters")
     if not isinstance(chars, list):
         return []
     return [c for c in chars if isinstance(c, dict)]

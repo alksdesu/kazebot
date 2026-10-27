@@ -1,13 +1,16 @@
-"""哪些环境变量是实例身份，以及数据根下被占着的那几个名字。
+"""哪些环境变量是实例身份、哪些只认进程环境，以及数据根下被占着的那几个名字。
 
 共享组把一个实例的 .env 抄进组里给别人用。端口、监听地址、平台令牌、路径抄过去，组里的实例就会去抢同一个端口、
-用同一个令牌登录、把文件写到别人家里 —— 所以 is_instance_env 漏一个就是一次串号。数据根下 stickers 和 shared
-两个目录不是实例，实例叫这名字工作区就落到它们身上。
+用同一个令牌登录、把文件写到别人家里 —— 所以 is_instance_env 漏一个就是一次串号。只认进程环境的设置写进共享
+密钥文件谁也读不到，manage_secret 报成功就是在骗人。数据根下 stickers 和 shared 两个目录不是实例，实例叫这名字
+工作区就落到它们身上。
 """
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -17,10 +20,31 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import config_layout  # noqa: E402
+from adapters.onebot import process_env as qq_process_env  # noqa: E402
 from adapters.onebot import provisioning as qq_provisioning  # noqa: E402
+from adapters.onebot.live_config import LIVE_KEYS  # noqa: E402
+from clonoth_runtime import SYSTEM_MODEL_SLOTS  # noqa: E402
+from platforms import protection  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
-from platforms.descriptor import PlatformDescriptor  # noqa: E402
-from platforms.protection import instance_env_names, is_instance_env  # noqa: E402
+from platforms.descriptor import HOOK_PROCESS_ENV, PlatformDescriptor  # noqa: E402
+from platforms.protection import (  # noqa: E402
+    BASIS_DECLARED,
+    BASIS_INJECTED,
+    BASIS_INTERPRETER,
+    BASIS_PATH,
+    BASIS_PROXY,
+    BASIS_SETTING,
+    ENV_INSTANCE,
+    ENV_PROCESS,
+    ENV_SHARED,
+    EnvScope,
+    env_scope,
+    instance_env_names,
+    is_instance_env,
+    is_process_env,
+    is_shareable_env,
+    process_env_names,
+)
 from platforms.registry import PLATFORM_ENV  # noqa: E402
 from supervisor import provisioning  # noqa: E402
 from supervisor.instances import ports_for  # noqa: E402
@@ -122,7 +146,10 @@ class TestWhatCountsAsInstanceIdentity:
 
     @pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONIOENCODING", "PYTHONUNBUFFERED"])
     def test_the_interpreter_settings_never_travel(self, name: str) -> None:
-        assert is_instance_env(name) is True
+        # 解释器只在启动时读进程环境：不是实例身份，但也一样不跟着组走。
+        assert is_instance_env(name) is False
+        assert is_process_env(name) is True
+        assert is_shareable_env(name) is False
 
     @pytest.mark.parametrize("name", [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "EXA_API_KEY", "DRAW_TAG_MODEL", "OPENAI_BASE_URL",
@@ -161,6 +188,152 @@ class TestWhatCountsAsInstanceIdentity:
 
         assert is_instance_env("X_BRIDGE_TOKEN", [other]) is True
         assert is_instance_env("X_BRIDGE_TOKEN", [QQ_NAPCAT]) is False
+
+
+_QQ_LIVE_ENV = sorted({env for key in LIVE_KEYS for env in key.env})
+_SLOT_ENV = sorted(
+    f"{spec.env_prefix}_{suffix}"
+    for spec in SYSTEM_MODEL_SLOTS
+    for suffix in ("MODEL", "BASE_URL", "API_KEY", "PROVIDER")
+)
+
+
+@pytest.fixture
+def fresh_hook_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(protection, "_warned_hooks", set())
+
+
+def _platform_with_hook(module_name: str) -> PlatformDescriptor:
+    return PlatformDescriptor(id="x", display_name="X", short_name="X", hooks={HOOK_PROCESS_ENV: module_name})
+
+
+class TestWhereEachVariableBelongs:
+    @pytest.mark.parametrize("name", sorted(protection._CORE_PROCESS_SETTINGS))
+    def test_a_core_setting_is_read_from_the_process_only(self, name: str) -> None:
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_SETTING)
+
+    @pytest.mark.parametrize("name", sorted(protection._CORE_INJECTED_ENV))
+    def test_runtime_context_is_injected_not_configured(self, name: str) -> None:
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_INJECTED)
+
+    @pytest.mark.parametrize("name", ["HTTP_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"])
+    def test_a_proxy_in_either_case_is_a_process_setting(self, name: str) -> None:
+        # Linux 上两种大小写是两个变量，urllib 先读小写的：只认大写的话小写那份照样被当成密钥抄走。
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_PROXY)
+        assert is_shareable_env(name) is False
+
+    @pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONHOME", "PYTHONUTF8"])
+    def test_the_interpreter_reads_its_own(self, name: str) -> None:
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_INTERPRETER)
+
+    @pytest.mark.parametrize("name", sorted(qq_process_env.STARTUP_ENV | qq_process_env.HOST_ENV))
+    def test_what_the_qq_side_reads_at_start_up_is_its_own(self, name: str) -> None:
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_SETTING, QQ_NAPCAT.id)
+
+    @pytest.mark.parametrize("name", _QQ_LIVE_ENV)
+    def test_a_live_option_fallback_is_a_qq_process_setting(self, name: str) -> None:
+        # 控制台平台页那些选项在两份配置文件都没写时兜底读的环境变量，只认适配进程自己的环境。
+        assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_SETTING, QQ_NAPCAT.id)
+
+    @pytest.mark.parametrize("name,expected", [
+        ("ONEBOT_FORWARD_BRIDGE_PORT", EnvScope(ENV_INSTANCE, BASIS_DECLARED, QQ_NAPCAT.id)),
+        ("CLONOTH_BASE_URL", EnvScope(ENV_INSTANCE, BASIS_DECLARED)),
+        ("ONEBOT_IDEMPOTENCY_STORE_FILE", EnvScope(ENV_INSTANCE, BASIS_PATH)),
+        ("CLONOTH_ORIGIN_ROOT", EnvScope(ENV_INSTANCE, BASIS_PATH)),
+        # NoneBot 自己读的，值是这个实例的 NapCat 接口地址
+        ("ONEBOT_API_ROOTS", EnvScope(ENV_INSTANCE, BASIS_PATH)),
+        ("ONEBOT_V11_API_ROOTS", EnvScope(ENV_INSTANCE, BASIS_PATH)),
+    ])
+    def test_identity_is_judged_before_the_process_lists(self, name: str, expected: EnvScope) -> None:
+        # 这几个适配进程也是启动时读一次，但值是端口、地址、路径，只能留在本实例 .env。
+        assert env_scope(name) == expected
+
+    @pytest.mark.parametrize("name", [
+        *_SLOT_ENV,
+        "CLONOTH_NATIVE_SEARCH_MODEL",
+        "CLONOTH_NATIVE_SEARCH_BASE_URL",
+        "CLONOTH_NATIVE_SEARCH_API_KEY",
+        "CLONOTH_NATIVE_SEARCH_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "EXA_API_KEY",
+        "EXA_BASE_URL",
+        "XAI_API_KEY",
+        "XAI_BASE_URL",
+        "WEB_SEARCH_PROVIDER",
+        "WEB_SEARCH_SOURCE",
+        "WEB_SEARCH_TOTAL_TIMEOUT_SEC",
+        "WEB_SEARCH_CHILD_TIMEOUT_SEC",
+        "NOVELAI_API_KEY",
+        "DRAW_TAG_MODEL",
+    ])
+    def test_what_the_secrets_file_serves_is_shared(self, name: str) -> None:
+        # 这些都经 dotenv 两层、${VAR} 或共享密钥文件取值，组里别的实例配上的这边读得到。
+        assert env_scope(name) == EnvScope(ENV_SHARED)
+        assert is_shareable_env(name) is True
+
+    def test_no_process_name_is_swallowed_by_the_identity_rules(self) -> None:
+        # 身份先判：名单里的名字带着路径后缀或被平台声明成身份的话，名单里那一行等于没写。
+        swallowed = sorted(name for name in process_env_names() if env_scope(name).kind != ENV_PROCESS)
+
+        assert swallowed == []
+
+
+class TestPlatformProcessEnvHooks:
+    def test_a_platform_without_the_hook_only_gets_the_core_lists(self, fresh_hook_warnings: None) -> None:
+        other = PlatformDescriptor(id="x", display_name="X", short_name="X")
+
+        assert env_scope("ONEBOT_GROUP_TRIGGER", [other]) == EnvScope(ENV_SHARED)
+        assert env_scope("CLONOTH_LOG_LEVEL", [other]) == EnvScope(ENV_PROCESS, BASIS_SETTING)
+        assert process_env_names([other]) == process_env_names([])
+
+    def test_what_a_hook_reports_belongs_to_its_platform(
+        self, fresh_hook_warnings: None, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = types.ModuleType("clonoth_process_env_probe")
+        module.process_env_names = lambda: frozenset({"X_POLL_SECONDS"})  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        other = _platform_with_hook(module.__name__)
+
+        assert env_scope("X_POLL_SECONDS", [other]) == EnvScope(ENV_PROCESS, BASIS_SETTING, "x")
+        assert env_scope("x_poll_seconds", [other]).kind == ENV_PROCESS
+        assert "X_POLL_SECONDS" in process_env_names([other])
+
+    def test_a_broken_hook_falls_back_to_the_core_lists_and_warns_once(
+        self, fresh_hook_warnings: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def broken() -> frozenset[str]:
+            raise RuntimeError("qq.yaml unreadable")
+
+        module = types.ModuleType("clonoth_process_env_broken_probe")
+        module.process_env_names = broken  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        other = _platform_with_hook(module.__name__)
+
+        with caplog.at_level(logging.WARNING, logger=protection.__name__):
+            first = env_scope("X_POLL_SECONDS", [other])
+            again = env_scope("X_POLL_SECONDS", [other])
+            core = env_scope("CLONOTH_LOG_LEVEL", [other])
+
+        assert first == again == EnvScope(ENV_SHARED)
+        assert core == EnvScope(ENV_PROCESS, BASIS_SETTING)
+        warnings = [record.getMessage() for record in caplog.records if "process_env" in record.getMessage()]
+        assert len(warnings) == 1
+        assert "qq.yaml unreadable" in warnings[0]
+
+    def test_a_hook_module_that_cannot_be_imported_does_not_break_the_judgement(
+        self, fresh_hook_warnings: None, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        other = _platform_with_hook("clonoth_no_such_process_env_module")
+
+        with caplog.at_level(logging.WARNING, logger=protection.__name__):
+            scope = env_scope("X_POLL_SECONDS", [other])
+
+        assert scope == EnvScope(ENV_SHARED)
+        assert any("process_env" in record.getMessage() for record in caplog.records)
 
 
 class TestNamesTheDataRootHasAlreadyTaken:

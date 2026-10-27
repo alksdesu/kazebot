@@ -1,19 +1,30 @@
 """生图渠道的回退链，以及提示词按可用渠道的裁剪。
 
 难点是「借主渠道」的边界：地址借错家不会报地址错误，只会得到一个跟配置毫无关系的
-404。所以格式对不上时宁可判成没配。
+404。所以格式对不上时宁可判成没配。models.yaml 读不了又是另一回事：那是判断不了，不是没配。
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import importlib.util
+import json
+import logging
+import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterator
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+from toolbox._common import safe_subprocess_env  # noqa: E402
 
 
 def _load(name: str, relative: str):
@@ -55,6 +66,23 @@ openai:
   model: '[v]some-chat-model'
 """
 
+_RESPONSES_MAIN = """
+version: 1
+provider: openai-responses
+openai-responses:
+  base_url: https://gw.example.com/v1
+  api_key: main-key
+  model: gpt-5.5
+"""
+
+# 出错的正是写着密钥的那一行：报出来的原因里不能带上它。
+_BROKEN_MODELS = """version: 1
+provider: openai
+openai:
+  api_key: [sk-secret-in-a-bad-line
+  base_url: https://gw.example.com/v1
+"""
+
 
 @pytest.fixture(autouse=True)
 def _no_ambient_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,7 +120,8 @@ class TestBorrowingTheMainChannel:
         assert resolved.usable
         assert resolved.base_url == "https://gw.example.com/v1"
 
-    def test_deepseek_counts_as_openai_compatible(self, tmp_path: Path) -> None:
+    def test_a_deepseek_main_channel_is_not_borrowed(self, tmp_path: Path) -> None:
+        # DeepSeek 只有 chat/completions，没有 images 端点，借过去发的每一张都是 404。
         root = _workspace(tmp_path, """
 version: 1
 provider: deepseek
@@ -101,7 +130,43 @@ deepseek:
   api_key: ds-key
   model: deepseek-v4
 """)
-        assert channel.resolve_image_channel("image_gpt", root=root).usable
+        resolved = channel.resolve_image_channel("image_gpt", root=root)
+
+        assert not resolved.usable
+        assert (resolved.api_key, resolved.base_url) == ("", "")
+
+    @pytest.mark.parametrize("config", [
+        _RESPONSES_MAIN,
+        # 块名随便起，type 写明是哪一家
+        """
+version: 1
+provider: relay
+relay:
+  type: openai-responses
+  base_url: https://gw.example.com/v1
+  api_key: main-key
+  model: gpt-5.5
+""",
+    ], ids=["block-name", "declared-type"])
+    def test_gpt_borrows_a_responses_main_channel(self, tmp_path: Path, config: str) -> None:
+        # 同一个兼容网关的根下 responses、chat/completions 和 images 都挂着，Engine 也按同一族看。
+        resolved = channel.resolve_image_channel("image_gpt", root=_workspace(tmp_path, config))
+
+        assert resolved.usable
+        assert (resolved.api_key, resolved.base_url) == ("main-key", "https://gw.example.com/v1")
+        assert resolved.model == "gpt-image-2"
+
+    def test_gemini_refuses_a_responses_main_channel(self, tmp_path: Path) -> None:
+        resolved = channel.resolve_image_channel("image_gemini", root=_workspace(tmp_path, _RESPONSES_MAIN))
+
+        assert resolved.api_key == ""
+        assert not resolved.usable
+
+    def test_the_gpt_slot_borrows_exactly_what_the_engine_calls_one_family(self) -> None:
+        from engine.runner import _OPENAI_COMPATIBLE_PROVIDERS
+
+        assert channel.OPENAI_FAMILY == _OPENAI_COMPATIBLE_PROVIDERS
+        assert set(channel.IMAGE_SLOTS["image_gpt"].providers) == channel.OPENAI_FAMILY
 
     def test_gemini_refuses_an_openai_main_channel(self, tmp_path: Path) -> None:
         # generateContent 是 Gemini 原生端点，别家的地址接不住。
@@ -245,15 +310,18 @@ class TestAvailabilityText:
         assert "finish" in text
 
 
+def _image_gen_prompt() -> str:
+    import yaml
+
+    data = yaml.safe_load((_ROOT / "defaults" / "nodes" / "draw.image_gen.yaml").read_text(encoding="utf-8"))
+    return str(data["prompt"])
+
+
 class TestRealPrompt:
     """拿真实节点提示词跑一遍，标记漏配对的话这里会先炸。"""
 
     def _prompt(self) -> str:
-        import yaml
-
-        data = yaml.safe_load(
-            (_ROOT / "defaults" / "nodes" / "draw.image_gen.yaml").read_text(encoding="utf-8"))
-        return str(data["prompt"])
+        return _image_gen_prompt()
 
     def test_only_gemini_leaves_no_trace_of_gpt(self) -> None:
         available = {"gpt_image_2": False, "gemini_image": True}
@@ -281,7 +349,8 @@ def _drawtools_workspace(tmp_path: Path, config: str, settings: str | None) -> P
     """带 tools/ 的完整工作区。按路径加载靠的是模块位置，所以脚本得真的在；运行时配置在实例的 config/drawtools/。"""
     root = _workspace(tmp_path, config)
     (root / "tools" / "drawtools").mkdir(parents=True, exist_ok=True)
-    for name in ("_channel.py",):
+    # _channel 按需从自己旁边加载 _wire：只跑这几个用例时没有别处先把它导进来。
+    for name in ("_channel.py", "_wire.py"):
         (root / "tools" / name).write_text(
             (_ROOT / "tools" / name).read_text(encoding="utf-8"), encoding="utf-8")
     for name in ("common.py",):
@@ -362,6 +431,261 @@ class TestDisabledDrawNodes:
             tmp_path, "version: 1\nprovider: openai\n", "api:\n  api_key: nai-key\n")
 
         assert self._disabled(root) == {"draw.image_gen"}
+
+    def test_an_unreadable_models_file_keeps_the_image_tools_and_their_node(self, tmp_path: Path) -> None:
+        # 判断不了不等于没配：摘掉的话模型只会说「没配生图」，真正的原因谁也看不到。
+        from engine.builtin.image_gen_gating import disabled_image_tools
+
+        root = _drawtools_workspace(tmp_path, _BROKEN_MODELS, "api:\n  api_key: ''\n")
+
+        assert disabled_image_tools(root) == set()
+        assert self._disabled(root) == {"draw.novelai_planner"}
+
+    def test_an_unreadable_settings_file_keeps_the_novelai_node(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: [nai-secret-key\n")
+
+        assert self._disabled(root) == set()
+
+    def test_a_settings_file_with_the_wrong_shape_keeps_the_novelai_node(self, tmp_path: Path) -> None:
+        # 能解析、结构却不对：判断不了，不是没配，原因要说到是哪一项
+        from clonoth_runtime import novelai_status
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: nai-key\nparams: 5\n")
+        status = novelai_status(root)
+
+        assert status.problem.endswith("settings.yaml 读不了：params 不是映射（key: value）")
+        assert not status.unconfigured
+        assert self._disabled(root) == set()
+
+
+class TestImageToolStatus:
+    def test_a_configured_tool_is_available(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_tool_status
+
+        status = image_tool_status(_drawtools_workspace(tmp_path, _OPENAI_MAIN, None), "gpt_image_2")
+
+        assert (status.available, status.problem, status.unconfigured) == (True, "", False)
+
+    def test_a_tool_with_nothing_to_borrow_is_unconfigured(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_tool_status
+
+        status = image_tool_status(_drawtools_workspace(tmp_path, _OPENAI_MAIN, None), "gemini_image")
+
+        assert (status.available, status.problem, status.unconfigured) == (False, "", True)
+
+    def test_an_unreadable_models_file_is_a_problem_not_a_verdict(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_tool_available, image_tool_status
+
+        root = _drawtools_workspace(tmp_path, _BROKEN_MODELS, None)
+        status = image_tool_status(root, "gpt_image_2")
+
+        assert status.problem.startswith("config/models.yaml 读不了")
+        assert "sk-secret-in-a-bad-line" not in status.problem
+        assert not status.available and not status.unconfigured
+        assert image_tool_available(root, "gpt_image_2") is False
+
+    def test_novelai_reports_an_unreadable_settings_file(self, tmp_path: Path) -> None:
+        from clonoth_runtime import novelai_available, novelai_status
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: [nai-secret-key\n")
+        status = novelai_status(root)
+
+        assert "settings.yaml 读不了" in status.problem
+        assert "nai-secret-key" not in status.problem
+        assert not status.available and not status.unconfigured
+        assert novelai_available(root) is False
+
+    def test_a_judgement_that_breaks_is_a_problem_not_a_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 判定自己出错时说「没配」是在撒谎；异常消息里可能带着配置里的值，只报类型
+        import clonoth_runtime
+        from engine.builtin.image_gen_gating import disabled_image_tools
+
+        root = _drawtools_workspace(tmp_path, _OPENAI_MAIN, None)
+
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise KeyError("sk-quoted-by-the-error")
+
+        monkeypatch.setattr(clonoth_runtime._image_channel_module(root), "resolve_image_channel", broken)
+        status = clonoth_runtime.image_tool_status(root, " gpt_image_2 ")
+
+        assert status.problem == "判断 gpt_image_2 能不能用时出错（KeyError）"
+        assert not status.available and not status.unconfigured
+        assert disabled_image_tools(root) == set()
+
+    def test_the_default_channel_comes_through_the_same_reader(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_default_channel
+
+        root = _drawtools_workspace(tmp_path, _OPENAI_MAIN + "image_gen:\n  default_channel: gemini_image\n", None)
+
+        assert image_default_channel(root) == "gemini_image"
+
+    @pytest.mark.parametrize("extra", ["image_gen:\n  default_channel: nai\n", "image_gen: on\n", ""])
+    def test_anything_but_an_image_tool_name_is_no_default(self, tmp_path: Path, extra: str) -> None:
+        from clonoth_runtime import image_default_channel
+
+        assert image_default_channel(_drawtools_workspace(tmp_path, _OPENAI_MAIN + extra, None)) == ""
+
+    def test_an_unreadable_models_file_has_no_default(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_default_channel
+
+        assert image_default_channel(_drawtools_workspace(tmp_path, _BROKEN_MODELS, None)) == ""
+
+
+class TestAnUnreadableModelsFile:
+    """models.yaml 写坏了：常驻进程沿用上一份能读的，没有上一份就说清读不了，不拿环境变量拼一条渠道去发计费请求。"""
+
+    def test_the_reason_says_where_but_not_what(self, tmp_path: Path) -> None:
+        root = _workspace(
+            tmp_path, _BROKEN_MODELS, dotenv="OPENAI_API_KEY=k-env\nOPENAI_BASE_URL=https://env.example.com/v1\n",
+        )
+
+        resolved = channel.resolve_image_channel("image_gpt", root=root)
+
+        assert not resolved.usable
+        assert resolved.error.startswith("config/models.yaml 读不了")
+        assert "（第 5 行第 11 列）" in resolved.error
+        assert "sk-secret-in-a-bad-line" not in resolved.error
+        assert (resolved.api_key, resolved.base_url) == ("", "")
+
+    def test_the_vision_channel_reports_it_too(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, _BROKEN_MODELS, dotenv="OPENAI_API_KEY=k-env\n")
+
+        result = channel.resolve_vision_channel(root=root)
+
+        assert not result.usable
+        assert result.error.startswith("config/models.yaml 读不了")
+
+    def test_a_later_breakage_keeps_the_last_good_reading(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        root = _workspace(tmp_path, _OPENAI_MAIN)
+        assert channel.resolve_image_channel("image_gpt", root=root).usable
+        (root / "config" / "models.yaml").write_text(_BROKEN_MODELS, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger=channel.__name__):
+            first = channel.resolve_image_channel("image_gpt", root=root)
+            again = channel.resolve_image_channel("image_gpt", root=root)
+
+        assert first.usable and first.api_key == "main-key"
+        assert again == first
+        warnings = [record.getMessage() for record in caplog.records if "沿用上一份" in record.getMessage()]
+        assert len(warnings) == 1
+        assert "sk-secret-in-a-bad-line" not in warnings[0]
+
+    def test_a_deleted_file_is_not_brought_back_from_memory(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, _OPENAI_MAIN)
+        assert channel.resolve_image_channel("image_gpt", root=root).usable
+
+        (root / "config" / "models.yaml").unlink()
+        resolved = channel.resolve_image_channel("image_gpt", root=root)
+
+        assert not resolved.usable
+        assert resolved.error == ""
+
+    def test_a_repaired_file_is_read_again(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, _BROKEN_MODELS)
+        assert channel.resolve_image_channel("image_gpt", root=root).error
+
+        (root / "config" / "models.yaml").write_text(_OPENAI_MAIN, encoding="utf-8")
+        resolved = channel.resolve_image_channel("image_gpt", root=root)
+
+        assert resolved.usable and resolved.error == ""
+
+    def test_what_is_handed_out_cannot_change_the_cache(self, tmp_path: Path) -> None:
+        path = _workspace(tmp_path, _OPENAI_MAIN) / "config" / "models.yaml"
+        channel.read_yaml_document(path, label="config/models.yaml").data["openai"]["api_key"] = "tampered"
+
+        assert channel.read_yaml_document(path, label="config/models.yaml").data["openai"]["api_key"] == "main-key"
+
+    @pytest.mark.parametrize("raw,said", [
+        (b"- just\n- a list\n", "顶层不是映射"),
+        # PyYAML 拿它造日期时抛的 ValueError，消息里带着这个值
+        (b"when: 2026-13-45\n", "ValueError"),
+        (b"\xff\xfeabc: 1\n", "不是 UTF-8 编码"),
+    ])
+    def test_an_odd_file_is_unreadable_without_being_quoted(self, tmp_path: Path, raw: bytes, said: str) -> None:
+        path = tmp_path / "odd.yaml"
+        path.write_bytes(raw)
+
+        document = channel.read_yaml_document(path, label="odd.yaml", keep_last_good=False)
+
+        assert document.data == {}
+        assert document.problem.startswith("odd.yaml 读不了")
+        assert said in document.problem
+        assert "2026-13-45" not in document.problem
+
+    @pytest.mark.parametrize("raw", [b"", b"# only a comment\n"])
+    def test_an_empty_file_is_an_empty_table(self, tmp_path: Path, raw: bytes) -> None:
+        path = tmp_path / "empty.yaml"
+        path.write_bytes(raw)
+
+        assert channel.read_yaml_document(path, label="empty.yaml") == channel.YamlDocument({})
+
+    def test_a_first_read_failure_is_only_logged_when_the_caller_says_how_it_copes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 脚本工具每次都是新进程，原因由它交给模型；常驻进程的调用方才需要日志。
+        quiet, noted = tmp_path / "quiet.yaml", tmp_path / "noted.yaml"
+        for path in (quiet, noted):
+            path.write_bytes(b"k: [1\n")
+
+        with caplog.at_level(logging.WARNING, logger=channel.__name__):
+            channel.read_yaml_document(quiet, label="quiet.yaml")
+            channel.read_yaml_document(noted, label="noted.yaml", unread_note="按空表算")
+            channel.read_yaml_document(noted, label="noted.yaml", unread_note="按空表算")
+
+        messages = [record.getMessage() for record in caplog.records]
+        noted_messages = [message for message in messages if "noted.yaml" in message]
+        assert not any("quiet.yaml" in message for message in messages)
+        assert len(noted_messages) == 1
+        assert noted_messages[0].endswith("按空表算")
+
+
+class TestPromptWhenChannelsCannotBeJudged:
+    def test_the_text_keeps_every_possible_tool_and_says_why(self) -> None:
+        text = inject.build_unjudgeable_text(
+            {"gpt_image_2": True, "gemini_image": True}, ["config/models.yaml 读不了：x（第 3 行第 1 列）"],
+        )
+
+        assert "判断不了" in text and "第 3 行" in text
+        assert "`gpt_image_2`" in text and "`gemini_image`" in text
+        assert "finish" not in text
+
+    def test_a_tool_known_to_be_unconfigured_is_left_out(self) -> None:
+        text = inject.build_unjudgeable_text({"gpt_image_2": False, "gemini_image": True}, ["p"])
+
+        assert "gpt_image_2" not in text
+
+    def test_the_injector_keeps_both_tools_when_models_yaml_is_broken(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(tmp_path, _BROKEN_MODELS, None)
+        ctx = SimpleNamespace(
+            node=SimpleNamespace(id="draw.image_gen"),
+            rctx=SimpleNamespace(workspace_root=root),
+            messages=[{"role": "system", "content": _image_gen_prompt()}],
+        )
+
+        result = asyncio.run(inject.ImageGenAvailabilityInjector().handle(ctx))
+
+        rendered = ctx.messages[0]["content"]
+        assert result is not None
+        assert "判断不了" in rendered
+        assert "gpt_image_2" in rendered and "gemini_image" in rendered
+        assert "<<IF:" not in rendered and "<<IMAGE_TOOLS_AVAILABILITY>>" not in rendered
+        assert "sk-secret-in-a-bad-line" not in rendered
+
+    def test_a_reason_is_logged_once_while_it_lasts_and_again_when_it_comes_back(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 每一步都会重新判一遍：不能每步都记，好了再坏也不能一声不吭
+        monkeypatch.setattr(inject, "_warned_problems", set())
+
+        with caplog.at_level(logging.WARNING, logger=inject.__name__):
+            for problems in (["p"], ["p"], [], ["p"]):
+                inject._warn_unjudgeable(problems)
+
+        assert len([record for record in caplog.records if "判断不了生图渠道" in record.getMessage()]) == 2
 
 
 class TestVisionChannel:
@@ -571,3 +895,87 @@ system_models:
     api_key: k
 """)
         assert self._resolve(root).endpoint() == "https://vision.example.com/v1/chat/completions"
+
+
+_PNG = base64.b64encode(b"\x89PNG\r\n\x1a\nnot-really-a-png").decode("ascii")
+
+
+@pytest.fixture()
+def image_relay() -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    """本地的兼容网关：记下每次请求的路径、认证头和请求体，回一张 base64 的图。"""
+    seen: list[dict[str, Any]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - http.server 的方法名
+            payload = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization") or "",
+                "body": json.loads(payload or b"{}"),
+            })
+            body = json.dumps({"data": [{"b64_json": _PNG}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _run_gpt_image(workspace: Path) -> dict[str, Any]:
+    """照注册表起工具的样子跑：cwd 是工作区，环境里的密钥已经剥掉。"""
+    # 开发机上的代理和同名渠道变量不能替测试里的配置做主。
+    env = {
+        key: value for key, value in safe_subprocess_env().items()
+        if not key.upper().endswith("_PROXY") and not key.upper().startswith(("CLONOTH_IMAGE_GPT_", "OPENAI_"))
+    }
+    env.update({"NO_PROXY": "*", "PYTHONIOENCODING": "utf-8"})
+    done = subprocess.run(
+        [sys.executable, str(_ROOT / "tools" / "gpt_image_2.py")],
+        input=json.dumps({"prompt": "a cat", "size": "1024x1024", "quality": "low"}),
+        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=workspace, env=env,
+    )
+    assert done.stdout.strip(), done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+class TestTheGptToolEndToEnd:
+    def test_a_responses_main_channel_gets_its_images_endpoint(
+        self, tmp_path: Path, image_relay: tuple[str, list[dict[str, Any]]],
+    ) -> None:
+        base_url, seen = image_relay
+        root = _workspace(tmp_path, _RESPONSES_MAIN.replace("https://gw.example.com/v1", f"{base_url}/v1"))
+
+        result = _run_gpt_image(root)
+
+        assert result["ok"] is True, result
+        assert [(sent["path"], sent["authorization"], sent["body"]["model"]) for sent in seen] == [
+            ("/v1/images/generations", "Bearer main-key", "gpt-image-2"),
+        ]
+        assert (root / result["data"]["path"]).is_file()
+
+    def test_an_unreadable_models_file_stops_it_before_any_request(
+        self, tmp_path: Path, image_relay: tuple[str, list[dict[str, Any]]],
+    ) -> None:
+        # 环境变量里的地址和密钥够拼出一条渠道，但读不了配置时谁也说不准它是不是该用的那条。
+        base_url, seen = image_relay
+        root = _workspace(tmp_path, _BROKEN_MODELS, dotenv=f"OPENAI_API_KEY=k-env\nOPENAI_BASE_URL={base_url}/v1\n")
+
+        result = _run_gpt_image(root)
+
+        assert result["ok"] is False
+        assert result["error"].startswith("config/models.yaml 读不了")
+        assert "sk-secret-in-a-bad-line" not in result["error"]
+        assert seen == []

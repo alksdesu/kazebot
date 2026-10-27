@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ _REPO_ROOT = DRAWTOOLS_DIR.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
     sys.path.insert(0, str(_REPO_ROOT))
 import config_layout  # noqa: E402
+from tools._channel import YamlDocument, read_yaml_document  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
@@ -92,23 +94,45 @@ def deep_merge(base: Any, override: Any) -> Any:
     return override
 
 
-def load_yaml_file(path: Path, default: Any) -> Any:
-    try:
-        if not path.exists():
-            return default
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        return default if data is None else data
-    except Exception:
-        return default
+class DrawtoolsConfigUnreadable(ValueError):
+    """config/drawtools 下的配置读不了，又没有上一份可沿用。消息只带位置和问题，不带原文。"""
+
+
+def _config_path(own: Path, example: Path) -> Path:
+    return own if own.exists() else example
+
+
+def _read_config_document(own: Path, example: Path) -> YamlDocument:
+    """实例那份，没有就读仓库的模板。常驻进程里写坏了沿用上一次读成的那份。"""
+    path = _config_path(own, example)
+    return read_yaml_document(path, label=config_layout.logical_path(WORKSPACE_ROOT, path))
+
+
+def _settings_document() -> YamlDocument:
+    """settings.yaml。params 不是映射也算读不了：出图预设补不进去。"""
+    document = _read_config_document(SETTINGS_PATH, SETTINGS_EXAMPLE_PATH)
+    params = document.data.get("params")
+    if params is None or isinstance(params, dict):
+        return document
+    label = config_layout.logical_path(WORKSPACE_ROOT, _config_path(SETTINGS_PATH, SETTINGS_EXAMPLE_PATH))
+    return YamlDocument({}, problem=f"{label} 读不了：params 不是映射（key: value）")
+
+
+def _with_defaults(raw: dict[str, Any]) -> dict[str, Any]:
+    # 默认值整份复制一遍：deep_merge 会把没写的那几段原样挂上来，调用方一改就改到默认值本身
+    settings = deep_merge(copy.deepcopy(DEFAULT_SETTINGS), raw)
+    presets = settings.setdefault("params", {}).setdefault("presets", [])
+    if not isinstance(presets, list) or not presets:
+        settings["params"]["presets"] = [copy.deepcopy(DEFAULT_PRESET)]
+    return settings
 
 
 def load_settings() -> dict[str, Any]:
-    raw = load_yaml_file(SETTINGS_PATH if SETTINGS_PATH.exists() else SETTINGS_EXAMPLE_PATH, {})
-    settings = deep_merge(DEFAULT_SETTINGS, raw if isinstance(raw, dict) else {})
-    presets = settings.setdefault("params", {}).setdefault("presets", [])
-    if not isinstance(presets, list) or not presets:
-        settings["params"]["presets"] = [dict(DEFAULT_PRESET)]
-    return settings
+    """settings.yaml 补上默认值。读不了又没有上一份可沿用时抛 DrawtoolsConfigUnreadable，不拿默认值顶上。"""
+    document = _settings_document()
+    if document.problem:
+        raise DrawtoolsConfigUnreadable(document.problem)
+    return _with_defaults(document.data)
 
 
 def iter_presets(settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -188,7 +212,12 @@ def selected_preset(settings: dict[str, Any] | None = None, preset_ref: str = ""
 def set_selected_preset(preset_ref: str) -> dict[str, Any]:
     # 读改写全程持锁：控制台和 QQ 命令同时改，后写的会把先写的那笔整份盖掉。
     with config_layout.locked(SETTINGS_PATH):
-        settings = load_settings()
+        document = _settings_document()
+        unreadable = document.problem or document.stale
+        if unreadable:
+            # 整份写回去的是默认值或上一份，手写到一半的那份就被盖掉了
+            raise DrawtoolsConfigUnreadable(f"{unreadable}。先在控制台的原文编辑器里修好再切换")
+        settings = _with_defaults(document.data)
         target = require_preset(settings, preset_ref)
         target_id = str(target.get("id") or "").strip()
         if not target_id:
@@ -240,8 +269,11 @@ def size_to_dimensions(size_label: str, settings: dict[str, Any] | None = None) 
 
 
 def load_character_tags() -> list[dict[str, Any]]:
-    data = load_yaml_file(CHARACTER_TAGS_PATH if CHARACTER_TAGS_PATH.exists() else CHARACTER_TAGS_EXAMPLE_PATH, {})
-    chars = data.get("characters") if isinstance(data, dict) else []
+    """角色库里的角色。读不了又没有上一份可沿用时抛 DrawtoolsConfigUnreadable。"""
+    document = _read_config_document(CHARACTER_TAGS_PATH, CHARACTER_TAGS_EXAMPLE_PATH)
+    if document.problem:
+        raise DrawtoolsConfigUnreadable(document.problem)
+    chars = document.data.get("characters")
     return [c for c in chars if isinstance(c, dict)] if isinstance(chars, list) else []
 
 

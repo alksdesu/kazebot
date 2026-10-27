@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import config_layout
 from file_lock import exclusive_lock
-from platforms.protection import is_instance_env
+from platforms.protection import is_shareable_env
 
 from .instances import instance_workspace, load_instances, url_prefix
 
@@ -278,9 +278,10 @@ def _link_config(workspace_root: Path, target: Path) -> str:
 
 
 def _shareable_env(workspace_root: Path) -> dict[str, str]:
-    """本实例 .env 里能跟着组走的键：端口、地址、平台令牌、路径这类实例身份不算。"""
+    """本实例 .env 里能跟着组走的键：端口、地址、平台令牌、路径这类实例身份不算，
+    日志级别、代理、适配器选项这类只认进程环境的也不算：抄进组的 secrets.env 谁也读不到。"""
     values = config_layout.read_env_file(Path(workspace_root) / ".env")
-    return {key: value for key, value in values.items() if not is_instance_env(key)}
+    return {key: value for key, value in values.items() if is_shareable_env(key)}
 
 
 def create_group(workspace_root: Path, raw_name: Any) -> dict[str, Any]:

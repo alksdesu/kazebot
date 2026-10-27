@@ -285,13 +285,22 @@ class TestTheConfigView:
 
         assert (main.provider, main.api_key, main.model) == ("openai", "k-shared", "m-alpha")
 
-    def test_a_platform_secret_falls_back_to_the_group_file(
+    def test_a_platform_secret_is_never_taken_from_the_group_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 平台令牌是实例身份：适配进程和账号操作只认本实例那份，工具从组里拿到的是别的实例的令牌。
         monkeypatch.delenv("VAULT_SIGNING", raising=False)
         root = _workspace(tmp_path, shared="VAULT_SIGNING=k-shared\n")
 
-        assert platform_secret("vault", "signing_key", "VAULT_SIGNING", root=root) == "k-shared"
+        assert platform_secret("vault", "signing_key", "VAULT_SIGNING", root=root) == ""
+
+    def test_a_platform_secret_comes_from_the_instance_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("VAULT_SIGNING", raising=False)
+        root = _workspace(tmp_path, shared="VAULT_SIGNING=k-shared\n", dotenv="VAULT_SIGNING=k-local\n")
+
+        assert platform_secret("vault", "signing_key", "VAULT_SIGNING", root=root) == "k-local"
 
     def test_the_platform_secrets_file_still_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("VAULT_SIGNING", raising=False)
@@ -407,6 +416,19 @@ class TestExaSearch:
             assert "EXA_API_KEY" in result["error"]
             assert upstream.seen == []
 
+    def test_arguments_cannot_send_the_key_elsewhere(self, tmp_path: Path) -> None:
+        # 模型多填一个 base_url，配置里的密钥就会跟着请求头发到它指定的主机去。
+        with _Upstream(_EXA_BODY) as upstream, _Upstream(_EXA_BODY) as elsewhere:
+            root = _workspace(tmp_path, shared=f"EXA_API_KEY=k-shared\nEXA_BASE_URL={upstream.url}\n")
+
+            result = _run_tool(
+                "exa_search.py", root, {"query": "alpha", "base_url": elsewhere.url, "api_key": "k-from-the-model"},
+            )
+
+            assert result["ok"] is True, result
+            assert elsewhere.seen == []
+            assert [seen[:2] for seen in upstream.seen] == [("/search", "k-shared")]
+
 
 class TestXSearch:
     def test_a_key_only_in_the_group_file_is_used(self, tmp_path: Path) -> None:
@@ -440,6 +462,50 @@ class TestXSearch:
             assert "XAI_API_KEY" in result["error"]
             assert upstream.seen == []
 
+    def test_a_relay_at_xai_base_url_gets_the_openai_key(self, tmp_path: Path) -> None:
+        with _Upstream(_X_BODY) as upstream:
+            root = _workspace(tmp_path, shared=f"OPENAI_API_KEY=k-relay\nXAI_BASE_URL={upstream.url}\n")
+
+            result = _run_tool("x_search.py", root, {"query": "alpha"})
+
+            assert result["ok"] is True, result
+            assert [(seen[0], seen[2]) for seen in upstream.seen] == [("/responses", "Bearer k-relay")]
+
+    def test_an_xai_key_wins_over_the_openai_key(self, tmp_path: Path) -> None:
+        with _Upstream(_X_BODY) as upstream:
+            root = _workspace(
+                tmp_path, shared=f"OPENAI_API_KEY=k-relay\nXAI_API_KEY=k-xai\nXAI_BASE_URL={upstream.url}\n",
+            )
+
+            _run_tool("x_search.py", root, {"query": "alpha"})
+
+            assert upstream.seen[0][2] == "Bearer k-xai"
+
+    def test_the_openai_key_is_never_sent_to_x_ai(self, tmp_path: Path) -> None:
+        # 没配 XAI_BASE_URL 时默认打 api.x.ai，那边不该收到别家的密钥；代理指到死端口，万一发出去也到不了外网。
+        root = _workspace(tmp_path, shared="OPENAI_API_KEY=k-relay\n")
+
+        result = _run_tool(
+            "x_search.py", root, {"query": "alpha"},
+            HTTPS_PROXY="http://127.0.0.1:9", https_proxy="http://127.0.0.1:9",
+        )
+
+        assert result["ok"] is False
+        assert "XAI_BASE_URL" in result["error"]
+        assert "OPENAI_API_KEY" in result["error"]
+
+    def test_arguments_cannot_send_the_key_elsewhere(self, tmp_path: Path) -> None:
+        with _Upstream(_X_BODY) as upstream, _Upstream(_X_BODY) as elsewhere:
+            root = _workspace(tmp_path, shared=f"XAI_API_KEY=k-shared\nXAI_BASE_URL={upstream.url}\n")
+
+            result = _run_tool(
+                "x_search.py", root, {"query": "alpha", "base_url": elsewhere.url, "api_key": "k-from-the-model"},
+            )
+
+            assert result["ok"] is True, result
+            assert elsewhere.seen == []
+            assert [(seen[0], seen[2]) for seen in upstream.seen] == [("/responses", "Bearer k-shared")]
+
 
 def _main_block(script: Path, stop_before: str) -> dict[str, Any]:
     """执行工具主块里到 stop_before 赋值为止的定义，拿到里面那几个纯函数。
@@ -470,7 +536,7 @@ def web_search_main() -> dict[str, Any]:
 class TestWebSearchSourcePicking:
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        for name in ("XAI_API_KEY", "OPENAI_API_KEY", "WEB_SEARCH_PROVIDER", "WEB_SEARCH_SOURCE"):
+        for name in ("XAI_API_KEY", "XAI_BASE_URL", "OPENAI_API_KEY", "WEB_SEARCH_PROVIDER", "WEB_SEARCH_SOURCE"):
             monkeypatch.delenv(name, raising=False)
 
     def test_it_loads_both_layers(self, web_search_main: dict[str, Any], tmp_path: Path) -> None:
@@ -499,6 +565,33 @@ class TestWebSearchSourcePicking:
         values = web_search_main["load_dotenv"](_workspace(tmp_path))
 
         assert web_search_main["normalize_source"]({}, "帮我查 推特 上的讨论", values) == "auto"
+
+    def test_an_openai_key_alone_does_not_route_to_x(self, web_search_main: dict[str, Any], tmp_path: Path) -> None:
+        # x_search 只把 OPENAI_API_KEY 发给 XAI_BASE_URL 指的中转站；单走 x 这一路时它失败了也没有退路。
+        values = web_search_main["load_dotenv"](_workspace(tmp_path, shared="OPENAI_API_KEY=k-relay\n"))
+
+        assert web_search_main["normalize_source"]({}, "帮我查 推特 上的讨论", values) == "auto"
+
+    def test_an_openai_key_with_a_relay_routes_to_x(self, web_search_main: dict[str, Any], tmp_path: Path) -> None:
+        values = web_search_main["load_dotenv"](_workspace(
+            tmp_path, shared="OPENAI_API_KEY=k-relay\n", dotenv="XAI_BASE_URL=https://relay.example/v1\n",
+        ))
+
+        assert web_search_main["normalize_source"]({}, "帮我查 推特 上的讨论", values) == "x"
+
+    @pytest.mark.parametrize("shared,configured", [
+        ("XAI_API_KEY=k\n", True),
+        ("OPENAI_API_KEY=k\n", False),
+        ("XAI_BASE_URL=https://relay.example/v1\n", False),
+        ("OPENAI_API_KEY=k\nXAI_BASE_URL=https://relay.example/v1\n", True),
+        ("", False),
+    ])
+    def test_x_counts_as_configured_exactly_when_x_search_can_pick_a_key(
+        self, web_search_main: dict[str, Any], tmp_path: Path, shared: str, configured: bool,
+    ) -> None:
+        values = web_search_main["load_dotenv"](_workspace(tmp_path, shared=shared))
+
+        assert web_search_main["x_search_configured"](values) is configured
 
     def test_an_explicit_source_is_not_overridden(self, web_search_main: dict[str, Any], tmp_path: Path) -> None:
         values = web_search_main["load_dotenv"](_workspace(tmp_path, shared="XAI_API_KEY=k-shared\n"))

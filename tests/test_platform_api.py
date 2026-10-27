@@ -103,7 +103,8 @@ def test_the_listing_includes_qq(call) -> None:
     assert qq["display_name"] == "QQ · NapCat"
     assert {channel["name"] for channel in qq["channels"]} >= {"qq_group", "qq_private"}
     assert qq["hooks"] == [
-        "account_ops", "console_schema", "instance_env", "known_accounts", "maintenance", "trigger_policy",
+        "account_ops", "console_schema", "instance_env", "known_accounts", "maintenance", "process_env",
+        "trigger_policy",
     ]
     assert qq["capabilities"]["mention"] == "native" and qq["capabilities"]["markdown"] is False
 

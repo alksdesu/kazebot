@@ -13,7 +13,7 @@ GPT Image 2 生图工具 (Clonoth external tool)
     双发（同一张图发两次）——这正是 NovelAI 插件当年修复过的坑。
 
 API 渠道配置见 _channel.resolve_image_channel：system_models.image_gpt >
-CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道（仅当主渠道本身收 OpenAI 格式）。
+CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道（仅当它是 openai 或 openai-responses，和 Engine 判同族一致）。
 model 不跟主渠道走，默认 gpt-image-2。
 """
 
@@ -123,7 +123,7 @@ if __name__ == "__main__":
         fail(f'Invalid size format: {size}. Use WxH, e.g. 1024x1536')
 
     # 优先级：models.yaml system_models.image_gpt > CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道。
-    # 主渠道只在它本来就收 OpenAI 格式时才借，否则地址对了格式也不对。
+    # 主渠道只在它是 openai 或 openai-responses 时才借：同一个兼容网关的根下才同时挂着 images 和 chat/completions。
     # model 不跟着借：主渠道那个是聊天模型，生图得用这里的默认值。
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -135,6 +135,8 @@ if __name__ == "__main__":
     base_url = channel.base_url
     model_name = channel.model
 
+    if channel.error:
+        fail(channel.error)
     if not api_key:
         fail('No API key found in config/models.yaml / env / .env file')
     if not base_url:

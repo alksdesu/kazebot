@@ -25,6 +25,7 @@ from platforms.descriptor import (  # noqa: E402
     HOOK_CONSOLE_SCHEMA,
     HOOK_KNOWN_ACCOUNTS,
     HOOK_MAINTENANCE,
+    HOOK_PROCESS_ENV,
     HOOK_TRIGGER_POLICY,
     STATE_ALIASES,
     STATE_KINDS,
@@ -502,6 +503,14 @@ class TestFilesAndHooks:
 
         assert platform_hook(QQ_NAPCAT, HOOK_ACCOUNT_OPS) is account_ops
         assert callable(account_ops.account_ops)
+
+    def test_the_process_env_hook_is_the_qq_module(self) -> None:
+        from adapters.onebot import process_env
+
+        assert platform_hook(QQ_NAPCAT, HOOK_PROCESS_ENV) is process_env
+        names = process_env.process_env_names()
+        assert isinstance(names, frozenset)
+        assert {"LOG_LEVEL", "ONEBOT_FORWARD_HTTP_ATTEMPTS", "ONEBOT_GROUP_TRIGGER"} <= names
 
     def test_the_shared_features_load_through_the_registry(self) -> None:
         from adapters._shared import features

@@ -119,8 +119,9 @@ if __name__ == "__main__":
             "请重新调用 exa_search，格式固定为：{\"query\": \"要搜索的内容\"}。如果已有用户问题，请把用户问题原文放入 query。",
         )
 
-    api_key = str(args.get("api_key") or os.environ.get("EXA_API_KEY") or "").strip()
-    base_url = str(args.get("base_url") or os.environ.get("EXA_BASE_URL") or "").strip().rstrip("/")
+    # 地址和密钥只认配置、不收工具参数：模型多填一个 base_url，配置里的 key 就跟着请求头发到它指定的主机去了。
+    api_key = str(os.environ.get("EXA_API_KEY") or "").strip()
+    base_url = str(os.environ.get("EXA_BASE_URL") or "").strip().rstrip("/")
 
     if not api_key or not base_url:
         dotenv = load_dotenv()
@@ -130,7 +131,7 @@ if __name__ == "__main__":
             base_url = str(dotenv.get("EXA_BASE_URL") or "").strip().rstrip("/")
 
     if not api_key:
-        fail("No Exa API key available. Set EXA_API_KEY in the environment or .env, or pass api_key.")
+        fail("No Exa API key available. Set EXA_API_KEY in .env or config/secrets.env.")
     if not base_url:
         base_url = "https://api.exa.ai"
     num_results = extract_int_alias(

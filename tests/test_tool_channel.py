@@ -16,7 +16,7 @@ if str(_ROOT) not in sys.path:
 if str(_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(_ROOT / "tools"))
 
-from _channel import OPENAI_COMPATIBLE, Channel  # noqa: E402
+from _channel import OPENAI_COMPATIBLE, OPENAI_FAMILY, Channel  # noqa: E402
 from toolbox._common import safe_subprocess_env  # noqa: E402
 
 CONFIG = "\n".join([
@@ -108,11 +108,17 @@ class TestSlotResolution:
 
 
 def test_only_openai_shaped_providers_are_listed_as_compatible() -> None:
-    # 这个集合决定 read_image 敢不敢跟随主渠道；anthropic 和 gemini 走自己的端点。
+    # 收 OpenAI 格式 /chat/completions 的那几家；anthropic 和 gemini 走自己的端点。
     assert "openai" in OPENAI_COMPATIBLE
     assert "deepseek" in OPENAI_COMPATIBLE
     assert "anthropic" not in OPENAI_COMPATIBLE
     assert "gemini" not in OPENAI_COMPATIBLE
+
+
+def test_the_family_a_gateway_serves_whole_is_the_two_openai_wires() -> None:
+    # gpt_image_2 借主渠道看的是这一族：同一个兼容网关的根下才同时挂着 images 端点，DeepSeek 只有 chat/completions。
+    assert OPENAI_FAMILY == {"openai", "openai-responses"}
+    assert "deepseek" in OPENAI_COMPATIBLE and "deepseek" not in OPENAI_FAMILY
 
 
 class TestReadImageFollowsTheMainChannel:

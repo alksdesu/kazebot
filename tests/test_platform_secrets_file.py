@@ -6,6 +6,7 @@ config/ 可能整份共享给别的实例，而连接令牌是这个实例的身
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ if str(_ROOT / "tools") not in sys.path:
 
 from _channel import platform_secret as tool_platform_secret  # noqa: E402
 
+import clonoth_runtime  # noqa: E402
 import config_layout  # noqa: E402
 from clonoth_runtime import (  # noqa: E402
     SECRET_FROM_CONFIG,
@@ -170,6 +172,53 @@ class TestTheRuntimeLookup:
 
         assert load_platform_secrets(ws) == {}
 
+    @pytest.mark.parametrize("text", [
+        "qq:\n  access_token: [oops-token-value\n",
+        "- qq\n- oops-token-value\n",
+        # PyYAML 拿它造日期时抛的 ValueError，消息里带着这个值
+        "qq:\n  access_token: 2026-13-45\n",
+    ])
+    def test_a_broken_file_is_logged_once_without_its_text(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, text: str,
+    ) -> None:
+        # 读不了的那一行多半就是令牌本身；日志会被收进诊断包、贴进工单。
+        monkeypatch.setattr(clonoth_runtime, "_platform_secrets_warned", {})
+        _write(config_layout.platform_secrets_path(ws), text)
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime.__name__):
+            assert load_platform_secrets(ws) == {}
+            assert load_platform_secrets(ws) == {}
+
+        warnings = [record.getMessage() for record in caplog.records if "platform_secrets.yaml" in record.getMessage()]
+        assert len(warnings) == 1
+        assert "平台密钥全按没配算" in warnings[0]
+        assert "oops-token-value" not in warnings[0]
+        assert "2026-13-45" not in warnings[0]
+
+    def test_another_broken_version_is_logged_again(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(clonoth_runtime, "_platform_secrets_warned", {})
+        path = _write(config_layout.platform_secrets_path(ws), "qq: [one\n")
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime.__name__):
+            load_platform_secrets(ws)
+            _write(path, "qq: [one, two\n")
+            load_platform_secrets(ws)
+
+        assert len([record for record in caplog.records if "platform_secrets.yaml" in record.getMessage()]) == 2
+
+    def test_an_empty_file_is_no_warning(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(clonoth_runtime, "_platform_secrets_warned", {})
+        _write(config_layout.platform_secrets_path(ws), "# 还没配\n")
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime.__name__):
+            assert load_platform_secrets(ws) == {}
+
+        assert not [record for record in caplog.records if "platform_secrets.yaml" in record.getMessage()]
+
 
 class TestTheStrayLeftoverSection:
     def test_a_models_file_still_carrying_platforms_is_reported(self, ws: Path) -> None:
@@ -223,6 +272,18 @@ class TestTheToolSubprocessReadsTheSameFile:
         assert tool_value == platform_secret(ws, QQ_NAPCAT, "forward_bridge_token").value
 
     def test_nothing_configured_is_an_empty_string(self, ws: Path) -> None:
+        assert tool_platform_secret(QQ_NAPCAT.id, "forward_bridge_token", BRIDGE_ENV, root=ws) == ""
+
+    def test_a_broken_file_falls_through_to_dotenv_like_the_main_process(self, ws: Path) -> None:
+        _write(config_layout.platform_secrets_path(ws), "qq: [oops\n")
+        _write(ws / ".env", f"{BRIDGE_ENV}=from-dotenv\n")
+
+        assert tool_platform_secret(QQ_NAPCAT.id, "forward_bridge_token", BRIDGE_ENV, root=ws) == "from-dotenv"
+
+    def test_the_group_secrets_file_is_not_a_source(self, ws: Path) -> None:
+        # 令牌是实例身份：bot 和账号操作只认本实例 .env，工具从组里拿到的是别的实例的令牌。
+        _write(config_layout.shared_secrets_path(ws), f"{BRIDGE_ENV}=from-the-group\n")
+
         assert tool_platform_secret(QQ_NAPCAT.id, "forward_bridge_token", BRIDGE_ENV, root=ws) == ""
 
 

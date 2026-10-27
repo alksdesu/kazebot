@@ -926,7 +926,7 @@ def plan_delegation(
 ) -> Delegation:
     """工具表、委派工具的说明和子任务交回结果里的合回提示都按这一份，不然会出现提示让调一个工具表里没有的工具。"""
     targets = list(node.delegate_targets)
-    # 一张图都画不出来的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
+    # 确定一个渠道都没配的绘图节点不参与委派：留着只会让模型认真规划一轮，再撞上工具报缺 key。
     try:
         from ..builtin.image_gen_gating import disabled_draw_nodes
         disabled = disabled_draw_nodes(workspace_root) & set(targets)

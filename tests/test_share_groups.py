@@ -189,6 +189,21 @@ class TestCreatingAGroup:
         assert result["copied_env"] == []
         assert not (shared / "team" / config_layout.SHARED_SECRETS_FILE).exists()
 
+    def test_settings_only_the_process_reads_stay_behind(self, ws: Path, shared: Path) -> None:
+        # 组的 secrets.env 只经 dotenv 两层和 ${VAR} 读，日志级别、代理、适配器选项抄过去谁也读不到。
+        (ws / ".env").write_text(
+            "CLONOTH_LOG_LEVEL=debug\nLOG_LEVEL=INFO\nHTTPS_PROXY=http://127.0.0.1:7890\n"
+            "https_proxy=http://127.0.0.1:7890\nCLONOTH_ALLOWED_GROUPS=123\nONEBOT_GROUP_TRIGGER=all\n"
+            "PYTHONPATH=/opt/x\nCLONOTH_TASK_ID=t-1\nEXA_API_KEY=exa-test\n",
+            encoding="utf-8",
+        )
+
+        result = share_groups.create_group(ws, "team")
+
+        assert result["copied_env"] == ["EXA_API_KEY"]
+        body = config_layout.read_env_file(shared / "team" / config_layout.SHARED_SECRETS_FILE)
+        assert dict(body) == {"EXA_API_KEY": "exa-test"}
+
     def test_an_instance_without_an_env_copies_nothing(self, ws: Path, shared: Path) -> None:
         result = share_groups.create_group(ws, "team")
 

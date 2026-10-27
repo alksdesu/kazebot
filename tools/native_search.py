@@ -189,12 +189,20 @@ if __name__ == "__main__":
         fail("缺少搜索关键词。格式固定为：{\"query\": \"要搜索的内容\"}")
 
     channel = Channel("native_search")
+    if channel.models_problem:
+        fail(channel.models_problem)
     main = channel.main()
     # 槽位的 provider 可以写成一个渠道名，那就连它的地址密钥模型一并用上。
     referenced = channel.named(channel.own("provider", "PROVIDER"))
-    provider = referenced.provider or main.provider or "openai"
+    own_base_url = channel.own("base_url", "BASE_URL")
     model = channel.pick("model", "MODEL", referenced.model, main.model)
-    api_key = channel.pick("api_key", "API_KEY", referenced.api_key, main.api_key)
+    if own_base_url:
+        # 地址和格式、密钥是绑死的一对：槽位自己指了地址又没点名是哪家，就按中转站的最小公约数 openai 算，主渠道的密钥也不发过去。
+        provider = referenced.provider or "openai"
+        api_key = channel.pick("api_key", "API_KEY", referenced.api_key)
+    else:
+        provider = referenced.provider or main.provider or "openai"
+        api_key = channel.pick("api_key", "API_KEY", referenced.api_key, main.api_key)
     # 搜索请求发出去就计费，认不出的渠道宁可直说，不按 OpenAI 猜着发一次。
     if provider not in PROVIDER_WIRES:
         fail("不认识渠道 " + provider + "，没法判断它的搜索接口该怎么调。")
@@ -205,6 +213,12 @@ if __name__ == "__main__":
         or default_base_url(wire),
     )
 
+    if own_base_url and not api_key:
+        fail(
+            "native_search 槽位指了自己的 base_url，却没配 api_key：主渠道的密钥不会发到别的地址去。"
+            "请在 config/models.yaml 的 system_models.native_search 里补上 api_key，"
+            "或在 .env、config/secrets.env 里设 CLONOTH_NATIVE_SEARCH_API_KEY。"
+        )
     if not model or not api_key:
         fail("主模型渠道没有配好 model 或 api_key，无法使用自带搜索。")
 

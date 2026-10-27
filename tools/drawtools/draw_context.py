@@ -30,7 +30,7 @@ if __name__ == "__main__":
     import sys
     from typing import Any
 
-    from common import is_selected_preset, iter_presets, load_character_tags, load_settings
+    from common import DrawtoolsConfigUnreadable, is_selected_preset, iter_presets, load_character_tags, load_settings
     # common 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
     from tools._channel import SwitchValueError, switch_arg
 
@@ -84,9 +84,15 @@ if __name__ == "__main__":
             })
 
         matched = []
+        character_problem = ""
         if include_characters:
+            # 角色库坏了不挡预设：模型照样能选画师串，只是这次匹配不了角色
+            try:
+                characters = load_character_tags()
+            except DrawtoolsConfigUnreadable as exc:
+                characters, character_problem = [], str(exc)
             qn = norm(query)
-            for ch in load_character_tags():
+            for ch in characters:
                 if not matches_character(qn, ch):
                     continue
                 matched.append({
@@ -102,13 +108,15 @@ if __name__ == "__main__":
 
         preset_lines = [f"- {p['name']} (id: {p['id']})" + (" [当前默认]" if p.get("selected") else "") for p in presets]
         char_lines = [f"- {c['name']} / {c['danbooru']}" for c in matched]
+        char_text = f"（{character_problem}，没法按角色库匹配）" if character_problem else ("\n".join(char_lines) or "（无）")
         output({
             "ok": True,
             "data": {
-                "result": "可用预设：\n" + ("\n".join(preset_lines) or "（无）") + "\n命中角色：\n" + ("\n".join(char_lines) or "（无）"),
+                "result": "可用预设：\n" + ("\n".join(preset_lines) or "（无）") + "\n命中角色：\n" + char_text,
                 "presets": presets,
                 "matched_characters": matched,
                 "character_match_count": len(matched),
+                "character_library_problem": character_problem,
             },
         })
     except Exception as exc:

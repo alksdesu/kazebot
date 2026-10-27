@@ -1,23 +1,31 @@
-"""工具子进程共用的渠道、平台密钥和开关参数解析。
+"""工具子进程共用的渠道、平台密钥、开关参数解析和 YAML 配置读取。
 
 工具是独立子进程、只吃标准库，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍。
-密钥只能从 .env 和 config/secrets.env 读：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
+密钥只能从 .env 和 config/secrets.env 读（平台令牌只认 .env）：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
 """
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import os
 import re
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 
+_log = logging.getLogger(__name__)
+
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
+# 和 Engine 的 _OPENAI_COMPATIBLE_PROVIDERS 同一族（测试比对两份）：同一个兼容网关的根下同时挂着 chat/completions、responses 和 images。
+OPENAI_FAMILY = frozenset({"openai", "openai-responses"})
 # 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE、SHARED_SECRETS_FILE 同值：这里只吃标准库，导不了它。
 _MODELS_FILE = ("config", "models.yaml")
 _PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
 _SHARED_SECRETS_FILE = ("config", "secrets.env")
+_INSTANCE_ENV_FILE = ".env"
 # 和 clonoth_runtime 的 parse_bool、parse_switch 认同一套写法、报同一句错（测试逐个比对两份）：写成字符串的 "false"、no 也算关
 _TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_WORDS = frozenset({"0", "false", "no", "n", "off"})
@@ -134,29 +142,137 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return {str(key): str(value).strip() for key, value in raw.items() if value is not None and str(value).strip()}
 
 
+def _dotenv_layers(base: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """(共享密钥文件 config/secrets.env, 本实例 .env) 各自有值的键。"""
+    return _read_env_file(base.joinpath(*_SHARED_SECRETS_FILE)), _read_env_file(base / _INSTANCE_ENV_FILE)
+
+
 def dotenv_values(root: Path | None = None) -> dict[str, str]:
     """工作区的 dotenv 值：共享密钥文件 config/secrets.env 垫底，本实例 .env 的同名项盖在上面。
 
     root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。
     """
-    base = Path(root) if root is not None else Path.cwd()
-    merged = _read_env_file(base.joinpath(*_SHARED_SECRETS_FILE))
-    merged.update(_read_env_file(base / ".env"))
-    return merged
+    shared, instance = _dotenv_layers(Path(root) if root is not None else Path.cwd())
+    return {**shared, **instance}
 
 
-def _read_yaml(path: Path) -> dict:
+def _yaml_error_text(exc: BaseException) -> str:
+    """YAML 解析失败的原因，只取 context、problem 和出错位置：异常的字符串形式会附上出错那一行原文，那一行可能正是密钥。"""
+    reason = "; ".join(
+        str(part).strip() for part in (getattr(exc, "context", None), getattr(exc, "problem", None)) if part
+    ) or type(exc).__name__
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    if mark is None:
+        return reason
+    return f"{reason}（第 {mark.line + 1} 行第 {mark.column + 1} 列）"
+
+
+def _file_stamp(path: Path) -> tuple[int, int, int] | None:
+    """和 config_layout.file_stamp 同一个指纹（测试比对两份）：修改时间、大小和 inode，不存在是 None。"""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size, info.st_ino
+
+
+def _parse_yaml_file(path: Path) -> tuple[dict, str, bool]:
+    """(内容, 读不了的原因, 文件不存在)。空文件按空表算。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return {}, "", True
+    except UnicodeDecodeError as exc:
+        return {}, f"不是 UTF-8 编码（第 {exc.start + 1} 个字节）", False
+    except OSError as exc:
+        return {}, exc.strerror or type(exc).__name__, False
     try:
         import yaml  # type: ignore
-    except Exception:
-        return {}
-    if not path.exists():
-        return {}
+    except ImportError:
+        return {}, "没装 PyYAML", False
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return {}, _yaml_error_text(exc), False
+    except RecursionError:
+        return {}, "嵌套太深", False
+    except Exception as exc:
+        # 构造日期这类值出错抛的是 ValueError，消息里带着那个值
+        return {}, type(exc).__name__, False
+    if data is None:
+        return {}, "", False
+    if not isinstance(data, dict):
+        return {}, "顶层不是映射（key: value）", False
+    return data, "", False
+
+
+class YamlDocument(NamedTuple):
+    """一份 YAML 配置读出来的样子。
+
+    problem 非空：这一版读不了，又没有上一份可沿用，data 是空表。
+    stale 非空：这一版读不了，data 是这个进程上一次读成的那份。
+    """
+
+    data: dict
+    problem: str = ""
+    stale: str = ""
+    missing: bool = False
+
+
+class _LastGood(NamedTuple):
+    stamp: tuple[int, int, int] | None
+    data: dict
+
+
+_yaml_lock = threading.Lock()
+_yaml_last_good: dict[str, _LastGood] = {}
+# 每份文件最近告警过的那一版：同一版坏文件只告警一次。
+_yaml_warned: dict[str, tuple[int, int, int] | None] = {}
+
+
+def read_yaml_document(
+    path: Path, *, label: str, keep_last_good: bool = True, unread_note: str = "",
+) -> YamlDocument:
+    """读一份顶层是映射的 YAML 配置，文件不存在或是空的按空表算。
+
+    原因里只有位置和问题，不带原文。读不了时 keep_last_good 就沿用这个进程上一次读成的那份，
+    同一版坏文件只告警一次；没有上一份可沿用时只在给了 unread_note 时告警（写成「按什么算」），
+    脚本工具每次都是新进程，由调用方把 problem 交给模型。交出去的是副本，调用方改了不影响下一次读。
+    """
+    path = Path(path)
+    key = os.path.abspath(path)
+    stamp = _file_stamp(path)
+    with _yaml_lock:
+        cached = _yaml_last_good.get(key)
+    if cached is not None and stamp is not None and cached.stamp == stamp:
+        return YamlDocument(copy.deepcopy(cached.data))
+    data, reason, missing = _parse_yaml_file(path)
+    if missing:
+        with _yaml_lock:
+            _yaml_last_good.pop(key, None)
+            _yaml_warned.pop(key, None)
+        return YamlDocument({}, missing=True)
+    if not reason:
+        with _yaml_lock:
+            _yaml_last_good[key] = _LastGood(stamp, data)
+            _yaml_warned.pop(key, None)
+        return YamlDocument(copy.deepcopy(data))
+    problem = f"{label} 读不了：{reason}"
+    with _yaml_lock:
+        fallback = _yaml_last_good.get(key) if keep_last_good else None
+        first = key not in _yaml_warned or _yaml_warned[key] != stamp
+        _yaml_warned[key] = stamp
+    if fallback is not None:
+        if first:
+            _log.warning("%s，沿用上一份能读的内容", problem)
+        return YamlDocument(copy.deepcopy(fallback.data), stale=problem)
+    if first and unread_note:
+        _log.warning("%s，%s", problem, unread_note)
+    return YamlDocument({}, problem=problem)
+
+
+def _models_document(base: Path) -> YamlDocument:
+    return read_yaml_document(base.joinpath(*_MODELS_FILE), label="/".join(_MODELS_FILE))
 
 
 def _is_provider_block(value: object) -> bool:
@@ -170,12 +286,23 @@ class _ConfigView:
         # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
         # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
         base = Path(root) if root is not None else Path.cwd()
-        self._dotenv = dotenv_values(base)
-        self._config = _read_yaml(base.joinpath(*_MODELS_FILE))
-        self._platform_secrets = _read_yaml(base.joinpath(*_PLATFORM_SECRETS_FILE))
+        shared, self._instance_env = _dotenv_layers(base)
+        self._dotenv = {**shared, **self._instance_env}
+        models = _models_document(base)
+        self._config = models.data
+        # models.yaml 读不了又没有上一份时的原因。调用方先报它：空配置下报「没配 key」是在误导人。
+        self.models_problem = models.problem
+        # 读不了按空表算、不沿用上一份，和主进程的 load_platform_secrets 同一个回退。
+        self._platform_secrets = read_yaml_document(
+            base.joinpath(*_PLATFORM_SECRETS_FILE), label="/".join(_PLATFORM_SECRETS_FILE), keep_last_good=False,
+        ).data
 
     def env(self, key: str) -> str:
         return (os.environ.get(key, "") or self._dotenv.get(key, "")).strip()
+
+    def instance_env(self, key: str) -> str:
+        """进程环境 > 本实例 .env，不看共享密钥文件。"""
+        return (os.environ.get(key, "") or self._instance_env.get(key, "")).strip()
 
     def first_env(self, names: str) -> str:
         """取第一个有值的变量。仓库的节点文件在用 $ENV{NEW|OLD} 这种回退写法。"""
@@ -193,7 +320,10 @@ class _ConfigView:
         return text
 
     def platform_secret(self, platform_id: str, name: str, env: str = "") -> str:
-        """和主进程同一个顺序：data/platform_secrets.yaml 的 <id>.<name> > 环境变量 > .env 文件。"""
+        """和主进程同一个顺序：data/platform_secrets.yaml 的 <id>.<name> > 环境变量 > 本实例 .env。
+
+        平台令牌是实例身份，不读共享的 config/secrets.env：适配进程和账号操作也只认本实例那份。
+        """
         block = self._platform_secrets.get(platform_id)
         raw = block.get(name) if isinstance(block, dict) else None
         # YAML 会把纯数字的令牌读成 int；布尔、列表、映射当成没配，和主进程判得一样。
@@ -201,13 +331,13 @@ class _ConfigView:
             value = self._deref(str(raw))
             if value:
                 return value
-        return self.env(env) if env else ""
+        return self.instance_env(env) if env else ""
 
 
 def platform_secret(platform_id: str, name: str, env: str = "", *, root: Path | None = None) -> str:
     """平台显式配的一项密钥，都没配返回空串，由调用方去读平台自动生成的密钥文件。
 
-    子进程的环境里剥掉了平台密钥，env 那一档通常是空的，实际落到 data/platform_secrets.yaml 或 .env 文件。
+    子进程的环境里剥掉了平台密钥，env 那一档通常是空的，实际落到 data/platform_secrets.yaml 或本实例 .env。
     """
     return _ConfigView(root=root).platform_secret(platform_id, name, env)
 
@@ -291,7 +421,7 @@ class ImageSlotSpec(NamedTuple):
 
 IMAGE_SLOTS: dict[str, ImageSlotSpec] = {
     "image_gpt": ImageSlotSpec(
-        providers=tuple(sorted(OPENAI_COMPATIBLE)),
+        providers=tuple(sorted(OPENAI_FAMILY)),
         key_envs=("OPENAI_API_KEY",),
         url_envs=("OPENAI_BASE_URL",),
         default_model="gpt-image-2",
@@ -308,13 +438,16 @@ IMAGE_SLOTS: dict[str, ImageSlotSpec] = {
 
 
 class ImageChannel(NamedTuple):
+    """生图渠道。error 非空时不可用：配置读不了，判断不了该用哪条渠道。"""
+
     api_key: str = ""
     base_url: str = ""
     model: str = ""
+    error: str = ""
 
     @property
     def usable(self) -> bool:
-        return bool(self.api_key and self.base_url)
+        return bool(self.api_key and self.base_url and not self.error)
 
 
 class VisionChannel(NamedTuple):
@@ -383,6 +516,8 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
     """
     wire_mod = _wire_module()
     channel = Channel("image", root=root)
+    if channel.models_problem:
+        return VisionChannel(error=channel.models_problem)
     main = channel.main()
 
     # 槽位的 provider 可以写成一个渠道名，那就连它的地址密钥一并用上。
@@ -436,6 +571,9 @@ def resolve_image_channel(
     if spec is None:
         return ImageChannel()
     channel = Channel(slot, root=root)
+    # 槽位和主渠道都写在 models.yaml 里，读不了就别只凭环境变量拼一条渠道去发计费请求。
+    if channel.models_problem:
+        return ImageChannel(error=channel.models_problem)
     main = channel.main_for(*spec.providers)
     api_key = channel.pick(
         "api_key", "API_KEY", *(channel.env(name) for name in spec.key_envs), main.api_key,
@@ -446,3 +584,12 @@ def resolve_image_channel(
     base_url = _wire_module().normalize_base_url(spec.wire, base_url or spec.default_base_url)
     model = str(model_override or "").strip() or channel.pick("model", "MODEL", spec.default_model)
     return ImageChannel(api_key=api_key, base_url=base_url, model=model)
+
+
+def image_default_channel(*, root: Path | None = None) -> str:
+    """控制台选的默认生图工具名：models.yaml 的 image_gen.default_channel。没选或读不了是空串，名字由调用方核对。"""
+    base = Path(root) if root is not None else Path.cwd()
+    block = _models_document(base).data.get("image_gen")
+    if not isinstance(block, dict):
+        return ""
+    return str(block.get("default_channel") or "").strip()

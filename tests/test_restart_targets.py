@@ -700,7 +700,7 @@ class TestTheRealProcessManagerComesBackUnderTheWatchdog:
 
 
 class TestEngineRestartReloadsTheWorkspaceEnv:
-    """控制台改过的密钥要先进 supervisor 的环境，新拉起的 engine 才继承得到。"""
+    """进程启动后才写进本实例 .env 的值要先进 supervisor 的环境，新拉起的 engine 才继承得到。"""
 
     def test_it_reloads_the_env_of_this_instance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

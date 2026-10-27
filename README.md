@@ -175,7 +175,7 @@ python main.py
 <summary>配置优先级与兼容说明</summary>
 
 - `config/features.yaml` 比 `.env` 中的同名功能设置优先；只填写需要覆盖的项即可。`config/qq.yaml` 可进一步覆盖通用功能项。
-- 模型与工具密钥中，`.env` 的同名值优先于 `config/secrets.env`；平台令牌优先读取 `data/platform_secrets.yaml`，再回退到对应环境变量。
+- 模型与工具密钥中，`.env` 的同名值优先于 `config/secrets.env`；平台令牌优先读取 `data/platform_secrets.yaml`，再回退到对应环境变量，只认本实例的 `.env`，不读共享的 `config/secrets.env`。日志级别、代理这类进程启动时直接读的设置也写不进 `config/secrets.env`，`manage_secret` 会拒绝并说明该去哪改。
 - `config/tools/` 的同路径脚本覆盖仓库 `tools/` 版本；未覆盖的节点与 runtime 键继续使用 `defaults/`。
 - QQ 或通用功能配置解析失败时继续使用上一份有效值。控制台显示来源与加载状态，也可通过管理员接口 `GET /v1/platforms/qq/config/state` 查询。
 - 会话默认值与单个会话覆盖保存在实例运行数据中，升级会保留已有设置。

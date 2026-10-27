@@ -37,6 +37,8 @@ HOOK_ACCOUNT_OPS = "account_ops"
 HOOK_INSTANCE_ENV = "instance_env"
 # 模块提供 maintenance_tasks()，约定见 platforms/maintenance.py；定期数据清理时平台自己要清的缓存走它。
 HOOK_MAINTENANCE = "maintenance"
+# 模块提供 process_env_names()：平台进程直接从进程环境读的变量名，共享密钥文件服务不了，manage_secret 不写、建组不抄。
+HOOK_PROCESS_ENV = "process_env"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"

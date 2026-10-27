@@ -90,6 +90,7 @@ if __name__ == "__main__":
 
     from cleanup import maybe_cleanup_novelai_attachments
     from common import (
+        DrawtoolsConfigUnreadable,
         PresetNotFoundError,
         load_settings,
         require_preset,
@@ -110,7 +111,10 @@ if __name__ == "__main__":
         sys.exit(1)
 
     args = json.loads(sys.stdin.read() or "{}")
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except DrawtoolsConfigUnreadable as exc:
+        fail(str(exc))
     maybe_cleanup_novelai_attachments(settings)
     preset_ref = str(args.get("preset") or args.get("preset_id") or "").strip()
     # 预设名写错就别出图：按默认预设画出来的风格不是用户要的，模型能读到错误自己改。

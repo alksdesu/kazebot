@@ -608,7 +608,12 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def cleanup_drawtools_attachments() -> dict[str, Any]:
         # 按包导入，不往 sys.path 插 drawtools 目录：插了它的 common、cleanup 会盖住 supervisor 里的同名模块。
         from tools.drawtools.cleanup import cleanup_novelai_attachments
-        return cleanup_novelai_attachments(force=True)
+        from tools.drawtools.common import DrawtoolsConfigUnreadable
+        try:
+            return cleanup_novelai_attachments(force=True)
+        except DrawtoolsConfigUnreadable as exc:
+            # 保留期和容量上限都在 settings.yaml 里，读不了就不删，不拿默认值去删
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ----- Model channels (config/models.yaml) -----
     @router.get("/config/raw")

@@ -99,7 +99,7 @@ class TestLoadWorkspaceEnv:
     def test_override_lets_the_workspace_file_win_over_the_process(
         self, tmp_path: Path, code_root: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # supervisor 以退出码 75 自己重启时环境还停在服务启动那一刻，控制台改过的密钥只能靠这里盖回来。
+        # supervisor 以退出码 75 自己重启时环境还停在服务启动那一刻，之后写进 .env 的值只能靠这里盖回来。
         monkeypatch.setenv(_NAME, "from-process")
         root = _dir(tmp_path, "workspace", f"{_NAME}=from-workspace\n")
 
@@ -280,7 +280,7 @@ class TestProcessWorkspace:
         )
         root = _dir(tmp_path, "workspace", f"{_PORT}=8801\n{_NAME}=from-workspace\n")
         monkeypatch.setenv("CLONOTH_WORKSPACE", str(root))
-        # launcher 的环境停在服务启动那一刻，控制台改过的值还是旧的。
+        # launcher 的环境停在服务启动那一刻，之后改进 .env 的值在它那里还是旧的。
         monkeypatch.setenv(_PORT, "8765")
         monkeypatch.setenv(_NAME, "from-process")
 

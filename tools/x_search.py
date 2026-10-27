@@ -81,18 +81,22 @@ if __name__ == "__main__":
     except Exception:
         max_tokens = 8000
     max_tokens = max(1000, min(16000, max_tokens))
-    api_key = str(args.get('api_key') or os.environ.get('XAI_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()
-    base_url = str(args.get('base_url') or os.environ.get('XAI_BASE_URL') or '').strip().rstrip('/')
+    dotenv = load_dotenv()
 
-    if not api_key or not base_url:
-        dotenv = load_dotenv()
-        if not api_key:
-            api_key = str(dotenv.get('XAI_API_KEY') or dotenv.get('OPENAI_API_KEY') or '').strip()
-        if not base_url:
-            base_url = str(dotenv.get('XAI_BASE_URL') or '').strip().rstrip('/')
-    
+    def configured(name):
+        return str(os.environ.get(name) or dotenv.get(name) or '').strip()
+
+    # 地址和密钥只认配置、不收工具参数：模型多填一个 base_url，配置里的 key 就跟着 Bearer 头发到它指定的主机去了。
+    base_url = configured('XAI_BASE_URL').rstrip('/')
+    api_key = configured('XAI_API_KEY')
+    # 只有自己配了地址（OpenAI 兼容的中转）才借 OPENAI_API_KEY，别家的 key 不往 api.x.ai 发。
+    if not api_key and base_url:
+        api_key = configured('OPENAI_API_KEY')
+
     if not api_key:
-        fail('No API key available. Set XAI_API_KEY or OPENAI_API_KEY in the environment or .env, or pass api_key.')
+        if base_url:
+            fail('No API key available. Set XAI_API_KEY, or OPENAI_API_KEY for the relay at XAI_BASE_URL, in .env or config/secrets.env.')
+        fail('No API key available. Set XAI_API_KEY in .env or config/secrets.env; OPENAI_API_KEY is only used together with XAI_BASE_URL.')
     if not base_url:
         base_url = 'https://api.x.ai/v1'
     

@@ -613,6 +613,42 @@ class TestEveryCacheUsesTheSameStamp:
         assert _MISSING_STAMP == (0, 0, 0)
 
 
+class TestTheToolSideYamlReader:
+    """工具那边只吃标准库导不了 config_layout，指纹是照抄的一份：两份得一直是同一个东西。"""
+
+    def test_its_stamp_is_the_config_layout_one(self, tmp_path: Path) -> None:
+        from tools import _channel
+
+        path = _write(tmp_path / "a.yaml", "k: 1\n")
+
+        assert _channel._file_stamp(path) == config_layout.file_stamp(path)
+        assert _channel._file_stamp(tmp_path / "nope.yaml") is None
+        assert config_layout.file_stamp(tmp_path / "nope.yaml") is None
+
+    def test_a_same_tick_rewrite_is_reparsed(self, tmp_path: Path) -> None:
+        from tools import _channel
+
+        path = _write(tmp_path / "config" / "models.yaml", "version: 1\nopenai:\n  model: m-aaa\n")
+        assert _channel.read_yaml_document(path, label="config/models.yaml").data["openai"]["model"] == "m-aaa"
+
+        _same_tick_replace(path, "version: 1\nopenai:\n  model: m-bbb\n")
+
+        assert _channel.read_yaml_document(path, label="config/models.yaml").data["openai"]["model"] == "m-bbb"
+
+    def test_a_same_tick_breakage_falls_back_to_the_last_good_reading(self, tmp_path: Path) -> None:
+        from tools import _channel
+
+        path = _write(tmp_path / "config" / "models.yaml", "version: 1\nopenai:\n  model: m-aaa\n")
+        _channel.read_yaml_document(path, label="config/models.yaml")
+
+        _same_tick_replace(path, "version: 1\nopenai:\n  model: [m-aa\n")
+        document = _channel.read_yaml_document(path, label="config/models.yaml")
+
+        assert document.data["openai"]["model"] == "m-aaa"
+        assert document.stale.startswith("config/models.yaml 读不了")
+        assert document.problem == ""
+
+
 class TestTheProfileFileAndConfigStoreShareIt:
     def test_the_config_store_notices_a_same_tick_rewrite(self, tmp_path: Path) -> None:
         path = _write(tmp_path / "config" / "models.yaml", "version: 1\nprovider: openai\nopenai:\n  model: m-aaa\n")

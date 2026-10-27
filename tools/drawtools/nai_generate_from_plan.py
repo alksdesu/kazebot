@@ -38,7 +38,7 @@ if __name__ == "__main__":
     from pathlib import Path
     from urllib import request as urllib_request
 
-    from common import PresetNotFoundError
+    from common import DrawtoolsConfigUnreadable, PresetNotFoundError
     from format_plan import build_tasks_from_plan
 
     def output(result):
@@ -94,6 +94,8 @@ if __name__ == "__main__":
         tasks = build_tasks_from_plan(plan_yaml)
     except PresetNotFoundError as exc:
         fail(f"{exc}；可用预设：{'、'.join(exc.available)}")
+    except DrawtoolsConfigUnreadable as exc:
+        fail(str(exc))
     except Exception as exc:
         fail(f"failed to parse plan_yaml: {exc}")
     if not tasks:

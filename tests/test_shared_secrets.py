@@ -30,9 +30,10 @@ from toolbox.context import ToolContext  # noqa: E402
 
 _POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="Windows 上没有 POSIX 权限位")
 
-# 组里共用的那种密钥，和实例身份那种。
+# 组里共用的那种密钥，实例身份那种，和只认进程环境那种。
 SHARED_KEY = "EXA_API_KEY"
-INSTANCE_KEYS = ("CLONOTH_PORT", "ONEBOT_ACCESS_TOKEN", "FOO_PATH", "PYTHONPATH")
+INSTANCE_KEYS = ("CLONOTH_PORT", "ONEBOT_ACCESS_TOKEN", "FOO_PATH")
+PROCESS_KEYS = ("CLONOTH_LOG_LEVEL", "CLONOTH_TASK_ID", "HTTPS_PROXY", "PYTHONPATH", "CLONOTH_ALLOWED_GROUPS", "LOG_LEVEL")
 
 
 def _workspace(tmp_path: Path, *, shared: str = "", dotenv: str = "") -> Path:
@@ -447,10 +448,33 @@ class TestManageSecretList:
 
         assert data == {"result": "尚未配置任何密钥。", "names": [], "instance": [], "shared": [], "count": 0}
 
+    def test_a_line_the_group_file_should_not_hold_is_pointed_out(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        config_layout.shared_secrets_path(tmp_path).write_text(
+            f"{SHARED_KEY}=k\nCLONOTH_LOG_LEVEL=debug\nCLONOTH_PORT=8770\n", encoding="utf-8",
+        )
+
+        lines = _run({"action": "list"}, secret_ctx)["data"]["result"].splitlines()
+
+        shared = config_layout.SHARED_SECRETS_FILE
+        assert lines == [
+            f"{SHARED_KEY} — 已配置（共享 {shared}）",
+            f"CLONOTH_LOG_LEVEL — 已配置（共享 {shared}，这一行不起作用：它只认进程环境）",
+            f"CLONOTH_PORT — 已配置（共享 {shared}，实例身份只该写在本实例 .env）",
+        ]
+
+    def test_an_instance_line_is_not_marked_for_being_in_dotenv(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text("CLONOTH_LOG_LEVEL=info\nCLONOTH_PORT=8770\n", encoding="utf-8")
+
+        lines = _run({"action": "list"}, secret_ctx)["data"]["result"].splitlines()
+
+        assert lines == ["CLONOTH_LOG_LEVEL — 已配置（本实例 .env）", "CLONOTH_PORT — 已配置（本实例 .env）"]
+
     @pytest.mark.parametrize("action,args", [
         ("list", {}),
         ("set", {"name": SHARED_KEY, "value": "k-very-secret-value"}),
         ("unset", {"name": SHARED_KEY}),
+        ("set", {"name": "CLONOTH_LOG_LEVEL", "value": "k-very-secret-value"}),
+        ("set", {"name": "CLONOTH_PORT", "value": "k-very-secret-value"}),
     ])
     def test_no_value_ever_shows_up_in_a_result(
         self, secret_ctx: _Ctx, tmp_path: Path, action: str, args: dict[str, Any],
@@ -500,6 +524,149 @@ class TestManageSecretGuard:
 
         assert result["ok"] is False
         assert secret_ctx.asked == []
+
+
+class TestManageSecretProcessOnlyNames:
+    """进程直接读的设置：config/secrets.env 服务不了，写进去报成功等于骗人。"""
+
+    @pytest.mark.parametrize("name", PROCESS_KEYS)
+    def test_setting_one_is_refused_before_anyone_is_asked(self, secret_ctx: _Ctx, tmp_path: Path, name: str) -> None:
+        # 先拒再问：审批人点了同意也写不出一个能生效的值，不该让人白白审一次。
+        result = _run({"action": "set", "name": name, "value": "v-process"}, secret_ctx)
+
+        assert result["ok"] is False
+        assert "没有写入" in result["error"]
+        assert secret_ctx.asked == []
+        assert not (tmp_path / ".env").exists()
+        assert not config_layout.shared_secrets_path(tmp_path).exists()
+
+    @pytest.mark.parametrize("name,said", [
+        ("CLONOTH_TASK_ID", "不该写进任何文件"),
+        ("HTTPS_PROXY", "代理设置"),
+        ("PYTHONPATH", "Python 解释器"),
+        ("CLONOTH_LOG_LEVEL", "request_restart target=all"),
+        ("CLONOTH_ALLOWED_GROUPS", "控制台平台页"),
+        ("LOG_LEVEL", "QQ 适配进程要另外重启"),
+    ])
+    def test_the_refusal_says_where_it_can_be_changed(self, secret_ctx: _Ctx, name: str, said: str) -> None:
+        result = _run({"action": "set", "name": name, "value": "v"}, secret_ctx)
+
+        assert said in result["error"]
+
+    def test_a_platform_setting_names_its_platform(self, secret_ctx: _Ctx) -> None:
+        result = _run({"action": "set", "name": "ONEBOT_GROUP_TRIGGER", "value": "all"}, secret_ctx)
+
+        assert "QQ 这一侧" in result["error"]
+
+    def test_unset_clears_a_line_that_never_did_anything(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        config_layout.shared_secrets_path(tmp_path).write_text(
+            f"CLONOTH_LOG_LEVEL=debug\n{SHARED_KEY}=k\n", encoding="utf-8",
+        )
+
+        result = _run({"action": "unset", "name": "CLONOTH_LOG_LEVEL"}, secret_ctx)
+
+        assert result["ok"] is True, result
+        assert dict(config_layout.shared_secrets(tmp_path)) == {SHARED_KEY: "k"}
+        assert "本来就不起作用" in result["data"]["result"]
+        assert secret_ctx.asked == [("write_file", {"path": ".secret/CLONOTH_LOG_LEVEL"})]
+
+    def test_unset_leaves_the_instance_copy_alone(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        # .env 里那份是进程环境的正当来源，删它不归 manage_secret。
+        (tmp_path / ".env").write_text("CLONOTH_LOG_LEVEL=info\n", encoding="utf-8")
+        config_layout.shared_secrets_path(tmp_path).write_text("CLONOTH_LOG_LEVEL=debug\n", encoding="utf-8")
+
+        result = _run({"action": "unset", "name": "CLONOTH_LOG_LEVEL"}, secret_ctx)
+
+        assert result["ok"] is True, result
+        assert dict(config_layout.read_env_file(tmp_path / ".env")) == {"CLONOTH_LOG_LEVEL": "info"}
+        assert dict(config_layout.shared_secrets(tmp_path)) == {}
+        assert "本实例 .env 里的同名项没动" in result["data"]["result"]
+
+    def test_unset_of_one_only_in_dotenv_is_refused(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text("CLONOTH_LOG_LEVEL=info\n", encoding="utf-8")
+        before = (tmp_path / ".env").read_bytes()
+
+        result = _run({"action": "unset", "name": "CLONOTH_LOG_LEVEL"}, secret_ctx)
+
+        assert result["ok"] is False
+        assert "只在本实例 .env 里" in result["error"]
+        assert (tmp_path / ".env").read_bytes() == before
+        assert secret_ctx.asked == []
+
+    def test_unset_of_one_set_nowhere_is_not_an_error(self, secret_ctx: _Ctx) -> None:
+        result = _run({"action": "unset", "name": "CLONOTH_LOG_LEVEL"}, secret_ctx)
+
+        assert result["ok"] is True
+        assert "本来就没有配置" in result["data"]["result"]
+
+
+class TestManageSecretSaysWhenItTakesEffect:
+    def test_a_platform_identity_names_the_adapter_and_the_unit(self, secret_ctx: _Ctx) -> None:
+        # 适配进程不归 request_restart 管；systemd 单元里的同名变量又压得住 .env。
+        text = _run({"action": "set", "name": "ONEBOT_ACCESS_TOKEN", "value": "t"}, secret_ctx)["data"]["result"]
+
+        assert "request_restart target=all" in text
+        assert "QQ 适配进程要另外重启" in text
+        assert "systemd 单元里也设了同名变量" in text
+
+    def test_a_core_identity_needs_a_full_restart(self, secret_ctx: _Ctx) -> None:
+        text = _run({"action": "set", "name": "CLONOTH_PORT", "value": "8770"}, secret_ctx)["data"]["result"]
+
+        assert "读它的进程重启后才会生效" in text
+        assert "request_restart target=all" in text
+        assert "systemd" not in text
+
+    def test_a_shadowed_shared_key_needs_the_engine_restarted(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        # .env 只在进程启动时灌进环境，先查进程环境的读法拿到的还是旧值。
+        (tmp_path / ".env").write_text(f"{SHARED_KEY}=k-old\n", encoding="utf-8")
+
+        text = _run({"action": "set", "name": SHARED_KEY, "value": "k-new"}, secret_ctx)["data"]["result"]
+
+        assert "request_restart target=engine" in text
+
+    def test_an_unshadowed_shared_key_needs_no_restart(
+        self, secret_ctx: _Ctx, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(SHARED_KEY, raising=False)
+
+        text = _run({"action": "set", "name": SHARED_KEY, "value": "k"}, secret_ctx)["data"]["result"]
+
+        assert "下次取值即生效" in text
+        assert "request_restart" not in text
+        assert "注意" not in text
+
+    def test_a_value_the_process_already_has_is_pointed_out(
+        self, secret_ctx: _Ctx, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(SHARED_KEY, "k-from-the-unit")
+
+        result = _run({"action": "set", "name": SHARED_KEY, "value": "k-new"}, secret_ctx)
+
+        assert "systemd 单元或启动脚本" in result["data"]["result"]
+        assert "k-from-the-unit" not in str(result)
+
+    def test_removing_a_shared_key_from_dotenv_needs_a_full_restart(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        # target=engine 重灌 .env 只会补上和改掉，删掉的那项还留在 supervisor 的环境里。
+        (tmp_path / ".env").write_text(f"{SHARED_KEY}=k-local\n", encoding="utf-8")
+
+        text = _run({"action": "unset", "name": SHARED_KEY}, secret_ctx)["data"]["result"]
+
+        assert "request_restart target=all" in text
+        assert "target=engine" not in text
+
+    def test_removing_an_identity_says_when_it_stops_applying(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        (tmp_path / ".env").write_text("CLONOTH_PORT=8770\n", encoding="utf-8")
+
+        text = _run({"action": "unset", "name": "CLONOTH_PORT"}, secret_ctx)["data"]["result"]
+
+        assert "读它的进程重启后才会生效" in text
+
+    def test_removing_a_key_that_was_only_shared_needs_no_restart(self, secret_ctx: _Ctx, tmp_path: Path) -> None:
+        config_layout.shared_secrets_path(tmp_path).write_text(f"{SHARED_KEY}=k\n", encoding="utf-8")
+
+        text = _run({"action": "unset", "name": SHARED_KEY}, secret_ctx)["data"]["result"]
+
+        assert "request_restart" not in text
 
 
 # ---------------------------------------------------------------------------

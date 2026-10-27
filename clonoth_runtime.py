@@ -658,23 +658,64 @@ def load_module_from(path: Path, module_name: str) -> Any:
     return module
 
 
-def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
-    """这个生图工具现在能不能跑通。"""
-    slot = IMAGE_TOOL_SLOTS.get(str(tool_name or "").strip())
+@dataclass(frozen=True)
+class ImageToolStatus:
+    """一个绘图工具现在能不能出图。problem 非空表示判断不了：配置读不了或判定本身出错，不能当成没配。"""
+
+    available: bool = False
+    problem: str = ""
+
+    @property
+    def unconfigured(self) -> bool:
+        """确定没配。门控只摘这一种，判断不了的留着，让工具自己报出读不了的原因。"""
+        return not self.available and not self.problem
+
+
+def _image_channel_module(root: Path) -> Any:
+    return load_module_from(root / "tools" / "_channel.py", "clonoth_image_channel")
+
+
+def _judgement_failed(subject: str, exc: Exception) -> str:
+    # 只报异常类型：消息里可能带着配置里的值，这句原因会进提示词和日志
+    return f"判断 {subject} 能不能用时出错（{type(exc).__name__}）"
+
+
+def image_tool_status(workspace_root: Path, tool_name: str) -> ImageToolStatus:
+    """这个生图工具现在能不能跑通，和工具子进程同一份 resolve_image_channel。"""
+    name = str(tool_name or "").strip()
+    slot = IMAGE_TOOL_SLOTS.get(name)
     if not slot:
-        return False
+        return ImageToolStatus()
     root = Path(workspace_root)
-    module = load_module_from(root / "tools" / "_channel.py", "clonoth_image_channel")
+    module = _image_channel_module(root)
     if module is None:
-        return False
+        return ImageToolStatus()
     try:
-        return bool(module.resolve_image_channel(slot, root=root).usable)
-    except Exception:
-        return False
+        channel = module.resolve_image_channel(slot, root=root)
+    except Exception as exc:
+        return ImageToolStatus(problem=_judgement_failed(name, exc))
+    if channel.error:
+        return ImageToolStatus(problem=channel.error)
+    return ImageToolStatus(available=bool(channel.usable))
 
 
-def novelai_available(workspace_root: Path) -> bool:
-    """NovelAI 配了 key 才算可用：settings.yaml 优先，其次 NOVELAI_API_KEY。
+def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
+    """这个生图工具现在能不能跑通。判断不了也是 False，要分清的用 image_tool_status。"""
+    return image_tool_status(workspace_root, tool_name).available
+
+
+def image_default_channel(workspace_root: Path) -> str:
+    """控制台选的默认生图工具，和可用性判断读同一份 models.yaml。没选、不是生图工具名或读不了是空串。"""
+    root = Path(workspace_root)
+    module = _image_channel_module(root)
+    if module is None:
+        return ""
+    name = module.image_default_channel(root=root)
+    return name if name in IMAGE_TOOL_SLOTS else ""
+
+
+def novelai_status(workspace_root: Path) -> ImageToolStatus:
+    """NovelAI 配了 key 才算可用：settings.yaml 优先，其次 NOVELAI_API_KEY。settings.yaml 读不了时判断不了。
 
     判定借 drawtools 自己那份 —— 它按工作区变量找 config/drawtools，supervisor 早把那组变量
     钉在本工作区上。settings.example.yaml 里 api_key 是空串，回退到示例不会判成已配。
@@ -682,11 +723,22 @@ def novelai_available(workspace_root: Path) -> bool:
     module = load_module_from(
         Path(workspace_root) / "tools" / "drawtools" / "common.py", "clonoth_drawtools_common")
     if module is None:
-        return False
+        return ImageToolStatus()
     try:
-        return bool(module.resolve_api_key(module.load_settings()))
-    except Exception:
-        return False
+        settings = module.load_settings()
+    except module.DrawtoolsConfigUnreadable as exc:
+        return ImageToolStatus(problem=str(exc))
+    except Exception as exc:
+        return ImageToolStatus(problem=_judgement_failed("NovelAI", exc))
+    try:
+        return ImageToolStatus(available=bool(module.resolve_api_key(settings)))
+    except Exception as exc:
+        return ImageToolStatus(problem=_judgement_failed("NovelAI", exc))
+
+
+def novelai_available(workspace_root: Path) -> bool:
+    """NovelAI 现在能不能出图。判断不了也是 False，要分清的用 novelai_status。"""
+    return novelai_status(workspace_root).available
 
 
 class _ModelsConfigUnusable(ValueError):
@@ -759,10 +811,41 @@ def load_models_config(workspace_root: Path | str) -> dict[str, Any]:
     return copy.deepcopy(_models_config_version(config_layout.models_path(workspace_root)).data)
 
 
+# 每份平台密钥文件最近告警过的那一版：同一版坏文件只告警一次。
+_platform_secrets_warned: dict[str, tuple[int, int, int] | None] = {}
+_platform_secrets_warned_lock = threading.Lock()
+
+
 def load_platform_secrets(workspace_root: Path | str) -> dict[str, Any]:
-    """平台密钥 data/platform_secrets.yaml：顶层按平台 id 分段。"""
-    data = load_yaml_dict(config_layout.platform_secrets_path(workspace_root))
-    return data if isinstance(data, dict) else {}
+    """平台密钥 data/platform_secrets.yaml：顶层按平台 id 分段。
+
+    读不了按空表算，和工具子进程同一个回退；同一版坏文件只告警一次。
+    """
+    path = config_layout.platform_secrets_path(workspace_root)
+    stamp = config_layout.file_stamp(path)
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    except Exception as exc:
+        # 只报异常类型：YAML 的报错会附上出错那一行原文，那一行可能正是令牌
+        _warn_platform_secrets_unreadable(path, stamp, type(exc).__name__)
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        _warn_platform_secrets_unreadable(path, stamp, "顶层不是映射")
+        return {}
+    return data
+
+
+def _warn_platform_secrets_unreadable(path: Path, stamp: tuple[int, int, int] | None, reason: str) -> None:
+    key = str(path)
+    with _platform_secrets_warned_lock:
+        if key in _platform_secrets_warned and _platform_secrets_warned[key] == stamp:
+            return
+        _platform_secrets_warned[key] = stamp
+    _log.warning("%s 读不了（%s），平台密钥全按没配算", path, reason)
 
 
 def stray_platforms_section(workspace_root: Path | str) -> bool:
@@ -953,7 +1036,8 @@ def offline_workspace(explicit: Path | str | None = None) -> Path:
 def process_workspace() -> Path:
     """常驻进程启动时定工作区并灌 .env，工作区自己那份盖过继承来的值。
 
-    supervisor 退出码 75 自己重启时，launcher 的环境还停在服务启动那一刻；控制台改过的密钥要靠这个生效。
+    supervisor 退出码 75 自己重启时，launcher 的环境还停在服务启动那一刻；之后写进本实例 .env 的值
+    （manage_secret 写的实例身份、部署脚本回填的令牌）要靠这次重灌才生效。
     """
     return _settle_workspace(None, override=True)
 

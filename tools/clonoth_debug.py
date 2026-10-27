@@ -154,6 +154,9 @@ if __name__ == "__main__":
         path = args.get("path", "")
         if not path:
             fail("api action 需要 path 参数")
+        # path 直接拼在 supervisor 地址后面：不以 / 开头的（@host/…、.host/…）能把请求连同管理令牌送到别的主机
+        if not isinstance(path, str) or not path.startswith("/"):
+            fail(f"path 必须是以 / 开头的 supervisor API 路径，收到 {json.dumps(path, ensure_ascii=False)[:80]}")
         method = str(args.get("method", "GET") or "GET").upper()
         # supervisor 在回环上对多数写端点不校验令牌，靠的是「同机进程可信」。
         # 这个工具让模型也成了同机进程，放开写方法等于把那条假设作废

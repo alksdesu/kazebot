@@ -104,6 +104,8 @@ if __name__ == "__main__":
     api_key = channel.api_key
     base_url = channel.base_url
 
+    if channel.error:
+        fail(channel.error)
     if not api_key:
         fail("No API key found in config/models.yaml / env / .env file")
 
