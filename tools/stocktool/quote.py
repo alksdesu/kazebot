@@ -49,13 +49,27 @@ SPEC = {
 TIMEOUT_SEC = 60
 
 
+def _input_error(error: str, result: str = "") -> dict:
+    return {
+        "ok": False,
+        "error": error,
+        "data": {"result": f"ERROR: {result or error}", "quotes": [], "failures": [], "warnings": [], "success_count": 0, "fail_count": 0},
+    }
+
+
 def _run(args: dict) -> dict:
     from stocklib.config import DEFAULT_MAX_ITEMS, HARD_MAX_ITEMS, DISCLAIMER, QUOTE_TTL_SEC
     from stocklib.formatter import format_result
     from stocklib.resolver import resolve_many
     from stocklib.sources import get_quote
     # stocklib.cache 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
-    from tools._channel import parse_bool
+    from tools._channel import SwitchValueError, switch_arg
+
+    try:
+        refresh = switch_arg(args, "refresh", False)
+        include_raw = switch_arg(args, "include_raw", False)
+    except SwitchValueError as exc:
+        return _input_error(str(exc))
 
     raw_symbols = args.get("symbols")
     if isinstance(raw_symbols, list) and raw_symbols:
@@ -65,11 +79,7 @@ def _run(args: dict) -> dict:
         inputs = [symbol] if symbol else []
 
     if not inputs:
-        return {
-            "ok": False,
-            "error": "no symbol specified",
-            "data": {"result": "ERROR: 请提供 symbol 或 symbols。", "quotes": [], "failures": [], "warnings": [], "success_count": 0, "fail_count": 0},
-        }
+        return _input_error("no symbol specified", "请提供 symbol 或 symbols。")
 
     try:
         max_items = int(args.get("max_items") or DEFAULT_MAX_ITEMS)
@@ -83,8 +93,6 @@ def _run(args: dict) -> dict:
         truncated_warning = ""
 
     market = str(args.get("market") or "auto")
-    refresh = bool(parse_bool(args.get("refresh"), False))
-    include_raw = bool(parse_bool(args.get("include_raw"), False))
 
     resolved, failures = resolve_many(inputs, market_hint=market)
     quotes = []

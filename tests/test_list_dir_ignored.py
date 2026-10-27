@@ -1,4 +1,4 @@
-"""list_dir：依赖、缓存和构建目录只列名字、标注内容已省略，递归时不进去；include_ignored=true 时照常列出。"""
+"""list_dir：依赖、缓存和构建目录只列名字、标注内容已省略，递归时不进去；include_ignored=true 时照常列出，写了认不出的值就拒。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +13,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from clonoth_runtime import switch_refusal  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
 from toolbox.ignore_rules import DEFAULT_IGNORED_DIRS  # noqa: E402
 
@@ -117,11 +118,19 @@ class TestRecursiveListing:
         assert "src/__pycache__/app.cpython-311.pyc" in names
         assert all("ignored" not in entry for entry in section["entries"])
 
-    @pytest.mark.parametrize("flag", [False, "false", "no", None, "garbage"])
-    def test_anything_but_a_true_value_keeps_the_default(self, project: Path, flag: Any) -> None:
+    @pytest.mark.parametrize("flag", [False, "false", "no", 0, None, "", "  "])
+    def test_false_or_unset_keeps_the_default(self, project: Path, flag: Any) -> None:
         section = _list(project, paths=["."], recursive=True, include_ignored=flag)["data"]["results"][0]
 
         assert "node_modules/left-pad/index.js" not in [entry["name"] for entry in section["entries"]]
+
+    @pytest.mark.parametrize("flag", ["garbage", "全部", 2, ["true"]])
+    def test_an_unrecognised_value_is_refused_instead_of_listing(self, project: Path, flag: Any) -> None:
+        result = _list(project, paths=["."], recursive=True, include_ignored=flag)
+
+        assert result["ok"] is False
+        assert result["error"] == switch_refusal("include_ignored", flag)
+        assert result["data"]["results"] == []
 
 
 @pytest.mark.parametrize("name", sorted(DEFAULT_IGNORED_DIRS))

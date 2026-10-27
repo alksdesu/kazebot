@@ -62,7 +62,7 @@ if __name__ == "__main__":
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
 
-    from _channel import parse_bool
+    from _channel import SwitchValueError, switch_arg
 
     MAX_BYTES = 16 * 1024 * 1024  # 最多读取 16MB 响应体，避免超大页面拖垮进程
     MAX_CHARS_CAP = 120000
@@ -209,6 +209,10 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     args = raw_input if isinstance(raw_input, dict) else {}
+    try:
+        want_raw = switch_arg(args, "raw", False)
+    except SwitchValueError as exc:
+        fail(str(exc))
     url = extract_url(raw_input)
     if not url:
         fail("缺少 url。", hint="请重新调用 read_web，格式：{\"url\": \"https://要读取的地址\"}。")
@@ -223,7 +227,6 @@ if __name__ == "__main__":
         fail(f"该地址不允许访问：{reason}", hint="请提供一个公网 http(s) 网址，不能是内网或本机地址。")
 
     max_chars = clamp_int(args.get("max_chars"), DEFAULT_MAX_CHARS, 200, MAX_CHARS_CAP)
-    want_raw = bool(parse_bool(args.get("raw"), False))
 
     req = Request(url, headers={
         "User-Agent": USER_AGENT,

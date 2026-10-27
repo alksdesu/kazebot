@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import SwitchValueError, switch_arg
 from platforms.registry import is_platform_conversation
 from platforms.sources import classify_source_name, is_external_platform
 
@@ -145,6 +145,13 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     conv_key = _resolve_schedule_conversation_key(args, ctx, sid)
     entry_node_id = str(args.get("entry_node_id") or "").strip()
     workflow_id = str(args.get("workflow_id") or "").strip()
+    # 送审之前就拒：照默认值建的话，once 写错就成了循环任务
+    try:
+        enabled = switch_arg(args, "enabled", True)
+        once = switch_arg(args, "once", False)
+        silent = switch_arg(args, "silent", True)
+    except SwitchValueError as exc:
+        return _err(exc)
 
     is_admin = _platform_admin_can_manage_schedules(ctx)
     origin = _originating_conversation_key(ctx)
@@ -175,9 +182,6 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
-    # 模型常把开关写成字符串，bool("false") 是真
-    enabled = bool(parse_bool(args.get("enabled"), True))
-    once = bool(parse_bool(args.get("once"), False))
 
     if stype == "script":
         # scheduler 执行 script 走 subprocess.run(shell=True)，等于一条定时的
@@ -206,7 +210,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         entry["command"] = command
         timeout = int(args.get("timeout") or 30)
         entry["timeout"] = max(5, min(timeout, 300))
-        entry["silent"] = bool(parse_bool(args.get("silent"), True))
+        entry["silent"] = silent
         if text:
             entry["text"] = text
     else:

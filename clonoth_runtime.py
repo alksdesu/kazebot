@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import logging
 import os
 import threading
@@ -9,7 +10,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import yaml
@@ -322,10 +323,13 @@ def get_float(data: dict[str, Any], dotted_key: str, default: float, *, min_valu
 
 _TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_WORDS = frozenset({"0", "false", "no", "n", "off"})
+# 拒绝原因里收到的值最多露这么多字
+_SHOWN_SWITCH_CHARS = 40
+_SwitchDefault = TypeVar("_SwitchDefault", bool, None)
 
 
 def parse_bool(raw: Any, default: bool | None = None) -> bool | None:
-    """配置和环境变量里的开关。认不出的（包括空）给 default，和 get_int、get_float 读坏值时一样。"""
+    """配置和环境变量里的开关。认不出的（包括空）给 default，和 get_int、get_float 读坏值时一样；模型填的工具参数用 switch_arg。"""
     if isinstance(raw, bool):
         return raw
     text = str(raw if raw is not None else "").strip().lower()
@@ -343,6 +347,32 @@ def env_bool(name: str, default: bool) -> bool:
 
 def get_bool(data: dict[str, Any], dotted_key: str, default: bool = False) -> bool:
     return bool(parse_bool(get_str(data, dotted_key, ""), bool(default)))
+
+
+class SwitchValueError(ValueError):
+    """模型填的开关写了 true、false 以外认不出的值。"""
+
+
+def switch_refusal(name: str, raw: Any) -> str:
+    shown = json.dumps(raw, ensure_ascii=False, default=str)
+    if len(shown) > _SHOWN_SWITCH_CHARS:
+        shown = shown[:_SHOWN_SWITCH_CHARS] + "...<truncated>"
+    return f"{name} 只能是 true 或 false，收到的是 {shown}"
+
+
+def parse_switch(raw: Any, default: _SwitchDefault, *, name: str) -> bool | _SwitchDefault:
+    """模型填的开关：没写、null、空串照 default，parse_bool 认得的写法照读，认不出的抛 SwitchValueError，不照 default 执行。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    value = parse_bool(raw)
+    if value is None:
+        raise SwitchValueError(switch_refusal(name, raw))
+    return value
+
+
+def switch_arg(args: Mapping[str, Any], key: str, default: _SwitchDefault) -> bool | _SwitchDefault:
+    """工具参数里名为 key 的开关，读法同 parse_switch。"""
+    return parse_switch(args.get(key), default, name=key)
 
 
 def main_session_enabled(config: dict[str, Any]) -> bool:

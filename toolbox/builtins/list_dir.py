@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import SwitchValueError, switch_arg
 
 from ..context import ToolContext, project_origin_of, project_root_of
 from .._common import request_guard, resolve_and_classify, guard_external_read
@@ -141,8 +141,12 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not dir_paths:
         return _empty_error_response("no paths specified")
 
-    recursive = parse_bool(args.get("recursive"), False)
-    ignore_dirs = _NO_IGNORED_DIRS if parse_bool(args.get("include_ignored"), False) else _DEFAULT_IGNORE_DIRS
+    try:
+        recursive = switch_arg(args, "recursive", False)
+        include_ignored = switch_arg(args, "include_ignored", False)
+    except SwitchValueError as exc:
+        return _empty_error_response(exc)
+    ignore_dirs = _NO_IGNORED_DIRS if include_ignored else _DEFAULT_IGNORE_DIRS
 
     # 工作区外的路径整批只送审一次。
     project_root = project_root_of(ctx)

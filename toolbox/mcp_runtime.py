@@ -21,7 +21,7 @@ from typing import Any, TypeVar
 import yaml
 
 import config_layout
-from clonoth_runtime import parse_bool, resolve_env_ref
+from clonoth_runtime import parse_bool, resolve_env_ref, switch_arg
 
 logger = logging.getLogger(__name__)
 
@@ -208,18 +208,22 @@ def get_client_spec(workspace_root: Path, client_id: str) -> dict[str, Any]:
     return _normalize_public_spec(cid, spec)
 
 
-def _shares_sessions(spec: dict[str, Any], previous: Any) -> bool:
+def requested_switches(spec: dict[str, Any]) -> tuple[bool, bool | None]:
+    """保存客户端时给的 enabled 和 share_sessions；share_sessions 没写是 None。认不出的值抛 SwitchValueError。"""
+    return switch_arg(spec, "enabled", True), switch_arg(spec, "share_sessions", None)
+
+
+def _shares_sessions(requested: bool | None, previous: Any) -> bool:
     """没传 share_sessions 就沿用文件里原来的值，传了才改。"""
-    requested = spec.get("share_sessions")
     if requested is None:
         return isinstance(previous, dict) and bool(parse_bool(previous.get("share_sessions"), False))
-    return bool(parse_bool(requested, False))
+    return requested
 
 
 def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
     cid = _normalize_client_id(spec.get("id"))
     transport = _normalize_transport(spec.get("transport"))
-    enabled = bool(parse_bool(spec.get("enabled"), True))
+    enabled, share_sessions = requested_switches(spec)
     description = str(spec.get("description") or "").strip()
 
     connection: dict[str, Any]
@@ -255,7 +259,7 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
             "enabled": enabled,
         }
         # 只在为真时写进文件：默认按对话隔离，文件里不出现这个键
-        if _shares_sessions(spec, clients.get(cid)):
+        if _shares_sessions(share_sessions, clients.get(cid)):
             record["share_sessions"] = True
         if description:
             record["description"] = description

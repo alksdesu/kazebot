@@ -104,9 +104,13 @@ if __name__ == "__main__":
 
     # 本实例 .env 盖在共享密钥文件上面：组里共用的 EXA_API_KEY 也读得到。
     from _channel import dotenv_values as load_dotenv
-    from _channel import parse_bool
+    from _channel import SwitchValueError, switch_arg
 
     args = _input if isinstance(_input, dict) else {}
+    try:
+        use_autoprompt = switch_arg(args, "use_autoprompt", True)
+    except SwitchValueError as exc:
+        fail(str(exc))
 
     query = extract_query(_input)
     if not query:
@@ -145,7 +149,7 @@ if __name__ == "__main__":
         "query": query,
         "type": search_type,
         "numResults": num_results,
-        "useAutoprompt": bool(parse_bool(args.get("use_autoprompt"), True)),
+        "useAutoprompt": use_autoprompt,
     }
 
     include_domains = as_clean_string_list(args.get("include_domains"))

@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from clonoth_runtime import switch_refusal
 from engine.materials import MaterialError, MaterialService
 from engine.materials.integration import begin_image_generation, persist_generated_images
 from supervisor.feature_auth import FeatureActor
@@ -142,6 +143,32 @@ def test_extraction_preserves_zero_and_requires_matching_revision(service, actor
     assert conflict.value.code == "version_conflict"
     with pytest.raises(MaterialError):
         service.create_extraction(actor, {"source_id": image["id"], "fields": [{"label": "bad", "value": "x", "bbox": [0, 0, 2, 1]}]})
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("false", False), ("No", False), (0, False), (False, False),
+    ("true", True), ("YES", True), (1, True), (True, True),
+    (None, True), ("", True), ("  ", True),
+])
+def test_extraction_reads_uncertain_as_a_switch(service, actor, raw, expected):
+    image = image_source(service, actor)
+    extracted = service.create_extraction(actor, {"source_id": image["id"], "kind": "table", "fields": [
+        {"id": "price", "label": "金额", "value": "1", "uncertain": raw},
+        {"id": "note", "label": "备注", "value": "x"},
+    ]})
+    assert [field["uncertain"] for field in extracted["fields"]] == [expected, True]
+
+
+@pytest.mark.parametrize("raw", ["maybe", "看不清", 2, ["true"]])
+def test_extraction_refuses_an_unrecognised_uncertain(service, actor, raw):
+    image = image_source(service, actor)
+    with pytest.raises(MaterialError) as refused:
+        service.create_extraction(actor, {"source_id": image["id"], "kind": "table", "fields": [
+            {"id": "price", "label": "金额", "value": "1", "uncertain": raw},
+        ]})
+    assert str(refused.value) == switch_refusal("字段 price 的 uncertain", raw)
+    assert refused.value.code == "invalid_input"
+    assert service.store.list("extraction", actor) == []
 
 
 def test_versions_restore_original_bytes_and_block_unconfirmed_exports(service, actor):

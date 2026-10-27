@@ -33,6 +33,7 @@ from _worktree_fixture import (  # noqa: E402
     write_policy,
     write_runtime,
 )
+from clonoth_runtime import switch_refusal  # noqa: E402
 from engine.worktree_report import worktree_lines  # noqa: E402
 from supervisor.file_claims import _resolver_locked, ledger_of  # noqa: E402
 from supervisor.worktrees.keys import WORKTREE_OUTCOME_KEY  # noqa: E402
@@ -427,6 +428,40 @@ class TestTheMergeTool:
         assert env.entry(child)["state"] == "abandoned"
         again = _run_tool(ctx, handle=view["handle"], abandon=True)
         assert again["ok"] is True and again["data"]["abandoned"] is False
+
+    @pytest.mark.parametrize("raw", ["true", "YES", 1])
+    def test_other_spellings_of_true_still_abandon(self, env: Env, raw: Any) -> None:
+        caller, _child, view = _finished_child(env)
+        ctx = _ToolCtx(env, caller)
+
+        result = _run_tool(ctx, handle=view["handle"], abandon=raw)
+
+        assert result["ok"] is True and result["data"]["abandoned"] is True
+        assert [path for path, _body in ctx.http.calls] == ["/abandon"]
+
+    @pytest.mark.parametrize("raw", [False, "false", 0, None, ""])
+    def test_false_or_unset_merges(self, env: Env, raw: Any) -> None:
+        caller, _child, view = _finished_child(env)
+        ctx = _ToolCtx(env, caller)
+
+        result = _run_tool(ctx, handle=view["handle"], abandon=raw)
+
+        assert result["ok"] is True, result
+        assert [path for path, _body in ctx.http.calls] == ["/preview", "/merge"]
+        assert (env.ws / "app" / "new.py").is_file()
+
+    @pytest.mark.parametrize("raw", ["discard", "放弃", 2, ["true"]])
+    def test_an_unrecognised_abandon_is_refused_instead_of_merging(self, env: Env, raw: Any) -> None:
+        caller, child, view = _finished_child(env)
+        ctx = _ToolCtx(env, caller)
+
+        result = _run_tool(ctx, handle=view["handle"], abandon=raw)
+
+        assert result["ok"] is False
+        assert result["error"] == switch_refusal("abandon", raw)
+        assert ctx.http.calls == [] and ctx.requested == []
+        assert env.entry(child)["state"] == "finished"
+        assert (env.ws / "app" / "main.py").read_text(encoding="utf-8") == ORIGINAL_MAIN
 
     def test_a_conflict_lists_the_files_and_lines(self, env: Env) -> None:
         caller, child, view = _finished_child(env)

@@ -23,6 +23,7 @@ for _p in (str(_ROOT), str(_TESTS)):
         sys.path.insert(0, _p)
 
 from _file_edits_fake import FakeFileEdits, FakeSupervisor  # noqa: E402
+from clonoth_runtime import switch_refusal  # noqa: E402
 from toolbox import edit_journal  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
 from toolbox.builtins.read_file import read_file  # noqa: E402
@@ -387,6 +388,46 @@ class TestUndo:
         assert result["ok"] is True
         assert path.read_bytes() == b"one\n"
         assert path.stat().st_mode & 0o777 == 0o600
+
+
+class TestForceValues:
+    @staticmethod
+    def _changed_after_the_task(tmp_path: Path) -> tuple[Path, _Ctx]:
+        path = seed(tmp_path / "f.txt", b"one\n")
+        ctx = _Ctx(tmp_path)
+        diff(ctx, "f.txt", "one", "two")
+        path.write_bytes(b"someone else\n")
+        return path, ctx
+
+    @pytest.mark.parametrize("raw", [True, "true", "YES", 1, " on "])
+    def test_a_true_value_restores_anyway(self, tmp_path: Path, raw: Any) -> None:
+        path, ctx = self._changed_after_the_task(tmp_path)
+
+        result = undo(ctx, force=raw)
+
+        assert result["ok"] is True
+        assert path.read_bytes() == b"one\n"
+
+    @pytest.mark.parametrize("raw", [False, "false", "No", 0, None, "", "  "])
+    def test_a_false_or_unset_value_skips_the_changed_file(self, tmp_path: Path, raw: Any) -> None:
+        path, ctx = self._changed_after_the_task(tmp_path)
+
+        result = undo(ctx, force=raw)
+
+        assert result["ok"] is False
+        assert result["data"]["skippedCount"] == 1
+        assert path.read_bytes() == b"someone else\n"
+
+    @pytest.mark.parametrize("raw", ["overwrite", "强制", 2, ["true"]])
+    def test_an_unrecognised_value_is_refused_before_anything_is_undone(self, tmp_path: Path, raw: Any) -> None:
+        path, ctx = self._changed_after_the_task(tmp_path)
+
+        result = undo(ctx, force=raw)
+
+        assert result["ok"] is False
+        assert result["error"] == switch_refusal("force", raw)
+        assert path.read_bytes() == b"someone else\n"
+        assert ctx.undo_requests() == []
 
 
 class TestUnrecorded:

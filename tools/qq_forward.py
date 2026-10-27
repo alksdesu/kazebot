@@ -137,7 +137,7 @@ if __name__ == "__main__":
     import uuid
     from pathlib import Path
 
-    from _channel import parse_bool
+    from _channel import SwitchValueError, switch_arg
 
     def _read_input():
         raw = (sys.stdin.read() or "{}").lstrip("\ufeff")
@@ -290,13 +290,19 @@ if __name__ == "__main__":
         except Exception:
             payload["limit"] = 20
     else:
+        try:
+            include_images = switch_arg(args, "include_images", True)
+            include_files = switch_arg(args, "include_files", True)
+            use_recent = switch_arg(args, "use_recent", False)
+        except SwitchValueError as exc:
+            fail(str(exc))
         payload["action"] = op
         payload["target_type"] = str(args.get("target_type") or "").strip().lower()
         payload["target_ref"] = str(args.get("target_ref") or "").strip()
         payload["query"] = str(args.get("query") or "").strip()
         payload["text"] = str(args.get("text") or "").strip()
-        payload["include_images"] = bool(parse_bool(args.get("include_images"), True))
-        payload["include_files"] = bool(parse_bool(args.get("include_files"), True))
+        payload["include_images"] = include_images
+        payload["include_files"] = include_files
         raw_refs = args.get("message_refs")
         message_refs = []
         if isinstance(raw_refs, list):
@@ -307,7 +313,6 @@ if __name__ == "__main__":
         payload["message_refs"] = message_refs
 
         # “最近生成/发出的图片”选择（如生图插件产出的图）。
-        use_recent = bool(parse_bool(args.get("use_recent"), False))
         recent_refs = []
         raw_recent = args.get("recent_refs")
         if isinstance(raw_recent, list):

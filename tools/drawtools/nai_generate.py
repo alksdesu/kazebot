@@ -99,7 +99,7 @@ if __name__ == "__main__":
         size_to_dimensions,
     )
     # common 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
-    from tools._channel import parse_bool
+    from tools._channel import SwitchValueError, parse_bool, switch_arg
 
     def output(result):
         print(json.dumps(result, ensure_ascii=False))
@@ -139,11 +139,14 @@ if __name__ == "__main__":
     scheduler = str(args.get("scheduler") or params.get("scheduler") or params.get("noise_schedule") or "karras")
     steps = int(args.get("steps") or params.get("steps") or 28)
     scale = float(args.get("scale") if args.get("scale") is not None else params.get("scale", 6))
-    # 预设、模型传的 params 和单独给的开关都可能写成字符串：合并后统一读成真假，单独给的认不出就留原来的
+    # params 宽松读：nai_generate_from_plan 会原样转来配置预设的 params，分不出谁写的；单独给的开关只会是模型写的，认不出就拒
     switch_defaults = {"qualityToggle": True, "autoSmea": False, "variety_boost": False, "sm": False, "sm_dyn": False, "decrisper": False}
     for bool_key, default in switch_defaults.items():
         configured = bool(parse_bool(params.get(bool_key), default))
-        params[bool_key] = bool(parse_bool(args.get(bool_key), configured)) if bool_key in args else configured
+        try:
+            params[bool_key] = switch_arg(args, bool_key, configured)
+        except SwitchValueError as exc:
+            fail(str(exc))
     for num_key in ("ucPreset", "cfg_rescale"):
         if num_key in args:
             params[num_key] = args.get(num_key)

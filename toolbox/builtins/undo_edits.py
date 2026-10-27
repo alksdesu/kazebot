@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import switch_arg
 
 from .. import file_state
 from .._common import request_guard, resolve_under_allowed_roots
@@ -601,9 +601,9 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     try:
         requested = _requested_paths(args.get("paths"))
+        force = switch_arg(args, "force", False)
     except ValueError as exc:
         return _error(str(exc))
-    force = bool(parse_bool(args.get("force"), False))
     ref = str(args.get("task_id") or "").strip()
     if ref:
         task, problem = _find_task(tasks, ref)

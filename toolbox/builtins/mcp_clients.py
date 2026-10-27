@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import config_layout
+from clonoth_runtime import SwitchValueError
 
 from ..context import ToolContext
 from .._common import request_guard
@@ -29,6 +30,11 @@ def _err(message: Any) -> dict[str, Any]:
 
 
 async def create_or_update_mcp_client(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    # 开关写错在送审前就拒，不让审批人批一份存不进去的配置
+    try:
+        mcp_runtime.requested_switches(args)
+    except SwitchValueError as exc:
+        return _err(exc)
     # stdio client 的 command 在 reload 后由 load_mcp_tools 起子进程执行，写这份配置
     # 等价于创建可执行工具，因此必须与 write_file 同权限——upsert_client 会直接落盘，
     # 不经 write_file 工具，少了这道 guard 就是绕过 execute_command 限制的后门。

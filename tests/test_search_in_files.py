@@ -1,6 +1,6 @@
 """search_in_files：rg 和 Python 两条路给出同样的结果，都认 .gitignore；扫描只按真读了的文件计量，遍历本身也有上限。
 
-replace 模式在文件锁里比戳、记编辑日志、原子写入，写完记新戳；节点关掉 search_replace 时在任何送审之前就拒。
+replace 模式在文件锁里比戳、记编辑日志、原子写入，写完记新戳；节点关掉 search_replace、开关写了认不出的值时在任何送审之前就拒。
 rg 在测试里用一个照参数挑文件的假 rg 顶替；装了真 rg 的机器上再拿真 rg 对一遍。
 """
 from __future__ import annotations
@@ -27,6 +27,7 @@ if str(_TESTS) not in sys.path:
 
 import config_layout  # noqa: E402
 from _file_edits_fake import FakeFileEdits, FakeSupervisor  # noqa: E402
+from clonoth_runtime import switch_refusal  # noqa: E402
 from toolbox import edit_journal, file_state, ignore_rules  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
 from toolbox.builtins.read_file import read_file  # noqa: E402
@@ -467,6 +468,60 @@ class TestPythonSearch:
         assert result["ok"] is False
         assert [op for op, _params in ctx.requested] == ["read_file"]
         assert ctx.requested[0][1]["tool_name"] == "search_in_files"
+
+
+class TestSwitchValues:
+    @staticmethod
+    def _ignored_only(root: Path) -> Path:
+        _write(root / ".git" / "HEAD", "ref\n")
+        _write(root / ".gitignore", "*.tmp\n")
+        _write(root / "only.tmp", "rare\n")
+        return root
+
+    @pytest.mark.parametrize("key", ["isRegex", "is_regex"])
+    @pytest.mark.parametrize("raw", [True, "true", "Yes", 1])
+    def test_a_true_value_turns_the_query_into_a_regex(self, tmp_path: Path, python_only: None, key: str, raw: Any) -> None:
+        _write(tmp_path / "a.txt", "a.b\naxb\n")
+
+        result = _search(_Ctx(tmp_path), query="a.b", **{key: raw})
+
+        assert _hits(result) == [("a.txt", 1, 1), ("a.txt", 2, 1)]
+
+    @pytest.mark.parametrize("key", ["isRegex", "is_regex"])
+    @pytest.mark.parametrize("raw", [False, "false", "off", 0, None, "", "  "])
+    def test_a_false_or_unset_value_keeps_the_query_literal(
+        self, tmp_path: Path, python_only: None, key: str, raw: Any,
+    ) -> None:
+        _write(tmp_path / "a.txt", "a.b\naxb\n")
+
+        result = _search(_Ctx(tmp_path), query="a.b", **{key: raw})
+
+        assert _hits(result) == [("a.txt", 1, 1)]
+
+    @pytest.mark.parametrize("key", ["includeIgnored", "include_ignored"])
+    @pytest.mark.parametrize("raw,reached", [
+        (True, True), ("yes", True), (1, True),
+        (False, False), ("no", False), (None, False), ("", False),
+    ])
+    def test_include_ignored_values(self, tmp_path: Path, python_only: None, key: str, raw: Any, reached: bool) -> None:
+        result = _search(_Ctx(self._ignored_only(tmp_path)), query="rare", **{key: raw})
+
+        assert _hits(result) == ([("only.tmp", 1, 1)] if reached else [])
+
+    @pytest.mark.parametrize("key", ["isRegex", "is_regex", "includeIgnored", "include_ignored"])
+    @pytest.mark.parametrize("raw", ["regex", "正则", 2, ["true"]])
+    def test_an_unrecognised_value_is_refused_before_any_replacement(
+        self, tmp_path: Path, python_only: None, key: str, raw: Any,
+    ) -> None:
+        path = _write(tmp_path / "a.txt", "a.b\naxb\n")
+        ctx = _Ctx(tmp_path)
+
+        result = _search(ctx, query="a.b", mode="replace", replace="c", **{key: raw})
+
+        assert result["ok"] is False
+        assert result["error"] == switch_refusal(key, raw)
+        assert path.read_bytes() == b"a.b\naxb\n"
+        assert ctx.requested == []
 
 
 class TestRipgrepAgreesWithPython:

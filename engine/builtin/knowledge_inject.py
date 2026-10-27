@@ -12,7 +12,7 @@ from typing import Any, Iterable
 import yaml
 
 import config_layout
-from clonoth_runtime import get_int, parse_bool
+from clonoth_runtime import SwitchValueError, get_int, parse_bool, switch_arg
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     memory_dir,
@@ -1482,7 +1482,10 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     content = args.get("content")
-    enabled = parse_bool(args.get("enabled"), True)
+    try:
+        enabled = switch_arg(args, "enabled", True)
+    except SwitchValueError as exc:
+        return _tool_err(exc)
 
     strategy = str(args.get("strategy", "")).strip().lower() or None
     raw_keywords = args.get("keywords")
@@ -1788,8 +1791,11 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     elif isinstance(raw_keywords, str) and raw_keywords.strip():
         keywords = [raw_keywords.strip()]
 
-    constant = parse_bool(args.get("constant"), False)
-    enabled = parse_bool(args.get("enabled"), True)
+    try:
+        constant = switch_arg(args, "constant", False)
+        enabled = switch_arg(args, "enabled", True)
+    except SwitchValueError as exc:
+        return _tool_err(exc)
 
     # Why: existing memory tools accepted node_ids as a list or comma-separated
     # string. How: preserve both forms. Purpose: node-scoped memory entries keep

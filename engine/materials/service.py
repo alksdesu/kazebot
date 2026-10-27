@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from clonoth_runtime import SwitchValueError, parse_switch
 from real_paths import real_path
 
 from .process import cancel_workers, release_owner, run_worker
@@ -285,9 +286,13 @@ class MaterialService:
             box = field.get("bbox")
             if box is not None and (not isinstance(box, list) or len(box) != 4 or any(type(n) not in {int, float} or not 0 <= n <= 1 for n in box) or box[0] >= box[2] or box[1] >= box[3]):
                 raise MaterialError("定位框须为 0–1 范围的 [左,上,右,下]。")
+            try:
+                uncertain = parse_switch(field.get("uncertain"), True, name=f"字段 {field_id} 的 uncertain")
+            except SwitchValueError as exc:
+                raise MaterialError(str(exc)) from None
             result.append({"id": field_id, "label": bounded_text(str(field.get("label") or field_id), "字段名", 120),
                            "value": bounded_text(str(field["value"]) if field.get("value") is not None else "", "识别文字", 4000),
-                           "bbox": box, "uncertain": bool(field.get("uncertain", True)), "corrected": False})
+                           "bbox": box, "uncertain": uncertain, "corrected": False})
             for key in ("row", "column"):
                 if key in field:
                     if type(field[key]) is not int or not 1 <= field[key] <= 1000:

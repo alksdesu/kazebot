@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import SwitchValueError, switch_arg
 from engine.worktree_report import MERGE_TOOL, file_line
 
 from .._common import request_guard
@@ -143,8 +143,13 @@ async def merge_worktree(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         return _failure("handle 不能为空：填子任务结果里给的句柄")
     if not str(getattr(ctx, "task_id", "") or "").strip():
         return _failure("没有任务身份，不能合回或放弃隔离副本")
+    # 写错的 abandon 照默认值读就成了合回，审批卡上是一份本想丢掉的改动
     try:
-        if parse_bool(args.get("abandon"), False):
+        abandon = switch_arg(args, "abandon", False)
+    except SwitchValueError as exc:
+        return _failure(str(exc))
+    try:
+        if abandon:
             return await _abandon(ctx, handle)
         preview = await _call(
             ctx, "/v1/worktrees/preview", {"task_id": ctx.task_id, "handle": handle}, timeout=_MERGE_TIMEOUT_SEC,

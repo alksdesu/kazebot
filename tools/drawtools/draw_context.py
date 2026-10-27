@@ -32,7 +32,7 @@ if __name__ == "__main__":
 
     from common import is_selected_preset, iter_presets, load_character_tags, load_settings
     # common 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
-    from tools._channel import parse_bool
+    from tools._channel import SwitchValueError, switch_arg
 
     def output(result):
         print(json.dumps(result, ensure_ascii=False))
@@ -65,7 +65,10 @@ if __name__ == "__main__":
 
     args = json.loads(sys.stdin.read() or "{}")
     query = str(args.get("query") or "")
-    include_characters = bool(parse_bool(args.get("include_characters"), True))
+    try:
+        include_characters = switch_arg(args, "include_characters", True)
+    except SwitchValueError as exc:
+        fail(str(exc))
     max_characters = int(args.get("max_characters") or 8)
     max_characters = max(1, min(50, max_characters))
 

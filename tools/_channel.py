@@ -5,10 +5,12 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypeVar
 
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
@@ -16,13 +18,15 @@ OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
 _MODELS_FILE = ("config", "models.yaml")
 _PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
 _SHARED_SECRETS_FILE = ("config", "secrets.env")
-# 和 clonoth_runtime.parse_bool 认同一套写法（测试逐个比对两份）：模型和手写配置写成字符串的 "false"、no 也算关
+# 和 clonoth_runtime 的 parse_bool、parse_switch 认同一套写法、报同一句错（测试逐个比对两份）：写成字符串的 "false"、no 也算关
 _TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_WORDS = frozenset({"0", "false", "no", "n", "off"})
+_SHOWN_SWITCH_CHARS = 40
+_SwitchDefault = TypeVar("_SwitchDefault", bool, None)
 
 
 def parse_bool(raw: object, default: bool | None = None) -> bool | None:
-    """工具参数和配置里的开关。认不出的（包括空）给 default。"""
+    """配置里的开关。认不出的（包括空）给 default；模型填的工具参数用 switch_arg。"""
     if isinstance(raw, bool):
         return raw
     text = str(raw if raw is not None else "").strip().lower()
@@ -31,6 +35,32 @@ def parse_bool(raw: object, default: bool | None = None) -> bool | None:
     if text in _FALSE_WORDS:
         return False
     return default
+
+
+class SwitchValueError(ValueError):
+    """模型填的开关写了 true、false 以外认不出的值。"""
+
+
+def switch_refusal(name: str, raw: object) -> str:
+    shown = json.dumps(raw, ensure_ascii=False, default=str)
+    if len(shown) > _SHOWN_SWITCH_CHARS:
+        shown = shown[:_SHOWN_SWITCH_CHARS] + "...<truncated>"
+    return f"{name} 只能是 true 或 false，收到的是 {shown}"
+
+
+def parse_switch(raw: object, default: _SwitchDefault, *, name: str) -> bool | _SwitchDefault:
+    """模型填的开关：没写、null、空串照 default，parse_bool 认得的写法照读，认不出的抛 SwitchValueError，不照 default 执行。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    value = parse_bool(raw)
+    if value is None:
+        raise SwitchValueError(switch_refusal(name, raw))
+    return value
+
+
+def switch_arg(args: Mapping[str, object], key: str, default: _SwitchDefault) -> bool | _SwitchDefault:
+    """工具参数里名为 key 的开关，读法同 parse_switch。"""
+    return parse_switch(args.get(key), default, name=key)
 
 
 class MainChannel(NamedTuple):

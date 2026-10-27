@@ -27,6 +27,7 @@ if str(_ROOT) not in sys.path:
 import config_layout  # noqa: E402
 import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 import toolbox.registry as registry_module  # noqa: E402
+from clonoth_runtime import SwitchValueError, switch_refusal  # noqa: E402
 from toolbox.builtins.mcp_clients import create_or_update_mcp_client, list_mcp_clients  # noqa: E402
 from toolbox.builtins.tool_manage import reload_tools  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
@@ -1038,6 +1039,7 @@ def test_saving_a_client_without_share_sessions_keeps_the_current_setting(ws: Pa
     assert _saved_client(ws)["share_sessions"] is True
     assert _saved_client(ws)["description"] == "改过的说明"
     assert mcp_runtime.upsert_client(ws, {**_SPEC, "share_sessions": None})["share_sessions"] is True
+    assert mcp_runtime.upsert_client(ws, {**_SPEC, "share_sessions": ""})["share_sessions"] is True
 
     # 传了 false 就去掉这个键：文件里没有它就是按对话隔离
     dropped = mcp_runtime.upsert_client(ws, {**_SPEC, "share_sessions": False})
@@ -1052,7 +1054,7 @@ def test_saving_a_client_without_share_sessions_keeps_the_current_setting(ws: Pa
     ("value", "expected"),
     [
         (True, True), ("yes", True), ("On", True), ("1", True), (1, True),
-        (False, False), ("no", False), ("off", False), (0, False), ("", False), ("sometimes", False),
+        (False, False), ("no", False), ("off", False), (0, False),
     ],
 )
 def test_share_sessions_is_read_like_other_switches(ws: Path, value: Any, expected: bool) -> None:
@@ -1061,6 +1063,18 @@ def test_share_sessions_is_read_like_other_switches(ws: Path, value: Any, expect
     assert mcp_runtime.get_client_spec(ws, "fs")["share_sessions"] is expected
     # 只在为真时写进文件，写的是布尔值，不是传进来的原样
     assert _saved_client(ws).get("share_sessions") is (True if expected else None)
+
+
+@pytest.mark.parametrize("value", ["sometimes", 2, ["true"]])
+def test_an_unrecognised_share_sessions_is_refused_and_the_client_stays(ws: Path, value: Any) -> None:
+    mcp_runtime.upsert_client(ws, {**_SPEC, "share_sessions": True})
+    before = _saved_client(ws)
+
+    with pytest.raises(SwitchValueError) as refused:
+        mcp_runtime.upsert_client(ws, {**_SPEC, "description": "改过的说明", "share_sessions": value})
+
+    assert str(refused.value) == switch_refusal("share_sessions", value)
+    assert _saved_client(ws) == before
 
 
 def test_list_clients_reports_share_sessions_as_written_by_hand(ws: Path) -> None:

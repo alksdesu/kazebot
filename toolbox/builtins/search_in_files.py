@@ -18,7 +18,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import get_int, load_runtime_config, parse_bool
+from clonoth_runtime import get_int, load_runtime_config, parse_bool, switch_arg
 
 from .. import edit_journal, file_state
 from ..context import ToolContext, project_origin_of, project_root_of
@@ -174,6 +174,11 @@ def _bounded_int(raw: Any, default: int, upper: int, name: str) -> int:
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{name} must be a positive integer") from None
     return max(1, min(upper, value))
+
+
+def _aliased_switch(args: Mapping[str, Any], key: str, alias: str) -> bool:
+    """驼峰和下划线两种写法都收，默认 false；报错时用模型实际写的那个名字。"""
+    return switch_arg(args, key if key in args else alias, False)
 
 
 def _skip_dir(name: str) -> bool:
@@ -862,8 +867,6 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     mode = str(args.get("mode", "search")).lower()
     rel_path = str(args.get("path", "."))
     pattern = str(args.get("pattern") or "**/*")
-    is_regex = parse_bool(args.get("isRegex", args.get("is_regex")), False)
-    include_ignored = parse_bool(args.get("includeIgnored", args.get("include_ignored")), False)
 
     if not query:
         return _error_response("empty query")
@@ -871,6 +874,8 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if mode == "replace" and replace_disabled(ctx):
         return _error_response(REPLACE_DISABLED_MESSAGE, refused=REPLACE_SWITCH)
     try:
+        is_regex = _aliased_switch(args, "isRegex", "is_regex")
+        include_ignored = _aliased_switch(args, "includeIgnored", "include_ignored")
         # 0 和没传一样按默认值算
         max_results = _bounded_int(
             args.get("maxResults") or args.get("max_results"), _DEFAULT_MAX_RESULTS, _MAX_RESULTS_LIMIT, "maxResults",
