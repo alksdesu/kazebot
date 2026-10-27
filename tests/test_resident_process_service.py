@@ -364,6 +364,30 @@ class TestLifetime:
         assert (views[mine["id"]]["status"], views[mine["id"]]["stop_reason"]) == ("stopped", "session_reset")
         assert views[theirs["id"]]["status"] == "running"
 
+    def test_stopping_the_conversation_stops_its_processes_and_its_sub_agents_ones(
+        self, service: ProcessService, state: SupervisorState, scripts: Path,
+    ) -> None:
+        sid = _session(state)
+        caller = _task(state, sid)
+        agent_sid = _session(state, f"agent:helper:{CONV}:accumulate")
+        origin = {"parent_session_id": sid, "caller_task_id": caller.task_id, "caller_node_id": "bootstrap.coder",
+                  "context_mode": "accumulate"}
+        child = _task(state, agent_sid, node="helper", _dispatch_origin=origin)
+        mine = _start(service, caller, _talker(scripts, 0))
+        sub_agents = _start(service, child, _talker(scripts, 0))
+        theirs = _start(service, _task(state, _session(state, OTHER_CONV)), _talker(scripts, 0))
+
+        assert state.cancel_session(sid) is True
+        service.sweep()
+
+        views = _by_id(service)
+        for view in (mine, sub_agents):
+            assert (views[view["id"]]["status"], views[view["id"]]["stop_reason"]) == ("stopped", "session_cancelled")
+        assert views[theirs["id"]]["status"] == "running"
+        assert service.status(task_id=caller.task_id, process_id=mine["id"])["process"]["stop_reason_text"] == (
+            "会话被停止，跟着停掉"
+        )
+
     def test_a_reset_only_marks_and_leaves_the_stopping_to_the_sweep(
         self, service: ProcessService, state: SupervisorState, scripts: Path,
     ) -> None:

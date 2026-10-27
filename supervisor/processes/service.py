@@ -53,6 +53,7 @@ ENDED = frozenset({EXITED, STOPPED, FAILED})
 
 REASON_STOP = "stop"
 REASON_SESSION_RESET = "session_reset"
+REASON_SESSION_CANCELLED = "session_cancelled"
 REASON_SESSION_GONE = "session_gone"
 REASON_IDLE = "idle"
 REASON_MAX_RUNTIME = "max_runtime"
@@ -63,6 +64,7 @@ REASON_ROOT_CLEANUP = "root_cleanup"
 REASON_TEXT = {
     REASON_STOP: "被 stop_process 停掉",
     REASON_SESSION_RESET: "会话重置，跟着停掉",
+    REASON_SESSION_CANCELLED: "会话被停止，跟着停掉",
     REASON_SESSION_GONE: "所属会话已经不在，跟着停掉",
     REASON_IDLE: "太久没人读输出，按空闲停掉",
     REASON_MAX_RUNTIME: "到了运行时长上限，停掉",
@@ -431,11 +433,15 @@ class ProcessService:
             self._stop_one(proc, self._limits().stop_grace_sec)
         return {"process": self._view(proc), "stopped": bool(claimed)}
 
-    def stop_for_session(self, session_id: str) -> int:
-        return self.stop_for_sessions({session_id})
+    def stop_for_session(self, session_id: str, *, reason: str = REASON_SESSION_RESET) -> int:
+        return self.stop_for_sessions({session_id}, reason=reason)
 
-    def stop_for_sessions(self, session_ids: Iterable[str]) -> int:
-        """会话重置时调：只记下要停哪些、叫醒巡检线程，返回新记下的个数。
+    def stop_for_cancelled_sessions(self, session_ids: Iterable[str]) -> int:
+        """整段对话被停止（cancel_session）时调，和重置一样只记下、不等。"""
+        return self.stop_for_sessions(session_ids, reason=REASON_SESSION_CANCELLED)
+
+    def stop_for_sessions(self, session_ids: Iterable[str], *, reason: str = REASON_SESSION_RESET) -> int:
+        """会话重置或被停止时调：只记下要停哪些、叫醒巡检线程，返回新记下的个数。
 
         调用方正攥着 supervisor 的锁，这里不等进程退出，也不拿进程锁：读输出的一方可能正拿着它读盘。
         """
@@ -449,7 +455,7 @@ class ProcessService:
                     continue
                 if proc.status in ENDED or proc.id in self._stop_marks:
                     continue
-                self._stop_marks[proc.id] = REASON_SESSION_RESET
+                self._stop_marks[proc.id] = reason
                 marked += 1
         if marked:
             self._wake.set()

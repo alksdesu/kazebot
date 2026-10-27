@@ -545,7 +545,8 @@ class SessionMixin:
             # 原因：入口 task 已经运行在 branch session 上，只取消主 session 会遗漏正在
             # pending/running 的分支任务。做法：遍历 parent→branches 索引并逐个调用
             # 现有 task 取消逻辑。目的：保持 /sessions/{id}/cancel 的语义仍是取消整段对话。
-            for branch_sid in self._entry_branch_ids_for_parent_locked(sid):
+            branches = set(self._entry_branch_ids_for_parent_locked(sid))
+            for branch_sid in branches:
                 self._cancelled_sessions.add(branch_sid)
                 self._cancel_session_tasks_locked(branch_sid)
             # 异步委派跑在 agent: 会话里，顺着会话树一起取消；先全部标记，被取消的子任务结算时调用方就不会被唤醒
@@ -553,6 +554,9 @@ class SessionMixin:
             self._cancelled_sessions.update(downstream)
             for tree_sid in downstream:
                 self._cancel_session_tasks_locked(tree_sid)
+            processes = getattr(self, "processes", None)
+            if processes is not None:
+                processes.stop_for_cancelled_sessions({sid, *branches, *downstream})
             self.eventlog.append(
                 session_id=sid,
                 component="supervisor",
