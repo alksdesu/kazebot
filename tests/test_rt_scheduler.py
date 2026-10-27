@@ -351,6 +351,65 @@ class TestTheEditorCheck:
         assert any("short" in line and "cron" in line for line in warnings)
         assert any("script" in line and "command" in line for line in warnings)
 
+    def test_cron_terms_that_never_fire_are_reported(self) -> None:
+        text = yaml.safe_dump({"schedules": [
+            {"id": "dead", "cron": "0-59/5 9 * * *", "text": "hi"},
+            {"id": "partly", "cron": "7,0-59/5 9 * * *", "text": "hi"},
+            {"id": "fine", "cron": "*/5 9 * * 1-5", "text": "hi"},
+        ]})
+
+        assert check_schedules_text(text) == [
+            "dead 的 cron 分钟段的 0-59/5 永远命中不了，整条不会触发",
+            "partly 的 cron 分钟段的 0-59/5 永远命中不了",
+        ]
+
+
+# ---------------------------------------------------------------------------
+#  永远不会触发的 cron
+# ---------------------------------------------------------------------------
+
+def _scheduler_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+
+
+class TestACronThatNeverFires:
+    def test_it_is_logged_once_until_its_cron_changes(
+        self, tmp_path: Path, runner: SchedulerThread, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        fine = {"id": "fine", "cron": "0 9 * * *", "text": "hi"}
+        _seed(tmp_path, {"id": "dead", "cron": "0-59/5 9 * * *", "text": "hi"}, fine)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.scheduler"):
+            runner._tick()
+            runner._tick()
+            _seed(tmp_path, {"id": "dead", "cron": "0 9 * *", "text": "hi"}, fine)
+            runner._tick()
+
+        assert _scheduler_warnings(caplog) == [
+            "[scheduler] 定时任务 dead 的 cron「0-59/5 9 * * *」分钟段的 0-59/5 永远命中不了，整条不会触发",
+            "[scheduler] 定时任务 dead 的 cron「0 9 * *」不是「分 时 日 月 周」五段，不会触发",
+        ]
+
+    def test_a_schedule_without_a_cron_is_logged_too(
+        self, tmp_path: Path, runner: SchedulerThread, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _seed(tmp_path, {"id": "blank", "text": "hi"})
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.scheduler"):
+            runner._tick()
+
+        assert _scheduler_warnings(caplog) == ["[scheduler] 定时任务 blank 的 cron「」不是「分 时 日 月 周」五段，不会触发"]
+
+    def test_a_disabled_schedule_is_not_logged(
+        self, tmp_path: Path, runner: SchedulerThread, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _seed(tmp_path, {"id": "off", "cron": "0-59/5 9 * * *", "text": "hi", "enabled": False})
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.scheduler"):
+            runner._tick()
+
+        assert _scheduler_warnings(caplog) == []
+
 
 # ---------------------------------------------------------------------------
 #  锁和写入

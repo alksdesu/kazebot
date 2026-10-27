@@ -155,6 +155,18 @@ class TestTheEditorCheck:
     def test_a_usable_file_passes_quietly(self, code_root: Path, text: str) -> None:
         assert check_runtime_text(text) == []
 
+    def test_a_cron_that_never_fires_passes_with_a_reminder(self, code_root: Path) -> None:
+        text = "memory:\n  dream:\n    cron: '0-59/5 19 * * *'\nmaintenance:\n  data_cleanup:\n    cron: '17 * * *'\n"
+
+        assert check_runtime_text(text) == [
+            "memory.dream.cron 分钟段的 0-59/5 永远命中不了，整条不会触发",
+            "maintenance.data_cleanup.cron 不是「分 时 日 月 周」五段，不会触发",
+        ]
+
+    @pytest.mark.parametrize("cron", ["", "0 19 * * *"])
+    def test_an_empty_or_working_cron_passes_quietly(self, code_root: Path, cron: str) -> None:
+        assert check_runtime_text(yaml.safe_dump({"memory": {"dream": {"cron": cron}}})) == []
+
     def test_a_retired_key_passes_with_a_reminder(self, code_root: Path) -> None:
         dotted = sorted(RETIRED_RUNTIME_KEYS)[0]
 

@@ -306,6 +306,7 @@ def test_the_docs_mention_retired_keys_only_in_the_retired_section() -> None:
 def fresh_runtime_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(clonoth_runtime, "_CACHE", {})
     monkeypatch.setattr(clonoth_runtime, "_WARNED_RETIRED", set())
+    monkeypatch.setattr(clonoth_runtime, "_WARNED_CRONS", set())
 
 
 def _write_runtime_yaml(workspace: Path, body: str) -> Path:
@@ -315,7 +316,7 @@ def _write_runtime_yaml(workspace: Path, body: str) -> Path:
     return path
 
 
-def _retired_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+def _runtime_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caplog.records
@@ -334,7 +335,7 @@ def test_retired_keys_warn_once_per_file_and_key(
     caplog.set_level(logging.WARNING)
 
     load_runtime_config(workspace)
-    first = _retired_warnings(caplog)
+    first = _runtime_warnings(caplog)
     assert len(first) == 2, first
     assert any("engine.history_limit" in message for message in first)
     assert any("tools.command" in message for message in first)
@@ -342,14 +343,14 @@ def test_retired_keys_warn_once_per_file_and_key(
 
     caplog.clear()
     load_runtime_config(workspace)
-    assert _retired_warnings(caplog) == []
+    assert _runtime_warnings(caplog) == []
 
     # 缓存按 mtime 失效，重新读文件也不该把同一句话再说一遍
     stat = path.stat()
     os.utime(path, (stat.st_atime + 10, stat.st_mtime + 10))
     caplog.clear()
     load_runtime_config(workspace)
-    assert _retired_warnings(caplog) == []
+    assert _runtime_warnings(caplog) == []
 
 
 def test_retired_key_warning_is_per_workspace(
@@ -363,11 +364,11 @@ def test_retired_key_warning_is_per_workspace(
     caplog.set_level(logging.WARNING)
 
     load_runtime_config(first_ws)
-    assert len(_retired_warnings(caplog)) == 1
+    assert len(_runtime_warnings(caplog)) == 1
 
     caplog.clear()
     load_runtime_config(second_ws)
-    assert len(_retired_warnings(caplog)) == 1
+    assert len(_runtime_warnings(caplog)) == 1
 
 
 def test_a_clean_runtime_yaml_warns_about_nothing(
@@ -378,7 +379,31 @@ def test_a_clean_runtime_yaml_warns_about_nothing(
 
     load_runtime_config(tmp_path)
 
-    assert _retired_warnings(caplog) == []
+    assert _runtime_warnings(caplog) == []
+
+
+def test_a_cron_that_never_fires_warns_once_per_file_key_and_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_runtime_cache: None,
+) -> None:
+    path = _write_runtime_yaml(tmp_path, "memory:\n  dream:\n    cron: '0-59/5 19 * * *'\n")
+    caplog.set_level(logging.WARNING)
+
+    load_runtime_config(tmp_path)
+    first = _runtime_warnings(caplog)
+    assert len(first) == 1 and str(path) in first[0], first
+    assert first[0].endswith("里的 memory.dream.cron「0-59/5 19 * * *」分钟段的 0-59/5 永远命中不了，整条不会触发")
+
+    stat = path.stat()
+    os.utime(path, (stat.st_atime + 10, stat.st_mtime + 10))
+    caplog.clear()
+    load_runtime_config(tmp_path)
+    assert _runtime_warnings(caplog) == []
+
+    _write_runtime_yaml(tmp_path, "memory:\n  dream:\n    cron: '0 19 * *'\n")
+    caplog.clear()
+    load_runtime_config(tmp_path)
+    second = _runtime_warnings(caplog)
+    assert len(second) == 1 and second[0].endswith("里的 memory.dream.cron「0 19 * *」不是「分 时 日 月 周」五段，不会触发")
 
 
 def test_retired_runtime_keys_reports_present_keys_in_table_order() -> None:

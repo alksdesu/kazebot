@@ -1,4 +1,4 @@
-"""cron 一段会命中哪些值、哪几项永远命中不了：定时任务工具按这两样判频率、拒写错的项，必须和 cron_match 实际命中的一致。"""
+"""cron 一段会命中哪些值、哪几项永远命中不了：定时任务工具按这两样判频率、拒写错的项，控制台和日志按它提醒，必须和 cron_match 实际命中的一致。"""
 from __future__ import annotations
 
 import sys
@@ -11,7 +11,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from engine.cron import cron_match, field_values, unmatched_terms  # noqa: E402
+from engine.cron import cron_faults, cron_match, field_values, unmatched_terms  # noqa: E402
 
 _TUESDAY_9AM = datetime(2026, 10, 27, 9, 0)
 _SUNDAY_9AM = datetime(2026, 11, 1, 9, 0)
@@ -60,6 +60,23 @@ def test_field_values_are_the_minutes_cron_match_fires_on(field: str, expected: 
 ])
 def test_unmatched_terms(field: str, low: int, high: int, dead: list[str]) -> None:
     assert unmatched_terms(field, low, high) == dead
+
+
+@pytest.mark.parametrize("expr,faults", [
+    pytest.param("*/5 9 * * 1-5", [], id="fine"),
+    pytest.param("0 9 * * 7", [], id="sunday-as-seven"),
+    pytest.param("0 9 * *", ["不是「分 时 日 月 周」五段，不会触发"], id="four-fields"),
+    pytest.param("", ["不是「分 时 日 月 周」五段，不会触发"], id="empty"),
+    pytest.param("0-59/5 9 * * *", ["分钟段的 0-59/5 永远命中不了，整条不会触发"], id="whole-field"),
+    pytest.param("7,0-59/5 9 * * *", ["分钟段的 0-59/5 永远命中不了"], id="one-term-of-a-list"),
+    pytest.param(
+        "0 9 0,32 * MON",
+        ["日期段的 0、32 永远命中不了，整条不会触发", "周几段的 MON 永远命中不了，整条不会触发"],
+        id="two-fields",
+    ),
+])
+def test_cron_faults(expr: str, faults: list[str]) -> None:
+    assert cron_faults(expr) == faults
 
 
 def test_sunday_fires_as_seven_too() -> None:

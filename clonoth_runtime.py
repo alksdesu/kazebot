@@ -17,6 +17,7 @@ import yaml
 from dotenv import load_dotenv
 
 import config_layout
+from engine.cron import cron_faults
 from real_paths import real_path
 from workspace import pin_workspace_env, resolve_workspace_root, workspace_env_root
 
@@ -111,6 +112,7 @@ RETIRED_RUNTIME_KEYS: dict[str, str] = {
 }
 
 _WARNED_RETIRED: set[tuple[str, str]] = set()
+_WARNED_CRONS: set[tuple[str, str, str]] = set()
 
 
 def _has_dotted(data: Mapping[str, Any], dotted_key: str) -> bool:
@@ -134,6 +136,29 @@ def _warn_retired_keys(path: Path, user_cfg: Mapping[str, Any]) -> None:
             continue
         _WARNED_RETIRED.add(marker)
         _log.warning("%s 里的 %s 已经没有代码读取，%s", path, key, RETIRED_RUNTIME_KEYS[key] or "可以删掉")
+
+
+def _runtime_crons(cfg: Mapping[str, Any], prefix: str = "") -> list[tuple[str, str]]:
+    """cfg 里叫 cron 的键（点分写法）和写的值，空值不算：dream、data_cleanup 的定时都写在这种键里，写成空串是不跑。"""
+    found: list[tuple[str, str]] = []
+    for key, value in cfg.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, Mapping):
+            found.extend(_runtime_crons(value, f"{dotted}."))
+        elif key == "cron" and value is not None and str(value).strip():
+            found.append((dotted, str(value).strip()))
+    return found
+
+
+def _warn_cron_faults(path: Path, user_cfg: Mapping[str, Any]) -> None:
+    for key, expr in _runtime_crons(user_cfg):
+        marker = (str(path), key, expr)
+        if marker in _WARNED_CRONS:
+            continue
+        _WARNED_CRONS.add(marker)
+        faults = cron_faults(expr)
+        if faults:
+            _log.warning("%s 里的 %s「%s」%s", path, key, expr, "；".join(faults))
 
 
 def runtime_config_path(workspace_root: Path) -> Path:
@@ -261,6 +286,8 @@ def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
 
     _warn_retired_keys(default_path, default_layer.data)
     _warn_retired_keys(own_path, own_layer.data)
+    _warn_cron_faults(default_path, default_layer.data)
+    _warn_cron_faults(own_path, own_layer.data)
     merged = _deep_merge(_deep_merge(DEFAULT_RUNTIME_CONFIG, default_layer.data), own_layer.data)
     _CACHE[key] = (stamp, merged)
     return copy.deepcopy(merged)
@@ -277,13 +304,14 @@ def runtime_config_error(workspace_root: Path) -> str:
 
 
 def check_runtime_text(text: str) -> list[str]:
-    """原文编辑器保存实例那份之前的校验：用不了就抛 RuntimeConfigError。返回保存之后该提醒的事。"""
+    """原文编辑器保存实例那份之前的校验：用不了就抛 RuntimeConfigError。返回保存之后该提醒的事：退役键、永远不会触发的 cron。"""
     default_layer = _runtime_layer(config_layout.default_runtime_path(), DEFAULT_RUNTIME_CONFIG)
     data = parse_runtime_text(text, _instance_shape(default_layer))
-    return [
+    retired = [
         f"{key} 已经没有代码读取，{RETIRED_RUNTIME_KEYS[key] or '可以删掉'}"
         for key in retired_runtime_keys(data)
     ]
+    return retired + [f"{key} {fault}" for key, expr in _runtime_crons(data) for fault in cron_faults(expr)]
 
 
 def get_str(data: dict[str, Any], dotted_key: str, default: str = "") -> str:

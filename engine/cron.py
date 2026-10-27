@@ -9,10 +9,11 @@ from collections.abc import Callable
 from datetime import datetime
 from functools import partial
 
-__all__ = ["CRON_FIELDS", "cron_match", "field_values", "unmatched_terms"]
+__all__ = ["CRON_FIELDS", "cron_faults", "cron_match", "field_values", "unmatched_terms"]
 
 # 各段的名字和 cron_match 会拿来比的取值范围；周几的 7 也是周日
 CRON_FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31), ("month", 1, 12), ("weekday", 0, 7))
+_FIELD_LABELS = {"minute": "分钟", "hour": "小时", "day": "日期", "month": "月份", "weekday": "周几"}
 
 
 def _match_step(step_text: str, value: int) -> bool:
@@ -61,6 +62,23 @@ def unmatched_terms(field: str, low: int, high: int) -> list[str]:
     if not terms:
         return [field]
     return [term for term, match in terms if not any(match(value) for value in span)]
+
+
+def cron_faults(expr: str) -> list[str]:
+    """这条 cron 哪里永远不会触发，一处一句给人看的话，空列表表示没有；不是五段时整条都不触发，只给这一句。"""
+    fields = expr.split()
+    if len(fields) != len(CRON_FIELDS):
+        return ["不是「分 时 日 月 周」五段，不会触发"]
+    faults: list[str] = []
+    for (name, low, high), field in zip(CRON_FIELDS, fields):
+        dead = unmatched_terms(field, low, high)
+        if not dead:
+            continue
+        fault = f"{_FIELD_LABELS[name]}段的 {'、'.join(dead)} 永远命中不了"
+        if not field_values(field, low, high):
+            fault += "，整条不会触发"
+        faults.append(fault)
+    return faults
 
 
 def _match_weekday(field: str, dt: datetime) -> bool:

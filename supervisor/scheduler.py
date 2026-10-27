@@ -28,7 +28,7 @@ import config_layout
 from clonoth_runtime import parse_bool
 from engine.context_store import cleanup_old_contexts
 from engine.conversation_migration import ConversationRekey, RekeyCount
-from engine.cron import cron_match
+from engine.cron import cron_faults, cron_match
 from toolbox._common import safe_subprocess_env
 
 
@@ -94,7 +94,7 @@ def schedules_lock(workspace_root: Path) -> contextlib.AbstractContextManager[No
 
 
 def check_schedules_text(text: str) -> list[str]:
-    """控制台原文编辑器保存前的校验：结构不对抛 ValueError，调度时会被跳过的条目只提醒。"""
+    """控制台原文编辑器保存前的校验：结构不对抛 ValueError，调度时会被跳过的条目和永远不会触发的 cron 只提醒。"""
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -112,8 +112,7 @@ def check_schedules_text(text: str) -> list[str]:
         if sid in seen:
             warnings.append(f"id {sid} 重复，同一分钟只有第一条会触发")
         seen.add(sid)
-        if len(str(item.get("cron") or "").split()) != 5:
-            warnings.append(f"{sid} 的 cron 不是「分 时 日 月 周」五段，不会触发")
+        warnings.extend(f"{sid} 的 cron {fault}" for fault in cron_faults(str(item.get("cron") or "")))
         if str(item.get("type") or "message").strip() == "script" and not str(item.get("command") or "").strip():
             warnings.append(f"{sid} 是 script 类型却没写 command，不会执行")
     return warnings
@@ -234,6 +233,7 @@ class SchedulerThread:
         self._state = state
         self._workspace_root = workspace_root
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
+        self._checked_crons: dict[str, str] = {}  # schedule_id -> 已经查过有没有永远不触发的项的 cron
         self._thread: threading.Thread | None = None
         # 还在跑的脚本任务，防重入；脚本在各自的线程里结束，所以要加锁。
         self._running_scripts: set[str] = set()
@@ -267,6 +267,7 @@ class SchedulerThread:
                 continue
 
             cron_expr = str(s.get("cron") or "").strip()
+            self._report_cron_faults(sid, cron_expr)
             if not cron_expr:
                 continue
 
@@ -297,6 +298,15 @@ class SchedulerThread:
                         now_key=now_key,
                     ),
                 )
+
+    def _report_cron_faults(self, sid: str, cron_expr: str) -> None:
+        """每分钟都读一遍 schedules.yaml：同一条只在 cron 改过之后再查，写错的不至于每分钟刷一条日志。"""
+        if self._checked_crons.get(sid) == cron_expr:
+            return
+        self._checked_crons[sid] = cron_expr
+        faults = cron_faults(cron_expr)
+        if faults:
+            log.warning("[scheduler] 定时任务 %s 的 cron「%s」%s", sid, cron_expr, "；".join(faults))
 
     def _inject_inbound(
         self, sid: str, text: str, conv_key: str, entry_node_id: str = "",
