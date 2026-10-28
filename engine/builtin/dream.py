@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,23 @@ from clonoth_runtime import (
     task_max_running_seconds,
 )
 from engine.cron import cron_match
-from engine.builtin.knowledge_inject import memory_entry_constant
+from engine.builtin.knowledge_inject import (
+    MemoryBookUnreadable,
+    _as_int,
+    _first_report,
+    _load_book,
+    _short_text,
+    memory_entry_constant,
+    skill_files,
+)
 from engine.builtin.memory_extract import _format_transcript_for_extract
 from engine import memory_subjects
+from engine.memory_hit_cache import HitCacheUnreadable, hit_timestamp, read_hit_cache, warn_unreadable
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     conversation_namespace,
     is_namespace_conversation_key,
+    memory_book_files,
     memory_dir,
     memory_root,
     namespace_conversation_key,
@@ -57,6 +68,12 @@ _PROMOTE_RECENT_HIT_DAYS = 7
 _PROMOTE_MIN_CHARS = 200
 _REACTIVATE_IDLE_DAYS = 20
 _MAX_MAINTENANCE_PER_KIND = 20
+
+# 一轮 dream 要把同一批记忆本读好几遍：同一本写坏的同一版，每种用途只记一次日志。
+_WARNED_BOOKS: OrderedDict[tuple[str, str], tuple[int, int, int] | None] = OrderedDict()
+
+# 命中侧车读不了时 <hit_cache> 里放的话。块头写着「不在表内 = 从未命中」，放空表就是让模型把整个语料当成过期。
+_HITS_UNKNOWN = "(这一轮读不到命中记录：每一条都不知道最后命中时间，不在这里不代表从未命中，不要按命中时间清理或合并)"
 
 
 def _days_since(stamp: str, *, now: datetime) -> int | None:
@@ -436,18 +453,14 @@ class DreamHandler:
             # 一条记忆无从谈起重复，两条起才有合并的余地。
             if len(entries) < 2:
                 continue
-            hits = self._hit_stamps(workspace_root, namespace, {entry["id"] for entry in entries})
+            hit_cache_json, maintenance_json = self._hit_blocks(workspace_root, namespace, entries, now=now)
             instruction = self._build_dream_instruction(
                 run_id=str(uuid.uuid4()),
                 now=now,
                 signals=[],
                 topology_json=self._build_keyword_topology_json(workspace_root, namespace),
-                hit_cache_json=self._load_hit_cache_json(
-                    workspace_root, namespace, {entry["id"] for entry in entries}, now=now,
-                ),
-                maintenance_json=json.dumps(
-                    self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False,
-                ),
+                hit_cache_json=hit_cache_json,
+                maintenance_json=maintenance_json,
                 skill_list=skill_list,
                 book_list=self._build_book_list(workspace_root, namespace),
             )
@@ -483,18 +496,14 @@ class DreamHandler:
         # current book landscape. How: rebuild the list at final task creation
         # time so files created during preprocessing are visible. Purpose: guide
         # save/delete decisions with live book names.
-        hits = self._hit_stamps(workspace_root, namespace, {entry["id"] for entry in entries})
+        hit_cache_json, maintenance_json = self._hit_blocks(workspace_root, namespace, entries, now=now)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
             signals=signals,
             topology_json=self._build_keyword_topology_json(workspace_root, namespace),
-            hit_cache_json=self._load_hit_cache_json(
-                workspace_root, namespace, {entry["id"] for entry in entries}, now=now,
-            ),
-            maintenance_json=json.dumps(
-                self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False,
-            ),
+            hit_cache_json=hit_cache_json,
+            maintenance_json=maintenance_json,
             skill_list=skill_list,
             book_list=self._build_book_list(workspace_root, namespace),
         )
@@ -850,23 +859,26 @@ class DreamHandler:
         # 空 namespace 只会命中未隔离的历史 book。
         # 带条目数：提示词让模型「合并条目数 ≤ 5 的碎片 book」，只给名字它只能靠猜，
         # 或者去全量 list_memories —— 那正是约束 1 禁止的。
+        # 读不了的本照样列出来、标明读不了：写成 (0) 模型会把它当碎片 book 去合并。
         mem_dir = self._namespace_dir(workspace_root, namespace)
         if mem_dir is None or not mem_dir.exists():
             return "(no books found)"
         books: list[str] = []
-        for path in sorted(mem_dir.glob("*.yaml")):
-            try:
-                data = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
-                entries = data.get("entries") if isinstance(data, dict) else None
-                count = len(entries) if isinstance(entries, list) else 0
-            except Exception as exc:
-                # 只报位置和问题：出错那一行是用户的原话。
-                log.warning(
-                    "[scheduler] dream book list skipped %s: %s", path.name, config_layout.config_error_text(exc),
-                )
-                continue
-            books.append(f"{path.stem}({count})")
+        for path in memory_book_files(mem_dir):
+            data = self._read_book(path, "book list")
+            books.append(f"{path.stem}(读不了，别往里存)" if data is None else f"{path.stem}({len(data['entries'])})")
         return ", ".join(books) if books else "(no books found)"
+
+    @staticmethod
+    def _read_book(path: Path, purpose: str) -> dict[str, Any] | None:
+        """读一本记忆，读不了时是 None。日志只有位置和问题，同一版每种用途只记一次：出错那一行是用户的原话。"""
+        stamp = config_layout.file_stamp(path)
+        try:
+            return _load_book(path)
+        except MemoryBookUnreadable as exc:
+            if _first_report(_WARNED_BOOKS, (purpose, str(path)), stamp):
+                log.warning("[scheduler] dream %s: memory book %s is unreadable: %s", purpose, path.name, exc.reason)
+            return None
 
     def _build_keyword_topology_json(self, workspace_root: Path, namespace: str) -> str:
         """Build Jaccard keyword clusters from one namespace's memory books."""
@@ -960,21 +972,12 @@ class DreamHandler:
             return []
 
         result: list[dict[str, Any]] = []
-        for yaml_path in sorted(mem_dir.glob("*.yaml")):
-            try:
-                data = config_layout.load_yaml_text(yaml_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                log.warning(
-                    "[scheduler] dream topology skipped %s: %s", yaml_path.name, config_layout.config_error_text(exc),
-                )
-                continue
-            if not isinstance(data, dict):
+        for yaml_path in memory_book_files(mem_dir):
+            data = self._read_book(yaml_path, "topology")
+            if data is None:
                 continue
             book = str(data.get("book") or yaml_path.stem).strip() or yaml_path.stem
-            raw_entries = data.get("entries")
-            if not isinstance(raw_entries, list):
-                continue
-            for entry in raw_entries:
+            for entry in data["entries"]:
                 if not isinstance(entry, dict):
                     continue
                 eid = str(entry.get("id") or "").strip()
@@ -1006,7 +1009,8 @@ class DreamHandler:
                         # 提示词按 created_at 判 30 天过期、7 天提升，按 priority 挑重激活候选，
                         # 按 content 长度判该不该提升成 skill —— 不发这几个字段，那几条约束就只能靠猜。
                         "created_at": str(entry.get("created_at") or ""),
-                        "priority": int(entry.get("priority") or 0),
+                        # 和注入同一套读法：写成 high、.inf 的不能让整轮整理崩掉。
+                        "priority": _as_int(entry.get("priority"), 0),
                     }
                 )
         return result
@@ -1046,7 +1050,7 @@ class DreamHandler:
     def _maintenance_candidates(
         self,
         entries: list[dict[str, Any]],
-        hits: dict[str, str],
+        hits: dict[str, str] | None,
         *,
         now: datetime,
     ) -> dict[str, list[dict[str, Any]]]:
@@ -1055,7 +1059,11 @@ class DreamHandler:
         topology 只输出 ≥2 成员的重复簇，一条孤立的过期记忆压根不会出现在里面 ——
         「30 天未命中就清理」「7 天以上且仍被命中就提升成 skill」这几条约束因此常年
         没有操作对象。判龄和命中间隔是纯算术，在代码里筛完只把少量候选交给模型判断。
+
+        hits 是 None（命中侧车读不了）时三类都不给：都按命中间隔挑，当成「全没命中」会把整个语料送进 prune。
         """
+        if hits is None:
+            return {"prune": [], "promote": [], "reactivate": []}
         prune: list[dict[str, Any]] = []
         promote: list[dict[str, Any]] = []
         reactivate: list[dict[str, Any]] = []
@@ -1108,23 +1116,19 @@ class DreamHandler:
             "reactivate": _top(reactivate, key="idle_days", reverse=True),
         }
 
-    def _hit_stamps(self, workspace_root: Path, namespace: str, entry_ids: set[str]) -> dict[str, str]:
-        """entry_id → 最后命中时间。命中查找必须走 hit_timestamp。
+    def _hit_stamps(self, workspace_root: Path, namespace: str, entry_ids: set[str]) -> dict[str, str] | None:
+        """entry_id → 最后命中时间。命中侧车读不了时是 None：不知道，不是「都没命中」。
 
-        升级前的记录是不带 namespace 的扁平 key，只认新 key 会让全部历史命中一夜之间
-        变成「从未命中」，整个语料一次性进 Prune 候选。
+        命中查找必须走 hit_timestamp：升级前的记录是不带 namespace 的扁平 key，只认新 key
+        会让全部历史命中一夜之间变成「从未命中」，整个语料一次性进 Prune 候选。
         """
         if not entry_ids:
             return {}
         try:
-            from engine.memory_hit_cache import hit_timestamp, read_hit_cache
-
             data = read_hit_cache(workspace_root)
-        except Exception as exc:
-            log.warning("[scheduler] dream: failed to load hit_cache: %s", exc)
-            return {}
-        if not data:
-            return {}
+        except HitCacheUnreadable as exc:
+            warn_unreadable(exc, "dream proposes no pruning, promotion or reactivation until it is fixed")
+            return None
         stamps: dict[str, str] = {}
         for eid in entry_ids:
             stamp = hit_timestamp(data, namespace, eid)
@@ -1132,22 +1136,24 @@ class DreamHandler:
                 stamps[str(eid)] = stamp
         return stamps
 
-    def _load_hit_cache_json(
-        self,
-        workspace_root: Path,
-        namespace: str,
-        entry_ids: set[str],
-        *,
-        now: datetime | None = None,
-    ) -> str:
-        """这个 namespace 的条目近 60 天的命中时间，压成一段 JSON 交给整理任务判断过期。
+    def _hit_blocks(
+        self, workspace_root: Path, namespace: str, entries: list[dict[str, Any]], *, now: datetime,
+    ) -> tuple[str, str]:
+        """(<hit_cache> 块, <maintenance_candidates> 块)。侧车只读一次，两块按的是同一份命中记录。"""
+        # 每个 Dream 任务只能操作自己那个 namespace，传全量会让模型引用它删不掉的 id。
+        hits = self._hit_stamps(workspace_root, namespace, {entry["id"] for entry in entries})
+        return (
+            self._hit_cache_json(hits, now=now),
+            json.dumps(self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False),
+        )
+
+    def _hit_cache_json(self, stamps: dict[str, str] | None, *, now: datetime | None = None) -> str:
+        """近 60 天的命中时间压成一段 JSON 交给整理任务判断过期；命中记录读不了时换成一句说明。
 
         只留 60 天内的，instruction 才不会随语料无限变长。
         """
-        # 每个 Dream 任务只能操作自己那个 namespace，传全量会让模型引用它删不掉的 id。
-        # 命中查找必须走 hit_timestamp：升级前的记录是不带 namespace 的扁平 key，
-        # 只认新 key 会让全部历史命中一夜之间变成「从未命中」，整个语料一次性进 Prune 候选。
-        stamps = self._hit_stamps(workspace_root, namespace, entry_ids)
+        if stamps is None:
+            return _HITS_UNKNOWN
         if not stamps:
             return "{}"
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=60)
@@ -1164,32 +1170,19 @@ class DreamHandler:
         return json.dumps(filtered, ensure_ascii=False)
 
     def _load_skill_list(self, workspace_root: Path) -> str:
-        """Load existing skill names and descriptions.
+        """现有 skill 的目录名和描述：Promote 阶段拿它判断有没有同主题的 skill，免得重复建。
 
-        [AutoC 2026-05-31] Why: Dream Promote phase needs to know existing
-        skills to avoid creating duplicates. How: scan config/skills/*/SKILL.md
-        frontmatter for name and description. Purpose: enable L1→L2 promotion.
+        frontmatter 写坏的照样按目录名列出来，标明读不了：漏掉它，模型会再建一个同主题的。
         """
-        skills_dir = config_layout.skills_dir(workspace_root)
-        if not skills_dir.exists():
+        if not config_layout.skills_dir(workspace_root).is_dir():
             return "(no skills directory)"
         lines: list[str] = []
-        for skill_dir in sorted(skills_dir.iterdir()):
-            skill_md = skill_dir / "SKILL.md"
-            if not skill_md.exists():
+        for skill in skill_files(workspace_root):
+            if skill.problem:
+                lines.append(f"- {skill.directory}: (读不了：{skill.problem})")
                 continue
-            name = skill_dir.name
-            # Extract description from frontmatter
-            desc = ""
-            try:
-                content = skill_md.read_text(encoding="utf-8")[:500]
-                for line in content.split("\n"):
-                    if line.strip().startswith("description:"):
-                        desc = line.split(":", 1)[1].strip().strip('"').strip("'")
-                        break
-            except Exception:
-                pass
-            lines.append(f"- {name}: {desc}")
+            description = " ".join(str(skill.meta.get("description") or "").split())
+            lines.append(f"- {skill.directory}: {_short_text(description)}")
         return "\n".join(lines) if lines else "(no skills found)"
 
     def _build_dream_instruction(

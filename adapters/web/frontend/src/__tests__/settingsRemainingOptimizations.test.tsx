@@ -110,8 +110,8 @@ describe('remaining Settings optimizations', () => {
 
   it('edits Agents as a structured form while keeping raw YAML collapsed', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'PUT') return jsonResponse({ ok: true });
-      return jsonResponse({ content: 'id: ereuna_main\nname: EreunaMain\ndescription: 主入口\ntype: ai\nmodel: gpt-4.1\nprovider: openai\nmemory_book: ereuna\npersistent: true\ndelegate_targets:\n  - worker_child\ntool_access:\n  mode: allowlist\n  allow:\n    - read_file\n' });
+      if (init?.method === 'PUT') return jsonResponse({ ok: true, hash: 'saved-1' });
+      return jsonResponse({ content: 'id: ereuna_main\nname: EreunaMain\ndescription: 主入口\ntype: ai\nmodel: gpt-4.1\nprovider: openai\nmemory_book: ereuna\npersistent: true\ndelegate_targets:\n  - worker_child\ntool_access:\n  mode: allowlist\n  allow:\n    - read_file\n', hash: 'node-1' });
     });
     vi.stubGlobal('fetch', fetchMock);
     useSettingsSelectionStore.setState({
@@ -155,8 +155,8 @@ describe('remaining Settings optimizations', () => {
   it('adds a collapsed raw Markdown editor to the Skills right panel and saves it', async () => {
     const rawMarkdown = '---\nenabled: true\nstrategy: normal\nkeywords: ["alpha"]\n---\n# Skill\n\nBody\n';
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'PUT') return jsonResponse({ ok: true });
-      return jsonResponse({ content: rawMarkdown });
+      if (init?.method === 'PUT') return jsonResponse({ ok: true, hash: 'saved-1' });
+      return jsonResponse({ content: rawMarkdown, hash: 'skill-1' });
     });
     vi.stubGlobal('fetch', fetchMock);
     useSettingsSelectionStore.setState({
@@ -178,7 +178,7 @@ describe('remaining Settings optimizations', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/skills/skill_alpha/raw', expect.objectContaining({
       method: 'PUT',
-      body: JSON.stringify({ content: `${rawMarkdown}\nExtra line\n` }),
+      body: JSON.stringify({ content: `${rawMarkdown}\nExtra line\n`, base_hash: 'skill-1' }),
     })));
   });
 });

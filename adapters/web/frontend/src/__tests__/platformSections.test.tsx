@@ -404,7 +404,7 @@ describe('跟着实况刷新', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       seen.push(url);
-      if (url.endsWith('/config/raw')) return json({ content: '', exists: false });
+      if (url.endsWith('/config/raw')) return json({ content: '', hash: '', exists: false });
       if (url.endsWith('/config/state')) return json({ published: false, applied: false, file: {}, state: null, platforms: [] });
       return json({});
     }));

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from supervisor.feature_auth import resolve_actor
+from supervisor.instances import InstanceDirectoryError
 
 from .service import OperationsService
 
@@ -44,7 +45,10 @@ def create_router(state: Any) -> APIRouter:
     @router.get("/instances")
     async def instances(request: Request):
         authorize(request)
-        return {"instances": service.instances()}
+        try:
+            return {"instances": service.instances()}
+        except InstanceDirectoryError as error:
+            raise HTTPException(status_code=503, detail=error.reason) from error
 
     @router.post("/diagnostics")
     async def diagnose(request: Request):

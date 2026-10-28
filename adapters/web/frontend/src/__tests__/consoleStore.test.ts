@@ -86,11 +86,13 @@ const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'v
     /** 每次状态快照换个心跳读数，看得出 live 有没有跟着换。 */
     beat: 0,
     warnings: [] as string[],
+    /** 给了就拿它当写回的回执，看回执读不懂时怎么收尾。 */
+    receipt: undefined as unknown,
   };
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === 'PUT') {
       box.sent.push(String(JSON.parse(String(init.body)).content));
-      return json({ ok: true, warnings: box.warnings });
+      return json(box.receipt ?? { ok: true, hash: `h${box.sent.length}`, warnings: box.warnings });
     }
     if (String(input).endsWith('/config/state')) {
       if (box.stateDown) throw new Error('读不到 bot 的状态');
@@ -100,7 +102,8 @@ const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'v
         state: { values, paths: PATHS }, platforms: [],
       });
     }
-    return json({ content: box.override || (box.sent.length ? box.sent[box.sent.length - 1] : raw), exists: true });
+    const content = box.override || (box.sent.length ? box.sent[box.sent.length - 1] : raw);
+    return json({ content, hash: `h${box.sent.length}`, exists: true });
   }));
   return box;
 };
@@ -734,12 +737,12 @@ describe('save', () => {
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(`${init?.method || 'GET'} ${String(input)}`);
-      if (init?.method === 'PUT') return json({ ok: true, warnings: [] });
+      if (init?.method === 'PUT') return json({ ok: true, hash: 'h3', warnings: [] });
       if (String(input).endsWith('/config/state')) {
         return json({ published: true, applied: true, file: {}, state: { values: {}, paths: PATHS }, platforms: [] });
       }
       // 别人刚改过全局文件：写回之后读到的不是自己写的那份。
-      return json({ content: 'version: 2\n', exists: true });
+      return json({ content: 'version: 2\n', hash: 'h2', exists: true });
     }));
 
     const outcome = await configStore(FEATURES_SCOPE).getState().save('token', ['signal_name']);
@@ -775,6 +778,20 @@ describe('save', () => {
       ok: true,
       message: `bot 没在跑，只校验了 YAML 语法；${WHOLE_FILE_REWRITTEN}`,
     });
+  });
+
+  // 写已经落盘了：报成写入失败，草稿留着，人会再写一次；认账照常探文件和 bot。
+  it('回执没读懂也算写进去了，原因跟着警告交代', async () => {
+    seedLive({ signal_name: false });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: true });
+    box.receipt = { ok: true, warnings: [] };
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
+
+    expect(outcome).toEqual({ ok: true, message: '平台 qq 的配置已经存上，可回执格式不对：缺 hash' });
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
+    expect(box.sent).toHaveLength(1);
   });
 
   it('列表整块重写洗掉注释时也如实说一句', async () => {

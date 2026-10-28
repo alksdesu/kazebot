@@ -75,11 +75,12 @@ export const VisionRouting = () => {
     setError('');
     try {
       // 只写这一个键，落在本实例那层；读和写之间被改过由后端回 409。
-      const { content, note: rewriteNote, result } = await commitRuntimeKeys(token, [{ path: PATH, value: yamlValueOf(mode) }]);
+      const { content, note: rewriteNote, result, receiptProblem } = await commitRuntimeKeys(token, [{ path: PATH, value: yamlValueOf(mode) }]);
       setRaw(content);
       setSaved(mode);
       const saved = rewriteNote ? `已保存。${rewriteNote}。下一条带图消息就按新规矩走。` : '已保存。下一条带图消息就按新规矩走。';
-      setNote(savedMessage(saved, '', result.warnings));
+      setNote(savedMessage(saved, '', result?.warnings));
+      setError(receiptProblem);
     } catch (caught) {
       setError(errorMessage(caught));
     }

@@ -277,6 +277,38 @@ class TestABrokenRosterIsNeverOverwritten:
         for link in (caught.value.__cause__, caught.value.__context__):
             assert link is not None and "qq-SECRET" not in str(link)
 
+    def test_the_reason_a_writer_gets_names_the_file_and_the_place(self, koki: Path, data_root: Path) -> None:
+        roster = data_root / "instances.yaml"
+        roster.write_text("instances:\n  - id: koki\n    account: qq-SECRET-account: x\n", encoding="utf-8")
+
+        with pytest.raises(InstanceDirectoryError) as caught:
+            load_instances(koki, required=True)
+
+        assert caught.value.reason == (
+            f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here"
+        )
+
+    @pytest.mark.parametrize("body,problem", [
+        ("instances: koki\n", "instances 不是列表"),
+        ("just text\n", "顶层既不是列表，也不是带 instances 的映射"),
+    ])
+    def test_a_roster_of_the_wrong_shape_says_which_shape(
+        self, koki: Path, data_root: Path, body: str, problem: str,
+    ) -> None:
+        roster = data_root / "instances.yaml"
+        roster.write_text(body, encoding="utf-8")
+
+        with pytest.raises(InstanceDirectoryError) as caught:
+            load_instances(koki, required=True)
+
+        assert str(caught.value) == "实例目录格式无效"
+        assert caught.value.reason == f"实例清单 {roster} 读不懂：{problem}"
+
+    def test_the_double_login_check_cannot_pass_a_roster_it_cannot_read(self, koki: Path, broken: Path) -> None:
+        # 查不了不等于没人占着：当成空表，同一个号就能在两个实例上登。
+        with pytest.raises(InstanceDirectoryError):
+            instances.account_owner(koki, "qq", _MAIN_ACCOUNT, prefix="/i/koki")
+
     def test_an_empty_roster_is_no_instances_yet_not_an_error(self, koki: Path, data_root: Path) -> None:
         (data_root / "instances.yaml").write_text("", encoding="utf-8")
 
@@ -353,3 +385,39 @@ class TestTheConsoleIsTold:
         switched = asyncio.run(platform_accounts.switch_account(state, QQ_NAPCAT, self._Ops(), _NEW_ACCOUNT))
 
         assert "roster_error" not in switched
+
+    def test_a_roster_error_says_where_the_file_broke(
+        self, state: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def refuse(*_args: Any, **_kwargs: Any) -> bool:
+            raise InstanceDirectoryError("实例目录暂时不可用", "实例清单 /srv/instances.yaml 读不懂：第 2 行第 5 列：x")
+
+        monkeypatch.setattr(platform_accounts, "record_account", refuse)
+
+        switched = asyncio.run(platform_accounts.switch_account(state, QQ_NAPCAT, self._Ops(), _NEW_ACCOUNT))
+
+        assert switched["roster_error"].endswith("实例清单 /srv/instances.yaml 读不懂：第 2 行第 5 列：x")
+
+    def test_a_roster_nobody_can_read_stops_the_switch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi import HTTPException
+
+        roster = tmp_path / "instances.yaml"
+        roster.write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+        monkeypatch.setenv(config_layout.INSTANCES_FILE_ENV, str(roster))
+        switched: list[str] = []
+
+        class Ops(self._Ops):
+            async def switch(self, account: str) -> dict[str, Any]:
+                switched.append(account)
+                return await super().switch(account)
+
+        state = SimpleNamespace(workspace_root=tmp_path, eventlog=SimpleNamespace(append=lambda **_kw: None))
+
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(platform_accounts.switch_account(state, QQ_NAPCAT, Ops(), _NEW_ACCOUNT))
+
+        assert caught.value.status_code == 503
+        assert caught.value.detail.startswith(f"查不了 {_NEW_ACCOUNT} 是不是已经登在别的实例上，没有换号：实例清单 {roster}")
+        assert switched == []

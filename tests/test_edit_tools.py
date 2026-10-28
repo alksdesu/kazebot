@@ -416,6 +416,19 @@ class TestWriteFile:
         assert result["data"]["syntaxCheck"]["ok"] is False
         assert (tmp_path / name).read_bytes() == content.encode("utf-8")
 
+    def test_a_broken_skill_frontmatter_is_reported_and_the_file_is_kept(self, ctx: _Ctx, tmp_path: Path) -> None:
+        # 加载时写坏的技能整个被跳过：改完就得告诉模型，不然它以为技能已经生效了
+        content = "---\nname: demo\nnote: sk-SECRET-skill: x\n---\n\n正文\n"
+
+        result = write(ctx, "config/skills/demo/SKILL.md", content)
+
+        assert result["ok"] is True
+        assert "语法检查未通过（SKILL.md）：第 3 行第 " in result["data"]["result"]
+        assert result["data"]["syntaxCheck"]["language"] == "skill"
+        assert result["data"]["syntaxCheck"]["message"].startswith("frontmatter 的 YAML 读不出来：")
+        assert "sk-SECRET" not in json.dumps(result, ensure_ascii=False)
+        assert (tmp_path / "config" / "skills" / "demo" / "SKILL.md").read_bytes() == content.encode("utf-8")
+
     def test_a_yaml_value_that_cannot_be_built_is_reported_not_raised(self, ctx: _Ctx, tmp_path: Path) -> None:
         # 检查在写盘之后跑：值构造失败要报成未通过，抛出去的话工具报错，人会以为这次没写上
         content = "port: !!int sk-SECRET-port\nwhen: 2024-13-45\n"

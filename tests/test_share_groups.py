@@ -117,7 +117,7 @@ class TestBeforeAnyGroupExists:
         overview = share_groups.overview(ws)
 
         assert overview == {
-            "available": True, "reason": "", "current": None, "groups": [], "archives": [],
+            "available": True, "reason": "", "current": None, "groups": [], "members_problem": "", "archives": [],
         }
 
     @pytest.mark.parametrize("name", ["", "Team", "1team", "a", "te am", "team-1", "a" * 33, None])
@@ -163,6 +163,18 @@ class TestCreatingAGroup:
         assert meta["name"] == "team"
         assert meta["created_by"] == "小号"
         assert meta["created_at"]
+
+    def test_a_roster_that_cannot_be_read_only_leaves_the_maker_unnamed(
+        self, ws: Path, shared: Path, data_root: Path,
+    ) -> None:
+        # 清单在建组时只用来记建组人的名字，读不懂不该把建组也挡掉。
+        (data_root / "instances.yaml").write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+
+        share_groups.create_group(ws, "team")
+
+        meta = json.loads((shared / "team" / "group.json").read_text(encoding="utf-8"))
+        assert meta["created_by"] == ""
+        assert config_layout.config_share_group(ws) == "team"
 
     def test_shareable_keys_follow_the_config_into_the_group(self, ws: Path, shared: Path) -> None:
         (ws / ".env").write_text(
@@ -571,6 +583,17 @@ class TestWhoIsInAGroup:
         assert len(overview["archives"]) == 1
         assert overview["archives"][0].startswith(f"data/{share_groups.ARCHIVE_PREFIX}")
 
+    def test_a_roster_that_cannot_be_read_leaves_the_members_unknown(self, ws: Path, data_root: Path) -> None:
+        # 成员只能从清单里各实例的 config/ 链接认：当成空表，在用的组看着就像没人用。
+        share_groups.create_group(ws, "team")
+        roster = data_root / "instances.yaml"
+        roster.write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+
+        overview = share_groups.overview(ws)
+
+        assert overview["current"] == "team" and [g["name"] for g in overview["groups"]] == ["team"]
+        assert overview["members_problem"].startswith(f"实例清单 {roster} 读不懂：第 1 行")
+
     def test_a_stray_directory_in_the_shared_root_is_not_a_group(self, ws: Path, shared: Path) -> None:
         share_groups.create_group(ws, "team")
         (shared / "Not A Group").mkdir()
@@ -607,6 +630,20 @@ class TestDeletingAGroup:
         share_groups.delete_group(ws, "team")
 
         assert share_groups.overview(ws)["groups"] == []
+
+    def test_a_group_is_kept_when_the_roster_cannot_say_who_uses_it(
+        self, ws: Path, shared: Path, data_root: Path,
+    ) -> None:
+        share_groups.create_group(ws, "team")
+        share_groups.leave_group(ws)
+        roster = data_root / "instances.yaml"
+        roster.write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+
+        with pytest.raises(ShareGroupError) as caught:
+            share_groups.delete_group(ws, "team")
+
+        assert str(caught.value).startswith(f"查不了还有哪些实例在用 team，没有删：实例清单 {roster} 读不懂")
+        assert (shared / "team" / "config").is_dir()
 
     def test_deleting_a_group_that_is_not_there_is_refused(self, ws: Path) -> None:
         with pytest.raises(ShareGroupError):
@@ -662,6 +699,20 @@ class TestTheHttpEndpoints:
 
         assert body["available"] is True
         assert body["current"] is None and body["groups"] == []
+        assert body["members_problem"] == ""
+
+    def test_the_listing_says_why_the_members_are_unknown(self, call, ws: Path, data_root: Path) -> None:
+        call("POST", "/v1/share-groups", json={"name": "team"})
+        roster = data_root / "instances.yaml"
+        roster.write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+
+        response = call("GET", "/v1/share-groups")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [g["name"] for g in body["groups"]] == ["team"]
+        assert body["members_problem"].startswith(f"实例清单 {roster} 读不懂：第 1 行")
+        assert "this is" not in response.text
 
     def test_creating_a_group_returns_the_new_overview(self, call, ws: Path) -> None:
         body = call("POST", "/v1/share-groups", json={"name": "team"}).json()

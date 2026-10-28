@@ -604,6 +604,35 @@ describe('记忆归属的提示', () => {
     expect(screen.queryByText(MIGRATED)).not.toBeInTheDocument();
   });
 
+  // 目录搬完了、命中记录却没跟着改名：不说的话，修好文件之后数据清理会把这些命中当成没主的摘掉。
+  it('命中记录没跟着改名时，搬迁照常交代，读不了的原因另起一行报错', async () => {
+    vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValue(scopePlan);
+    vi.mocked(api.migrateAccountScope).mockResolvedValue({
+      moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1',
+      hit_keys_rewritten: 0, hit_cache_problem: "第 1 行第 14 列：Expecting ':' delimiter",
+    });
+
+    await migrateThenFailRead();
+
+    expect(screen.getByText(MIGRATED)).toBeInTheDocument();
+    expect(screen.getByText(
+      "记忆命中记录读不了（第 1 行第 14 列：Expecting ':' delimiter），里面的命中时间没跟着换到新账号名下。"
+      + '修好文件时照 supervisor 日志里那份旧 → 新对照改掉前缀',
+    )).toHaveAttribute('role', 'alert');
+  });
+
+  it('命中记录跟着改了名就只交代搬迁', async () => {
+    vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValue(scopePlan);
+    vi.mocked(api.migrateAccountScope).mockResolvedValue({
+      moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1', hit_keys_rewritten: 2, hit_cache_problem: '',
+    });
+
+    await migrateThenFailRead();
+
+    expect(screen.getByText(MIGRATED)).toBeInTheDocument();
+    expect(screen.queryByText(/记忆命中记录/)).toBeNull();
+  });
+
   it('再点预览把搬迁的结果和读失败的原因一起清掉', async () => {
     vi.mocked(api.getAccountScope)
       .mockResolvedValueOnce(scopeIdle)

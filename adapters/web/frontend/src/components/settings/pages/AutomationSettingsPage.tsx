@@ -82,7 +82,7 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => getSchedulesRaw(adminToken),
         write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
         edits: (base) => scheduleCreateEdits(base, emptySchedule(id)),
@@ -90,7 +90,7 @@ export const AutomationSettingsPage = () => {
       });
       if (!requests.isCurrent()) return;
       setNewId('');
-      setMessage(savedMessage('任务已创建但尚未启用，请在右栏填写内容后启用。', note, result.warnings));
+      setMessage(savedMessage('任务已创建但尚未启用，请在右栏填写内容后启用。', note, result?.warnings), receiptProblem);
       await load();
       if (!requests.isCurrent()) return;
       setSelectedScheduleId(id);
@@ -107,7 +107,7 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => getSchedulesRaw(adminToken),
         write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
         edits: (base) => scheduleRemoveEdits(base, selectedScheduleId),
@@ -115,7 +115,7 @@ export const AutomationSettingsPage = () => {
       });
       if (!requests.isCurrent()) return;
       setSelectedScheduleId(null);
-      setMessage(savedMessage('定时任务已删除', note, result.warnings));
+      setMessage(savedMessage('定时任务已删除', note, result?.warnings), receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;

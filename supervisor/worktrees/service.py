@@ -32,7 +32,7 @@ from toolbox.text_files import replace_bytes
 
 from .. import child_retention
 from ..file_claims import _journal_session_locked, _live_locked, _resolver_locked, ledger_of
-from ..instances import load_instances, url_prefix
+from ..instances import InstanceDirectoryError, load_instances, url_prefix
 from ..policy import PathScope
 from ..types import Task, TaskStatus
 from . import git
@@ -557,7 +557,7 @@ class WorktreeService:
                 "family_root": str(self.state._task_family_root_locked(child) or ""),
                 "previous": plan.previous,
                 "previous_state": plan.previous_state,
-                "instance": self._instance_id(),
+                "instance": self._recorded_instance(),
             })
             self._enqueue(child.task_id)
             return
@@ -735,25 +735,33 @@ class WorktreeService:
         log.info("worktree %s ready at %s (base %s)", worktree_id, entry.get("path"), str(entry.get("base"))[:12])
 
     def _instance_id(self) -> str:
-        """本实例在多开清单里的 id；单实例部署、清单读不出来或找不到自己时给空串。"""
+        """本实例在多开清单里的 id；单实例部署或找不到自己时给空串。清单读不懂抛 InstanceDirectoryError。"""
         if config_layout.data_root() is None:
             return ""
         prefix = url_prefix()
-        try:
-            rows = load_instances(self.workspace_root)
-        except Exception:
-            log.warning("reading the instance list failed", exc_info=True)
-            return ""
+        rows = load_instances(self.workspace_root, required=True)
         return next((str(row["id"]) for row in rows if row.get("path") == prefix), "")
 
-    def merge_allowed(self, entry: Mapping[str, Any], settings: WorktreeSettings | None = None) -> bool:
-        """外部仓库只看审批；工作区所在仓库在多开时只许配置里点名的实例合回。"""
-        if not entry.get("workspace_repo"):
-            return True
-        if config_layout.data_root() is None:
-            return True
-        instance = self._instance_id()
-        return bool(instance) and instance in (settings or self.settings()).merge_instances
+    def _recorded_instance(self) -> str:
+        """登记里记的建副本的实例，只供查看：清单读不懂时记成空的，不挡子任务。"""
+        try:
+            return self._instance_id()
+        except InstanceDirectoryError as exc:
+            log.warning("worktree registered without its instance: %s", exc.reason)
+            return ""
+
+    def merge_refusal(self, entry: Mapping[str, Any], settings: WorktreeSettings | None = None) -> str:
+        """合不回时说为什么，合得回是空串。外部仓库只看审批；工作区所在仓库在多开时只许配置里点名的实例合回。"""
+        if not entry.get("workspace_repo") or config_layout.data_root() is None:
+            return ""
+        try:
+            instance = self._instance_id()
+        except InstanceDirectoryError as exc:
+            # 只说不能合回，人会去改 merge_instances，挡着的其实是读不懂的清单。
+            return f"查不了本实例能不能合回这个仓库：{exc.reason}"
+        if instance and instance in (settings or self.settings()).merge_instances:
+            return ""
+        return "本实例不能合回这个仓库"
 
     def needs_outcome_locked(self, task: Task) -> bool:
         if not task.input.get(WORKTREE_OWNER_KEY) or task.input.get(WORKTREE_OUTCOME_KEY):
@@ -813,7 +821,10 @@ class WorktreeService:
         view.update(self._summary_fields(summary))
         view["diff"] = diff
         view["diff_truncated"] = truncated or (settings.inline_diff_chars <= 0 and summary.patch_bytes > 0)
-        view["merge_allowed"] = self.merge_allowed(entry, settings)
+        refusal = self.merge_refusal(entry, settings)
+        view["merge_allowed"] = not refusal
+        if refusal:
+            view["merge_refusal"] = refusal
         return view
 
     @staticmethod
@@ -1035,10 +1046,11 @@ class WorktreeService:
             summary, failure = self._fresh_diff(entry)
         if summary is None:
             return {"ok": False, "reason": "failed", "message": failure}
-        if not self.merge_allowed(entry, settings):
+        refusal = self.merge_refusal(entry, settings)
+        if refusal:
             return {
                 "ok": False, "reason": "instance_not_allowed",
-                "message": f"本实例不能合回，补丁在 {_posix(entry.get('patch'))}",
+                "message": f"{refusal}，补丁在 {_posix(entry.get('patch'))}",
                 "patch": _posix(entry.get("patch")),
             }
         files, problem = self._merge_files(entry, summary)
@@ -1114,10 +1126,11 @@ class WorktreeService:
             task, entry, problem = self._merge_target_locked(task_id, handle, for_merge=True)
             if problem or entry is None or task is None:
                 return {"ok": False, "reason": "refused", "message": problem}
-            if not self.merge_allowed(entry):
+            refusal = self.merge_refusal(entry)
+            if refusal:
                 return {
                     "ok": False, "reason": "instance_not_allowed",
-                    "message": f"本实例不能合回，补丁在 {_posix(entry.get('patch'))}",
+                    "message": f"{refusal}，补丁在 {_posix(entry.get('patch'))}",
                     "patch": _posix(entry.get("patch")),
                 }
             worktree_id = str(entry["id"])

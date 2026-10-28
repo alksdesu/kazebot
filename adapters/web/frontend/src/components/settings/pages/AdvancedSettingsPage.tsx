@@ -2,13 +2,13 @@
 import { useMemo, useRef, useState } from 'react';
 
 import { errorMessage } from '../../../api/request';
-import { getPolicyRaw, getRuntimeFile, isEditConflict, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
+import { getPolicyRaw, getRuntimeFile, isEditConflict, receipted, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
 import { runtimeInstanceLayer } from '../../../console/yamlCommit';
 import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { savedMessage } from '../../../utils/sentence';
+import { appendSentence, reloadBeforeEditing, savedMessage } from '../../../utils/sentence';
 import { YamlEditor } from '../../common';
 import { RawFormStatus, RawSourceDetails } from '../RawSourceDetails';
 import {
@@ -50,10 +50,11 @@ const RUNTIME_CODEC: RawFormCodec<RuntimeConfigFormState> = { parse: parseRuntim
 
 const conflictMessage = (filename: string) => `${filename} 在打开之后被别处改过，没有保存：点「加载」读入最新内容，再把改动重做一遍。`;
 
-/** 一次读写的结果。失败的按错误显示，和成功的提示分开。 */
+/** 一次读写的结果。失败的按错误显示，和成功的提示分开；problem 是做成了、但还有要交代的问题。 */
 interface Outcome {
   text: string;
   failed: boolean;
+  problem?: string;
 }
 
 const NO_OUTCOME: Outcome = { text: '', failed: false };
@@ -61,8 +62,23 @@ const NO_OUTCOME: Outcome = { text: '', failed: false };
 const failed = (text: string): Outcome => ({ text, failed: true });
 
 const OutcomeText = ({ outcome }: { outcome: Outcome }) => (
-  outcome.failed ? <ErrorText role="alert">{outcome.text}</ErrorText> : <StatusText message={outcome.text} />
+  outcome.failed ? <ErrorText role="alert">{outcome.text}</ErrorText> : (
+    <>
+      <StatusText message={outcome.text} />
+      {outcome.problem && <ErrorText role="alert">{outcome.problem}</ErrorText>}
+    </>
+  )
 );
+
+/** 存上了、回执没读懂：照「加载」重读一遍换上落盘那一版的指纹。重读也没成就留着旧指纹，下次保存撞 409，不会整份盖掉。 */
+async function reloadAfterUnreadReceipt(receiptProblem: string, reload: () => Promise<void>): Promise<string> {
+  try {
+    await reload();
+    return receiptProblem;
+  } catch (error) {
+    return appendSentence(reloadBeforeEditing(receiptProblem, '点「加载」读入最新内容'), `刚才重新读取也没成：${errorMessage(error)}`);
+  }
+}
 
 const DirtyMark = ({ dirty }: { dirty: boolean }) => (
   dirty ? <p role="status" className="text-sm text-[var(--duties-secondary)]">有未保存修改</p> : null
@@ -157,10 +173,19 @@ const RuntimeFileBody = () => {
     if (blocked) { patch({ outcome: failed(blocked) }); return; }
     await run(async () => {
       try {
-        const result = await updateRuntimeRaw(adminToken, raw, file.base);
+        const { result, receiptProblem } = await receipted(updateRuntimeRaw(adminToken, raw, file.base));
         reset(raw);
-        patch({ base: result.hash, source: 'override' });
-        return { text: savedMessage('已保存', note, result.warnings), failed: false };
+        patch({ source: 'override' });
+        if (result) {
+          patch({ base: result.hash });
+          return { text: savedMessage('已保存', note, result.warnings), failed: false };
+        }
+        const problem = await reloadAfterUnreadReceipt(receiptProblem, async () => {
+          const runtime = await getRuntimeFile(adminToken);
+          reset(runtimeInstanceLayer(runtime));
+          patch({ base: runtime.hash, source: runtime.source });
+        });
+        return { text: savedMessage('已保存', note), failed: false, problem };
       } catch (error) {
         return failed(isEditConflict(error) ? conflictMessage('runtime.yaml') : errorMessage(error, '保存失败'));
       }
@@ -318,9 +343,17 @@ const PolicyFileBody = () => {
     if (issue) { patch({ outcome: failed(issue) }); return; }
     await run(async () => {
       try {
-        const result = await updatePolicyRaw(adminToken, value, file.base);
-        patch({ saved: value, base: result.hash });
-        return { text: savedMessage('已保存', '', result.warnings), failed: false };
+        const { result, receiptProblem } = await receipted(updatePolicyRaw(adminToken, value, file.base));
+        patch({ saved: value });
+        if (result) {
+          patch({ base: result.hash });
+          return { text: savedMessage('已保存', '', result.warnings), failed: false };
+        }
+        const problem = await reloadAfterUnreadReceipt(receiptProblem, async () => {
+          const { content, hash } = await getPolicyRaw(adminToken);
+          patch({ value: content, saved: content, base: hash });
+        });
+        return { text: '已保存', failed: false, problem };
       } catch (error) {
         return failed(isEditConflict(error) ? conflictMessage('policy.yaml') : errorMessage(error, '保存失败'));
       }

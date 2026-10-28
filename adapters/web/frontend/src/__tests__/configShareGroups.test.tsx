@@ -216,6 +216,28 @@ describe('共享配置组的几种状态', () => {
     expect(screen.queryByText('还没有共享组。')).toBeNull();
     expect(screen.queryByRole('textbox')).toBeNull();
   });
+
+  // 成员只能从实例清单认：清单读不懂时空的 members 是不知道，说成「还没有成员」再摆个删除，就是请人删一个也许有人在用的组。
+  it('实例清单读不懂时说查不了成员，不说没人，也不给删组', async () => {
+    const reason = '实例清单 /srv/kazebot-data/instances.yaml 读不懂：第 3 行第 31 列：mapping values are not allowed here';
+    await show(overview({ groups: [group('alpha'), group('beta')], members_problem: reason }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent(`查不了各组有哪些实例在用：${reason}。修好之前删不了组。`);
+    for (const name of ['alpha', 'beta']) {
+      expect(within(rowOf(name)).getByText('成员：查不了')).toBeInTheDocument();
+      expect(within(rowOf(name)).queryByText(/还没有成员/)).toBeNull();
+      expect(within(rowOf(name)).queryByRole('button', { name: '删除' })).toBeNull();
+      // 加入不看成员，照常给。
+      expect(within(rowOf(name)).getByRole('button', { name: '加入' })).toBeEnabled();
+    }
+  });
+
+  it('没有组时查不了成员也没什么可说的', async () => {
+    await show(overview({ members_problem: '实例清单读不懂' }));
+
+    expect(screen.getByText('还没有共享组。')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
 });
 
 describe('建共享配置组', () => {
@@ -475,5 +497,95 @@ describe('换完配置之后的那次重启', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(
       '没能重启 engine：调度器没应答。新配置要等它重启才生效，到「运行」里手动重启一次。',
     );
+  });
+});
+
+// 回执是改完才发的：读不懂不等于没改成。当成失败的话 engine 不重启、全貌停在改之前，人还会再点一次。
+describe('改完了只是回执读不懂', () => {
+  const RECEIPT = '共享配置组的操作已经做完，可回执格式不对：缺 group';
+
+  beforeEach(() => { vi.spyOn(window, 'confirm').mockReturnValue(true); });
+
+  it('建组照常收尾：清掉组名、重读全貌、重启 engine，回执的事另起一行', async () => {
+    vi.mocked(api.createShareGroup).mockRejectedValue(new api.ReceiptUnreadable(RECEIPT));
+    await show(overview());
+    vi.mocked(api.getShareGroups).mockResolvedValue(
+      overview({ current: 'alpha', groups: [group('alpha', [member('main', '主实例', true)])] }),
+    );
+
+    fireEvent.change(nameBox(), { target: { value: 'alpha' } });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '用本实例的配置建组' })); });
+
+    expect(api.restartEngine).toHaveBeenCalledExactlyOnceWith(TOKEN, '建共享配置组');
+    expect(screen.getByRole('status')).toHaveTextContent('已建组「alpha」并加入。engine 正在重启，工具和节点会换成新配置。');
+    expect(screen.getByRole('alert')).toHaveTextContent(RECEIPT);
+    expect(await screen.findByText('本实例在共享组')).toBeInTheDocument();
+    expect(api.getShareGroups).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('textbox', { name: '新共享组名' })).toBeNull();
+  });
+
+  it('加入照常按「加入」重启，交代加入了哪个组', async () => {
+    vi.mocked(api.joinShareGroup).mockRejectedValue(new api.ReceiptUnreadable(RECEIPT));
+    await show(overview({ groups: [group('alpha')] }));
+
+    await act(async () => { fireEvent.click(within(rowOf('alpha')).getByRole('button', { name: '加入' })); });
+
+    expect(api.restartEngine).toHaveBeenCalledExactlyOnceWith(TOKEN, '加入共享配置组');
+    expect(screen.getByRole('status')).toHaveTextContent('已加入「alpha」。engine 正在重启，工具和节点会换成新配置。');
+    expect(screen.getByRole('alert')).toHaveTextContent(RECEIPT);
+    expect(api.getShareGroups).toHaveBeenCalledTimes(2);
+  });
+
+  it('退出照常按「退出」重启，说的是退出前在的那个组', async () => {
+    vi.mocked(api.leaveShareGroup).mockRejectedValue(new api.ReceiptUnreadable(RECEIPT));
+    await show(overview({ current: 'alpha', groups: [group('alpha', [member('main', '主实例', true)])] }));
+    vi.mocked(api.getShareGroups).mockResolvedValue(overview({ groups: [group('alpha')] }));
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '退出这个组' })); });
+
+    expect(api.restartEngine).toHaveBeenCalledExactlyOnceWith(TOKEN, '退出共享配置组');
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '已退出「alpha」，本实例接着用退出时拷下来的那份配置。engine 正在重启，工具和节点会换成新配置。',
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(RECEIPT);
+    expect(await screen.findByText('本实例用的是自己的配置，没有和别的实例共享。')).toBeInTheDocument();
+  });
+
+  it('删组不重启，交代删掉了，回执的事另起一行', async () => {
+    vi.mocked(api.deleteShareGroup).mockRejectedValue(new api.ReceiptUnreadable(RECEIPT));
+    await show(overview({ groups: [group('beta')] }));
+    vi.mocked(api.getShareGroups).mockResolvedValue(overview());
+
+    await act(async () => { fireEvent.click(within(rowOf('beta')).getByRole('button', { name: '删除' })); });
+
+    expect(api.restartEngine).not.toHaveBeenCalled();
+    expect(screen.getByRole('status')).toHaveTextContent('已删除「beta」，组目录已改名归档。');
+    expect(screen.getByRole('alert')).toHaveTextContent(RECEIPT);
+    expect(await screen.findByText('还没有共享组。')).toBeInTheDocument();
+  });
+
+  it('回执没读懂、重启也没排上，两件事接成一句报错', async () => {
+    vi.mocked(api.restartEngine).mockResolvedValue({ scheduled: false, target: 'engine' });
+    vi.mocked(api.joinShareGroup).mockRejectedValue(new api.ReceiptUnreadable(RECEIPT));
+    await show(overview({ groups: [group('alpha')] }));
+
+    await act(async () => { fireEvent.click(within(rowOf('alpha')).getByRole('button', { name: '加入' })); });
+
+    expect(screen.getByRole('status')).toHaveTextContent(/^已加入「alpha」。$/);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      `${RECEIPT}。没能重启 engine：调度器没有排上这次重启。新配置要等它重启才生效，到「运行」里手动重启一次。`,
+    );
+  });
+
+  it('请求本身被拒还是只报错，不重启也不重读', async () => {
+    vi.mocked(api.joinShareGroup).mockRejectedValue(new api.ApiError(400, '没有叫 alpha 的共享组'));
+    await show(overview({ groups: [group('alpha')] }));
+
+    await act(async () => { fireEvent.click(within(rowOf('alpha')).getByRole('button', { name: '加入' })); });
+
+    expect(screen.getByRole('alert')).toHaveTextContent('400 没有叫 alpha 的共享组');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(api.restartEngine).not.toHaveBeenCalled();
+    expect(api.getShareGroups).toHaveBeenCalledTimes(1);
   });
 });

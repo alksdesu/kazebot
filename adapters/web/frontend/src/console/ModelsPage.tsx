@@ -179,13 +179,13 @@ const ModelsPageEditor = () => {
       const changes: YamlKeyEdit[] = specs
         .filter((spec) => spec.key in edits)
         .map((spec) => ({ path: pathFor(spec.key), value: valueFromShown(spec, edits[spec.key]) ?? undefined }));
-      const { content, note: rewriteNote, result } = await commitScope(token, scope, changes);
+      const { content, note: rewriteNote, result, receiptProblem } = await commitScope(token, scope, changes);
       setRaw(content);
       setEdits({});
       const saved = scope === GLOBAL
         ? '已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。'
         : '已保存。节点文件每次任务重新读，立刻生效。';
-      setMessage(savedMessage(saved, rewriteNote, result.warnings));
+      setMessage(savedMessage(saved, rewriteNote, result?.warnings), receiptProblem);
     } catch (caught) {
       setError(errorMessage(caught));
     }

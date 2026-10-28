@@ -69,7 +69,13 @@ export const AccountScope = () => {
       // 按预览认定的源账号搬：预览之后盘上多出别的账号的会话，也不会换成搬另一批。
       const result = await migrateAccountScope(adminToken, platformId, to, from);
       if (!requests.isCurrent()) return;
-      setMessage(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
+      const hitCacheProblem = typeof result.hit_cache_problem === 'string' ? result.hit_cache_problem : '';
+      // 目录搬完了、命中记录却没跟着改名：不改的话，下一轮数据清理会把这些命中当成没主的摘掉，搬过去的记忆就像从没被想起过。
+      setMessage(
+        `已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`,
+        hitCacheProblem && `记忆命中记录读不了（${hitCacheProblem}），里面的命中时间没跟着换到新账号名下。`
+          + '修好文件时照 supervisor 日志里那份旧 → 新对照改掉前缀',
+      );
       await load();
     } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); } finally { if (requests.isCurrent()) setBusy(false); }
   };

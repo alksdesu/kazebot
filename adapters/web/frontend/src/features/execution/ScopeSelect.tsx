@@ -1,3 +1,4 @@
+import { appendSentence } from '../../utils/sentence';
 import { controlClass } from '../ui';
 import { useScopePicker, type ScopePicker } from '../useScopePicker';
 
@@ -11,7 +12,7 @@ function ScopeField({ onChange, disabled = false, picker }: ScopeSelectProps & {
   </select></label><p className="break-words text-xs text-[var(--duties-secondary)]">当前范围：{picker.options.get(picker.value) || picker.placeholder}</p>
     {picker.loading && <p role="status">正在读取会话名称…</p>}
     {picker.message && <p role="status">{picker.message}</p>}
-    {picker.error && <p role="status">{picker.mode === 'all' ? picker.error : '会话列表读取失败；不能选择或操作未经确认的会话。'} <button type="button" className="underline" disabled={disabled} onClick={() => void picker.reload()}>重试会话列表</button></p>}
+    {picker.error && <p role="status">{appendSentence(picker.error, picker.mode === 'all' ? '仍可操作当前会话。' : '不能选择或操作未经确认的会话。')} <button type="button" className="underline" disabled={disabled} onClick={() => void picker.reload()}>重试会话列表</button></p>}
   </div>;
 }
 

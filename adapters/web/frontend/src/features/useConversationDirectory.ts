@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { errorMessage } from '../api/request';
 import { getConversations, type ConversationRow } from '../api/supervisorClient';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { isConversationScope, platformForScope } from '../platforms/registry';
@@ -20,11 +21,10 @@ export function useConversationDirectory(includePolicies = false) {
         includePolicies ? featureRequest<{ items: PolicyScope[] }>('/v1/community/settings/scopes', { signal: request.signal }) : Promise.resolve(null),
       ]);
       if (!request.isCurrent()) return;
-      if (!Array.isArray(result)) throw new Error('invalid conversations');
-      let rows = result.filter(row => row && typeof row.conversation_key === 'string');
+      let rows = result;
       const policyOnlyScopes: string[] = [];
       if (includePolicies) {
-        if (!Array.isArray(policies?.items) || policies.items.some(row => !row || typeof row.scope !== 'string' || !isConversationScope(row.scope) || typeof row.current_account !== 'boolean')) throw new Error('invalid policy scopes');
+        if (!Array.isArray(policies?.items) || policies.items.some(row => !row || typeof row.scope !== 'string' || !isConversationScope(row.scope) || typeof row.current_account !== 'boolean')) throw new Error('社区设置的作用域列表格式不对');
         const merged = new Map(rows.map(row => [row.conversation_key, row]));
         for (const policy of policies.items) {
           const existing = merged.get(policy.scope);
@@ -39,8 +39,9 @@ export function useConversationDirectory(includePolicies = false) {
         rows = [...merged.values()];
       }
       setSnapshot({ key: requests.key, rows, policyOnlyScopes, error: '', loading: false });
-    } catch {
-      if (request.isCurrent()) setSnapshot({ key: requests.key, rows: [], policyOnlyScopes: [], error: '会话列表读取失败，仍可操作当前会话。', loading: false });
+    } catch (caught) {
+      // 只说读不了和原因：读不了之后还能做什么，各处不一样，由用它的地方接着说。
+      if (request.isCurrent()) setSnapshot({ key: requests.key, rows: [], policyOnlyScopes: [], error: `会话列表读取失败：${errorMessage(caught)}`, loading: false });
     }
   }, [requests, token, includePolicies]);
   useEffect(() => { void reload(); }, [reload]);

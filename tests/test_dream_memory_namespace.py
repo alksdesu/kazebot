@@ -142,7 +142,7 @@ class TestNamespaceScan:
 
         assert payload["total_entries"] == 0
 
-    def test_a_broken_book_is_skipped_naming_the_place_but_not_the_line(
+    def test_a_broken_book_is_marked_unreadable_naming_the_place_but_not_the_line(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         # 每晚整理都扫到它；出错那一行是聊天里的原话，日志会被导出、贴进工单。
@@ -157,41 +157,78 @@ class TestNamespaceScan:
             books = DreamHandler()._build_book_list(tmp_path, namespace)
             payload = json.loads(DreamHandler()._build_keyword_topology_json(tmp_path, namespace))
 
-        assert books == "习惯(1)"
+        # 列成 (0) 的话，提示词让模型把「条目数 ≤ 5 的碎片 book」并走，这本写坏的就成了合并对象。
+        assert books == "习惯(1), 私密(读不了，别往里存)"
         assert payload["total_entries"] == 1
-        assert f"dream book list skipped 私密.yaml: {reason}" in caplog.text
-        assert f"dream topology skipped 私密.yaml: {reason}" in caplog.text
+        assert f"dream book list: memory book 私密.yaml is unreadable: {reason}" in caplog.text
+        assert f"dream topology: memory book 私密.yaml is unreadable: {reason}" in caplog.text
         assert "hunter2" not in caplog.text
+
+    @pytest.mark.parametrize("text,reason", [
+        pytest.param("- 习惯\n- 术语\n", "top level is a list, not a mapping", id="list"),
+        pytest.param("book: 杂项\nentries: 一条\n", "entries is a str, not a list", id="entries-text"),
+    ])
+    def test_a_book_of_the_wrong_shape_is_reported_once_per_version(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, text: str, reason: str,
+    ) -> None:
+        namespace = conversation_namespace(_GROUP_KEY)
+        path = tmp_path / "data" / "memory" / namespace / "杂项.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="engine.builtin.dream"):
+            for _ in range(3):
+                assert DreamHandler()._build_book_list(tmp_path, namespace) == "杂项(读不了，别往里存)"
+                assert DreamHandler()._load_memory_topology_entries(tmp_path, namespace) == []
+
+        messages = [record.getMessage() for record in caplog.records if "杂项.yaml" in record.getMessage()]
+        assert len(messages) == 2
+        assert all(reason in message for message in messages)
+
+    def test_a_priority_that_is_not_a_number_does_not_stop_the_run(self, tmp_path: Path) -> None:
+        namespace = conversation_namespace(_GROUP_KEY)
+        _write_memory(tmp_path, namespace, "习惯", [
+            {**_entry("m1", ["a"]), "priority": "high"},
+            {**_entry("m2", ["b"]), "priority": float("inf")},
+        ])
+
+        entries = DreamHandler()._load_memory_topology_entries(tmp_path, namespace)
+
+        assert [entry["priority"] for entry in entries] == [0, 0]
 
     def _write_cache(self, tmp_path: Path, payload: dict) -> None:
         cache = tmp_path / "data" / "memory" / ".hit_cache.json"
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(payload), encoding="utf-8")
 
+    def _hit_block(self, tmp_path: Path, namespace: str, entry_ids: set[str]) -> str:
+        handler = DreamHandler()
+        return handler._hit_cache_json(handler._hit_stamps(tmp_path, namespace, entry_ids), now=_NOW)
+
     def test_hit_cache_keeps_only_ids_this_namespace_can_touch(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"mine": _NOW.isoformat(), "theirs": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}, now=_NOW))
+        loaded = json.loads(self._hit_block(tmp_path, "conv_x", {"mine"}))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
     def test_hit_cache_is_empty_without_entries(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"whatever": _NOW.isoformat()})
 
-        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", set(), now=_NOW) == "{}"
+        assert self._hit_block(tmp_path, "conv_x", set()) == "{}"
 
     def test_a_legacy_flat_key_is_still_found(self, tmp_path: Path) -> None:
         """升级前写的记录不带 namespace；只认新 key 会让全部历史命中一夜变成「从未命中」。"""
         self._write_cache(tmp_path, {"mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
+        loaded = json.loads(self._hit_block(tmp_path, "conv_abc", {"mine"}))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
     def test_a_namespaced_key_is_found(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"conv_abc/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
+        loaded = json.loads(self._hit_block(tmp_path, "conv_abc", {"mine"}))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
@@ -199,7 +236,7 @@ class TestNamespaceScan:
         # 提取器的 id 规则鼓励用稳定别名，两个会话都有 user_zhangsan 是常态。
         self._write_cache(tmp_path, {"conv_other/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
+        loaded = json.loads(self._hit_block(tmp_path, "conv_abc", {"mine"}))
 
         assert loaded == {}
 
@@ -207,14 +244,20 @@ class TestNamespaceScan:
         older = (_NOW - timedelta(days=10)).isoformat()
         self._write_cache(tmp_path, {"mine": older, "conv_abc/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
+        loaded = json.loads(self._hit_block(tmp_path, "conv_abc", {"mine"}))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
-    def test_a_non_object_cache_does_not_raise(self, tmp_path: Path) -> None:
-        self._write_cache(tmp_path, [])  # type: ignore[arg-type]
+    @pytest.mark.parametrize("text", ["[]", '"2026-08-16"', '{"conv_abc/mine": '])
+    def test_an_unreadable_cache_means_unknown_not_never_hit(self, tmp_path: Path, text: str) -> None:
+        # 当成空表的话，<hit_cache> 块头那句「不在表内 = 从未命中」就把整个语料说成了过期。
+        cache = tmp_path / "data" / "memory" / ".hit_cache.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(text, encoding="utf-8")
 
-        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW) == "{}"
+        assert DreamHandler()._hit_stamps(tmp_path, "conv_abc", {"mine"}) is None
+        assert "读不到命中记录" in self._hit_block(tmp_path, "conv_abc", {"mine"})
+        assert cache.read_text(encoding="utf-8") == text
 
 
 class TestNamespaceResolution:
@@ -378,6 +421,36 @@ class TestPipeline:
         self._run_to_final(tmp_path, recorder)
 
         assert len(recorder.by_node("system.dream")) == 1
+
+    @pytest.mark.parametrize("cache_text,expected_prune", [
+        pytest.param("{}", ["m1", "m2"], id="readable-and-empty"),
+        pytest.param('{"conv_x/m1": ', [], id="unreadable"),
+        pytest.param("[]", [], id="not-an-object"),
+    ])
+    def test_an_unreadable_hit_cache_puts_nothing_up_for_pruning(
+        self, tmp_path: Path, cache_text: str, expected_prune: list[str],
+    ) -> None:
+        # 读不懂当成空表，等于说每条都从没命中过：老的自动条目全进 prune 候选，模型照单删掉。
+        _write_runtime(tmp_path)
+        _write_session(tmp_path, "sess-a", _GROUP_KEY)
+        created = (_NOW - timedelta(days=90)).isoformat()
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [
+            {**_entry("m1", ["a"]), "created_at": created},
+            {**_entry("m2", ["b"]), "created_at": created},
+        ])
+        cache = tmp_path / "data" / "memory" / ".hit_cache.json"
+        cache.write_text(cache_text, encoding="utf-8")
+        recorder = _Recorder()
+
+        self._run_to_final(tmp_path, recorder)
+
+        instruction = recorder.by_node("system.dream")[0]["input_data"]["instruction"]
+        block = instruction.split("<maintenance_candidates>")[1].split("</maintenance_candidates>")[0]
+        candidates = json.loads(block)
+        assert sorted(item["id"] for item in candidates["prune"]) == expected_prune
+        hits = instruction.split("<hit_cache>")[1].split("</hit_cache>")[0]
+        assert ("读不到命中记录" in hits) is (not expected_prune)
+        assert cache.read_text(encoding="utf-8") == cache_text
 
     def test_lock_is_written_only_after_every_organizer_finishes(self, tmp_path: Path) -> None:
         _write_runtime(tmp_path)

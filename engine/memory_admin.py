@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from engine.memory_namespace import (
     is_memory_namespace,
     is_valid_namespace,
     is_valid_subject,
+    memory_book_files,
     memory_dir,
     namespace_dirs,
     subject_from_namespace,
@@ -37,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MemoryAdminError",
+    "MemoryListing",
     "clear_namespace",
     "delete_entry",
     "list_entries",
@@ -53,6 +56,18 @@ _MAX_KEYWORD_LEN = 128
 
 class MemoryAdminError(ValueError):
     """消息可以直接回给控制台。"""
+
+
+@dataclass
+class MemoryListing:
+    """一个 namespace 里读得出来的条目，和读不出来的本。
+
+    读不出来的本不能悄悄跳过：控制台的条数、本数就少了一截，看着像那些记忆没了。
+    """
+
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    # [{"book": 本名, "problem": 位置和问题}]，不带文件内容。
+    unreadable_books: list[dict[str, str]] = field(default_factory=list)
 
 
 def _valid_namespace(namespace: str) -> str:
@@ -117,8 +132,15 @@ def _namespace_kind(namespace: str) -> str:
     return "conversation" if is_memory_namespace(namespace) else "memory_book"
 
 
+def _stamp_text(value: Any) -> str:
+    """时间戳写成文本。手写的不加引号时 YAML 读出来是 datetime 或 date，和字符串放在一起取最大值会抛 TypeError。"""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return "" if value is None else str(value)
+
+
 def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
-    """每个 namespace 一行，带条目数与最后修改时间。"""
+    """每个 namespace 一行，带条目数、读不出来的本与最后修改时间。"""
     result: list[dict[str, Any]] = []
     candidates: list[str] = [""]
     candidates.extend(directory.name for directory in namespace_dirs(Path(workspace_root)))
@@ -127,11 +149,12 @@ def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
         if name and not is_valid_namespace(name):
             continue
         try:
-            entries = list_entries(workspace_root, name)
+            listing = list_entries(workspace_root, name)
         except MemoryAdminError:
             continue
-        # 空的子目录仍要列出来，人才能把它清掉；根目录没东西就没什么可看的。
-        if not entries and not name:
+        entries = listing.entries
+        # 空的子目录仍要列出来，人才能把它清掉；根目录没东西就没什么可看的，只剩读不出来的本也得列出来。
+        if not entries and not listing.unreadable_books and not name:
             continue
         result.append({
             "namespace": name,
@@ -139,23 +162,24 @@ def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
             "subject": subject_from_namespace(name),
             "entry_count": len(entries),
             "books": sorted({entry["book"] for entry in entries}),
-            "updated_at": max((entry.get("updated_at") or "" for entry in entries), default=""),
+            "unreadable_books": [item["book"] for item in listing.unreadable_books],
+            "updated_at": max((_stamp_text(entry.get("updated_at")) for entry in entries), default=""),
         })
     return result
 
 
-def list_entries(workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
-    """某个 namespace 下全部记忆条目，附带它所在的 book。读不出来的本跳过并记一笔。"""
+def list_entries(workspace_root: Path, namespace: str) -> MemoryListing:
+    """某个 namespace 下全部记忆条目，附带它所在的 book；读不出来的本连同原因另列。"""
     directory = _namespace_dir(workspace_root, namespace)
+    listing = MemoryListing()
     if not directory.is_dir():
-        return []
-    result: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.yaml")):
+        return listing
+    for path in memory_book_files(directory):
         book = path.stem
         try:
             entries = _load_book(path)["entries"]
         except MemoryBookUnreadable as exc:
-            logger.warning("memory book skipped in console listing: %s", exc)
+            listing.unreadable_books.append({"book": book, "problem": exc.reason})
             continue
         for entry in entries:
             if not isinstance(entry, dict):
@@ -166,8 +190,8 @@ def list_entries(workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
             item["constant"] = memory_entry_constant(entry)
             item["enabled"] = memory_entry_enabled(entry)
             item.setdefault("scan_depth", _DEFAULT_SCAN_DEPTH)
-            result.append(item)
-    return result
+            listing.entries.append(item)
+    return listing
 
 
 def upsert_entry(
@@ -278,7 +302,7 @@ def clear_namespace(workspace_root: Path, namespace: str) -> int:
         return 0
     removed = 0
     with _memory_write_lock(Path(workspace_root)):
-        for path in sorted(directory.glob("*.yaml")):
+        for path in memory_book_files(directory):
             try:
                 removed += len(_load_book(path)["entries"])
             except MemoryBookUnreadable as exc:

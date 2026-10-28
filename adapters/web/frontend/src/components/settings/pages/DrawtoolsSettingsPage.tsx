@@ -10,6 +10,7 @@ import {
   getNodeRaw,
   initDrawtoolsConfigs,
   isNotFound,
+  receipted,
   updateDrawtoolsCharactersRaw,
   updateDrawtoolsPromptRaw,
   updateDrawtoolsSettingsRaw,
@@ -268,12 +269,15 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken) return;
     try {
       const base = section === 'node' ? nodeFile.hash : sectionFile(bundle, section)?.hash ?? null;
-      const result = section === 'settings' ? await updateDrawtoolsSettingsRaw(adminToken, editor, base)
-        : section === 'characters' ? await updateDrawtoolsCharactersRaw(adminToken, editor, base)
-          : section === 'node' ? await updateNodeRaw(adminToken, PLANNER_NODE, editor, base)
-            : await updateDrawtoolsPromptRaw(adminToken, section, editor, base);
+      const { result, receiptProblem } = await receipted(
+        section === 'settings' ? updateDrawtoolsSettingsRaw(adminToken, editor, base)
+          : section === 'characters' ? updateDrawtoolsCharactersRaw(adminToken, editor, base)
+            : section === 'node' ? updateNodeRaw(adminToken, PLANNER_NODE, editor, base)
+              : updateDrawtoolsPromptRaw(adminToken, section, editor, base),
+      );
       if (!requests.isCurrent()) return;
-      setMessage(savedMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。', '', result.warnings));
+      // 回执没读懂也照存上了收尾：紧接着的重读把编辑器和指纹都换成落盘那一版。
+      setMessage(savedMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。', '', result?.warnings), receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;
@@ -305,7 +309,7 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken || !confirmDiscard()) return;
     try {
       const loaded = file?.content || '';
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => target.read(adminToken),
         write: (content, hash) => target.write(adminToken, content, hash),
         edits: changedSections(loaded, next),
@@ -313,7 +317,7 @@ export const DrawtoolsSettingsPage = () => {
         proceed: requests.isCurrent,
       });
       if (!requests.isCurrent()) return;
-      setMessage(savedMessage(okText, note, result.warnings));
+      setMessage(savedMessage(okText, note, result?.warnings), receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;

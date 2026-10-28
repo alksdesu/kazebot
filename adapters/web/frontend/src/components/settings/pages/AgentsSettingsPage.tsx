@@ -8,7 +8,7 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 // stays focused on selection and operations while the right rail owns editing.
 import { useEffect, useState } from 'react';
 
-import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/supervisorClient';
+import { createNode, deleteNode, getNodes, receipted, type AdminNode } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
@@ -87,10 +87,10 @@ export const AgentsSettingsPage = () => {
     if (!id) { setError('请输入节点 ID'); return; }
     if (!confirmNavigation()) return;
     try {
-      const result = await createNode(adminToken, { id, content: nodeTemplate(id, template) });
+      const { result, receiptProblem } = await receipted(createNode(adminToken, { id, content: nodeTemplate(id, template) }));
       if (!requests.isCurrent()) return;
       setNewId('');
-      setMessage(savedMessage('节点已创建，请在右栏继续编辑 YAML。', '', result.warnings));
+      setMessage(savedMessage('节点已创建，请在右栏继续编辑 YAML。', '', result?.warnings), receiptProblem);
       await loadNodes();
       if (!requests.isCurrent()) return;
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);

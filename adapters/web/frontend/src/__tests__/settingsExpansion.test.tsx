@@ -130,19 +130,19 @@ describe('expanded settings API wrappers', () => {
   it('unwraps raw content responses and sends raw content payloads', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (init?.method === 'PUT') return jsonResponse({ ok: true });
-      if (url.endsWith('/raw')) return jsonResponse({ content: 'value: 1\n' });
+      if (init?.method === 'PUT') return jsonResponse({ ok: true, hash: 'h2' });
+      if (url.endsWith('/raw')) return jsonResponse({ content: 'value: 1\n', hash: 'h1' });
       return jsonResponse({});
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getPolicyRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getSchedulesRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getMcpClientsRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getNodeRaw('token', 'ereuna_main')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getToolRaw('token', 'read_file')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getSkillRaw('token', 'jina-reader')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getRuntimeRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getPolicyRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getSchedulesRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getMcpClientsRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getNodeRaw('token', 'ereuna_main')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getToolRaw('token', 'read_file')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getSkillRaw('token', 'jina-reader')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
 
     await updateRuntimeRaw('token', 'runtime: true\n', null);
     await updatePolicyRaw('token', 'policy: true\n', null);
@@ -160,7 +160,7 @@ describe('expanded settings API wrappers', () => {
   });
 
   it('uses the expected create delete reload and restart endpoints', async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ ok: true, scheduled: true, target: 'engine' }));
+    const fetchMock = vi.fn(async () => jsonResponse({ ok: true, hash: 'h1', scheduled: true, target: 'engine' }));
     vi.stubGlobal('fetch', fetchMock);
 
     await createNode('token', { id: 'new_node', content: 'id: new_node\n' });

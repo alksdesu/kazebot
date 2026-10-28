@@ -293,7 +293,7 @@ class TestInstances:
 
             for refused in (preview, merged):
                 assert refused["ok"] is False and refused["reason"] == "instance_not_allowed"
-                assert refused["message"] == f"本实例不能合回，补丁在 {view['patch']}"
+                assert refused["message"] == f"本实例不能合回这个仓库，补丁在 {view['patch']}"
                 assert Path(refused["patch"]).is_file()
             assert (ws / "app" / "main.py").read_text(encoding="utf-8") == ORIGINAL_MAIN
             assert environment.entry(child)["state"] == "finished"
@@ -302,6 +302,66 @@ class TestInstances:
             preview = environment.service.preview(task_id=caller.task_id, handle=view["handle"])
             merged = environment.service.merge(task_id=caller.task_id, handle=view["handle"], digest=preview["digest"])
             assert merged["ok"] is True, merged
+        finally:
+            close_service(state)
+
+    def test_a_roster_nobody_can_read_still_refuses_but_says_it_is_the_roster(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 只说本实例不能合回，人会去改 merge_instances；挡着的其实是读不懂的清单。
+        data_root = tmp_path / "data-root"
+        instances = write(data_root / "instances.yaml", yaml.safe_dump({"instances": [
+            {"id": "main", "path": "", "idx": 0},
+            {"id": "alt", "path": "/i/alt", "idx": 1},
+        ]}))
+        monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(instances))
+        monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/alt")
+        ws = make_repo(tmp_path / "ws")
+        write_runtime(ws, {"engine": {"worktree": {"merge_instances": ["alt"]}}})
+        state = make_state(ws)
+        try:
+            environment = Env(tmp_path, ws, state)
+            caller = environment.caller(environment.session())
+            child = environment.isolated_child(caller)
+            # 建副本时清单还读得懂；之后写坏了，子任务照样收尾。
+            write(instances, "instances: [ this is: not: valid\n")
+            write(environment.worktree_of(child) / "app" / "main.py", "def main():\n    return 2\n")
+            environment.finish(child)
+            [entry] = entries(caller)
+            view = entry["worktree"]
+            refusal = f"查不了本实例能不能合回这个仓库：实例清单 {instances} 读不懂：第 1 行"
+
+            assert view["merge_allowed"] is False
+            assert view["merge_refusal"].startswith(refusal)
+            assert any(line.startswith(refusal) for line in worktree_lines(view))
+            preview = environment.service.preview(task_id=caller.task_id, handle=view["handle"])
+            merged = environment.service.merge(task_id=caller.task_id, handle=view["handle"], digest=view["digest"])
+            for refused in (preview, merged):
+                assert refused["ok"] is False and refused["reason"] == "instance_not_allowed"
+                assert refused["message"].startswith(refusal)
+                assert refused["message"].endswith(f"，补丁在 {view['patch']}")
+                assert "this is" not in refused["message"]
+            assert (ws / "app" / "main.py").read_text(encoding="utf-8") == ORIGINAL_MAIN
+        finally:
+            close_service(state)
+
+    def test_a_roster_that_breaks_before_the_child_starts_does_not_stop_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 登记里记哪个实例建的只供查看，读不懂清单不该把隔离子任务挡掉。
+        data_root = tmp_path / "data-root"
+        instances = write(data_root / "instances.yaml", "instances: [ this is: not: valid\n")
+        monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(instances))
+        monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/alt")
+        ws = make_repo(tmp_path / "ws")
+        state = make_state(ws)
+        try:
+            environment = Env(tmp_path, ws, state)
+            caller = environment.caller(environment.session())
+            child = environment.isolated_child(caller)
+
+            assert environment.entry(child)["instance"] == ""
+            assert environment.worktree_of(child).is_dir()
         finally:
             close_service(state)
 

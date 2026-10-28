@@ -60,6 +60,10 @@ class ProvisionError(RuntimeError):
     """给调用方直接当 400 用的人话错误。"""
 
 
+class RosterUnreadable(ProvisionError):
+    """实例清单读不懂：坏的是服务器上的文件，不是请求，接口回 503。"""
+
+
 @dataclass(frozen=True)
 class Plan:
     instance_id: str
@@ -159,8 +163,9 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _unreadable_roster(workspace_root: Path) -> ProvisionError:
-    return ProvisionError(f"实例清单 {instances_file(workspace_root)} 读不懂，先在服务器上修好它")
+def _unreadable_roster(error: InstanceDirectoryError, then: str = "先在服务器上修好它") -> RosterUnreadable:
+    """给管理员看的那句：清单在哪、哪里读不懂（不带文件内容），接着说这一步因此怎么了。"""
+    return RosterUnreadable(f"{error.reason}。{then}")
 
 
 def _roster(workspace_root: Path) -> list[dict[str, Any]]:
@@ -168,7 +173,7 @@ def _roster(workspace_root: Path) -> list[dict[str, Any]]:
     try:
         return load_instances(workspace_root, required=True)
     except InstanceDirectoryError as error:
-        raise _unreadable_roster(workspace_root) from error
+        raise _unreadable_roster(error) from error
 
 
 def plan_instance(
@@ -287,7 +292,7 @@ def scaffold(plan: Plan, workspace_root: Path) -> None:
             account=plan.account,
         )
     except InstanceDirectoryError as error:
-        raise ProvisionError(f"实例清单 {instances_file(workspace_root)} 读不懂，没有登记 {plan.instance_id}") from error
+        raise _unreadable_roster(error, f"没有登记 {plan.instance_id}") from error
 
 
 async def _systemctl(*args: str) -> tuple[int, str]:
@@ -349,7 +354,7 @@ def forget(workspace_root: Path, instance_id: str) -> None:
     try:
         remove_instance(workspace_root, validate_instance_id(instance_id))
     except InstanceDirectoryError as error:
-        raise _unreadable_roster(workspace_root) from error
+        raise _unreadable_roster(error) from error
 
 
 def guard_removable(workspace_root: Path, instance_id: str, *, current_prefix: str) -> dict[str, Any]:
@@ -374,6 +379,7 @@ __all__ = [
     "ProvisionError",
     "REMOVE_UNIT",
     "RESERVED_IDS",
+    "RosterUnreadable",
     "data_root",
     "forget",
     "guard_removable",

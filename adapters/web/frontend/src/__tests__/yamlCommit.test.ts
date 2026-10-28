@@ -136,7 +136,29 @@ describe('commitYamlKeys', () => {
     const saved = await commitYamlKeys({ read: file.read, write: file.write, edits: [{ path: ['b'], value: 3 }] });
 
     expect(file.writes).toEqual([['a: 1   # 注释\nb: 3\n', 'h1']]);
-    expect(saved).toEqual({ content: 'a: 1   # 注释\nb: 3\n', note: '', result: { ok: true, hash: 'h2' } });
+    expect(saved).toEqual({ content: 'a: 1   # 注释\nb: 3\n', note: '', result: { ok: true, hash: 'h2' }, receiptProblem: '' });
+  });
+
+  // 写已经落盘了：当成失败，表单会说没存上，人再点一次；每次写回都先读最新一版，下一次写不靠这份回执。
+  it('treats an unreadable receipt as written and passes the reason on', async () => {
+    const file = fakeFile('b: 2\n');
+    const write = async (next: string, base: string | null) => {
+      await file.write(next, base);
+      throw new api.ReceiptUnreadable('节点 n 已经存上，可回执格式不对：缺 hash');
+    };
+
+    const saved = await commitYamlKeys({ read: file.read, write, edits: [{ path: ['b'], value: 3 }] });
+
+    expect(saved).toEqual({ content: 'b: 3\n', note: '', result: null, receiptProblem: '节点 n 已经存上，可回执格式不对：缺 hash' });
+    expect(file.content).toBe('b: 3\n');
+  });
+
+  it('still fails when the write itself was refused', async () => {
+    const file = fakeFile('b: 2\n');
+    const write = async () => { throw new api.ApiError(409, 'x 已被别处改过，刷新后再改'); };
+
+    await expect(commitYamlKeys({ read: file.read, write, edits: [{ path: ['b'], value: 3 }] }))
+      .rejects.toMatchObject({ status: 409 });
   });
 
   it('keeps what someone else changed in another key since the form opened', async () => {

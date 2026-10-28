@@ -12,6 +12,7 @@ import {
   getProviders,
   isEditConflict,
   isNotFound,
+  receipted,
   updateNodeFileRaw,
   updateNodeRaw,
   type RawText,
@@ -30,7 +31,7 @@ import {
 } from './components';
 import { commitYamlKeys } from './yamlCommit';
 import { parseYamlMapping, readYamlPath } from './yamlRewrite';
-import { savedMessage } from '../utils/sentence';
+import { reloadBeforeEditing, savedMessage } from '../utils/sentence';
 import { errorMessage } from '../api/request';
 
 const NODE_ID = 'qq.orchestrator';
@@ -131,11 +132,12 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
     if (!token || busy || !loaded) return;
     setBusy(true);
     try {
-      const result = await updateNodeFileRaw(token, fragment.filename, text, base);
+      const { result, receiptProblem } = await receipted(updateNodeFileRaw(token, fragment.filename, text, base));
       setSaved(text);
-      setBase(result.hash);
+      // 回执没读懂就留着旧指纹：下次保存撞 409，不会把这次存上的整份盖掉。没改动时「丢弃」点不了，只能刷新页面重读。
+      if (result) setBase(result.hash);
       setMissing(false);
-      setMessage(savedMessage(fragment.savedNote, '', result.warnings));
+      setMessage(savedMessage(fragment.savedNote, '', result?.warnings), result ? '' : reloadBeforeEditing(receiptProblem, '刷新页面读入最新内容'));
     } catch (caught) {
       setError(isEditConflict(caught)
         ? `${fragment.label}在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。`
@@ -224,7 +226,7 @@ const ModelChoiceEditor = () => {
     try {
       const value = model.trim();
       // 只改 model 这一个键，合并到现读的这一版上：节点文件的其他改动留着。留空就删掉这一行，跟随全局默认。
-      const { content, note: rewriteNote, result } = await commitYamlKeys({
+      const { content, note: rewriteNote, result, receiptProblem } = await commitYamlKeys({
         read: () => getNodeRaw(token, NODE_ID),
         write: (next, hash) => updateNodeRaw(token, NODE_ID, next, hash),
         edits: [{ path: ['model'], value: value || undefined }],
@@ -233,7 +235,7 @@ const ModelChoiceEditor = () => {
       const saved = rewriteNote
         ? `已保存。${rewriteNote}。节点文件每次任务都重新读，立刻生效。`
         : '已保存。节点文件每次任务都重新读，立刻生效。';
-      setMessage(savedMessage(saved, '', result.warnings));
+      setMessage(savedMessage(saved, '', result?.warnings), receiptProblem);
     } catch (caught) {
       setError(errorMessage(caught));
     }

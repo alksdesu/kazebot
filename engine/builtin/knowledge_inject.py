@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +16,7 @@ import config_layout
 from clonoth_runtime import SwitchValueError, get_int, parse_bool, switch_arg
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
+    memory_book_files,
     memory_dir,
     memory_root,
     node_memory_namespace,
@@ -28,6 +30,7 @@ from engine.memory_subjects import (
 from engine.node import Node
 from toolbox._common import request_guard, resolve_under_allowed_roots
 from toolbox.context import ToolContext
+from toolbox.text_files import BOM
 
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
@@ -66,12 +69,39 @@ PLUGIN_META = {
 }
 
 
+# 技能目录和记忆本两秒就重扫一次：同一个问题同一版只记一次日志。记过的满了丢最早的。
+_WARNED_LIMIT = 512
+_WARNED_LOCK = threading.Lock()
+_WARNED_KEYWORDS: OrderedDict[tuple[str, str], None] = OrderedDict()
+_WARNED_OUTPUT_RULES: OrderedDict[tuple[str, str], None] = OrderedDict()
+_WARNED_FILES: OrderedDict[str, tuple[int, int, int] | None] = OrderedDict()
+
+
+def _first_report(seen: OrderedDict[Any, Any], key: Any, version: Any = None) -> bool:
+    """key 的这一版是不是头一回报：是就记下来。"""
+    with _WARNED_LOCK:
+        if key in seen and seen[key] == version:
+            return False
+        seen[key] = version
+        seen.move_to_end(key)
+        while len(seen) > _WARNED_LIMIT:
+            seen.popitem(last=False)
+        return True
+
+
+def _warn_file_once(path: Path, stamp: tuple[int, int, int] | None, message: str, *args: Any) -> None:
+    """一份读不了的文件按 file_stamp 认版本，同一版只记一次。stamp 要在读文件之前取。"""
+    if _first_report(_WARNED_FILES, str(path), stamp):
+        logger.warning(message, *args)
+
 
 # ---------------------------------------------------------------------------
 #  Keyword matching
 # ---------------------------------------------------------------------------
 
 _REGEX_KEYWORD_RE = re.compile(r"^/(.+)/([ism]*)$", re.DOTALL)
+# 写错的正则抛 re.error，重复次数太大抛 OverflowError，括号嵌套太深抛 RecursionError。
+_REGEX_FAILURES = (re.error, OverflowError, RecursionError)
 # 纯 ASCII 的短词按子串匹配等于通配符：`ai` 命中 said / mail / again，
 # `qq`、`id` 同理。CJK 没有词边界可用，只能保子串。
 _BOUNDARY_MAX_LEN = 3
@@ -102,12 +132,14 @@ def compile_keyword(kw: str) -> re.Pattern[str] | str:
             flags |= re.MULTILINE
         try:
             return re.compile(pattern, flags)
-        except re.error as regex_error:
+        except _REGEX_FAILURES as regex_error:
             # 原来这里是静默 pass，用户写错正则只会得到「莫名匹配不上」。
-            logger.warning("keyword %r is not a valid regex, matching it literally: %s", kw, regex_error)
+            if _first_report(_WARNED_KEYWORDS, ("invalid_regex", kw)):
+                logger.warning("keyword %r is not a valid regex, matching it literally: %s", kw, regex_error)
             return kw.lower()
     elif kw.startswith("/") and kw.rfind("/") > 0:
-        logger.info("keyword %r is now matched literally, not as a regex", kw)
+        if _first_report(_WARNED_KEYWORDS, ("matched_literally", kw)):
+            logger.info("keyword %r is now matched literally, not as a regex", kw)
 
     lowered = kw.lower()
     if len(lowered) <= _BOUNDARY_MAX_LEN and lowered.isascii():
@@ -179,26 +211,92 @@ def build_scan_text(
 #  Skill frontmatter, catalog loading, and legacy skill builder
 # ---------------------------------------------------------------------------
 
+_FRONTMATTER_FENCE = "---"
+
+
+class SkillFrontmatterError(ValueError):
+    """SKILL.md 开头的 frontmatter 写坏了。消息只有位置和问题，不带文件内容。
+
+    problem 是不带位置的那句；line、column 从 1 数，说不出位置时是 None。
+    """
+
+    def __init__(self, problem: str, *, line: int | None = None, column: int | None = None) -> None:
+        where = "" if line is None else f"{config_layout.position_text(line, column)}："
+        super().__init__(f"{where}{problem}")
+        self.problem = problem
+        self.line = line
+        self.column = column
+
+
 def parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    """Parse YAML frontmatter from SKILL.md content."""
-    # Why: skill CRUD and skill injection now share this module after deleting
-    # the old separate skill runtime file. How: keep the same frontmatter delimiter
-    # and YAML fallback behavior. Purpose: preserve SKILL.md compatibility during
-    # the move.
-    if not text.startswith("---\n"):
+    """把 SKILL.md 拆成 frontmatter 和正文。
+
+    第一行不是 --- 的没有 frontmatter：元数据为空，正文是全文。开了头却没有收尾、YAML 读不出来、
+    顶层不是映射都抛 SkillFrontmatterError：按空元数据算的话，关掉的技能会被打开，输出规则会成了普通技能。
+    """
+    text = text.removeprefix(BOM)
+    lines = text.split("\n")
+    if lines[0].rstrip() != _FRONTMATTER_FENCE:
         return {}, text
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        return {}, text
-    head = text[4:end]
-    body = text[end + 5:]
+    close = next((index for index in range(1, len(lines)) if lines[index].rstrip() == _FRONTMATTER_FENCE), None)
+    if close is None:
+        raise SkillFrontmatterError("frontmatter 没有收尾，后面没有单独一行的 ---", line=1)
+    # 连开头那行一起解析：YAML 报的行号就是文件里的行号。
     try:
-        meta = yaml.safe_load(head) or {}
-    except Exception:
+        meta = config_layout.load_yaml_text("\n".join(lines[:close]))
+    except yaml.YAMLError as exc:
+        parts = config_layout.yaml_error_parts(exc)
+        raise SkillFrontmatterError(
+            f"frontmatter 的 YAML 读不出来：{parts.message}", line=parts.line, column=parts.column,
+        ) from exc
+    if meta is None:
         meta = {}
     if not isinstance(meta, dict):
-        meta = {}
-    return meta, body
+        raise SkillFrontmatterError("frontmatter 顶层不是 key: value 的映射")
+    return meta, "\n".join(lines[close + 1:])
+
+
+@dataclass(frozen=True)
+class SkillFile:
+    """config/skills/<目录>/SKILL.md 读出来的样子。problem 不空时这份用不了，meta 和 body 都是空的。
+
+    stamp 是读之前取的 file_stamp，同一版写坏的文件只记一次日志靠它。
+    """
+
+    directory: str
+    path: Path
+    stamp: tuple[int, int, int] | None
+    meta: dict[str, Any] = field(default_factory=dict)
+    body: str = ""
+    problem: str = ""
+
+
+def read_skill_file(path: Path) -> SkillFile:
+    stamp = config_layout.file_stamp(path)
+    directory = path.parent.name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return SkillFile(directory, path, stamp, problem=f"读不了：{config_layout.config_error_text(exc)}")
+    try:
+        meta, body = parse_skill_frontmatter(text)
+    except SkillFrontmatterError as exc:
+        return SkillFile(directory, path, stamp, problem=str(exc))
+    return SkillFile(directory, path, stamp, meta, body)
+
+
+def skill_files(workspace_root: Path) -> list[SkillFile]:
+    """config/skills/*/SKILL.md，按目录名排序。读不了、frontmatter 写坏的也在里面，problem 写着原因。"""
+    skills_dir = config_layout.skills_dir(workspace_root)
+    if not skills_dir.is_dir():
+        return []
+    return [read_skill_file(path) for path in sorted(skills_dir.glob("*/SKILL.md"))]
+
+
+def check_skill_text(text: str) -> list[str]:
+    """控制台保存 SKILL.md 之前的校验，和加载时是同一套：frontmatter 写坏抛 SkillFrontmatterError。"""
+    parse_skill_frontmatter(text)
+    return []
 
 
 def skill_strategy(meta: dict[str, Any]) -> str:
@@ -229,7 +327,7 @@ def output_rule_problem(meta: dict[str, Any]) -> str:
         return "a skill with strategy output needs a non-empty trigger regex"
     try:
         re.compile(trigger)
-    except re.error as exc:
+    except _REGEX_FAILURES as exc:
         return f"trigger is not a valid regex: {exc}"
     scope = meta.get("scope")
     if scope is not None and str(scope).strip().lower() not in OUTPUT_SCOPES:
@@ -240,21 +338,26 @@ def output_rule_problem(meta: dict[str, Any]) -> str:
     return ""
 
 
-_WARNED_OUTPUT_RULES: OrderedDict[tuple[str, str], None] = OrderedDict()
-_WARNED_OUTPUT_RULES_LIMIT = 512
-_WARNED_OUTPUT_RULES_LOCK = threading.Lock()
+def skill_meta_problem(meta: dict[str, Any]) -> str:
+    """frontmatter 里加载时会被悄悄按默认值算的写法，都没问题返回空串。
+
+    认不出的 strategy、不是整数的 order / priority / scan_depth，以及 output 策略写得不对的规则。
+    """
+    written = str(meta.get("strategy") or "").strip().lower()
+    if written and written not in SKILL_STRATEGIES:
+        return f"strategy must be one of {', '.join(SKILL_STRATEGIES)}, got {meta['strategy']!r}"
+    for key in ("order", "priority", "scan_depth"):
+        value = meta.get(key)
+        if value is not None and _whole_number(value) is None:
+            return f"{key} must be a whole number, got {value!r}"
+    if skill_strategy(meta) == OUTPUT_STRATEGY:
+        return output_rule_problem(meta)
+    return ""
 
 
 def _warn_output_rule_once(where: str, problem: str) -> None:
-    # 目录缓存两秒就重扫一次，同一条写错的规则不能每次都记一遍
-    key = (where, problem)
-    with _WARNED_OUTPUT_RULES_LOCK:
-        if key in _WARNED_OUTPUT_RULES:
-            return
-        _WARNED_OUTPUT_RULES[key] = None
-        while len(_WARNED_OUTPUT_RULES) > _WARNED_OUTPUT_RULES_LIMIT:
-            _WARNED_OUTPUT_RULES.popitem(last=False)
-    logger.warning("output rule %s: %s", where, problem)
+    if _first_report(_WARNED_OUTPUT_RULES, (where, problem)):
+        logger.warning("output rule %s: %s", where, problem)
 
 
 def parse_output_rule(meta: dict[str, Any], *, where: str) -> dict[str, Any]:
@@ -267,7 +370,7 @@ def parse_output_rule(meta: dict[str, Any], *, where: str) -> dict[str, Any]:
     else:
         try:
             pattern = re.compile(trigger)
-        except re.error as exc:
+        except _REGEX_FAILURES as exc:
             _warn_output_rule_once(where, f"trigger {trigger!r} is not a valid regex, the rule is skipped: {exc}")
     raw_scope = meta.get("scope")
     scope = str(raw_scope or DEFAULT_OUTPUT_SCOPE).strip().lower()
@@ -315,75 +418,75 @@ class _SkillCache:
             cls._entries[key] = (time.monotonic(), items)
 
 
+def _skill_fields(workspace_root: Path, skill: SkillFile) -> dict[str, Any]:
+    """一份能用的 SKILL.md 按加载时的读法得出的各项。注入、list_skills 和控制台列表看到的是同一组值。"""
+    meta = skill.meta
+    return {
+        "name": str(meta.get("name") or skill.directory).strip() or skill.directory,
+        "dir": skill.directory,
+        "path": config_layout.logical_path(workspace_root, skill.path),
+        "description": str(meta.get("description") or "").strip(),
+        "enabled": skill_enabled(meta),
+        "strategy": skill_strategy(meta),
+        "keywords": _as_string_list(meta.get("keywords")),
+        "order": _as_int(meta.get("order"), 0),
+        "priority": _as_int(meta.get("priority"), 0),
+        "scan_depth": max(0, _as_int(meta.get("scan_depth"), 0)),
+        "node_ids": _as_string_list(meta.get("node_ids")),
+    }
+
+
+def skill_rows(workspace_root: Path, *, preview_chars: int = 0) -> list[dict[str, Any]]:
+    """list_skills 工具和控制台技能列表的行，每个技能目录一行。dir 是目录名，读、写、删都认它，name 是 frontmatter 里写的。
+
+    用不了的那行只有 name（目录名）、dir、path 和 problem；output 策略的带上 trigger、scope、max_fires，写得不对的带 rule_error。
+    """
+    rows: list[dict[str, Any]] = []
+    for skill in skill_files(workspace_root):
+        if skill.problem:
+            rows.append({
+                "name": skill.directory,
+                "dir": skill.directory,
+                "path": config_layout.logical_path(workspace_root, skill.path),
+                "problem": skill.problem,
+            })
+            continue
+        row = _skill_fields(workspace_root, skill)
+        if preview_chars > 0:
+            row["body_preview"] = skill.body.strip()[:preview_chars]
+        if row["strategy"] == OUTPUT_STRATEGY:
+            rule = parse_output_rule(skill.meta, where=row["path"])
+            row.update({"trigger": rule["trigger"], "scope": rule["scope"], "max_fires": rule["max_fires"]})
+            problem = output_rule_problem(skill.meta)
+            if problem:
+                row["rule_error"] = problem
+        rows.append(row)
+    return rows
+
+
 def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list[dict[str, Any]]:
-    """Scan ``config/skills/*/SKILL.md`` and return metadata + body for each skill."""
-    # Why: skill scanning is now owned by the knowledge plugin. How: move the
-    # former skill catalog loader here byte-for-byte except for local matcher
-    # references. Purpose: keep skill injection output stable while removing the
-    # old runtime module.
+    """Scan ``config/skills/*/SKILL.md`` and return metadata + body for each usable skill.
+
+    读不了、frontmatter 写坏的跳过并记日志，同一版只记一次：按空元数据算的话，关掉的会被打开、输出规则会被当成普通技能注入。
+    """
     if _use_cache:
         cached = _SkillCache.get(workspace_root)
         if cached is not None:
             return cached
 
-    skills_dir = config_layout.skills_dir(workspace_root)
-    if not skills_dir.exists() or not skills_dir.is_dir():
-        return []
-
     items: list[dict[str, Any]] = []
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-        try:
-            text = skill_md.read_text(encoding="utf-8")
-            meta, body = parse_skill_frontmatter(text)
-            name = str(meta.get("name") or skill_md.parent.name).strip() or skill_md.parent.name
-            description = str(meta.get("description") or "").strip()
-            enabled = skill_enabled(meta)
-            path = config_layout.logical_path(workspace_root, skill_md)
-
-            strategy = skill_strategy(meta)
-
-            raw_kw = meta.get("keywords")
-            keywords: list[str] = []
-            if isinstance(raw_kw, list):
-                keywords = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
-            elif isinstance(raw_kw, str) and raw_kw.strip():
-                keywords = [raw_kw.strip()]
-
-            order = 0
-            if isinstance(meta.get("order"), (int, float)):
-                order = int(meta["order"])
-            priority = 0
-            if isinstance(meta.get("priority"), (int, float)):
-                priority = int(meta["priority"])
-            scan_depth = 0
-            if isinstance(meta.get("scan_depth"), (int, float)):
-                scan_depth = max(0, int(meta["scan_depth"]))
-
-            raw_node_ids = meta.get("node_ids")
-            node_ids: list[str] = []
-            if isinstance(raw_node_ids, list):
-                node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
-            elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
-                node_ids = [raw_node_ids.strip()]
-
-            items.append({
-                "name": name,
-                "description": description,
-                "enabled": enabled,
-                "path": path,
-                "strategy": strategy,
-                "keywords": keywords,
-                "compiled_keywords": [compile_keyword(k) for k in keywords],
-                "order": order,
-                "priority": priority,
-                "scan_depth": scan_depth,
-                "body": body.strip(),
-                "node_ids": node_ids,
-                "output_rule": parse_output_rule(meta, where=path) if strategy == OUTPUT_STRATEGY and enabled else None,
-            })
-        except Exception as load_error:
-            logger.warning("skill %s skipped, unreadable: %s", skill_md.parent.name, load_error)
+    for skill in skill_files(workspace_root):
+        if skill.problem:
+            _warn_file_once(skill.path, skill.stamp, "skill %s skipped, unusable: %s", skill.directory, skill.problem)
             continue
+        item = _skill_fields(workspace_root, skill)
+        is_rule = item["strategy"] == OUTPUT_STRATEGY and item["enabled"]
+        item.update({
+            "compiled_keywords": [compile_keyword(k) for k in item["keywords"]],
+            "body": skill.body.strip(),
+            "output_rule": parse_output_rule(skill.meta, where=item["path"]) if is_rule else None,
+        })
+        items.append(item)
     _SkillCache.put(workspace_root, items)
     return items
 
@@ -576,88 +679,53 @@ def load_memory_catalog(
         return []
 
     items: list[dict[str, Any]] = []
-    for yaml_path in sorted(mem_dir.glob("*.yaml")):
+    for yaml_path in memory_book_files(mem_dir):
+        stamp = config_layout.file_stamp(yaml_path)
         try:
-            text = yaml_path.read_text(encoding="utf-8")
-            data = config_layout.load_yaml_text(text)
-            if not isinstance(data, dict):
-                continue
-            book = str(data.get("book") or yaml_path.stem).strip()
-            entries = data.get("entries")
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                eid = str(entry.get("id") or "").strip()
-                if not eid:
-                    continue
-                if not memory_entry_enabled(entry):
-                    continue
-
-                content = str(entry.get("content") or "").strip()
-                if not content:
-                    continue
-
-                raw_kw = entry.get("keywords")
-                keywords: list[str] = []
-                if isinstance(raw_kw, list):
-                    keywords = [
-                        str(k).strip()
-                        for k in raw_kw
-                        if isinstance(k, str) and str(k).strip()
-                    ]
-                elif isinstance(raw_kw, str) and raw_kw.strip():
-                    keywords = [raw_kw.strip()]
-
-                constant = memory_entry_constant(entry)
-                priority = 0
-                if isinstance(entry.get("priority"), (int, float)):
-                    priority = int(entry["priority"])
-                scan_depth = _DEFAULT_SCAN_DEPTH
-                if isinstance(entry.get("scan_depth"), (int, float)):
-                    scan_depth = max(0, int(entry["scan_depth"]))
-
-                # Why: old memory books accepted node_ids as either a list or a
-                # comma-separated string. How: keep the same coercion. Purpose:
-                # node-scoped memories continue to load without migration.
-                raw_node_ids = entry.get("node_ids")
-                node_ids: list[str] = []
-                if isinstance(raw_node_ids, list):
-                    node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
-                elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
-                    node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
-
-                source = str(entry.get("source", "")).strip()
-                created_at = str(entry.get("created_at", "")).strip()
-                last_hit_at = str(entry.get("last_hit_at", "")).strip()
-
-                items.append({
-                    "book": book,
-                    "id": eid,
-                    "keywords": keywords,
-                    "compiled_keywords": [compile_keyword(k) for k in keywords],
-                    "content": content,
-                    "constant": constant,
-                    "priority": priority,
-                    "scan_depth": scan_depth,
-                    "node_ids": node_ids,
-                    "source": source,
-                    "created_at": created_at,
-                    "last_hit_at": last_hit_at,
-                })
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as load_error:
-            # 一个 YAML 语法错误原来会让整本记忆凭空消失，零日志零告警 —— 手工编辑
-            # 记忆本时打错一个冒号，那一整本就此不再被注入，而且无从察觉。
-            # 用 warning 而非 error：编辑期间每轮 prompt build 都会经过这里。
-            # 只报位置和问题：出错那一行是用户的原话。
-            logger.warning(
-                "memory book %s skipped, unreadable: %s", yaml_path.name, config_layout.config_error_text(load_error),
-            )
+            data = _load_book(yaml_path)
+        except MemoryBookUnreadable as exc:
+            _warn_file_once(yaml_path, stamp, "memory book %s skipped, unreadable: %s", yaml_path.name, exc.reason)
             continue
-        except Exception as load_error:
-            logger.warning("memory book %s skipped, unreadable: %s", yaml_path.name, load_error)
-            continue
+        book = str(data.get("book") or yaml_path.stem).strip()
+        for entry in data["entries"]:
+            if not isinstance(entry, dict):
+                continue
+            eid = str(entry.get("id") or "").strip()
+            if not eid:
+                continue
+            if not memory_entry_enabled(entry):
+                continue
+
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+
+            keywords = _as_string_list(entry.get("keywords"))
+
+            # Why: old memory books accepted node_ids as either a list or a
+            # comma-separated string. How: keep the same coercion. Purpose:
+            # node-scoped memories continue to load without migration.
+            raw_node_ids = entry.get("node_ids")
+            node_ids: list[str] = []
+            if isinstance(raw_node_ids, list):
+                node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+            elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+                node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
+
+            items.append({
+                "book": book,
+                "id": eid,
+                "keywords": keywords,
+                "compiled_keywords": [compile_keyword(k) for k in keywords],
+                "content": content,
+                "constant": memory_entry_constant(entry),
+                "priority": _as_int(entry.get("priority"), 0),
+                "scan_depth": max(0, _as_int(entry.get("scan_depth"), _DEFAULT_SCAN_DEPTH)),
+                "node_ids": node_ids,
+                "source": str(entry.get("source", "")).strip(),
+                "created_at": str(entry.get("created_at", "")).strip(),
+                "last_hit_at": str(entry.get("last_hit_at", "")).strip(),
+            })
 
     _MemoryCache.put(workspace_root, items, memory_book=memory_book)
     return items
@@ -721,7 +789,11 @@ def _as_int(value: Any, default: int = 0) -> int:
     # them as numbers. How: keep that rule here instead of parsing arbitrary
     # strings. Purpose: prevent a subtle behavior change during normalization.
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            return int(value)
+        except (OverflowError, ValueError):
+            # YAML 的 .inf、.nan 也是 float
+            return default
     return default
 
 
@@ -1479,6 +1551,22 @@ def _tool_err(message: Any, **fields: Any) -> dict[str, Any]:
     return response
 
 
+_INTEGER_TEXT_RE = re.compile(r"[+-]?[0-9]+")
+
+
+def _whole_number_arg(args: dict[str, Any], key: str) -> int | None:
+    """模型交来的整数参数，没给是 None。写成文字的整数也认；带小数、true/false、认不出的抛 ValueError，不截断也不丢掉。"""
+    raw = args.get(key)
+    if raw is None:
+        return None
+    number = _whole_number(raw)
+    if number is None and isinstance(raw, str) and _INTEGER_TEXT_RE.fullmatch(raw.strip()):
+        number = int(raw.strip())
+    if number is None:
+        raise ValueError(f"{key} must be a whole number, got {raw!r}")
+    return number
+
+
 async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a skill under config/skills/<name>/SKILL.md."""
     # Why: skill management tools now live beside skill loading and injection.
@@ -1488,6 +1576,8 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     content = args.get("content")
+    if content is not None and not isinstance(content, str):
+        return _tool_err("content must be the SKILL.md text as a string")
     try:
         enabled = switch_arg(args, "enabled", True)
     except SwitchValueError as exc:
@@ -1498,25 +1588,17 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     keywords: list[str] | None = None
     if isinstance(raw_keywords, list):
         keywords = [str(k).strip() for k in raw_keywords if isinstance(k, str) and str(k).strip()]
+    elif raw_keywords is not None:
+        return _tool_err(f"keywords must be a list of strings, got {raw_keywords!r}")
 
-    order: int | None = None
-    if args.get("order") is not None:
-        try:
-            order = int(args["order"])
-        except (TypeError, ValueError):
-            pass
-    priority: int | None = None
-    if args.get("priority") is not None:
-        try:
-            priority = int(args["priority"])
-        except (TypeError, ValueError):
-            pass
-    scan_depth: int | None = None
-    if args.get("scan_depth") is not None:
-        try:
-            scan_depth = max(0, int(args["scan_depth"]))
-        except (TypeError, ValueError):
-            pass
+    # 写错的数不截断也不丢掉：加载时它只会按 0 算，在这里拒掉模型才知道要改
+    try:
+        order = _whole_number_arg(args, "order")
+        priority = _whole_number_arg(args, "priority")
+        scan_depth = _whole_number_arg(args, "scan_depth")
+        max_fires = _whole_number_arg(args, "max_fires")
+    except ValueError as exc:
+        return _tool_err(exc)
 
     rule_fields: dict[str, Any] = {}
     if args.get("trigger") is not None:
@@ -1525,11 +1607,8 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         rule_fields["trigger"] = args["trigger"]
     if args.get("scope") is not None:
         rule_fields["scope"] = str(args["scope"]).strip().lower()
-    if args.get("max_fires") is not None:
-        try:
-            rule_fields["max_fires"] = int(args["max_fires"])
-        except (TypeError, ValueError):
-            return _tool_err(f"max_fires must be a whole number of at least 1, got {args['max_fires']!r}")
+    if max_fires is not None:
+        rule_fields["max_fires"] = max_fires
 
     if not name:
         return _tool_err("empty skill name")
@@ -1545,9 +1624,11 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         }
         body = description or f"Skill {name}"
     else:
-        meta, body = parse_skill_frontmatter(content)
-        if not isinstance(meta, dict):
-            meta = {}
+        try:
+            meta, body = parse_skill_frontmatter(content)
+        except SkillFrontmatterError as exc:
+            # 写坏的那段 frontmatter 不能丢掉重拼：node_ids、order 这些字段会悄悄没了
+            return _tool_err(f"the frontmatter in content cannot be used, nothing was written: {exc}")
         meta["name"] = name
         if description:
             meta["description"] = description
@@ -1563,14 +1644,13 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     if priority is not None:
         meta["priority"] = priority
     if scan_depth is not None:
-        meta["scan_depth"] = scan_depth
+        meta["scan_depth"] = max(0, scan_depth)
     meta.update(rule_fields)
-    # 写错的规则加载时只会被跳过，在这里拒掉模型才知道要改
-    if skill_strategy(meta) == OUTPUT_STRATEGY:
-        problem = output_rule_problem(meta)
-        if problem:
-            return _tool_err(problem)
-    elif rule_fields:
+    # 写错的值加载时只会按默认值算、写错的规则只会被跳过，在这里拒掉模型才知道要改
+    problem = skill_meta_problem(meta)
+    if problem:
+        return _tool_err(problem)
+    if rule_fields and skill_strategy(meta) != OUTPUT_STRATEGY:
         return _tool_err("trigger, scope and max_fires only apply to a skill with strategy output")
     content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
 
@@ -1586,60 +1666,14 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
 
 
 async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """List local skills under config/skills/*/SKILL.md."""
-    # Why: the listing tool was moved with the skill parser. How: keep the same
-    # filesystem scan and metadata coercion. Purpose: preserve tool output shape.
-    skills_dir = config_layout.skills_dir(ctx.workspace_root)
-    if not skills_dir.exists():
-        return _tool_ok("0 skills", skills=[])
+    """List local skills under config/skills/*/SKILL.md.
 
-    items: list[dict[str, Any]] = []
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-        try:
-            rel = config_layout.logical_path(ctx.workspace_root, skill_md)
-            text = skill_md.read_text(encoding="utf-8")
-            meta, _body = parse_skill_frontmatter(text)
-            if not isinstance(meta, dict):
-                meta = {}
-            strategy = skill_strategy(meta)
-            raw_kw = meta.get("keywords")
-            kw_list: list[str] = []
-            if isinstance(raw_kw, list):
-                kw_list = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
-            item_order = 0
-            if isinstance(meta.get("order"), (int, float)):
-                item_order = int(meta["order"])
-            item_priority = 0
-            if isinstance(meta.get("priority"), (int, float)):
-                item_priority = int(meta["priority"])
-            item_scan_depth = 0
-            if isinstance(meta.get("scan_depth"), (int, float)):
-                item_scan_depth = max(0, int(meta["scan_depth"]))
-            item: dict[str, Any] = {
-                "name": str(meta.get("name") or skill_md.parent.name),
-                "description": str(meta.get("description") or ""),
-                "enabled": skill_enabled(meta),
-                "strategy": strategy,
-                "keywords": kw_list,
-                "order": item_order,
-                "priority": item_priority,
-                "scan_depth": item_scan_depth,
-                "path": rel,
-            }
-            if strategy == OUTPUT_STRATEGY:
-                rule = parse_output_rule(meta, where=rel)
-                problem = output_rule_problem(meta)
-                item.update({
-                    "trigger": rule["trigger"],
-                    "scope": rule["scope"],
-                    "max_fires": rule["max_fires"],
-                    **({"rule_error": problem} if problem else {}),
-                })
-            items.append(item)
-        except Exception as e:
-            items.append({"name": skill_md.parent.name, "path": config_layout.logical_path(ctx.workspace_root, skill_md), "error": str(e)})
-
-    return _tool_ok(f"{len(items)} skills", skills=items)
+    读不了、frontmatter 写坏的也列出来，带着 problem：照默认值列出来的话，模型看到的是一个并不生效的技能。
+    """
+    rows = skill_rows(ctx.workspace_root)
+    unusable = sum(1 for row in rows if row.get("problem"))
+    summary = f"{len(rows)} skills" + (f", {unusable} unusable (see problem)" if unusable else "")
+    return _tool_ok(summary, skills=rows)
 
 
 async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1956,7 +1990,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
     result: list[dict[str, Any]] = []
     unreadable: list[str] = []
-    for yaml_path in sorted(mem_dir.glob("*.yaml")):
+    for yaml_path in memory_book_files(mem_dir):
         try:
             data = _load_book(yaml_path)
             bname = str(data.get("book") or yaml_path.stem).strip()
@@ -2110,7 +2144,8 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "list_skills",
-        "description": "List local skills under config/skills/*/SKILL.md.",
+        "description": "List local skills under config/skills/*/SKILL.md. Each row's dir is the directory name that "
+        "create_or_update_skill and delete_skill take as name; a row with problem is not loaded until its file is fixed.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "func": list_skills,
     },

@@ -1,6 +1,6 @@
 """Dream 判断命中新旧用的是这一轮的时钟，不是机器上的当前时间。
 
-_load_hit_cache_json 曾在函数里自己读 datetime.now()，同一个 handler 的其他方法却都接受
+渲染 <hit_cache> 的那一步要是自己读 datetime.now()，同一个 handler 的其他方法却都接受
 now=：用例只能把「现在」写死，日历一过 60 天窗口就整批失败；手动回放某一轮时也对不上。
 """
 from __future__ import annotations
@@ -33,12 +33,17 @@ def _write_cache(tmp_path: Path, payload: dict[str, str]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _hit_block(tmp_path: Path, namespace: str, entry_ids: set[str], **clock: datetime) -> dict[str, str]:
+    handler = DreamHandler()
+    return json.loads(handler._hit_cache_json(handler._hit_stamps(tmp_path, namespace, entry_ids), **clock))
+
+
 class TestInjectedClock:
     def test_a_hit_inside_the_window_of_the_injected_clock_is_kept(self, tmp_path: Path) -> None:
         stamp = (_RUN_AT - timedelta(days=59)).isoformat()
         _write_cache(tmp_path, {"conv_x/mine": stamp})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}, now=_RUN_AT))
+        loaded = _hit_block(tmp_path, "conv_x", {"mine"}, now=_RUN_AT)
 
         assert loaded == {"mine": stamp}
 
@@ -47,7 +52,7 @@ class TestInjectedClock:
         later = datetime.now(timezone.utc) + timedelta(days=400)
         _write_cache(tmp_path, {"conv_x/mine": (later - timedelta(days=61)).isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}, now=later))
+        loaded = _hit_block(tmp_path, "conv_x", {"mine"}, now=later)
 
         assert loaded == {}
 
@@ -55,7 +60,7 @@ class TestInjectedClock:
         stamp = datetime.now(timezone.utc).isoformat()
         _write_cache(tmp_path, {"conv_x/mine": stamp})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}))
+        loaded = _hit_block(tmp_path, "conv_x", {"mine"})
 
         assert loaded == {"mine": stamp}
 

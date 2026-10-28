@@ -280,14 +280,14 @@ const NodeRow = ({ node, tools, onSaved }: {
       const edits: YamlKeyEdit[] = [{ path: ['tool_access', 'mode'], value: mode }];
       if (mode === 'allowlist') edits.push({ path: ['tool_access', 'allow'], value: allow });
       if (mode === 'all') edits.push({ path: ['tool_access', 'deny'], value: deny });
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => getNodeRaw(adminToken, node.id),
         write: (content, hash) => updateNodeRaw(adminToken, node.id, content, hash),
         edits,
         proceed: requests.isCurrent,
       });
       if (!requests.isCurrent()) return;
-      setMessage(savedMessage('已保存，下一个任务即生效。', note, result.warnings));
+      setMessage(savedMessage('已保存，下一个任务即生效。', note, result?.warnings), receiptProblem);
       onSaved();
     } catch (caught) {
       if (!requests.isCurrent()) return;

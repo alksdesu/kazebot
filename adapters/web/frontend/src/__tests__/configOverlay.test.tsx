@@ -78,10 +78,10 @@ describe('覆盖层接口', () => {
   });
 
   it('读 runtime 连来源和路径一起读回来', async () => {
-    const fetchMock = stubFetch({ content: 'engine: {}\n', source: 'override', path: 'config/runtime.yaml' });
+    const fetchMock = stubFetch({ content: 'engine: {}\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml' });
 
     await expect(client.getRuntimeFile(TOKEN)).resolves.toEqual({
-      content: 'engine: {}\n', hash: null, source: 'override', path: 'config/runtime.yaml',
+      content: 'engine: {}\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml',
     });
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/runtime/raw', {
@@ -90,10 +90,17 @@ describe('覆盖层接口', () => {
     });
   });
 
-  it('后端没说来源就当仓库默认，缺的字段补空串', async () => {
-    stubFetch({});
+  // 来源认不出时当成仓库默认，结构化表单会从空文档写起，本实例那份里别的键就丢了；缺指纹的保存会整份盖掉。
+  it.each([
+    [{}, '缺 content'],
+    [{ content: 'engine: {}\n', source: 'override', path: 'config/runtime.yaml' }, '缺 hash'],
+    [{ content: 'engine: {}\n', hash: 'runtime-1', path: 'config/runtime.yaml' }, '缺 source'],
+    [{ content: 'engine: {}\n', hash: 'runtime-1', source: 'instance', path: 'config/runtime.yaml' }, 'source 不是 default、override 之一'],
+    [{ content: 'engine: {}\n', hash: 'runtime-1', source: 'override' }, '缺 path'],
+  ])('读回来对不上形状就报格式不对，不按仓库默认补（%j）', async (body, problem) => {
+    stubFetch(body);
 
-    await expect(client.getRuntimeFile(TOKEN)).resolves.toEqual({ content: '', hash: null, source: 'default', path: '' });
+    await expect(client.getRuntimeFile(TOKEN)).rejects.toThrow(`runtime.yaml 原文格式不对：${problem}`);
   });
 
   it('runtime 恢复默认删的是同一个地址', async () => {
@@ -179,6 +186,30 @@ describe('节点文件的来源与删除', () => {
 
     expect(vi.mocked(api.updateNodeFileRaw).mock.calls.map(call => [call[1], call[3]]))
       .toEqual([['mine.yaml', 'mine.yaml-1'], ['mine.yaml', 'saved']]);
+  });
+
+  it('回执没读懂照存上了收尾：重读这份文件，下一次保存交回重读到的指纹', async () => {
+    let version = 1;
+    vi.mocked(api.getNodeFileRaw).mockImplementation(async (_token, name) => ({ content: `# ${name}`, hash: `${name}-${version}` }));
+    vi.mocked(api.updateNodeFileRaw).mockImplementationOnce(async () => {
+      version = 2;
+      throw new api.ReceiptUnreadable('节点文件 mine.yaml 已经存上，可回执格式不对：缺 hash');
+    });
+    await ready();
+    await selectFile('mine.yaml');
+
+    fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: '# 改过' } });
+    click('保存当前文件');
+
+    await waitFor(() => expect(statusText()).toBe('已保存 mine.yaml'));
+    expect(screen.getByRole('alert')).toHaveTextContent('节点文件 mine.yaml 已经存上，可回执格式不对：缺 hash');
+    await waitFor(() => expect(api.getNodeFileRaw).toHaveBeenLastCalledWith(TOKEN, 'mine.yaml'));
+    await waitFor(() => expect(screen.getByLabelText('文件内容')).toHaveValue('# mine.yaml'));
+    fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: '# 再改一次' } });
+    click('保存当前文件');
+    await waitFor(() => expect(api.updateNodeFileRaw).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(api.updateNodeFileRaw).mock.calls.map(call => call[3])).toEqual(['mine.yaml-1', 'mine.yaml-2']);
   });
 
   it('换一份文件就换一份底子，不拿上一份的指纹去存这一份', async () => {

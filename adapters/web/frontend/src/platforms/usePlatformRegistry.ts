@@ -2,6 +2,7 @@
 // 拉不到就继续用内置的 —— 认不出通道会让整张会话列表退化成「会话」。
 import { useEffect, useSyncExternalStore } from 'react';
 
+import { errorMessage } from '../api/request';
 import { getPlatforms, type PlatformSummary } from '../api/supervisorClient';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useSettingsStore } from '../store/settingsStore';
@@ -46,8 +47,8 @@ export function usePlatformRegistry(): void {
         if (!request.isCurrent()) return;
         adoptPlatforms(platforms.map(toDescriptor).filter((row): row is PlatformDescriptor => row !== null), current);
       })
-      .catch(() => {
-        if (request.isCurrent()) settlePlatforms();
+      .catch((failure) => {
+        if (request.isCurrent()) settlePlatforms(errorMessage(failure, '平台清单读取失败'));
       });
   }, [requests, token]);
 }

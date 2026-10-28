@@ -16,12 +16,23 @@ beforeEach(() => { mocks.conversations.mockReset(); mocks.request.mockReset(); }
 afterEach(() => cleanup());
 
 describe('会话计划读取反馈', () => {
-  it('首次读取失败不把未知状态显示成零项', async () => {
-    mocks.conversations.mockRejectedValue(new Error('offline'));
+  // 计划按会话键查：会话列表没读到时连该查哪个会话都不知道，说成计划状态读不到就指错了地方。
+  it('会话列表没读到时照实说是会话列表，带上原因，不把未知状态显示成零项', async () => {
+    mocks.conversations.mockRejectedValue(new Error('503 会话列表读不回来'));
     render(<ConversationPlans sessionId="fixture-session" />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('计划状态读取失败');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('会话列表没读到，查不出本会话有哪些计划：503 会话列表读不回来');
+    expect(alert).not.toHaveTextContent('计划状态读取失败');
     expect(screen.getByText(/暂时无法读取/)).toBeVisible();
     expect(screen.queryByText(/0项待处理/)).toBeNull();
+    expect(mocks.request).not.toHaveBeenCalled();
+  });
+
+  it('计划本身没读到时说计划状态读取失败，带上原因', async () => {
+    mocks.conversations.mockResolvedValue([{ session_id: 'fixture-session', conversation_key: 'web:fixture' }]);
+    mocks.request.mockRejectedValue(new Error('502 计划服务没回'));
+    render(<ConversationPlans sessionId="fixture-session" />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('计划状态读取失败：502 计划服务没回');
   });
 
   it('连接恢复后可手动重读，真实空列表保持安静', async () => {

@@ -370,6 +370,74 @@ class TestThePathGuard:
         assert (config_layout.skills_dir(ws) / "writing" / "SKILL.md").is_file()
 
 
+class TestTheSkillsEndpoint:
+    # 坏的那一行上写着 sk-SECRET：原因里只能有位置和问题。
+    _BROKEN = "---\nname: broken\nnote: sk-SECRET-skill: x\nenabled: false\n---\nbody\n"
+
+    def test_every_row_names_its_directory(self, admin, ws: Path, code_root: Path) -> None:
+        # 文件按目录找：frontmatter 里的 name 和目录名不一样时，拿 name 去读写就找错了文件。
+        _write(config_layout.skills_dir(ws) / "alpha" / "SKILL.md", "---\nname: Alpha Skill\n---\nbody\n")
+
+        [row] = admin("GET", "/skills").json()
+
+        assert (row["name"], row["dir"], row["path"]) == ("Alpha Skill", "alpha", "config/skills/alpha/SKILL.md")
+        assert row["body_preview"] == "body"
+        assert admin("GET", f"/skills/{row['dir']}/raw").status_code == 200
+
+    def test_a_broken_frontmatter_is_listed_with_the_reason(self, admin, ws: Path, code_root: Path) -> None:
+        _write(config_layout.skills_dir(ws) / "broken" / "SKILL.md", self._BROKEN)
+        _write(config_layout.skills_dir(ws) / "fine" / "SKILL.md", "---\nname: fine\nenabled: false\n---\nbody\n")
+
+        rows = {row["dir"]: row for row in admin("GET", "/skills").json()}
+
+        assert rows["broken"]["problem"].startswith("第 3 行第 ")
+        assert "frontmatter 的 YAML 读不出来：mapping values are not allowed here" in rows["broken"]["problem"]
+        assert "enabled" not in rows["broken"]
+        assert rows["fine"]["enabled"] is False and "problem" not in rows["fine"]
+        assert "sk-SECRET" not in json.dumps(rows, ensure_ascii=False)
+
+    def test_an_output_rule_row_says_what_is_wrong_with_it(self, admin, ws: Path, code_root: Path) -> None:
+        _write(
+            config_layout.skills_dir(ws) / "guard" / "SKILL.md",
+            "---\nname: guard\nstrategy: output\ntrigger: '(unclosed'\nscope: text\n---\n别这么说。\n",
+        )
+
+        [row] = admin("GET", "/skills").json()
+
+        assert (row["strategy"], row["scope"], row["max_fires"]) == ("output", "text", 1)
+        assert "not a valid regex" in row["rule_error"]
+
+    @pytest.mark.parametrize("content,reason", [
+        pytest.param("---\nname: alpha\nkeywords: [a\n---\nbody\n", "frontmatter 的 YAML 读不出来", id="yaml-error"),
+        pytest.param("---\nname: alpha\nbody\n", "frontmatter 没有收尾", id="unclosed"),
+        pytest.param("---\n- alpha\n---\nbody\n", "frontmatter 顶层不是 key: value 的映射", id="list"),
+    ])
+    def test_saving_a_broken_frontmatter_is_refused(
+        self, admin, ws: Path, code_root: Path, content: str, reason: str,
+    ) -> None:
+        path = _write(config_layout.skills_dir(ws) / "alpha" / "SKILL.md", "---\nname: alpha\n---\nold\n")
+
+        response = admin("PUT", "/skills/alpha/raw", json={"content": content})
+
+        assert response.status_code == 400
+        assert reason in response.json()["detail"]
+        assert path.read_text(encoding="utf-8") == "---\nname: alpha\n---\nold\n"
+
+    def test_creating_a_skill_with_a_broken_frontmatter_is_refused(self, admin, ws: Path, code_root: Path) -> None:
+        response = admin("POST", "/skills", json={"id": "fresh", "content": "---\nname: fresh\nenabled: [no\n---\n"})
+
+        assert response.status_code == 400
+        assert "frontmatter 的 YAML 读不出来" in response.json()["detail"]
+        assert not (config_layout.skills_dir(ws) / "fresh").exists()
+
+    def test_a_skill_without_frontmatter_still_saves(self, admin, ws: Path, code_root: Path) -> None:
+        _write(config_layout.skills_dir(ws) / "plain" / "SKILL.md", "old\n")
+
+        response = admin("PUT", "/skills/plain/raw", json={"content": "只有正文，没有元数据。\n"})
+
+        assert response.status_code == 200, response.text
+
+
 class TestTheNodesEndpoint:
     def _seed(self, ws: Path, code_root: Path) -> None:
         _write(config_layout.default_nodes_dir() / "alpha.yaml", "id: alpha\ntype: ai\nprompt: default\n")
@@ -441,6 +509,49 @@ class TestTheNodesEndpoint:
 
         assert rows["relayed"]["provider"] == "relay-b"
         assert rows["follower"]["provider"] == ""
+
+    def test_every_row_says_which_address_its_file_names(self, admin, ws: Path, code_root: Path) -> None:
+        # 会话面板按这个字段显示「节点地址」那一层，没写的是空串、跟着渠道走。
+        _write(config_layout.nodes_dir(ws) / "relayed.yaml", "type: ai\nbase_url: ' https://relay-b.example/v1 '\n")
+        _write(config_layout.nodes_dir(ws) / "follower.yaml", "type: ai\nbase_url:\n")
+        _write(config_layout.nodes_dir(ws) / "broken.yaml", "type: ai\nbase_url: [x\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert rows["relayed"]["base_url"] == "https://relay-b.example/v1"
+        assert rows["follower"]["base_url"] == ""
+        assert rows["broken"]["base_url"] == "" and rows["broken"]["problem"]
+
+    def test_every_row_lists_the_old_ids_the_engine_still_answers_to(self, admin, ws: Path, code_root: Path) -> None:
+        # 会话里记着的可能还是改名前的 id，网页拿这一列找到它现在是哪一行。
+        _write(config_layout.nodes_dir(ws) / "renamed.yaml", "type: ai\naliases: [old_name, older]\n")
+        _write(config_layout.default_nodes_dir() / "single.yaml", "type: ai\naliases: legacy\n")
+        _write(config_layout.nodes_dir(ws) / "plain.yaml", "type: ai\n")
+        _write(config_layout.nodes_dir(ws) / "hidden.yaml", "type: ai\naliases: [_draft]\n")
+        _write(config_layout.nodes_dir(ws) / "_draft.template.yaml", "type: ai\naliases: [draft_old]\n")
+        _write(config_layout.nodes_dir(ws) / "demo.example.yaml", "type: ai\naliases: [demo_old]\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert rows["renamed"]["aliases"] == ["old_name", "older"]
+        assert rows["single"]["aliases"] == ["legacy"]
+        assert rows["plain"]["aliases"] == []
+        # 模板名按 id 一律找不到节点，声明了也不算；模板和示例自己不会被派发到，没有旧 id 可言。
+        assert rows["hidden"]["aliases"] == []
+        assert rows["_draft.template"]["aliases"] == []
+        assert rows["demo.example"]["aliases"] == []
+
+    def test_an_old_id_another_file_answers_to_is_not_listed(self, admin, ws: Path, code_root: Path) -> None:
+        # 按 id 找节点先找同名文件，再看排在前面的节点有没有认领：这两种旧 id 都找不到这个节点。
+        _write(config_layout.nodes_dir(ws) / "renamed.yaml", "type: ai\naliases: [taken, shared, free]\n")
+        _write(config_layout.default_nodes_dir() / "taken.yaml", "type: ai\n")
+        _write(config_layout.nodes_dir(ws) / "claimer.yaml", "type: ai\naliases: [shared]\n")
+
+        rows = {row["id"]: row for row in admin("GET", "/nodes").json()}
+
+        assert rows["renamed"]["aliases"] == ["free"]
+        assert rows["taken"]["aliases"] == []
+        assert rows["claimer"]["aliases"] == ["shared"]
 
     def test_reading_a_node_returns_the_file_that_is_actually_loaded(self, admin, ws: Path, code_root: Path) -> None:
         self._seed(ws, code_root)

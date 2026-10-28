@@ -268,6 +268,8 @@ class MigrationPlan:
 class MigrationOutcome:
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
     hit_keys_rewritten: int = 0
+    # 命中缓存读不了、没跟着改名时的原因（只有位置和问题），改名了或不用改是空串。
+    hit_cache_problem: str = ""
     route_keys_changed: int = 0
     backup_dir: Path | None = None
 
@@ -404,12 +406,18 @@ def move_memory(
         outcome.moved_dirs.append((rename.old_ns, rename.new_ns))
         ns_renames[rename.old_ns] = rename.new_ns
 
-    outcome.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
+    try:
+        outcome.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
+    except hit_cache.HitCacheUnreadable as exc:
+        # 目录已经搬完，不能停在半路；修好后旧前缀得照日志里的对照改掉，不然数据清理会当孤儿删掉。
+        renamed = ", ".join(f"{old} -> {new}" for old, new in ns_renames.items())
+        hit_cache.warn_unreadable(exc, f"its keys were not moved to the renamed namespaces: {renamed}")
+        outcome.hit_cache_problem = exc.reason
     return outcome
 
 
 def _rewrite_hit_cache(workspace: Path, ns_renames: dict[str, str]) -> int:
-    """把命中缓存里被改名 namespace 的前缀换掉，复用侧车自己的锁与原子写。"""
+    """把命中缓存里被改名 namespace 的前缀换掉，复用侧车自己的锁与原子写。读不了抛 HitCacheUnreadable，不写。"""
     if not ns_renames:
         return 0
     path = hit_cache.hit_cache_path(workspace)

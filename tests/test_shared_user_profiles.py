@@ -84,3 +84,30 @@ class TestTheRestOfTheContractHolds:
             assert _profiles(tmp_path, "users: [oops\n") == {}
 
         assert "failed to load user profiles" in caplog.text
+
+    @pytest.mark.parametrize("text,kind", [
+        pytest.param("- 10001\n- 10002\n", "list", id="list"),
+        pytest.param("张三\n", "str", id="scalar"),
+    ])
+    def test_a_file_that_is_not_a_mapping_yields_nothing_and_says_so(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, text: str, kind: str,
+    ) -> None:
+        # 不说一声的话，只会看到资料悄悄没生效。
+        with caplog.at_level(logging.WARNING, logger="adapters._shared.user_profiles"):
+            assert _profiles(tmp_path, text) == {}
+
+        assert f"the top level is a {kind}, not a mapping" in caplog.text
+
+    def test_users_that_is_not_a_mapping_is_reported(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="adapters._shared.user_profiles"):
+            profiles = _profiles(tmp_path, 'users:\n  - "10001"\n"10002":\n  display_name: 张三\n')
+
+        assert profiles == {"10002": {"display_name": "张三"}}
+        assert "users is a list, not a mapping" in caplog.text
+
+    @pytest.mark.parametrize("text", ["", "# 先空着\n"])
+    def test_an_empty_file_is_not_a_problem(self, tmp_path: Path, caplog: pytest.LogCaptureFixture, text: str) -> None:
+        with caplog.at_level(logging.WARNING, logger="adapters._shared.user_profiles"):
+            assert _profiles(tmp_path, text) == {}
+
+        assert caplog.text == ""

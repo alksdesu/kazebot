@@ -4,7 +4,7 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // The three answers used to live on three unrelated pages, so they are stacked here instead.
 import { useEffect, useState } from 'react';
 
-import { createTool, deleteTool, getTools, reloadTools, type AdminTool } from '../../../api/supervisorClient';
+import { createTool, deleteTool, getTools, receipted, reloadTools, type AdminTool } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
@@ -108,10 +108,10 @@ const ToolInventorySection = () => {
     if (!name) { setError('请输入工具名称'); return; }
     if (!confirmNavigation()) return;
     try {
-      const result = await createTool(adminToken, { id: name, content: defaultToolScript(name) });
+      const { result, receiptProblem } = await receipted(createTool(adminToken, { id: name, content: defaultToolScript(name) }));
       if (!requests.isCurrent()) return;
       setNewName('');
-      setMessage(savedMessage('工具已创建，请在右栏编辑 Python 脚本。', '', result.warnings));
+      setMessage(savedMessage('工具已创建，请在右栏编辑 Python 脚本。', '', result?.warnings), receiptProblem);
       await load();
       if (!requests.isCurrent()) return;
       setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom' });

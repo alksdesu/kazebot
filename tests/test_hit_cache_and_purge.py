@@ -47,6 +47,24 @@ def _read_cache(tmp_path: Path) -> dict:
     return json.loads(_cache_path(tmp_path).read_text(encoding="utf-8"))
 
 
+# key 后面少了冒号；key 里的 sk-live-SECRET 不能出现在原因里。
+_BROKEN = '{"conv_abc/sk-live-SECRET" "2026-08-17T12:00:00+00:00"}'
+
+
+def _write_raw(tmp_path: Path, text: str) -> Path:
+    p = _cache_path(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _unreadable_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == hits.logger.name and "is unreadable" in record.getMessage()
+    ]
+
+
 def _entry(eid: str, namespace: str = "conv_abc") -> dict:
     return {"id": eid, "namespace": namespace}
 
@@ -79,18 +97,48 @@ class TestReadHitCache:
     def test_a_missing_file_reads_as_empty(self, tmp_path: Path) -> None:
         assert hits.read_hit_cache(tmp_path) == {}
 
-    def test_a_non_object_payload_reads_as_empty(self, tmp_path: Path) -> None:
-        """`[]` 能解析成功，随后每次 .get 都抛 TypeError，一路打掉整个 prompt 构建。"""
-        _write_cache(tmp_path, [])
+    def test_a_leading_bom_is_fine(self, tmp_path: Path) -> None:
+        _write_raw(tmp_path, "\ufeff" + json.dumps({"conv_abc/m1": _NOW.isoformat()}))
 
-        assert hits.read_hit_cache(tmp_path) == {}
+        assert hits.read_hit_cache(tmp_path) == {"conv_abc/m1": _NOW.isoformat()}
 
-    def test_broken_json_reads_as_empty(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("text,reason", [
+        pytest.param("[]", "top level is a list, not an object", id="list"),
+        pytest.param('"2026-08-17"', "top level is a str, not an object", id="string"),
+        pytest.param("{not json", "第 1 行第 2 列：Expecting property name enclosed in double quotes", id="broken"),
+        pytest.param("[" * 100_000 + "]" * 100_000, "nested too deeply", id="nested"),
+    ])
+    def test_a_file_that_is_not_a_json_object_is_unreadable_not_empty(
+        self, tmp_path: Path, text: str, reason: str,
+    ) -> None:
+        # 当成空表的话，flush 拿空表合并写回，里面的历史命中整份被盖掉；按命中判龄的清理把每条都当成从没命中过。
+        _write_raw(tmp_path, text)
+
+        with pytest.raises(hits.HitCacheUnreadable) as caught:
+            hits.read_hit_cache(tmp_path)
+
+        assert caught.value.reason == reason
+        assert str(caught.value) == f"hit cache data/memory/.hit_cache.json is unreadable: {reason}"
+
+    def test_a_file_that_is_not_utf8_is_unreadable(self, tmp_path: Path) -> None:
         p = _cache_path(tmp_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("{not json", encoding="utf-8")
+        p.write_bytes(b'{"conv_abc/m1": "\xff"}')
 
-        assert hits.read_hit_cache(tmp_path) == {}
+        with pytest.raises(hits.HitCacheUnreadable, match="不是 UTF-8 编码"):
+            hits.read_hit_cache(tmp_path)
+
+    def test_the_reason_names_the_place_but_not_what_was_written(self, tmp_path: Path) -> None:
+        _write_raw(tmp_path, _BROKEN)
+
+        with pytest.raises(hits.HitCacheUnreadable) as caught:
+            hits.read_hit_cache(tmp_path)
+
+        assert caught.value.reason.startswith("第 1 行第 ")
+        assert "Expecting ':' delimiter" in caught.value.reason
+        assert "sk-live-SECRET" not in str(caught.value)
+        # 原来那个 JSONDecodeError 身上挂着整份原文，异常链上不能留着它。
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 class TestFlushMerges:
@@ -140,6 +188,44 @@ class TestFlushMerges:
         hits.flush_hit_cache(tmp_path)
 
         assert "conv_abc/m1" in hits._hit_pending
+
+    def test_an_unreadable_file_survives_a_flush(self, tmp_path: Path) -> None:
+        # 拿空表合并写回的话，坏文件连同里面的历史命中一起被盖掉，修都没得修。
+        path = _write_raw(tmp_path, _BROKEN)
+        hits.record_hits(tmp_path, [_entry("m1")])
+
+        hits.flush_hit_cache(tmp_path)
+
+        assert path.read_text(encoding="utf-8") == _BROKEN
+        assert "conv_abc/m1" in hits._hit_pending
+
+    def test_hits_kept_back_are_written_once_the_file_is_fixed(self, tmp_path: Path) -> None:
+        path = _write_raw(tmp_path, _BROKEN)
+        hits.record_hits(tmp_path, [_entry("m1")])
+        hits.flush_hit_cache(tmp_path)
+
+        path.write_text(json.dumps({"conv_abc/other": _NOW.isoformat()}), encoding="utf-8")
+        hits.flush_hit_cache(tmp_path)
+
+        assert set(_read_cache(tmp_path)) == {"conv_abc/other", "conv_abc/m1"}
+        assert hits._hit_pending == {}
+
+    def test_an_unreadable_version_is_logged_once(self, tmp_path: Path, caplog) -> None:
+        # flush 每 10 分钟一次：文件不修，同一版不能每次都记一遍。
+        path = _write_raw(tmp_path, _BROKEN)
+        with caplog.at_level("WARNING", logger=hits.logger.name):
+            for _ in range(3):
+                hits.record_hits(tmp_path, [_entry("m1")])
+                hits.flush_hit_cache(tmp_path)
+            assert len(_unreadable_warnings(caplog)) == 1
+
+            path.write_text("[]", encoding="utf-8")
+            hits.flush_hit_cache(tmp_path)
+
+        warnings = _unreadable_warnings(caplog)
+        assert len(warnings) == 2
+        assert "top level is a list, not an object" in warnings[1]
+        assert "sk-live-SECRET" not in caplog.text
 
     def test_flushing_nothing_does_not_create_a_file(self, tmp_path: Path) -> None:
         hits.flush_hit_cache(tmp_path)
@@ -290,6 +376,29 @@ class TestPurgeBasis:
 
         assert self._entries_left(book) == []
 
+    @pytest.mark.parametrize("text", [_BROKEN, "[]"])
+    def test_an_unreadable_hit_cache_ages_nothing_out(self, tmp_path: Path, monkeypatch, text: str) -> None:
+        # 读不了时只看 yaml 时间戳，等于把每条都当成从没命中过：老而天天被召回的条目会被删掉。
+        book = self._book(tmp_path, "conv_abc", [
+            {"id": "hot", "content": "x", "keywords": ["k"], "source": "auto", "updated_at": self._old()},
+        ])
+        cache = _write_raw(tmp_path, text)
+
+        self._purge(tmp_path, monkeypatch)
+
+        assert self._entries_left(book) == ["hot"]
+        assert cache.read_text(encoding="utf-8") == text
+
+    def test_an_unreadable_hit_cache_still_lets_empty_namespaces_go(self, tmp_path: Path, monkeypatch) -> None:
+        # 收空目录不看命中时间，照做。
+        empty = tmp_path / "data" / "memory" / "conv_empty"
+        empty.mkdir(parents=True)
+        _write_raw(tmp_path, _BROKEN)
+
+        self._purge(tmp_path, monkeypatch)
+
+        assert not empty.exists()
+
 
 class TestNamespacePrune:
     def test_pruning_one_namespace_keeps_the_others(self, tmp_path: Path) -> None:
@@ -335,6 +444,20 @@ class TestNamespacePrune:
         assert hits.prune_namespace_hits(tmp_path, "") == 0
         assert _read_cache(tmp_path) == {"m1": _NOW.isoformat()}
 
+    @pytest.mark.parametrize("prune", [
+        pytest.param(lambda root: hits.prune_namespace_hits(root, "conv_a"), id="namespace"),
+        pytest.param(lambda root: hits.prune_entry_hits(root, "conv_a", "m1"), id="entry"),
+    ])
+    def test_an_unreadable_file_is_left_alone(self, tmp_path: Path, prune) -> None:
+        # 摘不掉就不摘：整份写回会连别的会话的命中一起抹掉。
+        path = _write_raw(tmp_path, _BROKEN)
+        hits.record_hits(tmp_path, [_entry("m1", "conv_a")])
+
+        assert prune(tmp_path) == 0
+
+        assert path.read_text(encoding="utf-8") == _BROKEN
+        assert not any(k.startswith("conv_a/") for k in hits._hit_pending)
+
 
 class TestOrphanPrune:
     def test_a_hit_key_for_a_deleted_namespace_is_swept(self, tmp_path: Path) -> None:
@@ -359,6 +482,12 @@ class TestOrphanPrune:
         assert hits.prune_orphan_namespace_hits(tmp_path, set()) == 0
         assert _read_cache(tmp_path) == {"conv_gone/m1": _NOW.isoformat()}
 
+    def test_an_unreadable_file_is_left_alone(self, tmp_path: Path) -> None:
+        path = _write_raw(tmp_path, _BROKEN)
+
+        assert hits.prune_orphan_namespace_hits(tmp_path, {"conv_live"}) == 0
+        assert path.read_text(encoding="utf-8") == _BROKEN
+
     def test_the_cleanup_run_sweeps_orphan_hit_keys(self, tmp_path: Path, monkeypatch) -> None:
         import engine.data_cleanup as dc
 
@@ -375,6 +504,48 @@ class TestOrphanPrune:
 
         monkeypatch.setattr(dc, "DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(dc, "MEMORY_ENTRY_MAX_AGE", 14 * 24 * 3600)
+        dc.purge_expired_memory_entries()
+
+        assert _read_cache(tmp_path) == {"conv_live/x": _NOW.isoformat()}
+
+    def test_a_dry_run_counts_without_touching_the_file(self, tmp_path: Path) -> None:
+        _write_cache(tmp_path, {"conv_gone/m1": _NOW.isoformat(), "conv_live/m1": _NOW.isoformat()})
+        before = _cache_path(tmp_path).read_bytes()
+
+        assert hits.prune_orphan_namespace_hits(tmp_path, {"conv_live"}, dry_run=True) == 1
+
+        assert _cache_path(tmp_path).read_bytes() == before
+        assert sorted(p.name for p in _cache_path(tmp_path).parent.iterdir()) == [".hit_cache.json"]
+
+    def test_a_dry_run_cleanup_only_says_how_many_it_would_remove(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        import engine.data_cleanup as dc
+
+        (tmp_path / "data" / "memory" / "conv_live").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "data" / "memory" / "conv_live" / "people.yaml").write_text(
+            yaml.safe_dump({"book": "people", "entries": []}, allow_unicode=True), encoding="utf-8",
+        )
+        # 空目录这一轮会被收掉：演练时它还在盘上，它的命中键也得算进「会摘掉」里。
+        (tmp_path / "data" / "memory" / "conv_empty").mkdir()
+        _write_cache(tmp_path, {
+            "conv_live/x": _NOW.isoformat(),
+            "conv_gone/y": _NOW.isoformat(),
+            "conv_empty/z": _NOW.isoformat(),
+        })
+        before = _cache_path(tmp_path).read_bytes()
+
+        monkeypatch.setattr(dc, "DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(dc, "MEMORY_ENTRY_MAX_AGE", 14 * 24 * 3600)
+        monkeypatch.setattr(dc, "DRY_RUN", True)
+        with caplog.at_level("INFO"):
+            dc.purge_expired_memory_entries()
+
+        assert _cache_path(tmp_path).read_bytes() == before
+        assert (tmp_path / "data" / "memory" / "conv_empty").is_dir()
+        assert "[dry-run] would remove 2 orphan hit keys" in caplog.text
+
+        monkeypatch.setattr(dc, "DRY_RUN", False)
         dc.purge_expired_memory_entries()
 
         assert _read_cache(tmp_path) == {"conv_live/x": _NOW.isoformat()}

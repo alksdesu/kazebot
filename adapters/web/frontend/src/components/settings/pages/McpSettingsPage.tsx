@@ -83,7 +83,7 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => getMcpClientsRaw(adminToken),
         write: (content, hash) => updateMcpClientsRaw(adminToken, content, hash),
         edits: (base) => mcpClientCreateEdits(base, emptyMcpClient(id)),
@@ -91,7 +91,7 @@ export const McpSettingsPage = () => {
       });
       if (!requests.isCurrent()) return;
       setNewId('');
-      setMessage(savedMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。', note, result.warnings));
+      setMessage(savedMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。', note, result?.warnings), receiptProblem);
       await load();
       if (!requests.isCurrent()) return;
       setSelectedMcpClient({ id, enabled: false, transport: 'streamable_http', description: '通过设置页面创建的 MCP Client。' });
@@ -108,7 +108,7 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const { note, result } = await commitYamlKeys({
+      const { note, result, receiptProblem } = await commitYamlKeys({
         read: () => getMcpClientsRaw(adminToken),
         write: (content, hash) => updateMcpClientsRaw(adminToken, content, hash),
         edits: (base) => mcpClientRemoveEdits(base, selectedMcpClient.id),
@@ -116,7 +116,7 @@ export const McpSettingsPage = () => {
       });
       if (!requests.isCurrent()) return;
       setSelectedMcpClient(null);
-      setMessage(savedMessage('MCP Client 已删除', note, result.warnings));
+      setMessage(savedMessage('MCP Client 已删除', note, result?.warnings), receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;

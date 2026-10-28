@@ -83,18 +83,18 @@ describe('admin API infrastructure wrappers', () => {
 
   it('unwraps raw content endpoints and writes content payloads', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'PUT') return jsonResponse({ ok: true });
-      return jsonResponse({ content: 'value: 1\n' });
+      if (init?.method === 'PUT') return jsonResponse({ ok: true, hash: 'h2' });
+      return jsonResponse({ content: 'value: 1\n', hash: 'h1', path: 'config/x.yaml' });
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getPolicyRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getSchedulesRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getNodeRaw('admin-token', 'node/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getToolRaw('admin-token', 'tool/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getSkillRaw('admin-token', 'skill/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
-    await expect(getMcpClientsRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getRuntimeRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getPolicyRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getSchedulesRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getNodeRaw('admin-token', 'node/a')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getToolRaw('admin-token', 'tool/a')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getSkillRaw('admin-token', 'skill/a')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
+    await expect(getMcpClientsRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
 
     await updateRuntimeRaw('admin-token', 'runtime: true\n', null);
     await updatePolicyRaw('admin-token', 'policy: true\n', null);
@@ -116,7 +116,7 @@ describe('admin API infrastructure wrappers', () => {
   });
 
   it('creates and deletes nodes, tools, and skills through admin config endpoints', async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ ok: true }));
+    const fetchMock = vi.fn(async () => jsonResponse({ ok: true, hash: 'h1' }));
     vi.stubGlobal('fetch', fetchMock);
 
     await createNode('admin-token', { id: 'node-a', content: 'id: node-a\n' });

@@ -117,6 +117,31 @@ describe('本实例在跑的平台', () => {
     expect(currentPlatformId()).toBeNull();
     expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT]);
   });
+
+  // 退回内置照旧，可页面得交代：内置里没有的平台认不出，本实例跑哪个只能猜。
+  it('清单没读成时记下原因，空清单也算没读成', () => {
+    settlePlatforms('500 注册表挂了');
+    expect(platformRegistryState()).toMatchObject({ settled: true, error: '500 注册表挂了' });
+
+    resetPlatforms();
+    adoptPlatforms([]);
+    expect(platformRegistryState().error).toBe('后端给的平台清单是空的');
+  });
+
+  it('读成过的清单接着用，之后哪一次没读到都不算退回内置；reset 清掉原因', () => {
+    settlePlatforms('500 注册表挂了');
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM], 'telegram');
+    expect(platformRegistryState().error).toBe('');
+
+    settlePlatforms('503 网关断了');
+    expect(platformRegistryState()).toMatchObject({ error: '', current: 'telegram' });
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT, TELEGRAM]);
+
+    resetPlatforms();
+    settlePlatforms('500 注册表挂了');
+    resetPlatforms();
+    expect(platformRegistryState().error).toBe('');
+  });
 });
 
 describe('平台清单的订阅', () => {
@@ -180,6 +205,18 @@ describe('平台清单的订阅', () => {
     settlePlatforms();
 
     expect(seen).not.toHaveBeenCalled();
+  });
+
+  it('没读成的原因换了才重新通知', () => {
+    settlePlatforms('500 注册表挂了');
+    const seen = watch();
+
+    settlePlatforms('500 注册表挂了');
+    expect(seen).not.toHaveBeenCalled();
+
+    settlePlatforms('503 网关断了');
+    expect(seen).toHaveBeenCalledTimes(1);
+    expect(platformRegistryState().error).toBe('503 网关断了');
   });
 
   it('adopt 过之后再 settle 也不重复通知，清单也不退回内置的', () => {

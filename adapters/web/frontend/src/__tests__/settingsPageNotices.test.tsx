@@ -87,6 +87,8 @@ const READ_FAILURE = '503 列表读不回来';
 
 const WRITE_FAILURE = '502 写不进去';
 
+const RECEIPT_PROBLEM = '新建的那份已经存上，可回执格式不对：缺 hash';
+
 const ADMIN_TOKEN = 'admin-token';
 
 const ROTATED_TOKEN = 'rotated-token';
@@ -341,9 +343,9 @@ beforeEach(() => {
   vi.mocked(api.getMcpClients).mockResolvedValue([EXISTING_CLIENT]);
   vi.mocked(api.getMcpClientsRaw).mockResolvedValue(rawFile(MCP_RAW));
   vi.mocked(api.getSchedulesRaw).mockResolvedValue(rawFile(SCHEDULES_RAW));
-  vi.mocked(api.createNode).mockResolvedValue({ ok: true, hash: null });
-  vi.mocked(api.createSkill).mockResolvedValue({ ok: true, hash: null });
-  vi.mocked(api.createTool).mockResolvedValue({ ok: true, hash: null });
+  vi.mocked(api.createNode).mockResolvedValue({ ok: true, hash: 'node-1' });
+  vi.mocked(api.createSkill).mockResolvedValue({ ok: true, hash: 'skill-1' });
+  vi.mocked(api.createTool).mockResolvedValue({ ok: true, hash: 'tool-1' });
   vi.mocked(api.deleteNode).mockResolvedValue({ ok: true, restored: false });
   vi.mocked(api.deleteSkill).mockResolvedValue({ ok: true });
   vi.mocked(api.deleteTool).mockResolvedValue({ ok: true, restored: false });
@@ -492,6 +494,20 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
     expect(await alertText()).toBe(READ_FAILURE);
 
     await expectCleared(page.refreshLabel);
+  });
+
+  // 回执是写完才发的：说成新建失败，人会再建一次，撞上同名。
+  it('新建的回执没读懂照建好了收尾：结果照说，回执的事另起一行，选中项照落到刚建的那个上', async () => {
+    page.createWriter.mockRejectedValueOnce(new api.ReceiptUnreadable(RECEIPT_PROBLEM));
+    render(<Page />);
+    await ready();
+
+    page.create();
+    await written();
+
+    expect(await statusText()).toBe(page.createdText);
+    expect(await alertText()).toBe(RECEIPT_PROBLEM);
+    expect(page.selection()).toEqual(page.created.selection);
   });
 
   it('新建失败的原因报成错误，不当成提示', async () => {

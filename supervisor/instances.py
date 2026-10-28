@@ -157,7 +157,11 @@ def _stored(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class InstanceDirectoryError(ValueError):
-    pass
+    """清单用不了。str 是给匿名导航看的笼统说法；reason 给管理员看：文件在哪、哪里读不懂，不带文件内容。"""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason or message
 
 
 def _navigation_prefix(raw: Any) -> str:
@@ -181,38 +185,45 @@ _unreadable_stamps: dict[Path, tuple[int, int, int] | None] = {}
 _unreadable_lock = threading.Lock()
 
 
-def _report_unreadable(path: Path, reason: str) -> None:
+def _unreadable(path: Path, problem: str) -> str:
+    return f"实例清单 {path} 读不懂：{problem}"
+
+
+def _report_unreadable(path: Path, problem: str) -> None:
     stamp = config_layout.file_stamp(path)
     with _unreadable_lock:
         if path in _unreadable_stamps and _unreadable_stamps[path] == stamp:
             return
         _unreadable_stamps[path] = stamp
-    _log.warning("实例清单 %s 读不懂，按没有别的实例算，修好之前拦不住双登：%s", path, reason)
+    _log.warning("%s；只拿来展示的地方按没有登记任何实例算", _unreadable(path, problem))
 
 
 def _read(path: Path, *, mode: _ReadMode = "tolerant") -> list[dict[str, Any]]:
     """清单原样读出来洗一遍。
 
-    tolerant 读不懂就当成空表，只为展示读的一方用。required 是写入方用的：文件读不懂就抛，
-    拿空表写回去，别的实例就全从清单里消失了。strict 连单条写坏了也抛，给逐条信任清单的导航接口用。
+    tolerant 读不懂就当成空表，只给读错了也只是少显示几行的一方用。required 读不懂就抛：
+    写入方拿空表写回去，别的实例就全从清单里消失了；查双登、查谁在用共享组的一方拿空表，会放过本该拦下的操作。
+    strict 连单条写坏了也抛，给逐条信任清单的导航接口用。
     """
     try:
         raw = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except (OSError, UnicodeError, yaml.YAMLError) as error:
+        problem = config_layout.config_error_text(error)
         if mode == "tolerant":
-            _report_unreadable(path, config_layout.config_error_text(error))
+            _report_unreadable(path, problem)
             return []
-        raise InstanceDirectoryError("实例目录暂时不可用") from error
+        raise InstanceDirectoryError("实例目录暂时不可用", _unreadable(path, problem)) from error
     rows = raw.get("instances") if isinstance(raw, dict) else raw
     if rows is None and mode != "strict":
         rows = []
     if not isinstance(rows, list):
+        problem = "instances 不是列表" if isinstance(raw, dict) else "顶层既不是列表，也不是带 instances 的映射"
         if mode == "tolerant":
-            _report_unreadable(path, "实例目录格式无效")
+            _report_unreadable(path, problem)
             return []
-        raise InstanceDirectoryError("实例目录格式无效")
+        raise InstanceDirectoryError("实例目录格式无效", _unreadable(path, problem))
     strict = mode == "strict"
     seen: set[str] = set()
     cleaned: list[dict[str, Any]] = []
@@ -333,8 +344,11 @@ def account_owner_in(
 def account_owner(
     workspace_root: Path, platform_id: str, account: str, *, prefix: str,
 ) -> dict[str, Any] | None:
-    """别的实例里登记着这个号的那一条。同一个号两边登，会互相把对方踢下线。"""
-    return account_owner_in(load_instances(workspace_root), platform_id, account, prefix=prefix)
+    """别的实例里登记着这个号的那一条。同一个号两边登，会互相把对方踢下线。
+
+    清单读不懂抛 InstanceDirectoryError：查不了不等于没人占着这个号。
+    """
+    return account_owner_in(load_instances(workspace_root, required=True), platform_id, account, prefix=prefix)
 
 
 def port_in_use(port: int, *, host: str = "127.0.0.1", timeout: float = 0.35) -> bool:

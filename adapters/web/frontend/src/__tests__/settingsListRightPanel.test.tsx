@@ -22,7 +22,7 @@ function jsonResponse(body: unknown): Response {
 }
 
 function settingsYamlResponse(content: string): Response {
-  return jsonResponse({ content });
+  return jsonResponse({ content, hash: 'schedules-1', path: 'config/schedules.yaml' });
 }
 
 function authenticateSettings() {

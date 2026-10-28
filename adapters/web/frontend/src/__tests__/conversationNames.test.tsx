@@ -59,6 +59,17 @@ describe('共享会话名称', () => {
     fireEvent.click(await screen.findByRole('button', { name: '重试会话列表' }));
     expect(await screen.findByRole('option', { name: '新账号群' })).toBeInTheDocument();
   });
+  // 只说读取失败，人不知道是后端没起来、没权限还是回来的东西读不懂。
+  it.each([
+    ['all' as const, () => render(<ScopeSelect value={group} onChange={() => {}} />), '仍可操作当前会话。'],
+    ['groups' as const, () => render(<CommunityPage scope={group} />), '不能选择或操作未经确认的会话。'],
+  ])('会话列表读不了时说出原因，接着说这一处还能做什么（%s）', async (_mode, mount, then) => {
+    vi.mocked(api.getConversations).mockRejectedValue(new api.ApiError(503, '会话注册表读不懂'));
+    mount();
+
+    expect(await screen.findByText(/^会话列表读取失败/)).toHaveTextContent(`会话列表读取失败：503 会话注册表读不懂。${then}`);
+  });
+
   it('A到B再回A时迟到回应不能覆盖当前名册，退出认证也不保留名称', async () => {
     const old = deferred<api.ConversationRow[]>();
     vi.mocked(api.getConversations).mockReturnValueOnce(old.promise).mockResolvedValueOnce([row(person, '账号B名称')]).mockResolvedValueOnce([row(group, '账号A新名称')]);

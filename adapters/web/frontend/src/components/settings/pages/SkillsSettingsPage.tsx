@@ -7,7 +7,7 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // skill maintenance is split into a clean list and a focused editor.
 import { useEffect, useState } from 'react';
 
-import { createSkill, deleteSkill, getSkills, type AdminSkill } from '../../../api/supervisorClient';
+import { createSkill, deleteSkill, getSkills, receipted, skillDir, type AdminSkill } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -46,7 +46,7 @@ export const SkillsSettingsPage = () => {
       const items = await getSkills(adminToken);
       if (!request.isCurrent()) return;
       setSkills(items);
-      if (selectedSkill && !items.some((item) => item.name === selectedSkill.name)) setSelectedSkill(null);
+      if (selectedSkill && !items.some((item) => skillDir(item) === skillDir(selectedSkill))) setSelectedSkill(null);
       setLoadError('');
     } catch (caught) {
       if (!request.isCurrent()) return;
@@ -72,7 +72,7 @@ export const SkillsSettingsPage = () => {
     const handler = () => { void load(); };
     window.addEventListener('settings:skills-updated', handler);
     return () => window.removeEventListener('settings:skills-updated', handler);
-  }, [requests, selectedSkill?.name]);
+  }, [requests, selectedSkill ? skillDir(selectedSkill) : '']);
 
   const create = () => run(async () => {
     if (!adminToken) return;
@@ -80,10 +80,10 @@ export const SkillsSettingsPage = () => {
     if (!name) { setError('请输入技能名称'); return; }
     if (!confirmNavigation()) return;
     try {
-      const result = await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
+      const { result, receiptProblem } = await receipted(createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) }));
       if (!requests.isCurrent()) return;
       setNewName('');
-      setMessage(savedMessage('技能已创建，请在右栏编辑 frontmatter 和正文。', '', result.warnings));
+      setMessage(savedMessage('技能已创建，请在右栏编辑 frontmatter 和正文。', '', result?.warnings), receiptProblem);
       await load();
       if (!requests.isCurrent()) return;
       setSelectedSkill({ name, description: '通过设置页面创建的技能。', enabled: true, strategy: 'normal', keywords: [] });
@@ -94,10 +94,11 @@ export const SkillsSettingsPage = () => {
   });
   const remove = () => run(async () => {
     if (!adminToken || !selectedSkill) return;
-    if (!window.confirm(`确定要删除技能 ${selectedSkill.name} 吗？`)) return;
+    const dir = skillDir(selectedSkill);
+    if (!window.confirm(`确定要删除技能目录 ${dir} 吗？`)) return;
     if (!confirmNavigation()) return;
     try {
-      await deleteSkill(adminToken, selectedSkill.name);
+      await deleteSkill(adminToken, dir);
       if (!requests.isCurrent()) return;
       setSelectedSkill(null);
       setMessage('技能已删除');
@@ -116,9 +117,26 @@ export const SkillsSettingsPage = () => {
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {skills.map((skill) => (
-            <button className={`w-full border p-3 text-left ${selectedSkill?.name === skill.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={skill.name} disabled={busy} onClick={() => { setSelectedSkill(skill); setMessage(''); setRightPanelOpen(true); }} type="button">
-              <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{skill.name}</span><span className={`border px-1.5 py-0.5 text-nano ${skill.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{skill.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-micro text-[var(--duties-tertiary)]">{skill.strategy || 'normal'}</span></div>
-              <p className="mt-1 text-xs text-[var(--duties-secondary)]">{skill.description || skill.body_preview || '无描述'}</p>
+            <button className={`w-full border p-3 text-left ${selectedSkill && skillDir(selectedSkill) === skillDir(skill) ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={skillDir(skill)} disabled={busy} onClick={() => { setSelectedSkill(skill); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-xs font-semibold">{skill.name}</span>
+                {skillDir(skill) !== skill.name && <span className="font-mono text-micro text-[var(--duties-tertiary)]">{skillDir(skill)}/</span>}
+                {skill.problem ? (
+                  <span className="border border-[var(--duties-danger)] px-1.5 py-0.5 text-nano text-[var(--duties-danger)]">用不了</span>
+                ) : (
+                  <>
+                    <span className={`border px-1.5 py-0.5 text-nano ${skill.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{skill.enabled === false ? '禁用' : '启用'}</span>
+                    <span className="font-mono text-micro text-[var(--duties-tertiary)]">{skill.strategy || 'normal'}</span>
+                  </>
+                )}
+              </div>
+              {skill.problem ? (
+                // 加载时整个技能被跳过：不注入，也不当输出规则。
+                <p className="mt-1 text-xs text-[var(--duties-danger)]">技能文件用不了，选中后在右栏修好：{skill.problem}</p>
+              ) : (
+                <p className="mt-1 text-xs text-[var(--duties-secondary)]">{skill.description || skill.body_preview || '无描述'}</p>
+              )}
+              {skill.rule_error && <p className="mt-1 text-xs text-[var(--duties-danger)]">输出规则不生效：{skill.rule_error}</p>}
               {(skill.keywords || []).length > 0 && <p className="mt-1 truncate font-mono text-mini text-[var(--duties-tertiary)]">{(skill.keywords || []).join(', ')}</p>}
             </button>
           ))}

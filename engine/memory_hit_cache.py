@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import config_layout
 from engine.eventlog_rotation import eventlog_file_lock
 from engine.memory_namespace import memory_root
 
@@ -26,6 +27,34 @@ _hit_cache_last_flush: float = 0.0
 _hit_atexit_registered: bool = False
 _HIT_CACHE_FLUSH_INTERVAL = 600          # 10 minutes
 _HIT_KEY_SEP = "/"
+
+# 每 10 分钟一次的 flush、每晚的整理都会再读到同一份坏文件：同一版每种后果只记一次。
+_warned_versions: dict[tuple[str, str], tuple[int, int, int] | None] = {}
+_warned_lock = threading.Lock()
+
+
+class HitCacheUnreadable(ValueError):
+    """命中侧车在盘上，却读不出一个 JSON 对象。reason 只有位置和问题，不带文件内容。
+
+    stamp 是读之前取的 file_stamp，同一版坏文件只记一次日志靠它。
+    """
+
+    def __init__(self, path: Path, rel_path: str, reason: str, stamp: tuple[int, int, int] | None) -> None:
+        super().__init__(f"hit cache {rel_path} is unreadable: {reason}")
+        self.path = path
+        self.rel_path = rel_path
+        self.reason = reason
+        self.stamp = stamp
+
+
+def warn_unreadable(error: HitCacheUnreadable, consequence: str) -> None:
+    """记一条侧车读不了、这一处因此怎么办的警告。同一版文件、同一种后果只记一次。"""
+    key = (str(error.path), consequence)
+    with _warned_lock:
+        if key in _warned_versions and _warned_versions[key] == error.stamp:
+            return
+        _warned_versions[key] = error.stamp
+    logger.warning("%s; %s", error, consequence)
 
 
 def hit_cache_path(workspace_root: Path) -> Path:
@@ -54,27 +83,50 @@ def hit_timestamp(cache: dict[str, Any], namespace: str, entry_id: str) -> str:
 
 
 def read_hit_cache(workspace_root: Path) -> dict[str, str]:
-    """Read the hit sidecar, treating anything but a JSON object as empty.
+    """读命中侧车。文件不在是空表；在却读不了、解析不了、顶层不是对象抛 HitCacheUnreadable。
 
-    只挡解析异常是不够的：`[]` 能解析成功，随后每一次 `.get` 都抛 TypeError，
-    而这条异常会一路把 prompt 构建打掉（skill 与 memory 四个注入键全不设置）。
+    读不懂的侧车不能当空表：写回会把里面的历史命中整份盖掉，按命中判龄的清理会把每条都当成从没命中过。
     """
     path = hit_cache_path(workspace_root)
-    if not path.exists():
-        return {}
+    stamp = config_layout.file_stamp(path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as read_error:
-        logger.warning("hit cache unreadable, treating as empty: %s", read_error)
+        raw = json.loads(path.read_bytes().decode("utf-8-sig"))
+    except FileNotFoundError:
         return {}
-    if not isinstance(raw, dict):
-        logger.warning("hit cache is %s, not an object; treating as empty", type(raw).__name__)
-        return {}
-    return {str(k): str(v) for k, v in raw.items()}
+    except (OSError, UnicodeDecodeError) as exc:
+        problem = config_layout.config_error_text(exc)
+    except json.JSONDecodeError as exc:
+        problem = f"{config_layout.position_text(exc.lineno, exc.colno)}：{exc.msg}"
+    except RecursionError:
+        problem = "nested too deeply"
+    else:
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        problem = f"top level is a {type(raw).__name__}, not an object"
+    # 在 except 块外抛：UnicodeDecodeError、JSONDecodeError 身上挂着整份原文，不能留在异常链上。
+    raise HitCacheUnreadable(path, config_layout.logical_path(workspace_root, path), problem, stamp)
+
+
+def _publish(path: Path, cache: dict[str, str]) -> None:
+    """整份写回，调用方持有侧车的文件锁。同目录临时文件替换，读者只会看到旧的或新的。"""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(cache), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _keep_pending(pending: dict[str, str]) -> None:
+    """没落盘的命中放回缓冲，和这期间新记的同一个 key 取较新的那个。"""
+    with _hit_cache_lock:
+        for key, stamp in pending.items():
+            if stamp > str(_hit_pending.get(key) or ""):
+                _hit_pending[key] = stamp
 
 
 def flush_hit_cache(workspace_root: Path | None = None) -> None:
-    """Merge this process's pending hits into the sidecar and publish atomically."""
+    """Merge this process's pending hits into the sidecar and publish atomically.
+
+    侧车读不懂就不写：拿空表合并写回会把里面的历史命中整份盖掉。这一轮的命中留在进程里，下次再试。
+    """
     global _hit_pending, _hit_cache_last_flush
     if workspace_root is None:
         return
@@ -97,15 +149,13 @@ def flush_hit_cache(workspace_root: Path | None = None) -> None:
                 # 所以字典序就是时间序，不必为取 max 解析上千条。
                 if stamp > str(merged.get(key) or ""):
                     merged[key] = stamp
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(merged), encoding="utf-8")
-            os.replace(tmp, path)
+            _publish(path, merged)
+    except HitCacheUnreadable as unreadable:
+        warn_unreadable(unreadable, "new hits stay in this process and are written once it is fixed")
+        _keep_pending(pending)
     except Exception as flush_error:
         logger.warning("hit cache flush failed, keeping hits for the next attempt: %s", flush_error)
-        with _hit_cache_lock:
-            for key, stamp in pending.items():
-                if stamp > str(_hit_pending.get(key) or ""):
-                    _hit_pending[key] = stamp
+        _keep_pending(pending)
 
 
 def record_hits(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
@@ -181,17 +231,34 @@ def _drop_hit_keys(workspace_root: Path, matches: Callable[[str], bool]) -> int:
                 return 0
             for key in doomed:
                 del cache[key]
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(cache), encoding="utf-8")
-            os.replace(tmp, path)
+            _publish(path, cache)
             return len(doomed)
+    except HitCacheUnreadable as unreadable:
+        warn_unreadable(unreadable, "stamps of deleted memories stay in it until it is fixed")
+        return 0
     except Exception as prune_error:
         logger.warning("pruning hit stamps failed: %s", prune_error)
         return 0
 
 
-def prune_orphan_namespace_hits(workspace_root: Path, known_namespaces: Iterable[str]) -> int:
-    """Drop scoped hit stamps whose namespace directory is gone."""
+def _orphan_hit_keys(cache: dict[str, str], known: set[str]) -> list[str]:
+    doomed = []
+    for key in cache:
+        ns_part, sep, _ = key.partition(_HIT_KEY_SEP)
+        if not sep or not ns_part:
+            continue  # 扁平 key（无前缀段）一律保留
+        if ns_part not in known:
+            doomed.append(key)
+    return doomed
+
+
+def prune_orphan_namespace_hits(
+    workspace_root: Path, known_namespaces: Iterable[str], *, dry_run: bool = False,
+) -> int:
+    """Drop scoped hit stamps whose namespace directory is gone, returning how many.
+
+    dry_run 只数不写，也不拿文件锁：侧车是整份替换写的，不加锁读到的也是完整的一版。
+    """
     known = {str(ns) for ns in known_namespaces}
     # 空集合不能被解读成「所有 namespace 都没了」：调用方拿不到目录列表时要按兵不动。
     if not known:
@@ -200,23 +267,20 @@ def prune_orphan_namespace_hits(workspace_root: Path, known_namespaces: Iterable
     if not path.exists():
         return 0
     try:
+        if dry_run:
+            return len(_orphan_hit_keys(read_hit_cache(workspace_root), known))
         with eventlog_file_lock(path):
             cache = read_hit_cache(workspace_root)
-            doomed = []
-            for key in cache:
-                ns_part, sep, _ = key.partition(_HIT_KEY_SEP)
-                if not sep or not ns_part:
-                    continue  # 扁平 key（无前缀段）一律保留
-                if ns_part not in known:
-                    doomed.append(key)
+            doomed = _orphan_hit_keys(cache, known)
             if not doomed:
                 return 0
             for key in doomed:
                 del cache[key]
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(cache), encoding="utf-8")
-            os.replace(tmp, path)
+            _publish(path, cache)
             return len(doomed)
+    except HitCacheUnreadable as unreadable:
+        warn_unreadable(unreadable, "stamps of removed namespaces stay in it until it is fixed")
+        return 0
     except Exception as prune_error:
         logger.warning("pruning orphan namespace hits failed: %s", prune_error)
         return 0

@@ -15,8 +15,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,9 +44,18 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     _save_book,
     memory_entry_constant,
 )
+from engine.memory_hit_cache import (  # noqa: E402
+    HitCacheUnreadable,
+    hit_cache_path,
+    hit_timestamp,
+    prune_orphan_namespace_hits,
+    read_hit_cache,
+    warn_unreadable,
+)
 from engine.memory_namespace import (  # noqa: E402
     SUBJECT_PREFIX,
     is_namespace_conversation_key,
+    memory_book_files,
     memory_root,
     namespace_dirs,
 )
@@ -310,25 +318,19 @@ def _memory_entry_reference_ts(entry: dict[str, object], hit_stamp: str = "") ->
     return max(known) if known else None
 
 
-def _load_hit_stamps(mem_root: Path) -> tuple[dict, object]:
-    """Return (hit_cache_dict, lookup_fn); both empty/no-op when unavailable."""
+def _load_hit_stamps(workspace_root: Path) -> dict[str, str] | None:
+    """命中侧车。文件不在是空表；读不了是 None，这一轮不按年龄淘汰。
+
+    读不了时只看 yaml 里的时间戳，等于把每条都当成从没命中过：老而天天被召回的条目会被删掉。
+    """
     try:
-        from engine.memory_hit_cache import hit_timestamp, read_hit_cache
-
-        return read_hit_cache(mem_root.parent.parent), hit_timestamp
-    except Exception as exc:
-        # 读不到命中数据时按「一条都没命中过」处理会让 sweep 更激进，所以退化成
-        # 完全不参考命中，只用 YAML 里的时间戳。
-        logging.info("[memory] hit cache unavailable, ageing by yaml timestamps only: %s", exc)
-        return {}, (lambda _cache, _ns, _eid: "")
+        return read_hit_cache(workspace_root)
+    except HitCacheUnreadable as exc:
+        warn_unreadable(exc, "memory entries are not aged out until it is fixed")
+        return None
 
 
-_HitLookup = Callable[[dict, str, str], str]
-
-
-def _memory_entry_expired(
-    entry: object, namespace: str, cutoff: float, hit_cache: dict, hit_lookup: _HitLookup,
-) -> bool:
+def _memory_entry_expired(entry: object, namespace: str, cutoff: float, hit_cache: dict[str, str]) -> bool:
     if not isinstance(entry, dict) or memory_entry_constant(entry):
         return False
     # 只清自动提取写的条目。没有 source 的条目里有人手写的，一律当手工记忆保护，
@@ -337,7 +339,7 @@ def _memory_entry_expired(
     if str(entry.get("source") or "").strip() != "auto":
         return False
     ref_ts = _memory_entry_reference_ts(
-        entry, hit_lookup(hit_cache, namespace, str(entry.get("id") or "")),
+        entry, hit_timestamp(hit_cache, namespace, str(entry.get("id") or "")),
     )
     # 一个时间戳都没有的条目判不出年龄，留着不猜。
     return ref_ts is not None and ref_ts < cutoff
@@ -349,15 +351,17 @@ class _MemorySweep:
     deleted_entries: int = 0
     removed_empty_books: int = 0
     skipped_archives: int = 0
+    # 演练时空目录还在盘上，扫孤儿命中键得照真跑时的样子把它们算成没了。
+    removed_namespaces: set[str] = field(default_factory=set)
 
 
 def _expire_book_locked(
-    book_path: Path, namespace: str, cutoff: float, hit_cache: dict, hit_lookup: _HitLookup,
+    book_path: Path, namespace: str, cutoff: float, hit_cache: dict[str, str],
 ) -> tuple[int, bool]:
     """淘汰一本记忆里过期的自动条目，返回 (删掉的条数, 是否整本删空)。调用方持有记忆写锁。"""
     data = _load_book(book_path)
     entries = data["entries"]
-    kept = [entry for entry in entries if not _memory_entry_expired(entry, namespace, cutoff, hit_cache, hit_lookup)]
+    kept = [entry for entry in entries if not _memory_entry_expired(entry, namespace, cutoff, hit_cache)]
     deleted = len(entries) - len(kept)
     if not deleted:
         return 0, False
@@ -373,20 +377,22 @@ def _sweep_namespace_locked(
     namespace: str,
     directory: Path,
     cutoff: float,
-    hit_cache: dict,
-    hit_lookup: _HitLookup,
+    hit_cache: dict[str, str] | None,
     sweep: _MemorySweep,
 ) -> None:
-    """一个 namespace：淘汰过期的自动条目，删空了连目录一起收掉。调用方持有记忆写锁。"""
-    books = sorted(path for path in directory.glob("*.yaml") if path.is_file())
+    """一个 namespace：淘汰过期的自动条目，删空了连目录一起收掉。调用方持有记忆写锁。
+
+    hit_cache 是 None（命中侧车读不了）时这一轮不淘汰条目，只收空目录。
+    """
+    books = memory_book_files(directory)
     if namespace.startswith(SUBJECT_PREFIX):
         # 跨会话人物档案不参与年龄淘汰：画像的价值就在长期积累，
         # 「三个月前提过对象生日」正是它存在的理由。只能手工删。
         sweep.skipped_archives += len(books)
-    else:
+    elif hit_cache is not None:
         for book_path in books:
             try:
-                deleted, emptied = _expire_book_locked(book_path, namespace, cutoff, hit_cache, hit_lookup)
+                deleted, emptied = _expire_book_locked(book_path, namespace, cutoff, hit_cache)
             except MemoryBookUnreadable as exc:
                 logging.info("[memory] skipped unreadable book %s: %s", book_path, exc.reason)
                 continue
@@ -399,6 +405,7 @@ def _sweep_namespace_locked(
     # 判空和 rmdir 都得在锁里：engine 可能正往这个目录里写第一本。
     if namespace and not any(directory.iterdir()):
         _rmdir(directory)
+        sweep.removed_namespaces.add(namespace)
 
 
 def purge_expired_memory_entries():
@@ -419,25 +426,30 @@ def purge_expired_memory_entries():
 
     cutoff = time.time() - MEMORY_ENTRY_MAX_AGE
     sweep = _MemorySweep()
-    hit_cache, hit_lookup = _load_hit_stamps(mem_root)
+    hit_cache = _load_hit_stamps(workspace_root)
 
     namespaces = [("", mem_root), *((directory.name, directory) for directory in namespace_dirs(workspace_root))]
     for namespace, directory in namespaces:
         try:
             # 和 engine 的记忆工具同一把锁：读完到写回之间插进来的那次保存，会被这次整本写回盖掉。
             with _memory_write_lock(workspace_root):
-                _sweep_namespace_locked(namespace, directory, cutoff, hit_cache, hit_lookup, sweep)
+                _sweep_namespace_locked(namespace, directory, cutoff, hit_cache, sweep)
         except (OSError, TimeoutError) as exc:
             logging.info("[memory] namespace %s skipped: %s", namespace or "(root)", exc)
 
     removed_hit_keys = 0
     try:
-        from engine.memory_hit_cache import prune_orphan_namespace_hits
-
-        surviving = {p.name for p in mem_root.iterdir() if p.is_dir()}
-        removed_hit_keys = prune_orphan_namespace_hits(DATA_DIR.parent, surviving)
-    except Exception as exc:
+        surviving = {p.name for p in mem_root.iterdir() if p.is_dir()} - sweep.removed_namespaces
+    except OSError as exc:
         logging.info("[memory] orphan hit-key sweep skipped: %s", exc)
+    else:
+        removed_hit_keys = prune_orphan_namespace_hits(workspace_root, surviving, dry_run=DRY_RUN)
+        if DRY_RUN and removed_hit_keys:
+            logging.info(
+                "[dry-run] would remove %d orphan hit keys from %s",
+                removed_hit_keys,
+                hit_cache_path(workspace_root),
+            )
 
     logging.info(
         "[memory] scanned_books=%d deleted_entries=%d removed_empty_books=%d "

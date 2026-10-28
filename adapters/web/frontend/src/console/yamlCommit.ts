@@ -1,7 +1,7 @@
 // 结构化表单写回配置文件只走这一条：读最新一版，只改这次动过的键，带着这一版的指纹写回。
 // 读和写之间又被改过时后端回 409；给了打开时的原文，还会逐键核对这几个键在那之后有没有被别处改过。
 import { ApiError } from '../api/request';
-import { getRuntimeFile, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
+import { getRuntimeFile, receipted, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
 import { editYamlKeys, parseYamlMapping, readYamlPath, sameData, type YamlKeyEdit } from './yamlRewrite';
 
 export interface YamlSource {
@@ -14,7 +14,10 @@ export interface YamlCommit<R> {
   content: string;
   /** 注释没保住时交代的那句，保住了是空串。 */
   note: string;
-  result: R;
+  /** 写的回执。存上了、回执没读懂时是 null：每次写回都先读最新一版，下一次写不靠它的指纹。 */
+  result: R | null;
+  /** 回执哪里没读懂，读懂了是空串。 */
+  receiptProblem: string;
 }
 
 export interface YamlCommitOptions<S extends YamlSource, R> {
@@ -61,8 +64,8 @@ export async function commitYamlKeys<S extends YamlSource, R>(options: YamlCommi
     assertUntouched(options.loaded, latest.content, edits);
   }
   const { content, note } = editYamlKeys(base, edits);
-  const result = await options.write(content, latest.hash);
-  return { content, note, result };
+  const { result, receiptProblem } = await receipted(options.write(content, latest.hash));
+  return { content, note, result, receiptProblem };
 }
 
 /** 本实例那一层 runtime.yaml。还没有自己那份时读到的是仓库默认，写回要从空文档开始，

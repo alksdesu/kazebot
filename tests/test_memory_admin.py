@@ -5,15 +5,18 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import supervisor.admin_api as admin_api  # noqa: E402
 from engine import memory_admin  # noqa: E402
 from engine.builtin.knowledge_inject import _DEFAULT_SCAN_DEPTH  # noqa: E402
 
@@ -122,7 +125,7 @@ class TestNamespaceValidation:
 class TestListing:
     def test_nothing_is_listed_before_anything_is_written(self, tmp_path: Path) -> None:
         assert memory_admin.list_namespaces(tmp_path) == []
-        assert memory_admin.list_entries(tmp_path, "user_UserA") == []
+        assert memory_admin.list_entries(tmp_path, "user_UserA") == memory_admin.MemoryListing()
 
     def test_a_namespace_reports_its_kind_and_count(self, tmp_path: Path) -> None:
         memory_admin.upsert_entry(tmp_path, "user_UserA", {"id": "a", "content": "x", "keywords": ["k"]})
@@ -142,7 +145,7 @@ class TestListing:
             tmp_path, "user_UserA", {"id": "a", "content": "x", "keywords": ["k"], "book": "people"},
         )
 
-        assert memory_admin.list_entries(tmp_path, "user_UserA")[0]["book"] == "people"
+        assert memory_admin.list_entries(tmp_path, "user_UserA").entries[0]["book"] == "people"
 
     def test_a_legacy_entry_without_scan_depth_reads_as_the_default(self, tmp_path: Path) -> None:
         # 手写的 yaml 常常没有这个键，缺它会退回「只看当前这一句」。
@@ -150,7 +153,25 @@ class TestListing:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("book: default\nentries:\n- id: a\n  content: x\n  keywords: [k]\n", encoding="utf-8")
 
-        assert memory_admin.list_entries(tmp_path, "user_UserA")[0]["scan_depth"] == _DEFAULT_SCAN_DEPTH
+        assert memory_admin.list_entries(tmp_path, "user_UserA").entries[0]["scan_depth"] == _DEFAULT_SCAN_DEPTH
+
+    def test_unquoted_handwritten_timestamps_do_not_break_the_overview(self, tmp_path: Path) -> None:
+        # 不加引号的时间 YAML 读出来是 datetime 或 date，和字符串一起取最大值会抛 TypeError，整个来源列表跟着 500。
+        path = _book_path(tmp_path, "user_UserA")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "book: default\nentries:\n"
+            "- id: a\n  content: x\n  updated_at: 2026-10-01T08:00:00+00:00\n"
+            "- id: b\n  content: y\n  updated_at: '2026-10-02T08:00:00+00:00'\n"
+            "- id: c\n  content: z\n  updated_at: 2026-09-30\n"
+            "- id: d\n  content: w\n",
+            encoding="utf-8",
+        )
+
+        [row] = memory_admin.list_namespaces(tmp_path)
+
+        assert row["updated_at"] == "2026-10-02T08:00:00+00:00"
+        assert row["unreadable_books"] == []
 
 
 class TestDeletion:
@@ -166,7 +187,7 @@ class TestDeletion:
 
         memory_admin.delete_entry(tmp_path, "user_UserA", "default", "a")
 
-        assert [row["id"] for row in memory_admin.list_entries(tmp_path, "user_UserA")] == ["b"]
+        assert [row["id"] for row in memory_admin.list_entries(tmp_path, "user_UserA").entries] == ["b"]
 
     def test_deleting_something_that_is_not_there_reports_false(self, tmp_path: Path) -> None:
         assert not memory_admin.delete_entry(tmp_path, "user_UserA", "default", "nope")
@@ -180,3 +201,71 @@ class TestDeletion:
 
     def test_clearing_an_absent_namespace_is_not_an_error(self, tmp_path: Path) -> None:
         assert memory_admin.clear_namespace(tmp_path, "user_UserZ") == 0
+
+    @pytest.mark.parametrize("delete", [
+        pytest.param(lambda root: memory_admin.delete_entry(root, "user_UserA", "default", "a"), id="entry"),
+        pytest.param(lambda root: memory_admin.clear_namespace(root, "user_UserA"), id="namespace"),
+    ])
+    def test_an_unreadable_hit_cache_does_not_stop_a_delete_and_is_left_as_it_is(self, tmp_path: Path, delete) -> None:
+        # 摘命中戳那一步读不懂侧车就跳过：整份写回会把别的会话的命中一起抹掉。
+        memory_admin.upsert_entry(tmp_path, "user_UserA", {"id": "a", "content": "x", "keywords": ["k"]})
+        cache = tmp_path / "data" / "memory" / ".hit_cache.json"
+        cache.write_text('{"user_UserA/a": ', encoding="utf-8")
+
+        assert delete(tmp_path)
+
+        assert memory_admin.list_entries(tmp_path, "user_UserA").entries == []
+        assert cache.read_text(encoding="utf-8") == '{"user_UserA/a": '
+
+
+_TOKEN = "test-admin-token"
+_BASE = "/v1/admin/config"
+
+
+@pytest.fixture
+def console(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(admin_api.create_admin_router(workspace_root=tmp_path), prefix=_BASE)
+
+    def get(url: str) -> httpx.Response:
+        async def go() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+                return await http.get(f"{_BASE}{url}", headers={"Authorization": f"Bearer {_TOKEN}"})
+
+        return asyncio.run(go())
+
+    return get
+
+
+class TestConsoleEndpoints:
+    def test_handwritten_times_and_an_unreadable_book_come_back_as_json(self, tmp_path: Path, console) -> None:
+        # 只测 memory_admin 看不到序列化那一步：手写的时间读出来是 datetime 和 date，回执照样得是能解析的 JSON。
+        path = _book_path(tmp_path, "user_UserA")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "book: default\nentries:\n"
+            "- id: a\n  content: x\n  updated_at: 2026-10-01T08:00:00+00:00\n"
+            "- id: b\n  content: y\n  updated_at: 2026-09-30\n",
+            encoding="utf-8",
+        )
+        _book_path(tmp_path, "user_UserA", "people").write_text("entries: [ secret line: here: x\n", encoding="utf-8")
+
+        overview = console("/memory/overview")
+        entries = console("/memory/user_UserA/entries")
+
+        assert overview.status_code == 200
+        [row] = overview.json()["namespaces"]
+        assert (row["entry_count"], row["unreadable_books"]) == (2, ["people"])
+        assert row["updated_at"] == "2026-10-01T08:00:00+00:00"
+        assert entries.status_code == 200
+        body = entries.json()
+        # 带时区的那个交给 FastAPI 写成 JSON，写法是它定的（Z 或 +00:00），只核到秒。
+        assert [entry["updated_at"][:19] for entry in body["entries"]] == ["2026-10-01T08:00:00", "2026-09-30"]
+        [broken] = body["unreadable_books"]
+        assert broken["book"] == "people" and broken["problem"]
+        assert "secret line" not in overview.text + entries.text

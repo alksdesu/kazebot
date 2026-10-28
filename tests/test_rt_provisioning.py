@@ -120,16 +120,20 @@ class TestProgress:
 class TestABrokenRoster:
     def test_planning_stops_instead_of_handing_out_a_used_index(self, workspace: Path) -> None:
         # 当成没有别的实例的话，分到的序号可能正是一个在跑的实例的端口。
-        _break_roster(workspace)
+        roster = _break_roster(workspace)
 
-        with pytest.raises(provisioning.ProvisionError, match="instances.yaml"):
+        with pytest.raises(provisioning.RosterUnreadable) as caught:
             provisioning.plan_instance(workspace, instance_id="koki", label="")
 
-    def test_removing_stops_with_a_reason_instead_of_not_on_the_roster(self, workspace: Path) -> None:
-        _break_roster(workspace)
+        _says_where_it_broke(caught.value, roster, "。先在服务器上修好它")
 
-        with pytest.raises(provisioning.ProvisionError, match="读不懂"):
+    def test_removing_stops_with_a_reason_instead_of_not_on_the_roster(self, workspace: Path) -> None:
+        roster = _break_roster(workspace)
+
+        with pytest.raises(provisioning.RosterUnreadable) as caught:
             provisioning.guard_removable(workspace, "koki", current_prefix="")
+
+        _says_where_it_broke(caught.value, roster, "。先在服务器上修好它")
 
     def test_scaffolding_does_not_overwrite_it(self, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(provisioning, "allocate_index", lambda *_args, **_kwargs: 1)
@@ -139,10 +143,29 @@ class TestABrokenRoster:
         roster = _break_roster(workspace)
         before = roster.read_bytes()
 
-        with pytest.raises(provisioning.ProvisionError):
+        with pytest.raises(provisioning.RosterUnreadable) as caught:
             provisioning.scaffold(plan, workspace)
 
         assert roster.read_bytes() == before
+        _says_where_it_broke(caught.value, roster, "。没有登记 koki")
+
+    def test_forgetting_an_instance_says_where_the_roster_broke(self, workspace: Path) -> None:
+        roster = _break_roster(workspace)
+        before = roster.read_bytes()
+
+        with pytest.raises(provisioning.RosterUnreadable) as caught:
+            provisioning.forget(workspace, "koki")
+
+        assert roster.read_bytes() == before
+        _says_where_it_broke(caught.value, roster, "。先在服务器上修好它")
+
+
+def _says_where_it_broke(error: Exception, roster: Path, then: str) -> None:
+    """管理员要看得出是哪份文件、坏在哪一行，不能只有一句读不懂；文件里写的东西不能跟着出来。"""
+    message = str(error)
+    assert message.startswith(f"实例清单 {roster} 读不懂：第 1 行"), message
+    assert message.endswith(then), message
+    assert "this is" not in message
 
 
 class TestWhoMayCreate:

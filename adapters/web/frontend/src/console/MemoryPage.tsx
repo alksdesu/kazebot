@@ -15,6 +15,7 @@ import {
   type ConversationRow,
   type MemoryEntry,
   type MemoryNamespace,
+  type UnreadableMemoryBook,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Check, Empty, ErrorText, Footnote, Input, Pager, Tag } from './components';
@@ -45,6 +46,7 @@ const ID = 'font-mono text-xs';
 const META = 'font-mono text-mini text-[var(--duties-tertiary)]';
 const TEXT = 'mt-1.5 break-words text-xs leading-relaxed';
 const KW = 'mt-1 break-words font-mono text-mini text-[var(--duties-secondary)]';
+const UNREADABLE = 'flex-none font-mono text-mini text-[var(--duties-danger)]';
 // 上下文预览可能上百条，给个高度上限，不然整页被它撑开。
 const LOG = 'mt-1.5 max-h-80 overflow-auto border-t border-[var(--duties-border)] pt-1.5';
 const ADD = 'flex flex-col gap-1.5 border-t border-[var(--duties-border)] pt-2.5';
@@ -56,6 +58,30 @@ const GROUP = 'mb-1.5 mt-3.5 text-xs text-[var(--duties-secondary)]';
 
 // 群聊、私聊、人物档案和节点自己命名的记忆库分开，认不出出处的归通用。
 const BUCKETS = ['群组', '私聊', '人物', '节点记忆库', '通用'] as const;
+
+/** 照注入时的读法认关键词：列表里只认字符串，单独一个字符串算一个词，别的写法都算没写。手写的原值不动。 */
+function keywordsOf(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.filter((word): word is string => typeof word === 'string' && word.trim() !== '').map((word) => word.trim());
+  }
+  return typeof raw === 'string' && raw.trim() ? [raw.trim()] : [];
+}
+
+/** 照注入时那样把手写的 id 和正文当成一段文字：写成映射的直接交给 React 渲染，整页会崩掉。 */
+function entryText(raw: unknown): string {
+  if (typeof raw === 'string') return raw;
+  if (raw === null || raw === undefined) return '';
+  return typeof raw === 'object' ? JSON.stringify(raw) : String(raw);
+}
+
+const EntryKeywords = ({ raw }: { raw: unknown }) => {
+  const words = keywordsOf(raw);
+  return words.length ? <p className={KW}>关键词：{words.join('、')}</p> : null;
+};
+
+const unreadableText = (books: readonly UnreadableMemoryBook[]): string => (
+  books.map(({ book, problem }) => `${book}.yaml（${problem}）`).join('；')
+);
 
 function bucketOf(row: MemoryNamespace): (typeof BUCKETS)[number] {
   if (row.kind === 'subject') return '人物';
@@ -70,11 +96,15 @@ const MemoryBlock = () => {
   const [namespaces, setNamespaces] = useState<MemoryNamespace[]>([]);
   const [selected, setSelected] = useState('');
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
+  const [unreadable, setUnreadable] = useState<UnreadableMemoryBook[]>([]);
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [overviewLoading, setOverviewLoading] = useState(true);
+  // 读失败的原因合在页面底下那句报错里；这两个只管在原地给重读的按钮，别把没读成说成「没有」。
+  const [overviewFailed, setOverviewFailed] = useState(false);
+  const [entriesFailed, setEntriesFailed] = useState(false);
   const [entriesScope, setEntriesScope] = useState('');
   const requests = useRequestGuard();
   const confirmDiscard = useUnsavedChanges(JSON.stringify(draft) !== JSON.stringify(EMPTY_DRAFT), '记忆草稿尚未保存，确定切换来源或离开吗？');
@@ -92,9 +122,11 @@ const MemoryBlock = () => {
     try {
       const result = await getMemoryOverview(adminToken);
       if (!request.isCurrent()) return;
-      setNamespaces(result); setLoadError('', 'overview');
+      setNamespaces(result); setOverviewFailed(false); setLoadError('', 'overview');
     } catch (caught) {
-      if (request.isCurrent()) setLoadError(errorMessage(caught), 'overview');
+      if (!request.isCurrent()) return;
+      setOverviewFailed(true);
+      setLoadError(errorMessage(caught), 'overview');
     } finally {
       if (request.isCurrent()) setOverviewLoading(false);
     }
@@ -102,21 +134,24 @@ const MemoryBlock = () => {
 
   const loadEntries = async (namespace: string) => {
     const request = requests.begin('entries');
+    setEntriesFailed(false);
     if (!adminToken || !namespace) { setEntries([]); setLoadError('', 'entries'); return; }
     setLoading(true);
     try {
       const result = await getMemoryEntries(adminToken, namespace);
       if (!request.isCurrent()) return;
-      setEntries(result); setEntriesScope(namespace); setLoadError('', 'entries');
+      setEntries(result.entries); setUnreadable(result.unreadable_books); setEntriesScope(namespace); setLoadError('', 'entries');
     } catch (caught) {
-      if (request.isCurrent()) setLoadError(errorMessage(caught), 'entries');
+      if (!request.isCurrent()) return;
+      setEntriesFailed(true);
+      setLoadError(errorMessage(caught), 'entries');
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
   };
 
   useEffect(() => { void loadOverview(); }, [requests]);
-  useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { requests.drop('entries'); }; }, [requests, selected]);
+  useEffect(() => { setEntries([]); setUnreadable([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { requests.drop('entries'); }; }, [requests, selected]);
 
   // 固定按 BUCKETS 的顺序排，拍平成一条序列再分页 —— 按组各自分页会在一栏
   // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
@@ -169,10 +204,10 @@ const MemoryBlock = () => {
   };
 
   const remove = async (entry: MemoryEntry) => {
-    if (!adminToken || !selected || busy || loading || entriesScope !== selected || !window.confirm(`从「${current?.owner.label || '所选来源'}」删除「${entry.id}」？`)) return;
+    if (!adminToken || !selected || busy || loading || entriesScope !== selected || !window.confirm(`从「${current?.owner.label || '所选来源'}」删除「${entryText(entry.id)}」？`)) return;
     setBusy(true);
     try {
-      await deleteMemoryEntry(adminToken, selected, entry.book, entry.id);
+      await deleteMemoryEntry(adminToken, selected, entry.book, entryText(entry.id));
       await loadEntries(selected);
       await loadOverview();
     } catch (caught) { setError(errorMessage(caught)); } finally { setBusy(false); }
@@ -193,7 +228,9 @@ const MemoryBlock = () => {
 
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
-      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && !error && <Empty>还没有任何记忆。</Empty>}
+      {overviewLoading ? <Empty>正在读取记忆来源…</Empty>
+        : overviewFailed ? <Button className="mb-2" onClick={() => void loadOverview()} tone="quiet">重新读取记忆来源</Button>
+          : namespaces.length === 0 && <Empty>还没有任何记忆。</Empty>}
       <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[var(--duties-split-columns)]">
         <div className="flex flex-col gap-1">
           <Input
@@ -214,11 +251,12 @@ const MemoryBlock = () => {
                 disabled={busy}
                 aria-current={selected === row.key ? 'true' : undefined}
                 className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
-                onClick={() => { if (row.key !== selected && confirmDiscard()) { setEntries([]); setEntriesScope(''); setDraft(EMPTY_DRAFT); setMessage(''); setLoadError('', 'entries'); setSelected(row.key); } }}
+                onClick={() => { if (row.key !== selected && confirmDiscard()) { setEntries([]); setUnreadable([]); setEntriesScope(''); setDraft(EMPTY_DRAFT); setMessage(''); setLoadError('', 'entries'); setSelected(row.key); } }}
                 type="button"
               >
                 <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
                 <span className={META}>{row.entry_count}</span>
+                {row.unreadable_books.length > 0 && <span className={UNREADABLE}>{row.unreadable_books.length} 本读不了</span>}
               </button>
             </Fragment>
           ))}
@@ -237,30 +275,38 @@ const MemoryBlock = () => {
             <>
               <div className="flex items-center justify-between gap-2 font-mono text-xs">
                 <span>
-                  {current?.owner.label} · {entries.length} 条
-                  {constantCount > 0 && (
+                  {current?.owner.label}
+                  {/* 这一份还没读成时不报条数：读失败手上是空表，说成「0 条」就是说它没有记忆。 */}
+                  {entriesScope === selected && <> · {entries.length} 条{unreadable.length > 0 && `（不含读不了的 ${unreadable.length} 本）`}</>}
+                  {entriesScope === selected && constantCount > 0 && (
                     <Tag className="ml-2" tone="live">其中 {constantCount} 条常驻</Tag>
                   )}
                 </span>
                 <Button disabled={busy || loading || entriesScope !== selected} onClick={clearAll} tone="danger">清空</Button>
               </div>
               {loading && <Empty>正在读取该来源的记忆…</Empty>}
+              {!loading && entriesFailed && (
+                <Button className="self-start" onClick={() => void loadEntries(selected)} tone="quiet">重新读取这一份</Button>
+              )}
+              {entriesScope === selected && unreadable.length > 0 && (
+                <ErrorText role="alert">
+                  这几本读不出来，里面的记忆没算在上面：{unreadableText(unreadable)}。修好或删掉这些文件再看；清空会连它们一起删掉。
+                </ErrorText>
+              )}
               {pageEntries.map((entry) => (
                 <div
                   className={`${ENTRY}${entry.constant ? ` ${ENTRY_CONST}` : ''}`}
-                  key={`${entry.book}/${entry.id}`}
+                  key={`${entry.book}/${entryText(entry.id)}`}
                 >
                   <div className={HEAD}>
-                    <span className={ID}>{entry.id}</span>
+                    <span className={ID}>{entryText(entry.id)}</span>
                     {entry.constant && <Tag tone="live">常驻 · 每轮都注入</Tag>}
                     {entry.source === 'manual' && <Tag>手动</Tag>}
                     <span className="flex-1" />
                     <Button disabled={busy || loading} onClick={() => void remove(entry)} tone="danger">删除</Button>
                   </div>
-                  <p className={TEXT}>{entry.content}</p>
-                  {!!entry.keywords?.length && (
-                    <p className={KW}>关键词：{entry.keywords.join('、')}</p>
-                  )}
+                  <p className={TEXT}>{entryText(entry.content)}</p>
+                  <EntryKeywords raw={entry.keywords} />
                 </div>
               ))}
               <Pager

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
 from engine.memory_hit_cache import prune_namespace_hits
-from engine.memory_namespace import conversation_namespace
+from engine.memory_namespace import conversation_namespace, memory_book_files
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
 from adapters._shared import capability
 from adapters._shared.send_guard import AmbiguousClaim
@@ -606,7 +606,7 @@ def _clear_group_memory_namespace(group_id: int) -> tuple[bool, int]:
     existed = ns_dir.exists() and ns_dir.is_dir()
     if existed:
         try:
-            deleted_books = sum(1 for _ in ns_dir.glob("*.yaml"))
+            deleted_books = len(memory_book_files(ns_dir))
         except Exception:
             deleted_books = 0
         import shutil as _shutil

@@ -9,6 +9,7 @@ import {
   isValidShareGroupName,
   joinShareGroup,
   leaveShareGroup,
+  ReceiptUnreadable,
   restartEngine,
   type ShareGroup,
   type ShareGroupChange,
@@ -32,11 +33,13 @@ const ACTION_REASON: Record<Action, string> = {
   delete: '删除共享配置组',
 };
 
-const memberLine = (group: ShareGroup): string => (
-  group.members.length
+// membersKnown 为假时清单读不懂，空的 members 是不知道，不是没人。
+const memberLine = (group: ShareGroup, membersKnown: boolean): string => {
+  if (!membersKnown) return '查不了';
+  return group.members.length
     ? group.members.map(member => (member.current ? `${member.label}（当前实例）` : member.label)).join('、')
-    : '还没有成员'
-);
+    : '还没有成员';
+};
 
 const restartMissed = (reason: string): string => `没能重启 engine：${reason}。新配置要等它重启才生效，到「运行」里手动重启一次。`;
 
@@ -81,45 +84,63 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
 
   const locked = busy || loading || Boolean(error) || !overview?.available;
   const current = overview?.current ?? null;
+  const membersProblem = overview?.members_problem || '';
 
-  const run = async (action: Action, change: () => Promise<ShareGroupChange>, done: (result: ShareGroupChange) => string) => {
+  /** done 拿到的回执是 null 时，改动已经做完、只是回执读不懂：交代的话里不能用回执上的东西。 */
+  const run = async (
+    action: Action,
+    change: () => Promise<ShareGroupChange>,
+    done: (result: ShareGroupChange | null) => string,
+  ) => {
     if (!requests.isCurrent() || mutation.current) return;
     mutation.current = true; setBusy(true); setNote(''); setProblem('');
     try {
-      const result = await change();
+      let result: ShareGroupChange | null = null;
+      let receiptProblem = '';
+      try {
+        result = await change();
+      } catch (failure) {
+        if (!requests.isCurrent()) return;
+        if (!(failure instanceof ReceiptUnreadable)) { setProblem(errorMessage(failure)); return; }
+        receiptProblem = failure.message;
+      }
       if (!requests.isCurrent()) return;
-      // 结果里带着切换后的全貌，不必再读一遍；还没回来的旧读取作废，免得它盖掉这份。
-      requests.drop('overview');
-      setOverview(result.overview);
-      setLoading(false);
+      if (result) {
+        // 结果里带着切换后的全貌，不必再读一遍；还没回来的旧读取作废，免得它盖掉这份。
+        requests.drop('overview');
+        setOverview(result.overview);
+        setLoading(false);
+      } else {
+        // 回执里的全貌读不懂，眼下这份是改动之前的：另读一遍。
+        void refresh();
+      }
       const message = done(result);
-      if (action === 'delete') { setNote(message); return; }
+      if (action === 'delete') { setNote(message); setProblem(receiptProblem); return; }
       // 配置已经换掉是成功的那半句，照常交代；没重启上是另一回事，单独报错。
       try {
         const restart = await restartEngine(token, ACTION_REASON[action]);
         if (!requests.isCurrent()) return;
         if (restart.scheduled) {
           setNote(appendSentence(message, 'engine 正在重启，工具和节点会换成新配置。'));
+          setProblem(receiptProblem);
         } else {
           setNote(message);
-          setProblem(restartMissed(restartRefusal(restart)));
+          setProblem(appendSentence(receiptProblem, restartMissed(restartRefusal(restart))));
         }
       } catch (failure) {
         if (requests.isCurrent()) {
           setNote(message);
-          setProblem(restartMissed(errorMessage(failure)));
+          setProblem(appendSentence(receiptProblem, restartMissed(errorMessage(failure))));
         }
       }
-    } catch (failure) {
-      if (requests.isCurrent()) setProblem(errorMessage(failure));
     } finally {
       mutation.current = false;
       if (requests.isCurrent()) setBusy(false);
     }
   };
 
-  const archivedText = (result: ShareGroupChange): string => (
-    result.archived ? `原来的配置归档在 ${result.archived}。` : ''
+  const archivedText = (result: ShareGroupChange | null): string => (
+    result?.archived ? `原来的配置归档在 ${result.archived}。` : ''
   );
 
   const create = () => {
@@ -133,8 +154,8 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
     )) return;
     void run('create', () => createShareGroup(token, name), result => {
       setNewName('');
-      const copied = result.copied_env?.length ? `.env 里的 ${result.copied_env.join('、')} 已抄进组里。` : '';
-      return `已建组「${result.group}」并加入。${archivedText(result)}${copied}`;
+      const copied = result?.copied_env?.length ? `.env 里的 ${result.copied_env.join('、')} 已抄进组里。` : '';
+      return `已建组「${result?.group ?? name}」并加入。${archivedText(result)}${copied}`;
     });
   };
 
@@ -144,20 +165,23 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
       + '本实例改用组里的整套配置：人格、技能、工具、MCP、模型渠道与密钥、policy、平台配置都跟组走。'
       + '原来的配置归档到 data/config.archived-*，不会删除。记忆不共享。\n\n之后会重启本实例的 engine。',
     )) return;
-    void run('join', () => joinShareGroup(token, group.name), result => `已加入「${result.group}」。${archivedText(result)}`);
+    void run('join', () => joinShareGroup(token, group.name), result => `已加入「${result?.group ?? group.name}」。${archivedText(result)}`);
   };
 
   const leave = () => {
     if (!current) return;
+    const leaving = current;
     if (!window.confirm(
-      `退出共享组「${current}」？\n\n会拷一份组里现在的配置留给本实例接着用，之后两边各改各的。\n\n之后会重启本实例的 engine。`,
+      `退出共享组「${leaving}」？\n\n会拷一份组里现在的配置留给本实例接着用，之后两边各改各的。\n\n之后会重启本实例的 engine。`,
     )) return;
-    void run('leave', () => leaveShareGroup(token), result => `已退出「${result.group}」，本实例接着用退出时拷下来的那份配置。`);
+    void run('leave', () => leaveShareGroup(token), result => `已退出「${result?.group ?? leaving}」，本实例接着用退出时拷下来的那份配置。`);
   };
 
   const drop = (group: ShareGroup) => {
     if (!window.confirm(`删除共享组「${group.name}」？\n\n组目录会改名归档，不会直接删除，确认无误后可自行在服务器上清理。`)) return;
-    void run('delete', () => deleteShareGroup(token, group.name), result => `已删除「${result.group}」，组目录归档为 ${result.archived}。`);
+    void run('delete', () => deleteShareGroup(token, group.name), result => (
+      result ? `已删除「${result.group}」，组目录归档为 ${result.archived}。` : `已删除「${group.name}」，组目录已改名归档。`
+    ));
   };
 
   return <Block title="共享配置" hint="进了同一个组的实例共用整套配置：人格、技能、工具、MCP、模型渠道与密钥、policy、平台配置都在里面，同平台、跨平台都行。记忆永远各自一份。">
@@ -176,18 +200,23 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
           <Button disabled={locked} loading={busy} onClick={leave} tone="quiet">退出这个组</Button>
         </div> : <p className={DESC}>本实例用的是自己的配置，没有和别的实例共享。</p>}
       </Panel>
+      {membersProblem && overview.groups.length > 0 && (
+        <p role="alert" className="mb-3 text-sm text-[var(--duties-danger)]">
+          查不了各组有哪些实例在用：{membersProblem}。修好之前删不了组。
+        </p>
+      )}
       {overview.groups.length > 0 ? <List>
         {overview.groups.map(group => <Row key={group.name}>
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
             <ItemTitle className="break-all">{group.name}</ItemTitle>
-            <span className={DESC}>成员：{memberLine(group)}</span>
+            <span className={DESC}>成员：{memberLine(group, !membersProblem)}</span>
             {createdLine(group) && <span className={DESC}>{createdLine(group)}</span>}
           </span>
           {group.name === current
             ? <span className={DESC}>本实例在用</span>
             : <span className="flex flex-wrap items-center gap-2">
               {!current && <Button disabled={locked} onClick={() => join(group)} tone="quiet">加入</Button>}
-              {group.members.length === 0 && <Button disabled={locked} onClick={() => drop(group)} tone="danger">删除</Button>}
+              {!membersProblem && group.members.length === 0 && <Button disabled={locked} onClick={() => drop(group)} tone="danger">删除</Button>}
             </span>}
         </Row>)}
       </List> : <Facts>还没有共享组。</Facts>}

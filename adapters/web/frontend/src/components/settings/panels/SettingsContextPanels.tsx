@@ -2,7 +2,8 @@
 import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 
 import { errorMessage } from '../../../api/request';
-import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, isEditConflict, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type AdminSkill, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
+import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, isEditConflict, listUpstreamModels, receipted, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, skillDir, type AdminSkill, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
+import { ChannelOptions, type ChannelTableState } from '../../../console/channelFields';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
@@ -11,7 +12,7 @@ import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
-import { savedMessage } from '../../../utils/sentence';
+import { reloadBeforeEditing, savedMessage } from '../../../utils/sentence';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Button } from '../pages/settingsControls';
 import { RawFormStatus, RawSourceDetails } from '../RawSourceDetails';
@@ -52,6 +53,9 @@ function staleItemMessage(label: string): string {
   const gap = /[A-Za-z0-9]$/.test(label) ? ' ' : '';
   return `${label}${gap}打开之后被别处改过，点「刷新」读入最新内容再改。`;
 }
+
+// 「刷新」会重建编辑器，刚保存的这句提示跟着没了，所以不替人点：留着旧指纹，下次保存撞 409，不会整份盖掉。
+const unreadReceipt = (receiptProblem: string): string => reloadBeforeEditing(receiptProblem, '点「刷新」读入最新内容');
 
 const JsonBlock = ({ value }: { value: unknown }) => (
   <pre className="max-h-80 overflow-auto border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-xs leading-4 text-[var(--duties-secondary)]">
@@ -160,12 +164,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [channels, setChannels] = useState<ChannelChoice[]>([]);
   const [wires, setWires] = useState<string[]>([]);
-  // 存着的值可能是手写进 yaml 的。列不出来的选项会在保存时被悄悄换掉。
-  const providerIsListed = useMemo(
-    () => channels.some((c) => c.value === nodeConfigForm.provider)
-      || wires.includes(nodeConfigForm.provider),
-    [channels, wires, nodeConfigForm.provider],
-  );
+  const [channelTable, setChannelTable] = useState<{ state: ChannelTableState; problem: string }>({ state: 'loading', problem: '' });
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const { notice: modelFetchNote, error: modelFetchError, setMessage: setModelFetchNote, setError: setModelFetchError } = usePageNotice();
@@ -233,10 +232,14 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       return undefined;
     }
     const request = requests.begin('choices');
+    setChannelTable({ state: 'loading', problem: '' });
     Promise.all([
-      getProviders(adminToken).catch(() => undefined),
+      getProviders(adminToken).then(
+        (providers) => ({ providers, problem: '' }),
+        (caught: unknown) => ({ providers: undefined, problem: errorMessage(caught, '渠道表读取失败') }),
+      ),
       getNodes(adminToken).catch(() => undefined),
-    ]).then(([providers, nodes]) => {
+    ]).then(([{ providers, problem }, nodes]) => {
       if (!request.isCurrent()) return;
       setModelChoices(mergeModelChoices(
         modelsFromProviders(providers),
@@ -245,6 +248,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       const choices = channelChoices(providers);
       setChannels(choices.channels);
       setWires(choices.wires);
+      setChannelTable(providers ? { state: 'ready', problem: '' } : { state: 'failed', problem });
     });
     return () => { requests.drop('choices'); };
   }, [requests, adminToken, node?.id]);
@@ -260,11 +264,11 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
     setNodeYamlSaving(true);
     setNodeMessage('正在保存…');
     try {
-      const result = await updateNodeRaw(adminToken, node.id, raw, nodeBase);
+      const { result, receiptProblem } = await receipted(updateNodeRaw(adminToken, node.id, raw, nodeBase));
       resetSource(raw);
-      setNodeBase(result.hash);
+      if (result) setNodeBase(result.hash);
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage(savedMessage('节点配置已保存。', note, result.warnings));
+      setNodeMessage(savedMessage('节点配置已保存。', note, result?.warnings), result ? '' : unreadReceipt(receiptProblem));
     } catch (caught) {
       setNodeError(errorMessage(caught, '保存节点配置失败'));
     } finally {
@@ -325,23 +329,16 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
                     value={nodeConfigForm.provider}
                   >
                     <option value="">跟随活跃渠道</option>
-                    {nodeConfigForm.provider && !providerIsListed && (
-                      <option value={nodeConfigForm.provider}>{nodeConfigForm.provider}（后端不认）</option>
-                    )}
-                    {channels.length > 0 && (
-                      <optgroup label="已配渠道">
-                        {channels.map((choice) => (
-                          <option key={choice.value} value={choice.value}>{choice.label}</option>
-                        ))}
-                      </optgroup>
-                    )}
-                    <optgroup label="线格式">
-                      {wires.map((wire) => <option key={wire} value={wire}>{wire}</option>)}
-                    </optgroup>
+                    <ChannelOptions channels={channels} current={nodeConfigForm.provider} table={channelTable.state} wires={wires} />
                   </select>
                   <span className="mt-1 block text-xs text-[var(--duties-secondary)]">
                     选已配渠道会连它的地址密钥一起用；选线格式只定请求怎么发，地址得另填。
                   </span>
+                  {channelTable.state === 'failed' && (
+                    <span className="mt-1 block text-xs text-[var(--duties-danger)]" role="alert">
+                      渠道表没读到，下拉里列不出可选的渠道：{channelTable.problem}
+                    </span>
+                  )}
                 </label>
                 {/* 不用 label 包：里头那颗按钮会连带触发 label 的聚焦。 */}
                 <div className="block">
@@ -484,11 +481,11 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       // the rest of Settings reload parsed metadata. How: PUT the controlled Python
       // script and dispatch settings:tools-updated after success. Purpose: the tool
       // list can refresh after a raw script save without requiring an engine restart.
-      const result = await updateToolRaw(adminToken, tool.name, toolScript, toolBase);
+      const { result, receiptProblem } = await receipted(updateToolRaw(adminToken, tool.name, toolScript, toolBase));
       setToolBaseline(toolScript);
-      setToolBase(result.hash);
+      if (result) setToolBase(result.hash);
       window.dispatchEvent(new Event('settings:tools-updated'));
-      setToolMessage(savedMessage('工具脚本已保存。', '', result.warnings));
+      setToolMessage(savedMessage('工具脚本已保存。', '', result?.warnings), result ? '' : unreadReceipt(receiptProblem));
     } catch (caught) {
       setToolError(errorMessage(caught, '保存工具脚本失败'));
     } finally {
@@ -600,7 +597,7 @@ const skillStrategyOptions = (current: string) => (
 );
 
 export const SkillsSettingsRightPanel = () => {
-  const id = useSettingsSelectionStore(state => state.selectedSkill?.name);
+  const id = useSettingsSelectionStore(state => (state.selectedSkill ? skillDir(state.selectedSkill) : ''));
   const token = useSettingsStore(state => state.adminToken);
   const [generation, reload] = useReloadGeneration();
   return <SkillsEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
@@ -609,6 +606,7 @@ export const SkillsSettingsRightPanel = () => {
 const SkillsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const skill = useSettingsSelectionStore(state => state.selectedSkill);
+  const dir = skill ? skillDir(skill) : '';
   const source = useRawForm(SKILL_CODEC, skillSnapshotFields(skill));
   const { form: edit, reset: resetSource, update } = source;
   const [skillBase, setSkillBase] = useState<string | null>(null);
@@ -624,7 +622,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
     if (!adminToken || !skill) return undefined;
     const request = requests.begin('skill');
     setLoading(true);
-    getSkillRaw(adminToken, skill.name)
+    getSkillRaw(adminToken, dir)
       .then(({ content, hash }) => {
         if (!request.isCurrent()) return;
         resetSource(content);
@@ -634,7 +632,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
       .catch((caught) => { if (request.isCurrent()) { setLoaded(false); setError(errorMessage(caught, '加载技能失败')); } })
       .finally(() => { if (request.isCurrent()) setLoading(false); });
     return () => { requests.drop('skill'); };
-  }, [requests, adminToken, skill?.name, resetSource]);
+  }, [requests, adminToken, dir, resetSource]);
 
   const save = async () => {
     if (!adminToken || !skill || !loaded || saving) return;
@@ -647,11 +645,11 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
     setSaving(true);
     setMessage('正在保存…');
     try {
-      const result = await updateSkillRaw(adminToken, skill.name, raw, skillBase);
+      const { result, receiptProblem } = await receipted(updateSkillRaw(adminToken, dir, raw, skillBase));
       resetSource(raw);
-      setSkillBase(result.hash);
+      if (result) setSkillBase(result.hash);
       window.dispatchEvent(new Event('settings:skills-updated'));
-      setMessage(savedMessage('技能已保存。', note, result.warnings));
+      setMessage(savedMessage('技能已保存。', note, result?.warnings), result ? '' : unreadReceipt(receiptProblem));
     } catch (caught) {
       setError(errorMessage(caught, '保存技能失败'));
     } finally {
@@ -666,6 +664,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
       ) : (
         <div className="space-y-3 text-xs leading-5">
           <p><span className="text-[var(--duties-tertiary)]">名称：</span><span className="font-mono">{skill.name}</span></p>
+          {dir !== skill.name && <p><span className="text-[var(--duties-tertiary)]">目录：</span><span className="font-mono">{dir}</span></p>}
           {!loaded && !loading ? (
             <div className="space-y-2">
               {error
@@ -810,7 +809,7 @@ const McpEditor = ({ onReload }: EditorProps) => {
     try {
       const before = mcpFormForYaml(opened);
       const after = mcpFormForYaml(form);
-      const { content, note, result } = await commitYamlKeys({
+      const { content, note, result, receiptProblem } = await commitYamlKeys({
         read: () => getMcpClientsRaw(adminToken),
         write: (next, hash) => updateMcpClientsRaw(adminToken, next, hash),
         edits: (base) => mcpClientUpdateEdits(base, before, after),
@@ -820,7 +819,7 @@ const McpEditor = ({ onReload }: EditorProps) => {
       setForm(saved);
       setOpened(saved);
       window.dispatchEvent(new Event('settings:mcp-updated'));
-      setMessage(savedMessage('MCP Client 已保存。', note, result.warnings));
+      setMessage(savedMessage('MCP Client 已保存。', note, result?.warnings), receiptProblem);
     } catch (caught) {
       setError(isEditConflict(caught) ? staleItemMessage('这个 Client') : errorMessage(caught, '保存 MCP Client 失败'));
     } finally {
@@ -960,7 +959,7 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
     try {
       const before = opened;
       const after = form;
-      const { content, note, result } = await commitYamlKeys({
+      const { content, note, result, receiptProblem } = await commitYamlKeys({
         read: () => getSchedulesRaw(adminToken),
         write: (next, hash) => updateSchedulesRaw(adminToken, next, hash),
         edits: (base) => scheduleUpdateEdits(base, before, after),
@@ -970,7 +969,7 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
       setForm(saved);
       setOpened(saved);
       window.dispatchEvent(new Event('settings:schedules-updated'));
-      setMessage(savedMessage('定时任务已保存。', note, result.warnings));
+      setMessage(savedMessage('定时任务已保存。', note, result?.warnings), receiptProblem);
     } catch (caught) {
       setError(isEditConflict(caught) ? staleItemMessage('这个定时任务') : errorMessage(caught, '保存定时任务失败'));
     } finally {

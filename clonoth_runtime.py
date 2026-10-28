@@ -433,14 +433,6 @@ def task_max_running_seconds() -> float:
     return max(_MIN_TASK_MAX_RUNNING_SECONDS, value)
 
 
-def load_yaml_dict(path: Path) -> dict[str, Any] | None:
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def load_text_file(path: Path, default: str = "") -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -804,6 +796,10 @@ class _LastGoodConfig:
     def load(self, path: Path) -> dict[str, Any]:
         return copy.deepcopy(self.version(path).data)
 
+    def problem(self, path: Path) -> str:
+        """这份文件现在为什么用不了、在用的是哪份；空串表示用的就是文件里写的，或者文件不在、按 fallback 算。"""
+        return self._describe(self.version(path))
+
     def version(self, path: Path) -> _ConfigVersion:
         stamp = config_layout.file_stamp(path)
         key = str(path)
@@ -823,14 +819,15 @@ class _LastGoodConfig:
             data = None if stamp is None else self._parse(path)
         except _ConfigUnusable as exc:
             version = self._fallen_back(stamp, kept, str(exc))
-            _log.warning("%s 用不了，%s：%s", self._label, self._note(version), version.error)
+            _log.warning("%s", self._describe(version))
             return version
         if data is not None:
             return _ConfigVersion(stamp, data, adopted=True)
         if not self._keep_when_missing or kept is None:
             return _ConfigVersion(None, self._fallback(), adopted=False)
-        _log.warning("%s 不见了，%s", self._label, self._kept_note)
-        return _ConfigVersion(None, kept.data, adopted=True, error="文件不在")
+        version = _ConfigVersion(None, kept.data, adopted=True, error="文件不在")
+        _log.warning("%s", self._describe(version))
+        return version
 
     def _fallen_back(
         self, stamp: tuple[int, int, int] | None, kept: _ConfigVersion | None, error: str,
@@ -842,15 +839,22 @@ class _LastGoodConfig:
     def _note(self, version: _ConfigVersion) -> str:
         return self._kept_note if version.adopted else self._fallback_note
 
+    def _describe(self, version: _ConfigVersion) -> str:
+        if not version.error:
+            return ""
+        if version.stamp is None:
+            return f"{self._label} 不见了，{self._kept_note}"
+        return f"{self._label} 用不了，{self._note(version)}：{version.error}"
 
-def _parse_models_config(path: Path) -> dict[str, Any] | None:
+
+def _parse_mapping_file(path: Path) -> dict[str, Any] | None:
     """这一版文件的内容，空的按空配置算，文件这会儿不在了是 None。读不了、解析不了、顶层不是映射抛 _ConfigUnusable。"""
     try:
         text = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError) as exc:
-        raise _ConfigUnusable(f"读不了：{exc}") from exc
+        raise _ConfigUnusable(f"读不了：{config_layout.config_error_text(exc)}") from exc
     try:
         data = config_layout.load_yaml_text(text)
     except yaml.YAMLError as exc:
@@ -865,7 +869,7 @@ def _parse_models_config(path: Path) -> dict[str, Any] | None:
 # 文件不在是没配渠道，不是写坏，不沿用上一份。
 _MODELS_CONFIG = _LastGoodConfig(
     label=config_layout.MODELS_FILE,
-    parse=_parse_models_config,
+    parse=_parse_mapping_file,
     fallback=dict,
     keep_when_missing=False,
     kept_note="沿用上一份能用的",
@@ -879,6 +883,32 @@ def load_models_config(workspace_root: Path | str) -> dict[str, Any]:
     运行中写坏时沿用这个进程上一份读成的：Supervisor 给主渠道的那份也停在上一份，点名渠道、系统槽位和备选链才不会单独没了。
     """
     return _MODELS_CONFIG.load(config_layout.models_path(workspace_root))
+
+
+class SettingsFile:
+    """一份可有可无的 key: value 设置文件，取值时按 file_stamp 认出新版本。
+
+    不在或空着按默认值算；写坏时记一次日志、沿用这个进程上一份读成的，一份都没读成过按默认值算。
+    被删了是不要这些设置了，不是写坏，不沿用上一份。
+    """
+
+    def __init__(self, rel: str) -> None:
+        self.rel = rel
+        self._versions = _LastGoodConfig(
+            label=rel,
+            parse=_parse_mapping_file,
+            fallback=dict,
+            keep_when_missing=False,
+            kept_note="沿用上一份能用的",
+            fallback_note="各项按默认值算",
+        )
+
+    def load(self, path: Path) -> dict[str, Any]:
+        return self._versions.load(path)
+
+    def problem(self, path: Path) -> str:
+        """现在为什么用不了、在用的是哪份，健康检查报这个；空串表示用的就是文件里写的，或者文件不在。"""
+        return self._versions.problem(path)
 
 
 # 每份平台密钥文件最近告警过的那一版：同一版坏文件只告警一次。

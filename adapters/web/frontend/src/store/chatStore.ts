@@ -80,6 +80,8 @@ export interface HistoryView {
   hasMore: boolean;
   loadingOlder: boolean;
   olderError: string;
+  /** 子会话列表这一轮没读成的原因：子节点面板摆的还是上一次读成的那些，不是「没有子会话」。读成了是空串。 */
+  childrenError: string;
 }
 
 export interface SessionPaging {
@@ -142,7 +144,9 @@ const HISTORY_PAGE_SIZE = 200;
 const SESSION_PAGE_SIZE = 50;
 // Stream deltas arrive dozens per second; an unchanged phase is re-stamped at most once per interval.
 const TASK_ACTIVITY_REFRESH_MS = 1000;
-const IDLE_HISTORY: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '' };
+const IDLE_HISTORY: HistoryView = {
+  loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '',
+};
 const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
 // Only these move a conversation's sidebar timestamp; stream deltas would re-render the sidebar every frame.
 const SIDEBAR_ACTIVITY_EVENTS = new Set(['inbound_message', 'outbound_message', 'intermediate_reply', ...TERMINAL_TASK_EVENTS]);
@@ -1304,7 +1308,11 @@ async function syncConversation(conversationId: string, set: StoreSetter, get: S
       : { ...state.generatingBySession, [sessionId]: running };
 
     let chat: ChatStoreState = state;
-    const view: Partial<HistoryView> = { loading: false, error: '' };
+    const view: Partial<HistoryView> = {
+      loading: false,
+      error: '',
+      childrenError: children.status === 'fulfilled' ? '' : errorMessage(children.reason, '子会话列表读取失败'),
+    };
     if (history.status === 'fulfilled') {
       const applied = applyHistoryPage(state, conversationId, sessionId, history.value, 'latest', keepLive);
       chat = applied.chat;

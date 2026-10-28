@@ -223,6 +223,11 @@ def memory_dir(workspace_root: Path | str, namespace: Any = "") -> Path:
     return directory
 
 
+def memory_book_files(directory: Path) -> list[Path]:
+    """一个 namespace 目录里的记忆本。名字是 *.yaml 的目录不算：读它只会报读不了，清空时也删不掉。"""
+    return sorted(path for path in directory.glob("*.yaml") if path.is_file())
+
+
 def namespace_dirs(workspace_root: Path | str) -> list[Path]:
     """data/memory 下实际存在的各个 namespace 目录，名字合不合规都列出来。
 

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from engine.conversation_migration import RekeyConflict
+from engine.memory_hit_cache import HitCacheUnreadable, read_hit_cache
 from platforms.account_ops import AccountConflict, AccountOps, AccountOpsError, AccountRequestInvalid, AccountUnreachable
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import HOOK_ACCOUNT_OPS, PlatformDescriptor
@@ -90,8 +91,9 @@ def _remember_account(state: SupervisorState, platform: PlatformDescriptor, acco
     try:
         record_account(state.workspace_root, prefix=url_prefix(), platform_id=platform.id, account=text)
     except (OSError, InstanceDirectoryError) as exc:
-        _log.warning("实例清单没记上 %s 的新账号 %s：%s", platform.id, text, exc)
-        return {"roster_error": f"号已经换上，但没记进实例清单，别的实例拦不住同一个号重复登录：{exc}"}
+        reason = exc.reason if isinstance(exc, InstanceDirectoryError) else str(exc)
+        _log.warning("实例清单没记上 %s 的新账号 %s：%s", platform.id, text, reason)
+        return {"roster_error": f"号已经换上，但没记进实例清单，别的实例拦不住同一个号重复登录：{reason}"}
     return {}
 
 
@@ -99,7 +101,12 @@ async def switch_account(
     state: SupervisorState, platform: PlatformDescriptor, ops: AccountOps, account: str,
 ) -> dict[str, Any]:
     target = normalize_id(account, platform.id_shape)
-    owner = account_owner(state.workspace_root, platform.id, target, prefix=url_prefix())
+    try:
+        owner = account_owner(state.workspace_root, platform.id, target, prefix=url_prefix())
+    except InstanceDirectoryError as exc:
+        raise HTTPException(
+            status_code=503, detail=f"查不了 {target} 是不是已经登在别的实例上，没有换号：{exc.reason}",
+        ) from exc
     if owner is not None:
         # 同一个号两边登，会互相把对方踢下线，数据也会分成两份。
         raise HTTPException(status_code=409, detail=f"{target} 归实例 {owner['label']} 管，去它的控制台登录")
@@ -233,6 +240,18 @@ def scope_status(
     return payload
 
 
+def _hit_cache_problem(state: SupervisorState, report: Any) -> str:
+    """搬了记忆目录、命中记录却读不了时的原因：里面的 key 没跟着改名，修好之前它们对不上搬过去的记忆。"""
+    if not report.moved_dirs or report.hit_keys_rewritten:
+        return ""
+    # 迁移脚本的报告里没有这一项：搬完紧接着再读一次，读不了就是改名那一步也跳过了。
+    try:
+        read_hit_cache(state.workspace_root)
+    except HitCacheUnreadable as exc:
+        return exc.reason
+    return ""
+
+
 def migrate_scope(
     state: SupervisorState, platform: PlatformDescriptor, request: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -260,10 +279,17 @@ def migrate_scope(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     reloaded = state.reload_session_registry()
+    hit_cache_problem = _hit_cache_problem(state, report)
+    if hit_cache_problem:
+        _log.warning(
+            "%s 的账号搬迁做完了，记忆命中记录读不了、没跟着改名（%s）；修好它时照这份对照把旧前缀换掉：%s",
+            platform.id, hit_cache_problem, ", ".join(f"{old} -> {new}" for old, new in report.moved_dirs),
+        )
     _audit(
         state, "platform_scope_migrated", platform,
         source_scope=report.source_scope, target_scope=report.target_scope,
         moved=len(report.moved_dirs), sessions=report.sessions_changed,
+        hit_cache_problem=hit_cache_problem,
     )
     return {
         "ok": True,
@@ -271,6 +297,7 @@ def migrate_scope(
         "target_scope": report.target_scope,
         "moved_memory_dirs": len(report.moved_dirs),
         "hit_keys_rewritten": report.hit_keys_rewritten,
+        "hit_cache_problem": hit_cache_problem,
         "route_keys_changed": report.route_keys_changed,
         "sessions_changed": report.sessions_changed,
         "sessions_reloaded": reloaded,

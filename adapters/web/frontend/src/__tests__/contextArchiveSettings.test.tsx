@@ -141,6 +141,23 @@ describe('压缩上下文归档保留设置', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('归档保留设置已保存。engine.other_setting 没有任何地方读');
   });
 
+  // 写已经落盘了：报成失败，草稿留着，人会再存一次。下一次保存先现读最新一版再逐键核对，不靠这份回执。
+  it('回执没读懂也按已保存收尾，原因另起一行，接着改还存得下去', async () => {
+    await open(); change('21');
+    vi.mocked(api.updateRuntimeRaw).mockRejectedValueOnce(new api.ReceiptUnreadable('runtime.yaml 已经存上，可回执格式不对：缺 hash'));
+    fireEvent.click(save());
+
+    expect(await screen.findByRole('status')).toHaveTextContent('归档保留设置已保存。');
+    expect(screen.getByRole('alert')).toHaveTextContent('runtime.yaml 已经存上，可回执格式不对：缺 hash');
+    expect(input()).toHaveValue('21'); expect(save()).toBeDisabled();
+
+    vi.mocked(api.getRuntimeFile).mockResolvedValue(raw(21, 'version-2'));
+    change('22'); fireEvent.click(save());
+    await waitFor(() => expect(api.updateRuntimeRaw).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.updateRuntimeRaw).mock.calls[1][2]).toBe('version-2');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('加载失败可重试，不提供伪造默认值保存', async () => {
     vi.mocked(api.getRuntimeFile).mockRejectedValueOnce(new api.ApiError(503, 'unavailable'));
     render(<ContextArchiveSettings />); await screen.findByText('503 unavailable');

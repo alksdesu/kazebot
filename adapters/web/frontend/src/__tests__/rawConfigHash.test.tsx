@@ -55,16 +55,18 @@ describe('读回来的原文带着指纹', () => {
     expect(fetch).toHaveBeenCalledExactlyOnceWith(`/v1${CONFIG}`, { headers: AUTH, signal: expect.any(AbortSignal) });
   });
 
-  it('老后端不给指纹就是 null，保存时照旧整份覆盖', async () => {
-    serveRead(CONFIG, { content: 'a: 1\n' });
+  // 拿 null 顶上，保存时不带指纹，真文件被整份盖掉；拿空串顶上，编辑器摆出一份空文件，照着存就清空了。
+  it.each([
+    [{ content: 'a: 1\n' }, '缺 hash'],
+    [{ content: 'a: 1\n', hash: null }, 'hash 不是字符串'],
+    [{ content: 'a: 1\n', hash: 12345 }, 'hash 不是字符串'],
+    [{ hash: 'h1' }, '缺 content'],
+    [{ content: null, hash: 'h1' }, 'content 不是字符串'],
+    [[], '返回的不是 JSON 对象'],
+  ])('正文或指纹对不上形状就报格式不对，不拿空串、null 顶上（%j）', async (body, problem) => {
+    serveRead(CONFIG, body);
 
-    await expect(api.getConfigRaw(TOKEN)).resolves.toEqual({ content: 'a: 1\n', hash: null });
-  });
-
-  it('指纹不是字符串一律当没有', async () => {
-    serveRead(CONFIG, { content: 'a: 1\n', hash: 12345 });
-
-    await expect(api.getConfigRaw(TOKEN)).resolves.toEqual({ content: 'a: 1\n', hash: null });
+    await expect(api.getConfigRaw(TOKEN)).rejects.toThrow(`models.yaml 原文格式不对：${problem}`);
   });
 
   it('文件还不存在时后端给空串，那也是一份指纹', async () => {
@@ -73,10 +75,23 @@ describe('读回来的原文带着指纹', () => {
     await expect(api.getConfigRaw(TOKEN)).resolves.toEqual({ content: '', hash: '' });
   });
 
-  it('正文缺失时给空串，不把 undefined 递给编辑器', async () => {
-    serveRead(CONFIG, { hash: 'h1' });
+  it('报错说的是哪一份文件', async () => {
+    const cases: Array<[string, () => Promise<unknown>, string]> = [
+      [RUNTIME, () => api.getRuntimeRaw(TOKEN), 'runtime.yaml 原文'],
+      ['/admin/config/policy/raw', () => api.getPolicyRaw(TOKEN), 'policy.yaml 原文'],
+      ['/admin/config/schedules/raw', () => api.getSchedulesRaw(TOKEN), 'schedules.yaml 原文'],
+      ['/admin/config/mcp-clients/raw', () => api.getMcpClientsRaw(TOKEN), 'mcp.yaml 原文'],
+      ['/admin/config/nodes/a%20b/raw', () => api.getNodeRaw(TOKEN, 'a b'), '节点 a b 的原文'],
+      ['/admin/config/node-files/x.yaml/raw', () => api.getNodeFileRaw(TOKEN, 'x.yaml'), '节点文件 x.yaml 的原文'],
+      ['/admin/config/tools/t/raw', () => api.getToolRaw(TOKEN, 't'), '工具 t 的源码'],
+      ['/admin/config/skills/s/raw', () => api.getSkillRaw(TOKEN, 's'), '技能 s 的原文'],
+      ['/admin/config/drawtools/settings/raw', () => api.getDrawtoolsSettingsRaw(TOKEN), '绘图 settings.yaml 原文'],
+      ['/admin/config/drawtools/characters/raw', () => api.getDrawtoolsCharactersRaw(TOKEN), '绘图 character_tags.yaml 原文'],
+      ['/admin/config/drawtools/prompts/top-system/raw', () => api.getDrawtoolsPromptRaw(TOKEN, 'top-system'), '绘图提示词 top-system 的原文'],
+    ];
+    for (const [path] of cases) serveRead(path, { content: 'x: 1\n' });
 
-    await expect(api.getConfigRaw(TOKEN)).resolves.toEqual({ content: '', hash: 'h1' });
+    for (const [, read, what] of cases) await expect(read()).rejects.toThrow(`${what}格式不对：缺 hash`);
   });
 
   it('runtime 连来源、路径和指纹一起读回来', async () => {
@@ -97,6 +112,27 @@ describe('读回来的原文带着指纹', () => {
     serveRead('/features/config/raw', { content: 'vision: {}\n', hash: 'f1', exists: true });
 
     await expect(api.getFeaturesRaw(TOKEN)).resolves.toEqual({ content: 'vision: {}\n', hash: 'f1', exists: true });
+  });
+
+  it('还没接管的平台配置给的是空正文、空指纹、exists 为假', async () => {
+    serveRead('/platforms/qq/config/raw', { content: '', hash: '', exists: false });
+
+    await expect(api.getPlatformRaw(TOKEN, 'qq')).resolves.toEqual({ content: '', hash: '', exists: false });
+  });
+
+  // 缺了 exists，「还没接管」和「接管了但是空的」就分不开；缺了指纹，结构化写回不带基准。
+  it.each([
+    ['/platforms/qq/config/raw', () => api.getPlatformRaw(TOKEN, 'qq'), '平台 qq 的配置原文'],
+    ['/features/config/raw', () => api.getFeaturesRaw(TOKEN), 'features.yaml 原文'],
+  ])('平台和功能配置缺了指纹或 exists 都报格式不对（%s）', async (path, read, what) => {
+    serveRead(path, { content: 'x: 1\n', exists: true });
+    await expect(read()).rejects.toThrow(`${what}格式不对：缺 hash`);
+
+    serveRead(path, { content: 'x: 1\n', hash: 'h1' });
+    await expect(read()).rejects.toThrow(`${what}格式不对：缺 exists`);
+
+    serveRead(path, { content: 'x: 1\n', hash: 'h1', exists: 'yes' });
+    await expect(read()).rejects.toThrow(`${what}格式不对：exists 不是 true 或 false`);
   });
 });
 
@@ -136,10 +172,48 @@ describe('保存时交回指纹', () => {
     ]);
   });
 
-  it('后端不回指纹就是 null，下一次保存不拿旧的顶上', async () => {
-    serveWrite(CONFIG, { ok: true });
+  // 回执是存完才发的：拿 null 当下一次的基准，保存时不带指纹，别处的改动会被整份盖掉；当成失败，人会再存一次。
+  it.each([
+    [{ ok: true }, 'models.yaml 已经存上，可回执格式不对：缺 hash'],
+    [{ ok: true, hash: null }, 'models.yaml 已经存上，可回执格式不对：hash 不是字符串'],
+    [{ hash: 'h2' }, 'models.yaml 已经存上，可回执格式不对：缺 ok'],
+    [{ ok: true, hash: 'h2', warnings: 'x' }, 'models.yaml 已经存上，可回执格式不对：warnings 不是字符串数组'],
+  ])('回执对不上形状时抛 ReceiptUnreadable，说清已经存上（%j）', async (body, message) => {
+    serveWrite(CONFIG, body);
 
-    await expect(api.updateConfigRaw(TOKEN, 'a: 2\n', 'h1')).resolves.toEqual({ ok: true, hash: null });
+    const failure = await api.updateConfigRaw(TOKEN, 'a: 2\n', 'h1').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(api.ReceiptUnreadable);
+    expect((failure as Error).message).toBe(message);
+  });
+
+  it('回执不是 JSON 也算回执读不懂，不算没存上', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>', { status: 200 })));
+
+    const failure = await api.updateConfigRaw(TOKEN, 'a: 2\n', 'h1').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(api.ReceiptUnreadable);
+    expect((failure as Error).message).toBe('models.yaml 已经存上，可回执不是 JSON');
+  });
+
+  it.each([
+    ['节点 n', () => api.createNode(TOKEN, { id: 'n', content: 'id: n\n' }), '/admin/config/nodes'],
+    ['工具 t', () => api.createTool(TOKEN, { id: 't', content: 'print(1)\n' }), '/admin/config/tools'],
+    ['技能 s', () => api.createSkill(TOKEN, { id: 's', content: '# s\n' }), '/admin/config/skills'],
+  ])('新建文件的回执读不懂时说清%s已经建好', async (what, create, path) => {
+    routes[key('POST', `/v1${path}`)] = { ok: true };
+
+    const failure = await create().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(api.ReceiptUnreadable);
+    expect((failure as Error).message).toBe(`${what} 已经建好，可回执格式不对：缺 hash`);
+  });
+
+  it('新建文件的回执带着落盘那一版的指纹和提醒', async () => {
+    routes[key('POST', '/v1/admin/config/nodes')] = { ok: true, hash: 'n1', path: 'config/nodes/n.yaml', warnings: ['没人读 foo'] };
+
+    await expect(api.createNode(TOKEN, { id: 'n', content: 'id: n\n' }))
+      .resolves.toEqual({ ok: true, hash: 'n1', warnings: ['没人读 foo'] });
   });
 
   it('后端明说 ok:false 才算没存上', async () => {
@@ -154,6 +228,26 @@ describe('保存时交回指纹', () => {
     await expect(api.updatePlatformRaw(TOKEN, 'qq', 'qq: {a: 1}\n', 'q1'))
       .resolves.toEqual({ ok: true, hash: 'q2', warnings: ['bot 没在跑'] });
     expect(writes('/platforms/qq/config/raw')).toEqual([{ content: 'qq: {a: 1}\n', base_hash: 'q1' }]);
+  });
+
+  // 平台和全局设置的回执总带 warnings：缺了它就分不出「没有提醒」和「提醒没送到」。
+  it.each([
+    [{ ok: true, warnings: [] }, '平台 qq 的配置已经存上，可回执格式不对：缺 hash'],
+    [{ ok: true, hash: 'q2' }, '平台 qq 的配置已经存上，可回执格式不对：缺 warnings'],
+  ])('平台配置的回执对不上形状时抛 ReceiptUnreadable（%j）', async (body, message) => {
+    serveWrite('/platforms/qq/config/raw', body);
+
+    const failure = await api.updatePlatformRaw(TOKEN, 'qq', 'qq: {a: 1}\n', 'q1').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(api.ReceiptUnreadable);
+    expect((failure as Error).message).toBe(message);
+  });
+
+  it('全局设置的回执读不懂时说的是 features.yaml', async () => {
+    serveWrite('/features/config/raw', { ok: true, warnings: [] });
+
+    await expect(api.updateFeaturesRaw(TOKEN, 'vision: {}\n', 'f1'))
+      .rejects.toThrow('features.yaml 已经存上，可回执格式不对：缺 hash');
   });
 
   it('功能配置不给指纹时同样不带 base_hash', async () => {
@@ -178,7 +272,8 @@ describe('保存时交回指纹', () => {
       ['/admin/config/drawtools/characters/raw', () => api.updateDrawtoolsCharactersRaw(TOKEN, 'characters: []\n', 'b')],
       ['/admin/config/drawtools/prompts/top-system/raw', () => api.updateDrawtoolsPromptRaw(TOKEN, 'top-system', 'top\n', 'b')],
     ];
-    for (const [, call] of cases) await call();
+    for (const [path] of cases) serveWrite(path, { ok: true, hash: 'next' });
+    for (const [, call] of cases) await expect(call()).resolves.toMatchObject({ hash: 'next' });
 
     for (const [path] of cases) expect(writes(path)[0]).toMatchObject({ base_hash: 'b' });
     expect(sent.filter(call => call.method === 'PUT')).toHaveLength(cases.length);
@@ -192,10 +287,45 @@ describe('服务端策略也按指纹保存', () => {
     await expect(api.getPolicy(TOKEN)).resolves.toEqual({ policy: { version: 1 }, hash: 'p1' });
   });
 
-  it('后端没给 policy 字段时给一份空文档，渲染不至于直接炸', async () => {
-    serveRead('/config/policy', {});
+  // 补成空文档的话，页面会把每一类都摆成「没有规则」，照着存一次就把整份策略清空了。
+  it.each([
+    [{}, '缺 policy'],
+    [{ policy: [], hash: 'p1' }, 'policy 不是 JSON 对象'],
+    [{ policy: { version: 1 } }, '缺 hash'],
+    [{ policy: { version: 1 }, hash: null }, 'hash 不是字符串'],
+  ])('读回来对不上形状就报格式不对，不给一份空文档（%j）', async (body, problem) => {
+    serveRead('/config/policy', body);
 
-    await expect(api.getPolicy(TOKEN)).resolves.toEqual({ policy: {}, hash: null });
+    await expect(api.getPolicy(TOKEN)).rejects.toThrow(`服务端策略格式不对：${problem}`);
+  });
+
+  it('策略文件还不存在时指纹是空串，照常读', async () => {
+    serveRead('/config/policy', { policy: { version: 1 }, hash: '' });
+
+    await expect(api.getPolicy(TOKEN)).resolves.toEqual({ policy: { version: 1 }, hash: '' });
+  });
+
+  // 回执是存完才发的：读不懂也得让页面知道已经存上了，免得当成失败再存一次。
+  it.each([
+    [{ policy: { version: 2 } }, '策略已经存上，可回执格式不对：缺 hash'],
+    [{ hash: 'p2' }, '策略已经存上，可回执格式不对：缺 policy'],
+  ])('保存的回执对不上形状时抛 ReceiptUnreadable，说清已经存上（%j）', async (body, message) => {
+    routes[key('PUT', '/v1/config/policy')] = body;
+
+    const failure = await api.updatePolicy(TOKEN, { version: 2 }, 'p1').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(api.ReceiptUnreadable);
+    expect((failure as Error).message).toBe(message);
+  });
+
+  it('保存被拒（409）是请求失败，不是回执读不懂', async () => {
+    statuses[key('PUT', '/v1/config/policy')] = 409;
+    routes[key('PUT', '/v1/config/policy')] = { detail: 'policy.yaml 已被别处改过，刷新后再改' };
+
+    const failure = await api.updatePolicy(TOKEN, { version: 2 }, 'p1').catch((error: unknown) => error);
+
+    expect(api.isEditConflict(failure)).toBe(true);
+    expect(failure).not.toBeInstanceOf(api.ReceiptUnreadable);
   });
 
   it('保存带 base_hash，结果里换成新指纹', async () => {
@@ -272,53 +402,63 @@ describe('认出编辑冲突', () => {
   });
 });
 
+const FIRST = [
+  'shell:',
+  '  entry_node_id: qq.orchestrator',
+  'routing:',
+  '  vision:',
+  '    enabled: auto',
+  '',
+].join('\n');
+
+const jsonReply = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
+  status, headers: { 'Content-Type': 'application/json' },
+});
+
+/**
+ * 真后端那套：保存时指纹对不上就 409，一个字节都不写，存一次指纹换一版。
+ * receipt 给了就拿它当存完的回执；rereadFails 时存过之后再读 runtime 都回 500。
+ */
+const serveRuntime = ({ receipt, rereadFails = false }: { receipt?: unknown; rereadFails?: boolean } = {}) => {
+  let content = FIRST;
+  let version = 1;
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = String(input);
+    const method = (init.method ?? 'GET').toUpperCase();
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    sent.push({ url, method, body });
+    const hash = `r${version}`;
+    if (url.endsWith(`/v1${RUNTIME}`) && method === 'PUT') {
+      if (body.base_hash !== hash) return jsonReply({ detail: 'runtime.yaml 已被别处改过，刷新后再改' }, 409);
+      content = body.content;
+      version += 1;
+      return jsonReply(receipt ?? { ok: true, hash: `r${version}` });
+    }
+    if (url.endsWith(`/v1${RUNTIME}`)) {
+      if (rereadFails && version > 1) return jsonReply({ detail: '磁盘忙' }, 500);
+      return jsonReply({ content, hash, source: 'override', path: 'config/runtime.yaml' });
+    }
+    return jsonReply({});
+  }));
+};
+
+const runtimeSection = () => screen.getByText('运行时配置 (runtime.yaml)').closest('details')!;
+
+const openRuntime = async () => {
+  const element = runtimeSection();
+  element.open = true;
+  fireEvent(element, new Event('toggle'));
+  fireEvent.click(within(element).getByRole('button', { name: '加载' }));
+  await waitFor(() => expect(screen.getByLabelText('runtime.yaml YAML 编辑器')).toHaveValue(FIRST));
+};
+
+const saveRuntime = (content: string) => {
+  fireEvent.change(screen.getByLabelText('runtime.yaml YAML 编辑器'), { target: { value: content } });
+  fireEvent.click(within(runtimeSection()).getByRole('button', { name: '保存运行时配置' }));
+};
+
 // 同一份 runtime.yaml 两个编辑器同时开着：指纹各记各的，一边存完不会顺手把另一边的底子换新。
 describe('一份文件上的两个编辑器', () => {
-  const FIRST = [
-    'shell:',
-    '  entry_node_id: qq.orchestrator',
-    'routing:',
-    '  vision:',
-    '    enabled: auto',
-    '',
-  ].join('\n');
-
-  /** 真后端那套：保存时指纹对不上就 409，一个字节都不写。 */
-  const serveRuntime = () => {
-    let content = FIRST;
-    let hash = 'r1';
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
-      const url = String(input);
-      const method = (init.method ?? 'GET').toUpperCase();
-      const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
-      sent.push({ url, method, body });
-      if (url.endsWith(`/v1${RUNTIME}`) && method === 'PUT') {
-        if (body.base_hash !== hash) {
-          return new Response(JSON.stringify({ detail: 'runtime.yaml 已被别处改过，刷新后再改' }), {
-            status: 409, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        content = body.content;
-        hash = 'r2';
-        return new Response(JSON.stringify({ ok: true, hash }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      const payload = url.endsWith(`/v1${RUNTIME}`)
-        ? { content, hash, source: 'override', path: 'config/runtime.yaml' }
-        : {};
-      return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }));
-  };
-
-  const runtimeSection = () => screen.getByText('运行时配置 (runtime.yaml)').closest('details')!;
-
-  const openRuntime = async () => {
-    const element = runtimeSection();
-    element.open = true;
-    fireEvent(element, new Event('toggle'));
-    fireEvent.click(within(element).getByRole('button', { name: '加载' }));
-    await waitFor(() => expect(screen.getByLabelText('runtime.yaml YAML 编辑器')).toHaveValue(FIRST));
-  };
-
   it('一边存完，另一边拿着自己那份旧指纹去存，撞上冲突而不是静默盖掉', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     useSettingsStore.setState({ adminToken: TOKEN, isAuthenticated: true });
@@ -368,5 +508,45 @@ describe('一份文件上的两个编辑器', () => {
 
     expect(await screen.findByText('已保存')).toBeInTheDocument();
     expect(writes(RUNTIME).map(body => body.base_hash)).toEqual(['r1', 'r2']);
+  });
+});
+
+// 回执读不懂时文件已经写下去了：说成保存失败，人会再存一次；手上的指纹不换，下一次保存就撞冲突。
+describe('原文编辑器保存的回执读不懂', () => {
+  beforeEach(() => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    useSettingsStore.setState({ adminToken: TOKEN, isAuthenticated: true });
+  });
+
+  it('照存上了收尾，重读一遍换上落盘那一版的指纹', async () => {
+    serveRuntime({ receipt: { ok: true } });
+    render(<AdvancedSettingsPage />);
+    await openRuntime();
+
+    saveRuntime(`${FIRST}engine:\n  max_workers: 8\n`);
+
+    expect(await screen.findByText('已保存')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('runtime.yaml 已经存上，可回执格式不对：缺 hash');
+    expect(screen.queryByText(/保存失败/)).toBeNull();
+    await waitFor(() => expect(sent.filter(call => call.method === 'GET' && call.url === `/v1${RUNTIME}`)).toHaveLength(2));
+
+    saveRuntime(`${FIRST}engine:\n  max_workers: 9\n`);
+
+    await waitFor(() => expect(writes(RUNTIME).map(body => body.base_hash)).toEqual(['r1', 'r2']));
+  });
+
+  it('重读也没成就留着旧指纹，交代先点「加载」再改', async () => {
+    serveRuntime({ receipt: { ok: true }, rereadFails: true });
+    render(<AdvancedSettingsPage />);
+    await openRuntime();
+
+    saveRuntime(`${FIRST}engine:\n  max_workers: 8\n`);
+
+    expect(await screen.findByText('已保存')).toBeInTheDocument();
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('runtime.yaml 已经存上，可回执格式不对：缺 hash');
+    expect(alert).toHaveTextContent('点「加载」读入最新内容再改，不然再存会被当成冲突拒掉');
+    expect(alert).toHaveTextContent('刚才重新读取也没成：500 磁盘忙');
+    expect(screen.getByLabelText('runtime.yaml YAML 编辑器')).toHaveValue(`${FIRST}engine:\n  max_workers: 8\n`);
   });
 });

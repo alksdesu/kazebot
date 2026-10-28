@@ -135,6 +135,18 @@ class TestListing:
             },
         ]
 
+    def test_an_unreadable_roster_is_reported_instead_of_listed_as_empty(self, call, workspace: Path) -> None:
+        # 控制台拿空表当单实例，换号前的双登检查就一律放行了。
+        roster = workspace / "kazebot-data" / "instances.yaml"
+        roster.write_text("instances:\n  - id: koki\n    account: qq-SECRET-account: x\n", encoding="utf-8")
+
+        response = call("GET", "/v1/instances")
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert str(roster) in detail and "第 3 行第 31 列：mapping values are not allowed here" in detail
+        assert "qq-SECRET" not in detail
+
     def test_listing_carries_an_active_provisioning_job_for_page_recovery(
         self, call, workspace: Path,
     ) -> None:
@@ -272,6 +284,22 @@ class TestCreate:
         assert response.status_code == 400 and "已经归实例 主号 管了" in response.json()["detail"]
         assert units == []
 
+    def test_an_unreadable_roster_stops_creation_and_says_where_it_broke(
+        self, call, units: list[str], scaffolded: list[provisioning.Plan], workspace: Path,
+    ) -> None:
+        # 坏的是服务器上的文件，不是请求：只说「读不懂」，管理员不知道去修哪一行。
+        roster = workspace / "kazebot-data" / "instances.yaml"
+        roster.write_text("instances:\n  - id: koki\n    account: qq-SECRET-account: x\n", encoding="utf-8")
+
+        response = call("POST", "/v1/instances", json={"id": "xiaoyu"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here。先在服务器上修好它"
+        )
+        assert "qq-SECRET" not in response.text
+        assert scaffolded == [] and units == []
+
     def test_a_body_that_is_not_an_object_is_refused(self, call, units: list[str]) -> None:
         response = call("POST", "/v1/instances", json=["koki"])
 
@@ -343,6 +371,20 @@ class TestDelete:
         call("DELETE", "/v1/instances/koki")
 
         assert call("GET", "/v1/instances").json()["instances"][0]["id"] == "koki"
+
+    def test_an_unreadable_roster_stops_removal_and_says_where_it_broke(
+        self, call, units: list[str], workspace: Path,
+    ) -> None:
+        roster = workspace / "kazebot-data" / "instances.yaml"
+        roster.write_text("instances: [ this is: not: valid\n", encoding="utf-8")
+
+        response = call("DELETE", "/v1/instances/koki")
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail.startswith(f"实例清单 {roster} 读不懂：第 1 行") and detail.endswith("。先在服务器上修好它")
+        assert "this is" not in detail
+        assert units == []
 
     @pytest.mark.parametrize("name,prefix,refusal", [
         ("koki", "/i/koki", "正在用"),

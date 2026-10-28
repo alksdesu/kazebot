@@ -123,6 +123,27 @@ describe('节点编辑器', () => {
     expect(confirm).not.toHaveBeenCalled();
   });
 
+  // 「刷新」会把编辑器连同刚保存的提示一起重建，所以不替人点：留着旧指纹，下次保存撞冲突，不会整份盖掉。
+  it('保存的回执没读懂：照存上了收尾、不说保存失败，留着旧指纹并交代先点「刷新」', async () => {
+    vi.mocked(api.updateNodeRaw).mockRejectedValueOnce(new api.ReceiptUnreadable('节点 qq.alpha 已经存上，可回执格式不对：缺 hash'));
+    await open();
+
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '新名字' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存节点配置' }));
+
+    expect(await screen.findByText('节点配置已保存。')).toBeInTheDocument();
+    expect(screen.getByText(/^节点 qq\.alpha 已经存上/)).toHaveTextContent(
+      '节点 qq.alpha 已经存上，可回执格式不对：缺 hash。点「刷新」读入最新内容再改，不然再存会被当成冲突拒掉',
+    );
+    expect(screen.getByText(/^节点 qq\.alpha 已经存上/)).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/保存节点配置失败/)).toBeNull();
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '再改一次' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存节点配置' }));
+    await waitFor(() => expect(api.updateNodeRaw).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(api.updateNodeRaw).mock.calls.map(call => call[3])).toEqual(['node-1', 'node-1']);
+  });
+
   it('读不出来的节点也留着「刷新」，不然这一栏只能换个节点再换回来', async () => {
     vi.mocked(api.getNodeRaw).mockRejectedValueOnce(new Error('500 读不到节点文件'));
     useSettingsSelectionStore.setState({ selectedNode: { id: 'qq.alpha', type: 'ai' } as any });
@@ -266,6 +287,30 @@ describe('MCP Client 按项保存', () => {
     edit('第一次');
     save();
     await waitFor(() => expect(api.updateMcpClientsRaw).toHaveBeenCalledOnce());
+    edit('第二次');
+    save();
+    await waitFor(() => expect(api.updateMcpClientsRaw).toHaveBeenCalledTimes(2));
+
+    expect(screen.queryByText(STALE)).toBeNull();
+    expect(yaml.load(onDisk)).toMatchObject({ clients: { alpha: { description: '第二次' } } });
+  });
+
+  // 按项保存每次都先现读再合并，下一次不靠这份回执的指纹，所以不必叫人先刷新。
+  it('回执没读懂照存上了收尾，接着再存也不误报冲突', async () => {
+    await open();
+    let onDisk = mcpRaw('原来的说明');
+    vi.mocked(api.getMcpClientsRaw).mockImplementation(async () => rawText(onDisk, 'mcp-x'));
+    vi.mocked(api.updateMcpClientsRaw).mockImplementation(async (_token, content) => {
+      onDisk = content;
+      throw new api.ReceiptUnreadable('mcp.yaml 已经存上，可回执格式不对：缺 hash');
+    });
+
+    edit('第一次');
+    save();
+
+    expect(await screen.findByText('MCP Client 已保存。')).toBeInTheDocument();
+    expect(screen.getByText('mcp.yaml 已经存上，可回执格式不对：缺 hash')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/保存 MCP Client 失败/)).toBeNull();
     edit('第二次');
     save();
     await waitFor(() => expect(api.updateMcpClientsRaw).toHaveBeenCalledTimes(2));

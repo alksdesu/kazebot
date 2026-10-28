@@ -189,6 +189,23 @@ describe('实例管理入口', () => {
     expect(api.switchPlatformAccount).not.toHaveBeenCalled();
   });
 
+  // 后端读不懂 instances.yaml 时回 503 带原因：当成单实例的话，同一个号就能在两个实例上登。
+  it('后端说实例清单读不懂时，实例列表和快速切换都把原因说出来', async () => {
+    const reason = '实例清单 /srv/kazebot-data/instances.yaml 读不懂：第 3 行第 31 列：mapping values are not allowed here';
+    vi.mocked(api.getInstances).mockRejectedValue(new api.ApiError(503, reason));
+    vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
+    render(<AccountWorkspaceSlot />);
+
+    expect(await screen.findByText(`503 ${reason}`)).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/还没启用多开/)).toBeNull();
+    expect(screen.queryByRole('button', { name: '建实例' })).toBeNull();
+    expect(await screen.findByText(
+      `实例归属尚未确认：503 ${reason}。查清这些号有没有登在别的实例上之前，不能从这里免扫码切号。`,
+    )).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '切到这个号' })).toBeDisabled();
+    expect(api.switchPlatformAccount).not.toHaveBeenCalled();
+  });
+
   it('实例整页跳转沿用原生离开保护，未放行时保留实例与草稿', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     render(<AccountWorkspaceSlot />);

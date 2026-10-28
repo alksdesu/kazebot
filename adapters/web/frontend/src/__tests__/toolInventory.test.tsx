@@ -130,7 +130,7 @@ describe('工具右栏', () => {
   });
 
   it('外部工具照旧能编辑', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n', hash: 'tool-1' })));
     useSettingsSelectionStore.setState({ selectedTool: CATALOG[2] as never });
 
     render(<ToolsSettingsRightPanel />);
@@ -139,7 +139,7 @@ describe('工具右栏', () => {
   });
 
   it('改仓库自带的那份之前先说清楚保存落到哪', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n', hash: 'tool-1' })));
     useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'bundled' } as never });
 
     render(<ToolsSettingsRightPanel />);
@@ -148,7 +148,7 @@ describe('工具右栏', () => {
   });
 
   it('已经是本实例那份就改说去哪恢复默认', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n', hash: 'tool-1' })));
     useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'override' } as never });
 
     render(<ToolsSettingsRightPanel />);
@@ -157,7 +157,7 @@ describe('工具右栏', () => {
   });
 
   it('自建的和老后端不给来源的都不摆这句', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n', hash: 'tool-1' })));
     useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'custom' } as never });
 
     render(<ToolsSettingsRightPanel />);

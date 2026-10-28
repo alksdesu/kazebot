@@ -5,6 +5,7 @@ import {
   enableCodeWrite,
   getPolicy,
   isEditConflict,
+  ReceiptUnreadable,
   updatePolicy,
   type ApprovalGrantSettings,
   type PolicyDecision,
@@ -16,6 +17,7 @@ import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
+import { appendSentence } from '../../../utils/sentence';
 import { Button, Check, DangerPanel, ErrorText, SaveBar, ScopeBadge } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
@@ -610,23 +612,34 @@ export const PolicyRulesSection = () => {
     setBusy(true);
     setMessage('');
     try {
-      const next = await updatePolicy(adminToken, doc, base);
-      if (!requests.isCurrent()) return;
-      setDoc(next.policy);
-      setSaved(JSON.stringify(next.policy));
-      setBase(next.hash);
+      let receiptProblem = '';
+      try {
+        const next = await updatePolicy(adminToken, doc, base);
+        if (!requests.isCurrent()) return;
+        setDoc(next.policy);
+        setSaved(JSON.stringify(next.policy));
+        setBase(next.hash);
+      } catch (caught) {
+        if (!(caught instanceof ReceiptUnreadable)) throw caught;
+        if (!requests.isCurrent()) return;
+        // 存上了，只是回执读不懂：重读服务器上那一份，草稿不能冒充存好的，底子也得换成落盘那一版的指纹。
+        receiptProblem = caught.message;
+        setGeneration((value) => value + 1);
+      }
       setFullAutoPending(false);
       setFullAutoOriginal(null);
       setCodeWriteRequested(false);
       if (enableCodeWriteAfterSave) {
         try {
           await enableCodeWrite(adminToken);
-          if (requests.isCurrent()) setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
+          if (requests.isCurrent()) setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao', receiptProblem);
         } catch (caught) {
-          if (requests.isCurrent()) setMessage('策略已保存。', `代码目录写权限没能启用：${errorMessage(caught, '宿主机操作失败')}`);
+          if (requests.isCurrent()) {
+            setMessage('策略已保存。', appendSentence(receiptProblem, `代码目录写权限没能启用：${errorMessage(caught, '宿主机操作失败')}`));
+          }
         }
       } else {
-        setMessage('已保存，立即生效，不用重启');
+        setMessage('已保存，立即生效，不用重启', receiptProblem);
       }
     } catch (caught) {
       if (!requests.isCurrent()) return;

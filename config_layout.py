@@ -38,6 +38,8 @@ RUNTIME_FILE = f"{CONFIG_DIR}/runtime.yaml"
 MODELS_FILE = f"{CONFIG_DIR}/models.yaml"
 POLICY_FILE = f"{CONFIG_DIR}/policy.yaml"
 MCP_FILE = f"{CONFIG_DIR}/mcp.yaml"
+EXECUTION_SETTINGS_FILE = f"{CONFIG_DIR}/execution.yaml"
+REMINDER_SETTINGS_FILE = f"{CONFIG_DIR}/reminders.yaml"
 SKILLS_DIR = f"{CONFIG_DIR}/skills"
 TOOLS_DIR = f"{CONFIG_DIR}/tools"
 PLUGINS_DIR = f"{CONFIG_DIR}/plugins"
@@ -156,6 +158,14 @@ def policy_path(workspace_root: Path | str) -> Path:
 
 def mcp_path(workspace_root: Path | str) -> Path:
     return Path(workspace_root) / MCP_FILE
+
+
+def execution_settings_path(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / EXECUTION_SETTINGS_FILE
+
+
+def reminder_settings_path(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / REMINDER_SETTINGS_FILE
 
 
 def skills_dir(workspace_root: Path | str) -> Path:

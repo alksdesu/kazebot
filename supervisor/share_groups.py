@@ -23,7 +23,7 @@ import config_layout
 from file_lock import exclusive_lock
 from platforms.protection import is_shareable_env
 
-from .instances import instance_workspace, load_instances, url_prefix
+from .instances import InstanceDirectoryError, instance_workspace, load_instances, url_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -69,9 +69,9 @@ def _locked_groups(root: Path):
 
 
 def _instance_workspaces(workspace_root: Path) -> list[tuple[dict[str, Any], Path]]:
-    """清单里每个找得到工作区的实例，连同它的工作区。"""
+    """清单里每个找得到工作区的实例，连同它的工作区。清单读不懂抛 InstanceDirectoryError：查不了不等于组里没人。"""
     found: list[tuple[dict[str, Any], Path]] = []
-    for row in load_instances(workspace_root):
+    for row in load_instances(workspace_root, required=True):
         workspace = instance_workspace(workspace_root, row)
         if workspace is not None:
             found.append((row, workspace))
@@ -92,6 +92,7 @@ def _members(workspace_root: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def _current_row(workspace_root: Path) -> dict[str, Any] | None:
+    """只拿来记建组人的名字：清单读不懂时记成空的，不挡建组。"""
     prefix = url_prefix()
     return next((row for row in load_instances(workspace_root) if row["path"] == prefix), None)
 
@@ -124,9 +125,13 @@ def overview(workspace_root: Path) -> dict[str, Any]:
             "reason": "单实例部署没有数据根，多开之后才能共享配置",
             "current": None,
             "groups": [],
+            "members_problem": "",
             "archives": _archives(workspace_root),
         }
-    members = _members(workspace_root)
+    try:
+        members, members_problem = _members(workspace_root), ""
+    except InstanceDirectoryError as error:
+        members, members_problem = {}, error.reason
     groups: list[dict[str, Any]] = []
     try:
         entries = sorted(root.iterdir()) if root.is_dir() else []
@@ -142,7 +147,15 @@ def overview(workspace_root: Path) -> dict[str, Any]:
             "created_at": str(meta.get("created_at") or ""),
             "created_by": str(meta.get("created_by") or ""),
         })
-    return {"available": True, "reason": "", "current": current, "groups": groups, "archives": _archives(workspace_root)}
+    return {
+        "available": True,
+        "reason": "",
+        "current": current,
+        "groups": groups,
+        # 不空时各组的 members 是不知道，不是没人。
+        "members_problem": members_problem,
+        "archives": _archives(workspace_root),
+    }
 
 
 def _make_dir_link(link: Path, target: Path) -> None:
@@ -403,7 +416,10 @@ def delete_group(workspace_root: Path, raw_name: Any) -> dict[str, Any]:
         target = root / name
         if not (target / config_layout.CONFIG_DIR).is_dir():
             raise ShareGroupError(f"没有叫 {name} 的共享组")
-        members = _members(Path(workspace_root)).get(name, [])
+        try:
+            members = _members(Path(workspace_root)).get(name, [])
+        except InstanceDirectoryError as error:
+            raise ShareGroupError(f"查不了还有哪些实例在用 {name}，没有删：{error.reason}") from error
         if members:
             labels = "、".join(member["label"] for member in members)
             raise ShareGroupError(f"组里还有 {labels}，先让它们退出")

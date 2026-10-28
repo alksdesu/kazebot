@@ -1,6 +1,6 @@
 // 控制台各页在设置侧栏里的登记项。页面本体只写内容，外壳由这里统一套：
 // 平台页按平台清单生成，走 PlatformPage（状态栏 + 连接卡 + 折叠分区，分区来自后端 schema），机器人页与模型页走通用素壳。
-import { Empty } from '../components/settings/pages/settingsControls';
+import { Empty, ErrorText } from '../components/settings/pages/settingsControls';
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { PlainPage } from './components';
 import { AccountSettingsPage } from './AccountSettingsPage';
@@ -153,9 +153,14 @@ export function platformPages(platforms: readonly PlatformDescriptor[]): Platfor
 }
 
 const PlatformPageById = ({ platformId }: { platformId: string }) => {
-  const platform = usePlatformRegistryState().platforms.find((row) => row.id === platformId);
+  const registry = usePlatformRegistryState();
+  const platform = registry.platforms.find((row) => row.id === platformId);
   if (!platform) {
-    return (
+    return registry.error ? (
+      <PlainPage eyebrow="平台" note="后端的平台清单没读到，只认得内置的平台。" title={platformId}>
+        <ErrorText role="alert">平台清单没读到：{registry.error}。内置的平台里没有「{platformId}」，刷新页面再试。</ErrorText>
+      </PlainPage>
+    ) : (
       <PlainPage eyebrow="平台" note="后端公布的平台清单里没有这个平台。" title={platformId}>
         <Empty>平台清单里已经没有「{platformId}」了，可能是后端换了版本。从侧栏重新进一个平台页。</Empty>
       </PlainPage>
@@ -163,7 +168,13 @@ const PlatformPageById = ({ platformId }: { platformId: string }) => {
   }
   return (
     <PlatformPage
-      connection={<><ConnectionCard /><DiagnosticsPanel /></>}
+      connection={<>
+        {registry.error && (
+          <ErrorText role="alert">平台清单没读到：{registry.error}。这一页先按内置的平台描述显示。</ErrorText>
+        )}
+        <ConnectionCard />
+        <DiagnosticsPanel />
+      </>}
       note={platformNote(platform)}
       parts={PLATFORM_PAGE_EXTRAS[platform.id]?.parts || NO_PARTS}
       platform={platform}

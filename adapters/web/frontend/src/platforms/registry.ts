@@ -55,6 +55,8 @@ export interface PlatformRegistryState {
   running: readonly PlatformDescriptor[];
   /** 后端的清单到了，或者确定拿不到了。到之前认不出的平台页，可能只是清单还在路上。 */
   settled: boolean;
+  /** 清单没读成、手上还是内置那份的原因；读成过、还在读时是空串。 */
+  error: string;
 }
 
 function runningOf(platforms: readonly PlatformDescriptor[], current: string | null): readonly PlatformDescriptor[] {
@@ -65,7 +67,7 @@ function runningOf(platforms: readonly PlatformDescriptor[], current: string | n
 }
 
 function makeState(platforms: readonly PlatformDescriptor[], current: string | null, settled: boolean): PlatformRegistryState {
-  return { platforms, current, running: runningOf(platforms, current), settled };
+  return { platforms, current, running: runningOf(platforms, current), settled, error: '' };
 }
 
 let state: PlatformRegistryState = makeState(BUILTIN_PLATFORMS, null, false);
@@ -114,15 +116,18 @@ export function subscribePlatforms(listener: () => void): () => void {
 /** 换上后端公布的清单。空清单一律忽略：认不出通道会让整张会话列表退化成「会话」。 */
 export function adoptPlatforms(rows: readonly PlatformDescriptor[], current: string | null = null): void {
   if (!rows.length) {
-    settlePlatforms();
+    settlePlatforms('后端给的平台清单是空的');
     return;
   }
   publish(makeState(rows, current, true));
 }
 
-/** 清单拿不到：接着用内置的那份，但不用再等了。 */
-export function settlePlatforms(): void {
-  if (!state.settled) publish({ ...state, settled: true });
+/** 清单拿不到：接着用手上那份，不用再等了。error 是没读成的原因，页面拿它交代退回了内置的平台。 */
+export function settlePlatforms(error = ''): void {
+  // 读成过的清单接着用，这一次没读到不算退回内置。
+  const reason = state.platforms === BUILTIN_PLATFORMS ? error : '';
+  if (state.settled && state.error === reason) return;
+  publish({ ...state, settled: true, error: reason });
 }
 
 export function resetPlatforms(): void {

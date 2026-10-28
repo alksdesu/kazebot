@@ -13,7 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config_layout
-from clonoth_runtime import get_int, load_yaml_dict
+from clonoth_runtime import SettingsFile, get_int
 from engine.conversation_migration import (
     ConversationRekey,
     RekeyCount,
@@ -26,6 +26,8 @@ from platforms.sources import is_external_platform
 from supervisor.feature_auth import FeatureActor
 
 log = logging.getLogger(__name__)
+
+REMINDER_SETTINGS = SettingsFile(config_layout.REMINDER_SETTINGS_FILE)
 
 
 def reminders_path(workspace_root: Path) -> Path:
@@ -77,8 +79,8 @@ class ReminderService:
 
     @property
     def max_open(self) -> int:
-        """每人最多同时留几条未完成的提醒。每次取值都重读 config/reminders.yaml：共享组里别的实例也会改它；填的不是数按默认算。"""
-        config = load_yaml_dict(config_layout.config_dir(self.state.workspace_root) / "reminders.yaml") or {}
+        """每人最多同时留几条未完成的提醒。每次取值都看一眼 config/reminders.yaml：共享组里别的实例也会改它；填的不是数按默认算。"""
+        config = REMINDER_SETTINGS.load(config_layout.reminder_settings_path(self.state.workspace_root))
         return get_int(config, "max_open_per_owner", 50, min_value=1, max_value=500)
 
     @contextmanager

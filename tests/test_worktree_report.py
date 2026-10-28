@@ -130,6 +130,16 @@ class TestWorktreeLines:
             f"本实例不能合回这个仓库，补丁在 {PATCH}；不要了就调用 {MERGE_TOOL}，handle 填 {HANDLE}，带上 abandon=true 放弃。"
         )
 
+    def test_a_refusal_with_its_own_reason_says_that_reason(self) -> None:
+        # 清单读不懂时只说本实例不能合回，人会去改 merge_instances，挡着的其实是清单。
+        refusal = "查不了本实例能不能合回这个仓库：实例清单 /srv/instances.yaml 读不懂：第 1 行第 16 列：x"
+
+        lines = worktree_lines(_view(merge_allowed=False, merge_refusal=refusal))
+
+        assert lines[-1] == (
+            f"{refusal}，补丁在 {PATCH}；不要了就调用 {MERGE_TOOL}，handle 填 {HANDLE}，带上 abandon=true 放弃。"
+        )
+
     def test_the_worktree_id_stands_in_for_a_missing_handle(self) -> None:
         view = _view()
         view.pop("handle")

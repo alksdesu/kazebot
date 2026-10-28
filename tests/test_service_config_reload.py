@@ -1,10 +1,12 @@
-"""执行计划和提醒的上限每次取值都重读配置文件。
+"""执行计划和提醒的上限每次取值都看一眼配置文件。
 
 共享组里别的实例改了 config/execution.yaml、config/reminders.yaml，这边不重启也要跟上；
-文件读不懂或还不在就按默认值走，不能让一份写坏的配置把服务带下去。
+文件还不在或空着按默认值走。写坏了不能把服务带下去，也不能悄悄当成没写：
+这个进程读成过一份就沿用那份，一份都没读成过才按默认值，原因记一次日志、进健康检查。
 """
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,16 +19,26 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import clonoth_runtime  # noqa: E402
 import config_layout  # noqa: E402
-from supervisor.execution.service import ExecutionService  # noqa: E402
+from supervisor.execution.service import EXECUTION_SETTINGS, ExecutionService  # noqa: E402
 from supervisor.feature_auth import FeatureActor  # noqa: E402
-from supervisor.reminders.service import ReminderService  # noqa: E402
+from supervisor.reminders.service import REMINDER_SETTINGS, ReminderService  # noqa: E402
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_PARALLEL = 3
 DEFAULT_MAX_OPEN = 50
 
-UNREADABLE = ("a: [1, 2\n", "- one\n- two\n", "just a string\n", "")
+UNREADABLE = pytest.mark.parametrize("text,reason", [
+    pytest.param("a: [1, 2\n", "第 2 行", id="yaml-error"),
+    pytest.param("- one\n- two\n", "顶层必须是映射", id="list"),
+    pytest.param("just a string\n", "顶层必须是映射", id="scalar"),
+])
+EMPTY = pytest.mark.parametrize("text", [
+    pytest.param("", id="empty"),
+    pytest.param("# 先空着\n", id="comment-only"),
+    pytest.param("\n\n", id="blank-lines"),
+])
 
 # 解析得出来但不是个整数的值。填错一个字符不能让这个组里每个实例的每个请求都 500。
 NOT_AN_INTEGER = pytest.mark.parametrize("written", [
@@ -45,6 +57,14 @@ def _config(root: Path, name: str, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _settings_warnings(caplog: pytest.LogCaptureFixture, rel: str) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == clonoth_runtime._log.name and record.levelno == logging.WARNING
+        and record.getMessage().startswith(f"{rel} ")
+    ]
 
 
 @pytest.fixture
@@ -94,14 +114,51 @@ class TestExecutionLimits:
 
         assert execution.max_parallel == expected
 
-    @pytest.mark.parametrize("text", UNREADABLE)
-    def test_an_unreadable_file_falls_back_to_the_defaults(
-        self, execution: ExecutionService, tmp_path: Path, text: str,
+    @UNREADABLE
+    def test_a_file_broken_before_anything_was_read_uses_the_defaults(
+        self, execution: ExecutionService, tmp_path: Path, text: str, reason: str,
     ) -> None:
-        _config(tmp_path, "execution.yaml", text)
+        path = _config(tmp_path, "execution.yaml", text)
 
         assert execution.max_bytes == DEFAULT_MAX_BYTES
         assert execution.max_parallel == DEFAULT_MAX_PARALLEL
+        problem = EXECUTION_SETTINGS.problem(path)
+        assert problem.startswith(f"{config_layout.EXECUTION_SETTINGS_FILE} 用不了，各项按默认值算：")
+        assert reason in problem
+
+    @EMPTY
+    def test_an_empty_file_means_the_defaults_and_is_not_a_problem(
+        self, execution: ExecutionService, tmp_path: Path, text: str,
+    ) -> None:
+        path = _config(tmp_path, "execution.yaml", text)
+
+        assert execution.max_bytes == DEFAULT_MAX_BYTES
+        assert execution.max_parallel == DEFAULT_MAX_PARALLEL
+        assert EXECUTION_SETTINGS.problem(path) == ""
+
+    def test_a_missing_file_is_not_a_problem(self, execution: ExecutionService, tmp_path: Path) -> None:
+        assert execution.max_bytes == DEFAULT_MAX_BYTES
+        assert EXECUTION_SETTINGS.problem(config_layout.execution_settings_path(tmp_path)) == ""
+
+    def test_a_file_that_is_not_utf8_is_reported_as_unreadable(
+        self, execution: ExecutionService, tmp_path: Path,
+    ) -> None:
+        path = config_layout.execution_settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"max_parallel_steps: 6\n# \xff\xfe\n")
+
+        assert execution.max_parallel == DEFAULT_MAX_PARALLEL
+        assert "读不了：不是 UTF-8 编码" in EXECUTION_SETTINGS.problem(path)
+
+    def test_the_problem_names_the_place_but_not_what_was_written(
+        self, execution: ExecutionService, tmp_path: Path,
+    ) -> None:
+        path = _config(tmp_path, "execution.yaml", "max_input_bytes: [sk-live-0123456789abcdef\n")
+
+        assert execution.max_bytes == DEFAULT_MAX_BYTES
+        problem = EXECUTION_SETTINGS.problem(path)
+        assert "第 2 行第 1 列" in problem
+        assert "sk-live-0123456789abcdef" not in problem
 
     @NOT_AN_INTEGER
     def test_a_value_that_is_not_an_integer_falls_back_to_the_defaults(
@@ -164,15 +221,66 @@ class TestExecutionLimits:
 
         assert execution.max_bytes == DEFAULT_MAX_BYTES
 
-    def test_breaking_the_file_goes_back_to_the_defaults(
+    def test_breaking_the_file_keeps_the_values_read_last(
+        self, execution: ExecutionService, tmp_path: Path,
+    ) -> None:
+        # 改到一半存了一份坏的，不能让并行上限悄悄回到默认值。
+        path = _config(tmp_path, "execution.yaml", "max_input_bytes: 4096\nmax_parallel_steps: 6\n")
+        assert (execution.max_bytes, execution.max_parallel) == (4096, 6)
+
+        config_layout.write_config_text(path, "max_parallel_steps: [6\n")
+
+        assert (execution.max_bytes, execution.max_parallel) == (4096, 6)
+        problem = EXECUTION_SETTINGS.problem(path)
+        assert problem.startswith(f"{config_layout.EXECUTION_SETTINGS_FILE} 用不了，沿用上一份能用的：")
+        assert "第 2 行第 1 列" in problem
+
+    def test_fixing_a_broken_file_takes_effect_and_clears_the_problem(
         self, execution: ExecutionService, tmp_path: Path,
     ) -> None:
         path = _config(tmp_path, "execution.yaml", "max_parallel_steps: 6\n")
         assert execution.max_parallel == 6
+        config_layout.write_config_text(path, "- not a mapping\n")
+        assert execution.max_parallel == 6
 
-        path.write_text("max_parallel_steps: [6\n", encoding="utf-8")
+        config_layout.write_config_text(path, "max_parallel_steps: 2\n")
+
+        assert execution.max_parallel == 2
+        assert EXECUTION_SETTINGS.problem(path) == ""
+
+    def test_removing_a_broken_file_goes_back_to_the_defaults(
+        self, execution: ExecutionService, tmp_path: Path,
+    ) -> None:
+        # 删掉是不要这些设置了，不是写坏，不沿用上一份。
+        path = _config(tmp_path, "execution.yaml", "max_parallel_steps: 6\n")
+        assert execution.max_parallel == 6
+        config_layout.write_config_text(path, "max_parallel_steps: [6\n")
+        assert execution.max_parallel == 6
+
+        path.unlink()
 
         assert execution.max_parallel == DEFAULT_MAX_PARALLEL
+        assert EXECUTION_SETTINGS.problem(path) == ""
+
+    def test_a_broken_version_is_logged_once(
+        self, execution: ExecutionService, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = _config(tmp_path, "execution.yaml", "max_parallel_steps: 6\n")
+        assert execution.max_parallel == 6
+        caplog.set_level(logging.WARNING, logger=clonoth_runtime._log.name)
+
+        config_layout.write_config_text(path, "max_parallel_steps: [6\n")
+        for _ in range(3):
+            assert execution.max_parallel == 6
+            assert execution.max_bytes == DEFAULT_MAX_BYTES
+        assert len(_settings_warnings(caplog, config_layout.EXECUTION_SETTINGS_FILE)) == 1
+
+        config_layout.write_config_text(path, "max_parallel_steps: [66\n")
+        assert execution.max_parallel == 6
+
+        warnings = _settings_warnings(caplog, config_layout.EXECUTION_SETTINGS_FILE)
+        assert len(warnings) == 2
+        assert all("沿用上一份能用的" in warning for warning in warnings)
 
     def test_a_second_service_on_the_same_workspace_agrees(self, tmp_path: Path) -> None:
         # 共享组里几个实例读的是同一份文件，算出来的上限必须一样。
@@ -223,13 +331,43 @@ class TestReminderLimit:
 
         assert reminders.max_open == expected
 
-    @pytest.mark.parametrize("text", UNREADABLE)
-    def test_an_unreadable_file_falls_back_to_the_default(
-        self, reminders: ReminderService, tmp_path: Path, text: str,
+    @UNREADABLE
+    def test_a_file_broken_before_anything_was_read_uses_the_default(
+        self, reminders: ReminderService, tmp_path: Path, text: str, reason: str,
     ) -> None:
-        _config(tmp_path, "reminders.yaml", text)
+        path = _config(tmp_path, "reminders.yaml", text)
 
         assert reminders.max_open == DEFAULT_MAX_OPEN
+        problem = REMINDER_SETTINGS.problem(path)
+        assert problem.startswith(f"{config_layout.REMINDER_SETTINGS_FILE} 用不了，各项按默认值算：")
+        assert reason in problem
+
+    @EMPTY
+    def test_an_empty_file_means_the_default_and_is_not_a_problem(
+        self, reminders: ReminderService, tmp_path: Path, text: str,
+    ) -> None:
+        path = _config(tmp_path, "reminders.yaml", text)
+
+        assert reminders.max_open == DEFAULT_MAX_OPEN
+        assert REMINDER_SETTINGS.problem(path) == ""
+
+    def test_breaking_the_file_keeps_the_limit_read_last(
+        self, reminders: ReminderService, tmp_path: Path,
+    ) -> None:
+        # 改到一半存了一份坏的，上限不能悄悄从 2 跳回 50。
+        path = _config(tmp_path, "reminders.yaml", "max_open_per_owner: 2\n")
+        actor = _actor()
+        reminders.create(actor, "第一条", _due())
+        reminders.create(actor, "第二条", _due())
+
+        config_layout.write_config_text(path, "max_open_per_owner: [2\n")
+
+        assert reminders.max_open == 2
+        with pytest.raises(ValueError, match="2 条"):
+            reminders.create(actor, "第三条", _due())
+        assert REMINDER_SETTINGS.problem(path).startswith(
+            f"{config_layout.REMINDER_SETTINGS_FILE} 用不了，沿用上一份能用的：",
+        )
 
     @NOT_AN_INTEGER
     def test_a_value_that_is_not_an_integer_falls_back_to_the_default(

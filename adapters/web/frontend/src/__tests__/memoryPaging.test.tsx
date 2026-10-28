@@ -50,6 +50,7 @@ type Reply = (() => Response) | null;
 function stub({
   namespaces = [] as any[],
   entries = [] as any[],
+  unreadable = [] as any[],
   conversations = [] as any[],
   removed = 0,
   replies = {} as { overview?: Reply[]; entries?: Reply[]; save?: Reply[] },
@@ -66,10 +67,12 @@ function stub({
     const url = String(input);
     if (url.includes('/memory/overview')) return take('overview', { namespaces });
     if (url.includes('/entries')) {
-      return (init?.method || 'GET') === 'GET' ? take('entries', { entries }) : take('save', { entry: {} });
+      return (init?.method || 'GET') === 'GET' ? take('entries', { entries, unreadable_books: unreadable }) : take('save', { entry: {} });
     }
     if (url.includes('/admin/config/memory/')) return jsonResponse({ removed });
-    if (url.includes('/admin/config/runtime/raw')) return jsonResponse({ content: '', hash: '' });
+    if (url.includes('/admin/config/runtime/raw')) {
+      return jsonResponse({ content: '', hash: '', source: 'default', path: 'defaults/runtime.yaml' });
+    }
     if (url.includes('/admin/conversations')) return jsonResponse({ conversations });
     if (url.includes('/platforms/qq/account/scope')) return jsonResponse({ current_scope: '', bot_alive: false });
     return jsonResponse({});
@@ -407,5 +410,142 @@ describe('记忆页的那一句提示', () => {
     expect(await screen.findByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
     expect(screen.queryByText('已添加')).toBeNull();
     expect(screen.queryByText(/条目读不回来/)).toBeNull();
+  });
+});
+
+// 读失败时手上是空表：说成「0 条」「还没有任何记忆」就是说它没有记忆，原因合在底下那句里，原地给重读。
+describe('没读成不说成没有', () => {
+  const sources = [namespace(1, '甲群', 'group')];
+
+  it('条目没读成时不报条数，原地给重读，读到了照常列出', async () => {
+    stub({ namespaces: sources, entries: [entry(1), entry(2)], replies: { entries: [fails('条目读不回来')] } });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+    expect(await screen.findByText('503 条目读不回来')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/· 0 条/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新读取这一份' }));
+
+    expect(await screen.findByText('第 1 条')).toBeInTheDocument();
+    expect(screen.getByText(/· 2 条/)).toBeInTheDocument();
+    expect(screen.queryByText('503 条目读不回来')).toBeNull();
+    expect(screen.queryByRole('button', { name: '重新读取这一份' })).toBeNull();
+  });
+
+  it('条目读回来对不上形状也算没读成', async () => {
+    stub({ namespaces: sources, replies: { entries: [() => jsonResponse({})] } });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText('记忆条目列表格式不对：缺 entries')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/· 0 条/)).toBeNull();
+    expect(screen.getByRole('button', { name: '重新读取这一份' })).toBeInTheDocument();
+  });
+
+  it('来源没读成时原地给重读，读到了就列出来', async () => {
+    stub({ namespaces: sources, replies: { overview: [fails('总览读不回来')] } });
+    render(<MemoryPage />);
+
+    expect(await screen.findByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
+    fireEvent.click(screen.getByRole('button', { name: '重新读取记忆来源' }));
+
+    expect(await screen.findByRole('button', { name: /甲群/ })).toBeInTheDocument();
+    expect(screen.queryByText('503 总览读不回来')).toBeNull();
+    expect(screen.queryByRole('button', { name: '重新读取记忆来源' })).toBeNull();
+  });
+
+  it('来源读回来对不上形状，说格式不对，不说还没有任何记忆', async () => {
+    stub({
+      replies: { overview: [() => jsonResponse({ namespaces: [{ ...namespace(1, '甲群', 'group'), entry_count: '3' }] })] },
+    });
+    render(<MemoryPage />);
+
+    expect(await screen.findByText('记忆来源列表格式不对：namespaces[0].entry_count 不是数字')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('还没有任何记忆。')).toBeNull();
+  });
+});
+
+// 悄悄跳过的话，条数和本数少了一截，看着像那几本里的记忆没了；清空时它们也会被一起删掉。
+describe('读不出来的记忆本', () => {
+  const broken = [{ book: 'people', problem: '第 3 行第 5 列：mapping values are not allowed here' }];
+
+  it('来源列表标出有几本读不了', async () => {
+    stub({ namespaces: [{ ...namespace(2, '甲群', 'group'), unreadable_books: ['people'] }] });
+    render(<MemoryPage />);
+
+    const row = await screen.findByRole('button', { name: /甲群/ });
+
+    expect(within(row).getByText('1 本读不了')).toBeInTheDocument();
+  });
+
+  it('条目区说出哪几本读不了、为什么，条数注明不含它们', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [entry(1)], unreadable: broken });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText(/· 1 条（不含读不了的 1 本）/)).toBeInTheDocument();
+    const notice = screen.getByText(/这几本读不出来/);
+    expect(notice).toHaveAttribute('role', 'alert');
+    expect(notice).toHaveTextContent('people.yaml（第 3 行第 5 列：mapping values are not allowed here）');
+    expect(notice).toHaveTextContent('清空会连它们一起删掉');
+  });
+
+  it('都读得出来时不提', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [entry(1)] });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText(/· 1 条$/)).toBeInTheDocument();
+    expect(screen.queryByText(/这几本读不出来/)).toBeNull();
+    expect(screen.queryByText(/本读不了/)).toBeNull();
+  });
+});
+
+// 关键词是记忆本里手写的：写成单个字符串、混着数字都有，显示时照注入时的读法认，不能整页崩掉。
+describe('手写的关键词', () => {
+  it.each([
+    ['单个词', '关键词：单个词'],
+    [['甲', 3, ' 乙 ', ''], '关键词：甲、乙'],
+  ])('照注入时的读法显示（%j）', async (keywords, shown) => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [{ ...entry(1), keywords }] });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText(shown)).toBeInTheDocument();
+  });
+
+  it('手写成数字的 id、写成映射的正文照样显示，删除时按 id 的文字找', async () => {
+    stub({
+      namespaces: [namespace(1, '甲群', 'group')],
+      entries: [{ ...entry(1), id: 42, content: { text: '映射写的正文' } }],
+    });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText('{"text":"映射写的正文"}')).toBeInTheDocument();
+    expect(screen.getByText('42')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '删除' }));
+
+    await waitFor(() => expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/memory/ns-1/entries/main/42'), expect.objectContaining({ method: 'DELETE' }),
+    ));
+  });
+
+  it.each([[{ a: 1 }], [42], [null]])('认不出的写法不崩，也不摆关键词那一行（%j）', async (keywords) => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [{ ...entry(1), keywords }] });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+
+    expect(await screen.findByText('第 1 条')).toBeInTheDocument();
+    expect(screen.queryByText(/关键词：/)).toBeNull();
   });
 });

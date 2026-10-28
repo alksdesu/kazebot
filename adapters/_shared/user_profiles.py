@@ -62,8 +62,16 @@ def load_profiles(path: Path | None) -> dict[str, dict[str, str]]:
     except Exception:
         logger.warning("failed to load user profiles: %s", source, exc_info=True)
         return {}
-    if not isinstance(data, dict):
+    if data is None:
         return {}
+    if not isinstance(data, dict):
+        logger.warning("user profiles %s not loaded: the top level is a %s, not a mapping", source, type(data).__name__)
+        return {}
+    if data.get("users") is not None and not isinstance(data["users"], dict):
+        logger.warning(
+            "user profiles %s: users is a %s, not a mapping; reading the top level as the profiles instead",
+            source, type(data["users"]).__name__,
+        )
     users = data.get("users") if isinstance(data.get("users"), dict) else data
     profiles: dict[str, dict[str, str]] = {}
     for raw_key, raw_profile in users.items():

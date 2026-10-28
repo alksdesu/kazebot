@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -19,11 +20,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from engine.builtin import knowledge_inject  # noqa: E402
 from engine.builtin.knowledge_inject import (  # noqa: E402
     _filter_entries,
     compile_keyword,
     match_keywords,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 记过日志的关键词存在进程里，用例之间不能串
+    monkeypatch.setattr(knowledge_inject, "_WARNED_KEYWORDS", OrderedDict())
 
 
 def _matches(keyword: str, text: str) -> bool:
@@ -74,6 +82,28 @@ class TestRegexKeywordsNeedTheWholeForm:
             compile_keyword("/api/config")
 
         assert any("matched literally" in str(r.getMessage()) for r in caplog.records)
+
+    @pytest.mark.parametrize("keyword,needle", [
+        ("/[unclosed/i", "not a valid regex"),
+        ("/api/config", "matched literally"),
+    ])
+    def test_the_same_keyword_is_logged_once(self, caplog, keyword: str, needle: str) -> None:
+        # 技能目录和记忆本两秒就重扫一次，写错的关键词不改就每次都记一遍。
+        with caplog.at_level("INFO"):
+            for _ in range(5):
+                compile_keyword(keyword)
+            compile_keyword(keyword.replace("unclosed", "still-unclosed").replace("config", "settings"))
+
+        assert sum(needle in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.parametrize("keyword", ["/a{4294967296}/", "/" + "(" * 1000 + "x" + ")" * 1000 + "/"])
+    def test_a_regex_python_gives_up_on_falls_back_to_literal(self, caplog, keyword: str) -> None:
+        # 重复次数太大抛 OverflowError、嵌套太深抛 RecursionError，都不是 re.error：接不住就打断整轮注入。
+        with caplog.at_level("WARNING"):
+            compiled = compile_keyword(keyword)
+
+        assert compiled == keyword.lower()
+        assert any("not a valid regex" in r.getMessage() for r in caplog.records)
 
 
 class TestShortAsciiKeywordsNeedBoundaries:

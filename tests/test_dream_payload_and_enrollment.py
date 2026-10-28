@@ -189,6 +189,18 @@ class TestMaintenanceCandidates:
 
         assert "never_hit" in picked["prune"]
 
+    def test_unknown_hits_put_nothing_up(self) -> None:
+        # None 是命中侧车读不了：三类都按命中间隔挑，不知道的时候一条都不能给。
+        entries = [
+            self._entry("stale"),
+            self._entry("lesson", created_at=_iso(20), content_chars=500),
+            self._entry("valuable", priority=5, created_at=_iso(60)),
+        ]
+
+        result = DreamHandler()._maintenance_candidates(entries, None, now=_NOW)
+
+        assert result == {"prune": [], "promote": [], "reactivate": []}
+
 
 class TestInstructionReferencesRealData:
     def test_every_constraint_points_at_a_block_that_exists(self, tmp_path: Path) -> None:

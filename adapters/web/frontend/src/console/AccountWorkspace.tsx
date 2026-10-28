@@ -93,7 +93,7 @@ const AccountWorkspace = ({ token }: { token: string }) => {
   return <>
     <InstanceManagement token={token} instances={instances} loading={loading} error={error} refresh={refresh} />
     <ConfigShareGroups token={token} />
-    <AccountConnectionPage token={token} instances={instances} ownershipReady={!loading && !error} />
+    <AccountConnectionPage token={token} instances={instances} ownershipReady={!loading && !error} ownershipError={error} />
     <AccountScope />
   </>;
 };
@@ -240,7 +240,15 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
   </Block>;
 };
 
-const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: string; instances: ConsoleInstance[]; ownershipReady: boolean }) => {
+interface AccountConnectionProps {
+  token: string;
+  instances: ConsoleInstance[];
+  ownershipReady: boolean;
+  /** 实例清单没读成的原因：查不了一个号是不是登在别的实例上，不能当成没人占着。 */
+  ownershipError: string;
+}
+
+const AccountConnectionPage = ({ token, instances, ownershipReady, ownershipError }: AccountConnectionProps) => {
   const platformId = usePlatform().id;
   const requests = useRequestGuard(platformId);
   const mutation = useRef(false);
@@ -593,7 +601,13 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
         </Panel>
       </Block>
 
-      {!ownershipReady && status?.quick_login?.length ? <Facts>实例归属尚未确认，请先刷新实例列表后再快速登录。</Facts> : null}
+      {!ownershipReady && status?.quick_login?.length ? (
+        <Facts>
+          {ownershipError
+            ? `实例归属尚未确认：${ownershipError}。查清这些号有没有登在别的实例上之前，不能从这里免扫码切号。`
+            : '实例归属尚未确认，请先刷新实例列表后再快速登录。'}
+        </Facts>
+      ) : null}
 
       {status && !noticeInWaitBlock && <AccountFeedback error={error} notice={notice} />}
     </>

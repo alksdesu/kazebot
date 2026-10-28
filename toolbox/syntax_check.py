@@ -1,4 +1,4 @@
-"""改完之后的检查：按扩展名在进程内查语法，再按 runtime 的 edit_checks.commands 跑外部检查命令。
+"""改完之后的检查：按扩展名在进程内查语法（技能的 SKILL.md 查 frontmatter），再按 runtime 的 edit_checks.commands 跑外部检查命令。
 
 检查不通过不回滚，结论附在工具结果末尾。外部命令和 execute_command 走同一套策略审批。"""
 from __future__ import annotations
@@ -34,7 +34,12 @@ _LANGUAGES: dict[str, str] = {
     ".yaml": "yaml", ".yml": "yaml",
     ".toml": "toml",
 }
-_LANGUAGE_LABELS: dict[str, str] = {"python": "Python", "json": "JSON", "yaml": "YAML", "toml": "TOML"}
+_LANGUAGE_LABELS: dict[str, str] = {
+    "python": "Python", "json": "JSON", "yaml": "YAML", "toml": "TOML", "skill": "SKILL.md",
+}
+# 技能的元数据写在 SKILL.md 开头的 frontmatter 里：写坏了，加载时整个技能被跳过。
+_SKILL_FILE_NAME = "SKILL.md"
+_SKILLS_DIR_PARTS = Path(config_layout.SKILLS_DIR).parts
 # 这些 .json 其实是 JSONC，允许注释和尾逗号，按严格 JSON 查只会误报
 _JSONC_NAMES = ("tsconfig*.json", "jsconfig*.json", "devcontainer.json", ".devcontainer.json", ".eslintrc.json")
 _MAX_CHECK_CHARS = 4_000_000
@@ -97,7 +102,14 @@ def _is_jsonc(path: Path) -> bool:
     return ".vscode" in path.parts or any(fnmatch.fnmatchcase(path.name, name) for name in _JSONC_NAMES)
 
 
+def _is_skill_file(path: Path) -> bool:
+    """config/skills/<目录>/SKILL.md。"""
+    return path.name == _SKILL_FILE_NAME and path.parent.parent.parts[-len(_SKILLS_DIR_PARTS):] == _SKILLS_DIR_PARTS
+
+
 def language_of(path: Path) -> str | None:
+    if _is_skill_file(path):
+        return "skill"
     language = _LANGUAGES.get(path.suffix.lower())
     if language == "json" and _is_jsonc(path):
         return None
@@ -157,11 +169,24 @@ def _check_toml(path: Path, source: str) -> SyntaxReport:
     return SyntaxReport("toml", True)
 
 
-_CHECKERS = {"python": _check_python, "json": _check_json, "yaml": _check_yaml, "toml": _check_toml}
+def _check_skill(path: Path, source: str) -> SyntaxReport:
+    # 放在函数里导入：knowledge_inject 顶上就导入了 toolbox。
+    from engine.builtin.knowledge_inject import SkillFrontmatterError, parse_skill_frontmatter
+
+    try:
+        parse_skill_frontmatter(source)
+    except SkillFrontmatterError as exc:
+        return SyntaxReport("skill", False, exc.line, exc.column, exc.problem)
+    return SyntaxReport("skill", True)
+
+
+_CHECKERS = {
+    "python": _check_python, "json": _check_json, "yaml": _check_yaml, "toml": _check_toml, "skill": _check_skill,
+}
 
 
 def check_syntax(path: Path, text: str) -> SyntaxReport | None:
-    """按扩展名查 text 的语法；没有对应检查器的返回 None。"""
+    """按扩展名查 text 的语法，config/skills/<目录>/SKILL.md 查 frontmatter；没有对应检查器的返回 None。"""
     language = language_of(path)
     if language is None:
         return None

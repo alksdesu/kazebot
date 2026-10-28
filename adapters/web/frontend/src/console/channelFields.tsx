@@ -89,19 +89,35 @@ export const wireOf = (name: string, channels: ChannelChoice[]): string => (
   channels.find((c) => c.value === name)?.wire || (name || '').toLowerCase()
 );
 
+/** 渠道表读到哪一步了。没读成时，某个值列不出来只说明表不在手上。 */
+export type ChannelTableState = 'ready' | 'loading' | 'failed';
+
+const UNLISTED_MARK: Record<ChannelTableState, string> = {
+  ready: '（后端不认）',
+  loading: '',
+  failed: '（渠道表没读到）',
+};
+
 /**
  * provider 下拉的选项。已配渠道带着地址密钥模型，裸线格式只定请求怎么发 ——
  * 后者不能省：只想换格式、地址走环境变量的配置要用它。
  *
- * current 列不出来时补一条「后端不认」，否则手写进 yaml 的值会在保存时被悄悄换掉。
+ * current 列不出来时照样补成一项，否则手写进 yaml 的值会在保存时被悄悄换掉。
+ * 渠道表读成了才标「后端不认」：还在读时不标，读失败时标「渠道表没读到」。
  */
 export const ChannelOptions = ({
-  channels, wires, current,
-}: { channels: ChannelChoice[]; wires: string[]; current: string }) => {
+  channels, wires, current, table = 'ready',
+}: {
+  channels: ChannelChoice[];
+  wires: string[];
+  current: string;
+  /** 渠道表由调用方自己读、可能还没读成时给上。不给就按已读成算。 */
+  table?: ChannelTableState;
+}) => {
   const listed = channels.some((c) => c.value === current) || wires.includes(current);
   return (
     <>
-      {current && !listed && <option value={current}>{current}（后端不认）</option>}
+      {current && !listed && <option value={current}>{`${current}${UNLISTED_MARK[table]}`}</option>}
       {channels.length > 0 && (
         <optgroup label="已配渠道">
           {channels.map((choice) => (

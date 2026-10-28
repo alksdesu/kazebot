@@ -3,7 +3,7 @@ import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 
-import { deleteNodeFile, getNodeFileRaw, getNodeFiles, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
+import { deleteNodeFile, getNodeFileRaw, getNodeFiles, receipted, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { Block, Button, Feedback, Field, PageShell, Select } from './settingsControls';
@@ -112,11 +112,12 @@ const NodeFilesSettingsPageEditor = () => {
     if (!adminToken || !selected || !loaded || loading || saving) return;
     setSaving(true);
     try {
-      const result = await updateNodeFileRaw(adminToken, selected, content, base);
-      setSaved(content); setBase(result.hash);
-      setMessage(savedMessage(`已保存 ${selected}`, '', result.warnings));
-      // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变。
-      if (files.find(file => file.name === selected)?.source === 'default') await loadFiles();
+      const { result, receiptProblem } = await receipted(updateNodeFileRaw(adminToken, selected, content, base));
+      setSaved(content);
+      if (result) setBase(result.hash);
+      setMessage(savedMessage(`已保存 ${selected}`, '', result?.warnings), receiptProblem);
+      // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变；回执没读懂时靠这次重读换上落盘那一版的指纹。
+      if (!result || files.find(file => file.name === selected)?.source === 'default') await loadFiles();
     } catch (caught) {
       setError(errorMessage(caught, '保存失败'));
     } finally {

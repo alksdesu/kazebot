@@ -15,3 +15,8 @@ export function appendSentence(current: string, next: string): string {
 export function savedMessage(done: string, note = '', warnings: readonly string[] = []): string {
   return [note && `${note}。`, ...warnings].reduce(appendSentence, done);
 }
+
+/** 存上了、回执没读懂，手上留着的还是存之前那一版指纹时交代的那句。reload 是这一页读入最新内容的说法。 */
+export function reloadBeforeEditing(receiptProblem: string, reload = '重新载入'): string {
+  return appendSentence(receiptProblem, `${reload}再改，不然再存会被当成冲突拒掉`);
+}

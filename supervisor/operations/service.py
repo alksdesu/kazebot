@@ -23,14 +23,17 @@ from clonoth_runtime import (
     runtime_config_error,
     stray_platforms_section,
 )
+from engine.memory_hit_cache import HitCacheUnreadable, read_hit_cache
 from engine.model import create_llm_http_client
 from platforms.descriptor import PlatformDescriptor
 from platforms.protection import secret_env_names
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
+from supervisor.execution.service import EXECUTION_SETTINGS
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader
 from supervisor.platform_api import platform_health
+from supervisor.reminders.service import REMINDER_SETTINGS
 from toolbox import mcp_runtime
 from toolbox.redaction import HIDDEN, MIN_SECRET_CHARS, NUMERIC_SECRET_KEY, SENSITIVE_KEY, assigned_values, redact
 
@@ -256,7 +259,8 @@ class OperationsService:
         add("配置布局", "passed", f"配置用的是共享组 {group}" if group else "配置都在 config/ 下")
 
     def instances(self) -> list[dict[str, Any]]:
-        rows = load_instances(self.root)
+        """清单读不懂就抛 InstanceDirectoryError：当成单实例交出去，看的人会以为别的实例都没了。"""
+        rows = load_instances(self.root, required=True)
         prefix = url_prefix()
         if not rows:
             # 和读清单时一样：序号 0 占站点根，带前缀的推不出序号，标 -1。
@@ -296,6 +300,23 @@ class OperationsService:
             mcp_error = mcp_runtime.config_error(self.root)
             if mcp_error:
                 add("MCP 配置文件", "warning", mcp_error, f"修好 {config_layout.MCP_FILE}，各 worker 会自己换上修好的配置")
+            for name, settings, path in (
+                ("执行计划设置文件", EXECUTION_SETTINGS, config_layout.execution_settings_path(self.root)),
+                ("提醒设置文件", REMINDER_SETTINGS, config_layout.reminder_settings_path(self.root)),
+            ):
+                settings_error = settings.problem(path)
+                if settings_error:
+                    add(name, "warning", settings_error, f"修好 {settings.rel}，下一次取值就换上，不用重启")
+            try:
+                await asyncio.to_thread(read_hit_cache, self.root)
+            except HitCacheUnreadable as error:
+                add(
+                    "记忆命中记录", "warning",
+                    f"{error.rel_path} 读不了：{error.reason}。修好之前新的命中只留在各 engine 进程里，进程重启就丢；"
+                    "数据清理不按多久没被用到淘汰记忆，dream 也不提清理、提升和重新启用",
+                    f"修好 {error.rel_path}。删掉也能接着记，但以往的命中时间跟着没了，"
+                    "之后的清理按条目自己的时间算，常用的老条目也会被当成没用过",
+                )
             store = getattr(self.state, "feature_config_store", None) or ConfigStore(
                 path=config_layout.models_path(self.root), workspace_root=self.root,
             )

@@ -220,6 +220,52 @@ class TestToml:
         assert "(at line" not in report.message
 
 
+class TestSkillFrontmatter:
+    _SKILL = Path("ws") / "config" / "skills" / "demo" / "SKILL.md"
+
+    def test_a_good_frontmatter_passes(self) -> None:
+        report = check_syntax(self._SKILL, "---\nname: demo\nkeywords: [a, b]\n---\n\n正文\n")
+
+        assert report is not None and report.ok
+        assert report.describe() == "语法检查通过（SKILL.md）"
+
+    def test_a_skill_without_frontmatter_passes(self) -> None:
+        report = check_syntax(self._SKILL, "只有正文。\n")
+
+        assert report is not None and report.ok
+
+    def test_a_yaml_error_reports_the_line_in_the_file(self) -> None:
+        report = check_syntax(self._SKILL, "---\nname: demo\nnote: sk-SECRET-skill: x\n---\n正文\n")
+
+        assert report is not None and not report.ok
+        assert (report.line, report.column) == (3, 22)
+        assert report.message == "frontmatter 的 YAML 读不出来：mapping values are not allowed here"
+        assert "sk-SECRET" not in report.describe()
+
+    @pytest.mark.parametrize("content,line,message", [
+        pytest.param("---\nname: demo\n正文\n", 1, "frontmatter 没有收尾，后面没有单独一行的 ---", id="unclosed"),
+        pytest.param("---\n- demo\n---\n正文\n", None, "frontmatter 顶层不是 key: value 的映射", id="list"),
+    ])
+    def test_a_frontmatter_that_cannot_be_used_fails(self, content: str, line: int | None, message: str) -> None:
+        report = check_syntax(self._SKILL, content)
+
+        assert report is not None and not report.ok
+        assert (report.line, report.message) == (line, message)
+
+    def test_a_leading_bom_and_crlf_are_fine(self) -> None:
+        report = check_syntax(self._SKILL, "\ufeff---\r\nname: demo\r\n---\r\n正文\r\n")
+
+        assert report is not None and report.ok
+
+    @pytest.mark.parametrize("path", [
+        Path("docs") / "SKILL.md",
+        Path("ws") / "config" / "skills" / "demo" / "notes.md",
+        Path("ws") / "skills" / "demo" / "SKILL.md",
+    ])
+    def test_only_skill_files_under_config_skills_are_checked(self, path: Path) -> None:
+        assert check_syntax(path, "---\nbroken: [\n") is None
+
+
 class TestWhatGetsChecked:
     @pytest.mark.parametrize("name", ["notes.md", "script.sh", "Makefile", "data.csv"])
     def test_other_files_have_no_checker(self, name: str) -> None:

@@ -2397,8 +2397,13 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         prefix = url_prefix()
+        try:
+            # 读不懂不能回空表：控制台拿空表当单实例，换号前的双登检查就一律放行了。
+            roster = load_instances(st.workspace_root, required=True)
+        except InstanceDirectoryError as error:
+            raise HTTPException(status_code=503, detail=error.reason) from error
         rows: list[dict[str, Any]] = []
-        for row in load_instances(st.workspace_root):
+        for row in roster:
             item = {**row, "current": row["path"] == prefix}
             try:
                 active_progress = provisioning.progress(st.workspace_root, str(row["id"]))
@@ -2432,6 +2437,8 @@ def create_app(
             # 先占清单再触发：并发两个请求时后来的会看见序号已被占，不会分到同一组端口。
             provisioning.scaffold(plan, st.workspace_root)
             await provisioning.start_unit(provisioning.CREATE_UNIT.format(instance_id=plan.instance_id))
+        except provisioning.RosterUnreadable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except provisioning.ProvisionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {
@@ -2459,6 +2466,8 @@ def create_app(
                 st.workspace_root, instance_id, current_prefix=url_prefix(),
             )
             await provisioning.start_unit(provisioning.REMOVE_UNIT.format(instance_id=row["id"]))
+        except provisioning.RosterUnreadable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except provisioning.ProvisionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"ok": True, "id": row["id"]}

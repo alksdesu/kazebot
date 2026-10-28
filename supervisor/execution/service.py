@@ -16,7 +16,7 @@ from typing import Any
 from fastapi import HTTPException
 
 import config_layout
-from clonoth_runtime import get_int, load_yaml_dict
+from clonoth_runtime import SettingsFile, get_int
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.tool_outputs import excerpt_text
 from real_paths import real_path
@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 _STEP_TEXT_MAX_CHARS = 200_000
 # 报错随每次计划更新事件发出去，留够看清原因就行
 _STEP_ERROR_MAX_CHARS = 2000
+
+EXECUTION_SETTINGS = SettingsFile(config_layout.EXECUTION_SETTINGS_FILE)
 
 
 def now() -> str:
@@ -49,8 +51,8 @@ class ExecutionService:
         self._thread: threading.Thread | None = None
 
     def _config(self) -> dict[str, Any]:
-        """config/execution.yaml 的现状。每次取值都重读：只有几行，共享组里别的实例也会改它。"""
-        return load_yaml_dict(config_layout.config_dir(self.root) / "execution.yaml") or {}
+        """config/execution.yaml 现在生效的那份。每次取值都看一眼文件：共享组里别的实例也会改它。"""
+        return EXECUTION_SETTINGS.load(config_layout.execution_settings_path(self.root))
 
     # 填了不是数的值按默认算：每次取值都重读，抛出去就是这个组里每个实例的每个请求都 500。
     @property

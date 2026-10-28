@@ -856,6 +856,49 @@ class TestSupervisorScopeQuery:
         row = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))["sid-1"]
         assert row["conversation_key"] == new_stable and row["updated_at"] == touched.isoformat()
 
+    def test_a_migration_says_when_the_hit_record_could_not_follow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 目录搬完了、命中记录里还是旧前缀：修好文件之前不说，下一轮数据清理会把它们当孤儿摘掉。
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        hit_cache = tmp_path / "data" / "memory" / ".hit_cache.json"
+        hit_cache.write_text('{"conv_x/m1" "2020-01-01T00:00:00+00:00"}', encoding="utf-8")
+        before = hit_cache.read_bytes()
+
+        with caplog.at_level("WARNING", logger="supervisor.platform_accounts"):
+            response = self._call(
+                tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert (body["moved_memory_dirs"], body["hit_keys_rewritten"]) == (1, 0)
+        assert body["hit_cache_problem"] == "第 1 行第 14 列：Expecting ':' delimiter"
+        assert hit_cache.read_bytes() == before
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "data" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        migrated = [event for event in events if event["type"] == "platform_scope_migrated"]
+        assert migrated[-1]["payload"]["hit_cache_problem"] == body["hit_cache_problem"]
+        # 修文件的人得知道每个旧前缀该换成什么，这份对照只有日志里有。
+        new_ns = _ns(f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}")
+        warnings = [record.getMessage() for record in caplog.records if record.name == "supervisor.platform_accounts"]
+        assert any(f"{seed['ns']} -> {new_ns}" in message and body["hit_cache_problem"] in message for message in warnings)
+
+    def test_a_migration_whose_hit_record_followed_reports_no_problem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+
+        response = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert response.status_code == 200, response.text
+        assert (response.json()["hit_keys_rewritten"], response.json()["hit_cache_problem"]) == (1, "")
+
     def test_a_store_the_migration_cannot_read_is_a_server_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

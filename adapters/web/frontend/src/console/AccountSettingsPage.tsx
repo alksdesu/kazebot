@@ -2,7 +2,7 @@ import { QQ_NAPCAT } from '../platforms/registry';
 import { usePlatformRegistryState } from '../platforms/usePlatformRegistry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountWorkspaceSlot } from './AccountWorkspace';
-import { Empty } from './components';
+import { Empty, ErrorText } from './components';
 import { useConsoleStore } from './consoleStore';
 import { useLiveRefresh } from './liveRefresh';
 import { PlatformProvider } from './platformContext';
@@ -33,6 +33,12 @@ export const AccountSettingsPage = () => {
   if (platform.id !== QQ_NAPCAT.id) return <Empty>当前实例的平台尚未提供账号管理界面。</Empty>;
 
   return <PlatformProvider key={`${adminToken}:${platform.id}`} platform={platform}>
+    {/* 清单没读到时本实例跑哪个平台是猜的：内置只有这一个，账号请求就照它发。 */}
+    {registry.error && (
+      <ErrorText className="mb-4" role="alert">
+        平台清单没读到：{registry.error}。先当本实例跑的是内置的 {platform.displayName}。
+      </ErrorText>
+    )}
     <CurrentAccountSettings token={adminToken} />
   </PlatformProvider>;
 };

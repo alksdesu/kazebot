@@ -757,6 +757,14 @@ class TestCleanupSchedule:
         assert len(calls) == 1
         assert calls[0][-1] == "--dry-run"
 
+    def test_it_starts_the_cleanup_as_a_package_module(self, tmp_path: Path, monkeypatch) -> None:
+        self._config(tmp_path)
+        calls = self._spy(monkeypatch)
+
+        self._handler().on_tick(self._ctx(tmp_path, now=datetime(2026, 8, 17, 5, 17, tzinfo=timezone.utc)))
+
+        assert calls[0][:3] == [sys.executable, "-m", "engine.data_cleanup"]
+
     def test_it_stays_quiet_off_the_cron_minute(self, tmp_path: Path, monkeypatch) -> None:
         self._config(tmp_path)
         calls = self._spy(monkeypatch)

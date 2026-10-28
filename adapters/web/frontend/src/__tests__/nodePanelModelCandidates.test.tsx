@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getNodeRaw, getNodes, getProviders, listUpstreamModels } from '../api/supervisorClient';
 import { AgentsSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
+import { ChannelOptions, type ChannelTableState } from '../console/channelFields';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -166,6 +167,68 @@ describe('渠道下拉', () => {
 
     expect([...channelBox().options].map((option) => option.textContent))
       .toContain('some-relay（后端不认）');
+  });
+
+  it('渠道表还在读时不打标记，读成了才标后端不认', async () => {
+    let finish: (value: unknown) => void = () => {};
+    vi.mocked(getProviders).mockReturnValue(new Promise((resolve) => { finish = resolve; }) as any);
+    vi.mocked(getNodeRaw).mockResolvedValue({ content: `${NODE_YAML}provider: some-relay\n`, hash: 'node-1' });
+    selectNode();
+    render(<AgentsSettingsRightPanel />);
+
+    await waitFor(() => expect(channelBox().value).toBe('some-relay'));
+    expect([...channelBox().options].map((option) => option.textContent)).toContain('some-relay');
+
+    finish(PROVIDERS);
+
+    await waitFor(() => expect([...channelBox().options].map((option) => option.textContent))
+      .toContain('some-relay（后端不认）'));
+  });
+
+  it('渠道表没读到时不说后端不认，红字报出原因', async () => {
+    // 表不在手上，列不出来的渠道说明不了什么；标成后端不认会让人把写对的渠道改掉。
+    vi.mocked(getProviders).mockRejectedValue(new Error('503 渠道表读不了'));
+    vi.mocked(getNodeRaw).mockResolvedValue({ content: `${NODE_YAML}provider: openai\n`, hash: 'node-1' });
+    selectNode();
+    render(<AgentsSettingsRightPanel />);
+
+    expect(await screen.findByText('渠道表没读到，下拉里列不出可选的渠道：503 渠道表读不了')).toHaveAttribute('role', 'alert');
+    const texts = [...channelBox().options].map((option) => option.textContent);
+    expect(texts).toContain('openai（渠道表没读到）');
+    expect(texts.filter((text) => text?.includes('后端不认'))).toEqual([]);
+    expect(channelBox().value).toBe('openai');
+  });
+
+  it('渠道表读成了就不挂红字', async () => {
+    selectNode();
+    render(<AgentsSettingsRightPanel />);
+
+    await waitFor(() => expect([...channelBox().options].map((option) => option.value)).toContain('openai'));
+
+    expect(screen.queryByText(/渠道表没读到/)).toBeNull();
+  });
+});
+
+describe('渠道选项的标记', () => {
+  const unlistedText = (table?: ChannelTableState) => {
+    render(
+      <select aria-label="渠道" defaultValue="relay">
+        <ChannelOptions channels={[]} current="relay" table={table} wires={['openai']} />
+      </select>,
+    );
+    return channelBox().options[0].textContent;
+  };
+
+  it('不给读取状态时照旧标后端不认：系统槽位和备选链都是渠道表读成了才摆下拉', () => {
+    expect(unlistedText()).toBe('relay（后端不认）');
+  });
+
+  it.each([
+    ['ready', 'relay（后端不认）'],
+    ['loading', 'relay'],
+    ['failed', 'relay（渠道表没读到）'],
+  ] as const)('读取状态是 %s 时列不出来的值显示成 %s', (table, text) => {
+    expect(unlistedText(table)).toBe(text);
   });
 });
 

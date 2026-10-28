@@ -5,7 +5,7 @@ import * as api from '../api/supervisorClient';
 import { GeneralSettingsPage } from '../components/settings/pages/GeneralSettingsPage';
 import { getSettingsTab } from '../components/settings/settingsTabs';
 import { platformConsoleStore } from '../console/consoleStore';
-import { adoptPlatforms, QQ_NAPCAT, resetPlatforms } from '../platforms/registry';
+import { adoptPlatforms, QQ_NAPCAT, resetPlatforms, settlePlatforms } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 
@@ -91,6 +91,17 @@ describe('机器人分组中的账号与连接', () => {
     adoptPlatforms([QQ_NAPCAT]);
     render(<AccountPage />);
     expect(await screen.findByText('当前机器人')).toBeVisible();
+    expect(api.getPlatformAccount).toHaveBeenCalledWith('current-token', 'qq');
+    expect(screen.queryByText(/平台清单没读到/)).toBeNull();
+  });
+
+  // 退回内置的那一个平台照旧能管账号，可本实例跑的是不是它是猜的，得说一声。
+  it('平台清单没读到时照内置的平台管账号，并交代清单没读到的原因', async () => {
+    resetPlatforms();
+    settlePlatforms('500 注册表挂了');
+    render(<AccountPage />);
+    expect(await screen.findByText('当前机器人')).toBeVisible();
+    expect(screen.getByText('平台清单没读到：500 注册表挂了。先当本实例跑的是内置的 QQ · NapCat。')).toHaveAttribute('role', 'alert');
     expect(api.getPlatformAccount).toHaveBeenCalledWith('current-token', 'qq');
   });
 

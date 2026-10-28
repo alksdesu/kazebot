@@ -76,9 +76,9 @@ function stubPolicy(policy = POLICY, codeWrite: () => Response = () => jsonRespo
     }
     if (init?.method === 'PUT') {
       lastPut = JSON.parse(String(init.body)).policy;
-      return jsonResponse({ policy: lastPut });
+      return jsonResponse({ policy: lastPut, hash: 'p2' });
     }
-    return jsonResponse({ policy });
+    return jsonResponse({ policy, hash: 'p1' });
   }));
 }
 
@@ -292,7 +292,7 @@ describe('服务端策略', () => {
       vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
         if (init?.method === 'PUT') return put.promise;
         reads += 1;
-        return reads === 1 ? Promise.resolve(jsonResponse({ policy: POLICY })) : new Promise<Response>(() => {});
+        return reads === 1 ? Promise.resolve(jsonResponse({ policy: POLICY, hash: 'p1' })) : new Promise<Response>(() => {});
       }));
       render(<PolicyRulesSection />);
       await screen.findByRole('button', { name: /写入/ });
@@ -310,7 +310,7 @@ describe('服务端策略', () => {
     it('不把服务端回写的文档落到新会话，也不写已保存那句', async () => {
       const put = await saveInFlight();
 
-      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN }));
+      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN, hash: 'p2' }));
 
       expect(screen.queryByText(SERVER_RULE)).toBeNull();
       expect(screen.queryByText('已保存，立即生效，不用重启')).toBeNull();
@@ -329,7 +329,7 @@ describe('服务端策略', () => {
     it('提前 return 之后保存按钮不卡在正在保存', async () => {
       const put = await saveInFlight();
 
-      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN }));
+      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN, hash: 'p2' }));
 
       expect(screen.queryByRole('button', { name: '正在保存…' })).toBeNull();
       expect(screen.getByRole('button', { name: '保存策略' })).toBeEnabled();
@@ -420,6 +420,35 @@ describe('服务端策略', () => {
       expect(screen.getByLabelText('兜底档位')).toHaveValue('deny');
       expect(puts).toHaveLength(0);
     });
+  });
+
+  // 补成空文档的话，每一类都摆成「没有规则」，照着存一次就把整份策略清空了。
+  it('读回来缺 policy 时报格式不对，不摆一份空策略让人改', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ hash: 'p1' })));
+    render(<PolicyRulesSection />);
+
+    expect(await screen.findByText('服务端策略格式不对：缺 policy')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByRole('button', { name: '保存策略' })).toBeNull();
+  });
+
+  // 回执是存完才发的：当成没存上，人会再存一次撞上冲突；拿它当新底子，下一次保存就不带指纹。
+  it('存上了只是回执读不懂：交代已保存、回执的事另起一行，页面换成服务器上那一份', async () => {
+    const reads: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT') return jsonResponse({ policy: REWRITTEN });
+      reads.push(reads.length ? 'p2' : 'p1');
+      return jsonResponse({ policy: reads.length === 1 ? POLICY : REWRITTEN, hash: reads[reads.length - 1] });
+    }));
+    render(<PolicyRulesSection />);
+    await screen.findByRole('button', { name: /写入/ });
+
+    fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'deny' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策略' }));
+
+    expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+    expect(screen.getByText('策略已经存上，可回执格式不对：缺 hash')).toHaveAttribute('role', 'alert');
+    expect(await screen.findByText(SERVER_RULE)).toBeInTheDocument();
+    expect(reads).toEqual(['p1', 'p2']);
   });
 
   // 授权时长单独一个页签，保存仍是整份 PUT：读到的这一段要原样带回去，改了的要按数字带上。

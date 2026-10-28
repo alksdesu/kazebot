@@ -221,13 +221,32 @@ class TestConsoleRefusesToOverwrite:
             assert _PRIVATE not in str(link)
             link = link.__cause__ or link.__context__
 
-    def test_listing_skips_it_and_shows_the_rest(self, tmp_path: Path) -> None:
-        _write(_namespace_dir(tmp_path) / "default.yaml", _BROKEN)
+    def test_listing_shows_the_rest_and_names_the_book_it_could_not_read(self, tmp_path: Path) -> None:
+        # 悄悄跳过的话，控制台的条数和本数少了一截，看着像那本里的记忆没了。
+        _write(_namespace_dir(tmp_path) / "default.yaml", _BROKEN_ON_A_PRIVATE_LINE)
         _book(_namespace_dir(tmp_path) / "rules.yaml", [{"id": "r1", "content": "规则", "keywords": ["k"]}])
 
-        entries = memory_admin.list_entries(tmp_path, self._namespace(tmp_path))
+        listing = memory_admin.list_entries(tmp_path, self._namespace(tmp_path))
 
-        assert [entry["id"] for entry in entries] == ["r1"]
+        assert [entry["id"] for entry in listing.entries] == ["r1"]
+        assert listing.unreadable_books == [{"book": "default", "problem": _BROKEN_ON_A_PRIVATE_LINE_REASON}]
+
+    def test_the_overview_counts_only_what_it_read_and_lists_the_rest_by_name(self, tmp_path: Path) -> None:
+        _write(_namespace_dir(tmp_path) / "default.yaml", _BROKEN_ON_A_PRIVATE_LINE)
+        _book(_namespace_dir(tmp_path) / "rules.yaml", [{"id": "r1", "content": "规则", "keywords": ["k"]}])
+
+        [row] = memory_admin.list_namespaces(tmp_path)
+
+        assert (row["entry_count"], row["books"], row["unreadable_books"]) == (1, ["rules"], ["default"])
+        assert _PRIVATE not in str(row)
+
+    def test_a_namespace_with_nothing_but_an_unreadable_book_is_still_listed(self, tmp_path: Path) -> None:
+        # 只列条数为零的一行，人会以为这里本来就是空的，顺手清掉。
+        _write(tmp_path / "data" / "memory" / "default.yaml", _BROKEN)
+
+        [row] = memory_admin.list_namespaces(tmp_path)
+
+        assert (row["namespace"], row["entry_count"], row["unreadable_books"]) == ("", 0, ["default"])
 
     def test_clearing_the_namespace_still_drops_it(self, tmp_path: Path) -> None:
         # 清空是人明确要删掉整个 namespace，读不出来的那本也在其中。
@@ -384,3 +403,17 @@ class TestHitStampsOnToolDelete:
 
         assert prune_entry_hits(tmp_path, "", "m1") == 0
         assert read_hit_cache(tmp_path) == {"m1": "2026-09-01T00:00:00+00:00"}
+
+    def test_an_unreadable_hit_cache_does_not_stop_delete_memory_and_is_left_as_it_is(self, tmp_path: Path) -> None:
+        # 摘命中戳读不懂侧车就跳过：整份写回会把别的会话的命中一起抹掉。
+        ctx = _ctx(tmp_path)
+        assert asyncio.run(save_memory({"id": "m1", "book": "people", "content": "x", "keywords": ["k"]}, ctx))["ok"]
+        path = hit_cache_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        broken = '{"conv_other/m1": '
+        path.write_text(broken, encoding="utf-8")
+
+        assert asyncio.run(delete_memory({"id": "m1", "book": "people"}, ctx))["ok"]
+
+        assert not (_namespace_dir(tmp_path) / "people.yaml").exists()
+        assert path.read_text(encoding="utf-8") == broken

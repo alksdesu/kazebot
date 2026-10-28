@@ -33,7 +33,7 @@ const json = (value: unknown, status = 200): Response => new Response(JSON.strin
   headers: { 'Content-Type': 'application/json' },
 });
 
-const IDLE: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '' };
+const IDLE: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '' };
 
 const message = (id: string, role: WsMessage['role'], text: string, createdAt = '2026-05-31T03:00:00.000Z'): WsMessage => ({
   id,
@@ -105,6 +105,24 @@ describe('消息列表的历史提示', () => {
     expect(screen.queryByRole('button', { name: '加载更早的消息' })).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
   });
+
+  // 子节点面板摆的是上一次读成的那份：不说一声，读失败看着就像这个会话没派出过子节点。
+  it('子会话列表没读到时消息照常摆着，另起一行说原因，重试就重读整个会话', () => {
+    const retry = vi.fn();
+    render(<MessageListV2 messages={[message('m1', 'user', '还在这里')]} toolsById={{}} history={{ ...IDLE, childrenError: '503 子会话挂了' }} onRetryHistory={retry} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('子节点列表没读到：503 子会话挂了');
+    expect(screen.getByText('还在这里')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
+  it('还没有消息时子会话列表没读到也说出来，不只摆一句开始对话', () => {
+    render(<MessageListV2 messages={[]} toolsById={{}} history={{ ...IDLE, childrenError: '503 子会话挂了' }} onRetryHistory={() => {}} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('子节点列表没读到：503 子会话挂了');
+    expect(screen.getByText(/发送消息，开始对话/)).toBeInTheDocument();
+  });
 });
 
 describe('会话历史的读取、往前翻与重试', () => {
@@ -152,6 +170,41 @@ describe('会话历史的读取、往前翻与重试', () => {
     useChatStore.getState().retryHistory();
     await waitFor(() => expect(view()).toMatchObject({ loading: false, error: '' }));
     expect(texts()).toEqual(['question', 'answer']);
+  });
+
+  it('子会话列表读失败记在这个会话的历史状态上，历史照常换上；重试读成了就清掉', async () => {
+    let fail = true;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-p/history')) return json([historyRow(0, 'user', 'question')]);
+      if (url.includes('/v1/sessions/sess-p/children')) return fail ? json({ detail: '子会话挂了' }, 503) : json([]);
+      if (url.includes('/running_tasks')) return json({ tasks: [] });
+      return json([]);
+    }));
+    seed();
+
+    useChatStore.getState().selectConversation('conv-p');
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, error: '', childrenError: '503 子会话挂了' }));
+    expect(texts()).toEqual(['question']);
+
+    fail = false;
+    useChatStore.getState().retryHistory();
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, error: '', childrenError: '' }));
+  });
+
+  it('子会话列表对不上形状也算没读成，不当成一个子会话都没有', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-p/history')) return json([]);
+      if (url.includes('/v1/sessions/sess-p/children')) return json({ children: [] });
+      if (url.includes('/running_tasks')) return json({ tasks: [] });
+      return json([]);
+    }));
+    seed();
+
+    useChatStore.getState().selectConversation('conv-p');
+
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, childrenError: '子会话列表格式不对：返回的不是数组' }));
   });
 
   it('往前翻带着最早一条的位置去读，读到的接在最前面，翻到头就不再有按钮', async () => {

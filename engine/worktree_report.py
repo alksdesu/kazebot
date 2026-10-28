@@ -46,10 +46,11 @@ def _merge_hint(view: dict[str, Any], *, can_merge: bool) -> str:
     handle = _handle(view)
     patch = str(view.get("patch") or "").strip()
     if view.get("merge_allowed") is False:
+        why = str(view.get("merge_refusal") or "").strip() or "本实例不能合回这个仓库"
         where = f"补丁在 {patch}" if patch else "没有补丁文件"
         if not can_merge:
-            return f"本实例不能合回这个仓库，{where}；这个节点也不能调用 {MERGE_TOOL}，副本到了保留期会被清理。"
-        return f"本实例不能合回这个仓库，{where}；不要了就调用 {MERGE_TOOL}，handle 填 {handle}，带上 abandon=true 放弃。"
+            return f"{why}，{where}；这个节点也不能调用 {MERGE_TOOL}，副本到了保留期会被清理。"
+        return f"{why}，{where}；不要了就调用 {MERGE_TOOL}，handle 填 {handle}，带上 abandon=true 放弃。"
     if not can_merge:
         # 同一会话家族里有合回工具的上级拿这个句柄就能合回
         return (

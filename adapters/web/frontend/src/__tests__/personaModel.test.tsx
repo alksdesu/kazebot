@@ -13,6 +13,7 @@ import {
   getNodes,
   getProviders,
   isNotFound,
+  ReceiptUnreadable,
   updateNodeFileRaw,
   updateNodeRaw,
   type NodeFileInfo,
@@ -347,6 +348,25 @@ describe('人设正文的保存基准', () => {
     expect(await screen.findByText('人设在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'))
       .toBeInTheDocument();
     expect(editor()).toHaveValue('改了一版');
+  });
+
+  // 没改动时「丢弃」点不了、读不回新指纹，只能留着旧的：下次保存撞冲突，不会把这次存上的整份盖掉。
+  it('回执没读懂时照存上了说，留着旧指纹并交代先刷新页面再改', async () => {
+    vi.mocked(updateNodeFileRaw).mockRejectedValueOnce(new ReceiptUnreadable('节点文件 _persona.md 已经存上，可回执格式不对：缺 hash'));
+    await ready();
+
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+
+    expect(await screen.findByText('已保存，下一条消息就会用新的人设。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      '节点文件 _persona.md 已经存上，可回执格式不对：缺 hash。刷新页面读入最新内容再改，不然再存会被当成冲突拒掉',
+    );
+    fireEvent.change(editor(), { target: { value: '又改一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(updateNodeFileRaw).mock.calls.map((call) => call[3])).toEqual(['persona-1', 'persona-1']);
   });
 
   it('别的失败照实说，不冒充成冲突', async () => {

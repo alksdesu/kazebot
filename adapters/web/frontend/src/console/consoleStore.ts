@@ -239,14 +239,14 @@ const createConsoleState = (scope: ConfigScope) => (
   /** 这一次写回还是不是最新的一次。新的写回一开始，旧的那次就无权再改认账状态。 */
   const current = (written: Written): boolean => writeVersions.get(scope.id) === written.generation;
 
-  /** 把草稿合进磁盘上最新那份原文写回。返回写进去的原文和要交代的警告。 */
+  /** 把草稿合进磁盘上最新那份原文写回。返回写进去的原文和要交代的警告；回执没读懂也是存上了，原因跟着警告交代。 */
   const write = async (token: string, live: ConfigLiveState | null, subset: Draft) => {
-    const { content, note, result } = await commitYamlKeys({
+    const { content, note, result, receiptProblem } = await commitYamlKeys({
       read: () => api.getRaw(token),
       write: (merged, hash) => api.putRaw(token, merged, hash),
       edits: draftEdits(subset, live?.state?.paths || {}),
     });
-    return { content, warnings: note ? [...result.warnings, note] : result.warnings };
+    return { content, warnings: [...(result?.warnings ?? []), note, receiptProblem].filter(Boolean) };
   };
 
   /** 探一次：文件还是不是写进去的那份，生效方换上没有。 */

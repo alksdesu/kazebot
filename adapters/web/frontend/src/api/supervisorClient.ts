@@ -1,8 +1,9 @@
 // Supervisor 接口的薄封装：只管路径和请求体，鉴权、时限与报错交给 request。
 import type { NodeDef, SupervisorEvent } from '../types';
+import { nameWith } from '../console/format';
 import { commandAction } from '../plugins/commands';
 import { isInstancePath, MOUNT } from '../instances/paths';
-import { ApiError, request, send, type RequestOptions } from './request';
+import { ApiError, errorMessage, request, send, type RequestOptions } from './request';
 
 export { MOUNT, instanceConsoleHref } from '../instances/paths';
 export { ApiError, isEditConflict, isNotFound, isTransientApiError } from './request';
@@ -11,6 +12,114 @@ const API = `${MOUNT}/v1`;
 
 function apiFetch(path: string, options?: RequestOptions): Promise<Response> {
   return request(`${API}${path}`, options);
+}
+
+// ── 响应形状 ──
+// 后端一定会发的东西对不上形状就抛「…格式不对」：补成空值的话，界面会把「没读懂」说成「一个都没有」。
+
+const isJsonObject = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
+/** 一种值该是什么样。mismatch 是对不上时接在位置后面的那半句，比如「不是字符串」。 */
+interface Kind<T> {
+  readonly ok: (value: unknown) => value is T;
+  readonly mismatch: string;
+}
+
+const TEXT: Kind<string> = {
+  ok: (value): value is string => typeof value === 'string',
+  mismatch: '不是字符串',
+};
+const NON_EMPTY_TEXT: Kind<string> = {
+  ok: (value): value is string => typeof value === 'string' && value !== '',
+  mismatch: '不是非空字符串',
+};
+const BOOLEAN: Kind<boolean> = {
+  ok: (value): value is boolean => typeof value === 'boolean',
+  mismatch: '不是 true 或 false',
+};
+const NUMBER: Kind<number> = {
+  ok: (value): value is number => typeof value === 'number' && Number.isFinite(value),
+  mismatch: '不是数字',
+};
+const OBJECT: Kind<Record<string, unknown>> = {
+  ok: isJsonObject,
+  mismatch: '不是 JSON 对象',
+};
+const TEXT_LIST: Kind<string[]> = {
+  ok: (value): value is string[] => Array.isArray(value) && value.every(TEXT.ok),
+  mismatch: '不是字符串数组',
+};
+
+/** 接口类型里带问号的字段：缺了照旧，在就得对得上。 */
+const optional = <T>(kind: Kind<T>): Kind<T | undefined> => ({
+  ok: (value): value is T | undefined => value === undefined || kind.ok(value),
+  mismatch: kind.mismatch,
+});
+
+const nullable = <T>(kind: Kind<T>): Kind<T | null> => ({
+  ok: (value): value is T | null => value === null || kind.ok(value),
+  mismatch: `${kind.mismatch}，也不是 null`,
+});
+
+/** 后端只发这几个值里的一个：认不出的不按哪一个猜。 */
+const oneOf = <T extends string>(...values: readonly T[]): Kind<T> => ({
+  ok: (value): value is T => typeof value === 'string' && (values as readonly string[]).includes(value),
+  mismatch: `不是 ${values.join('、')} 之一`,
+});
+
+type Shape = Readonly<Record<string, Kind<unknown>>>;
+type Shaped<S extends Shape> = {
+  -readonly [K in keyof S]: S[K] extends Kind<infer T> ? T : never;
+} & Record<string, unknown>;
+
+// path 是值在响应里的位置，比如 instances[2].current；空串指整个响应。
+const at = (path: string, key: string | number): string => (
+  typeof key === 'number' ? `${path}[${key}]` : path ? `${path}.${key}` : key
+);
+
+function formatError(what: string, value: unknown, path: string, mismatch: string): Error {
+  if (value === undefined && path) return new Error(`${what}格式不对：缺 ${path}`);
+  return new Error(`${what}格式不对：${path ? `${path} ` : '返回的'}${mismatch}`);
+}
+
+/** value 得是对象，shape 里的字段都对得上；对不上抛 what 的格式错误。shape 以外的字段原样留着。 */
+function shaped<S extends Shape>(what: string, value: unknown, shape: S, path = ''): Shaped<S> {
+  if (!isJsonObject(value)) throw formatError(what, value, path, OBJECT.mismatch);
+  for (const [key, kind] of Object.entries(shape)) {
+    if (!kind.ok(value[key])) throw formatError(what, value[key], at(path, key), kind.mismatch);
+  }
+  return value as Shaped<S>;
+}
+
+/** value 得是数组，每一项都按 shape 对得上。 */
+function shapedRows<S extends Shape>(what: string, value: unknown, shape: S, path = ''): Shaped<S>[] {
+  if (!Array.isArray(value)) throw formatError(what, value, path, '不是数组');
+  return value.map((row: unknown, index) => shaped(what, row, shape, at(path, index)));
+}
+
+/** 改动在后端已经做完，只是回执读不懂。调用方照做完收尾、另读一遍现状，再单独交代回执的事：当成失败，人会再点一次。 */
+export class ReceiptUnreadable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReceiptUnreadable';
+  }
+}
+
+/** 按 read 读 2xx 的回执。正文不是 JSON、形状对不上都抛 ReceiptUnreadable；what 打头的那半句得先说清已经做完。 */
+async function receiptOf<T>(what: string, resp: Response, read: (body: unknown) => T): Promise<T> {
+  let body: unknown;
+  try {
+    body = await resp.json();
+  } catch {
+    throw new ReceiptUnreadable(`${what}不是 JSON`);
+  }
+  try {
+    return read(body);
+  } catch (error) {
+    throw new ReceiptUnreadable(errorMessage(error));
+  }
 }
 
 /** 附件在本实例上的地址。path 是工作区相对路径，例如 data/attachments/xxx/yyy.png；令牌走请求头，不进地址。 */
@@ -272,13 +381,25 @@ export interface ConfigRemoveResult {
 }
 
 export interface AdminSkill {
+  /** frontmatter 里写的名字，没写是目录名。 */
   name: string;
+  /** 技能目录名，读、写、删都按它找文件。 */
+  dir?: string;
+  path?: string;
   description?: string;
   enabled?: boolean;
   strategy?: string;
   keywords?: string[];
   body_preview?: string;
-  error?: string;
+  /** 非空 = 文件读不了或 frontmatter 写坏了，加载时整个技能被跳过；只有位置和问题，不带原文。 */
+  problem?: string;
+  /** output 策略的 trigger / scope / max_fires 写得不对，这条规则不生效。 */
+  rule_error?: string;
+}
+
+/** 技能文件在哪个目录：frontmatter 里的 name 可以和目录名不一样，拿 name 去读写会找错文件。 */
+export function skillDir(skill: AdminSkill): string {
+  return skill.dir || skill.name;
 }
 
 export interface McpClient {
@@ -302,7 +423,7 @@ export interface AdminCreatePayload {
 /**
  * 原文连同读到它时的指纹。编辑器自己留着 hash，保存时原样交回：文件中途被别处改过
  * （共享组里别的实例、另一个标签页、同一页上的另一个面板），后端回 409，一个字节都不写。
- * 空串表示读的时候文件还不存在；null 表示后端没给指纹，保存时照旧整份覆盖。
+ * 空串表示读的时候文件还不存在。读回来的总有指纹；null 只出现在手上没有读成过的那一版上，保存时不带基准整份覆盖。
  */
 export interface RawText {
   content: string;
@@ -312,48 +433,65 @@ export interface RawText {
 /** 保存之后磁盘上那一版的指纹，拿它当下一次保存的基准。 */
 export interface RawSaveResult {
   ok: boolean;
-  hash: string | null;
+  hash: string;
   /** 后端保存前校验给的提醒：能存，但有该知道的事（比如某个键已经没人读了）。没有提醒时不带这一项。 */
   warnings?: string[];
 }
 
-const warningsOf = (json: unknown): string[] => {
-  const warnings = (json as { warnings?: unknown } | null)?.warnings;
-  return Array.isArray(warnings) ? warnings.map(String) : [];
-};
+const SAVE_RECEIPT = { ok: BOOLEAN, hash: TEXT, warnings: optional(TEXT_LIST) };
 
-/** 写配置文件的回执：原文编辑器保存和新建文件回的是同一种。 */
-const saveResultOf = (json: unknown): RawSaveResult => {
-  const warnings = warningsOf(json);
-  return {
-    ok: (json as { ok?: unknown } | null)?.ok !== false,
-    hash: hashOf(json),
-    ...(warnings.length ? { warnings } : {}),
-  };
-};
+/**
+ * 写配置文件的回执：原文编辑器保存和新建文件回的是同一种。receipt 打头说清已经存上。
+ * 指纹读不懂抛 ReceiptUnreadable：拿 null 当下一次保存的基准，保存时不带指纹，别处的改动会被整份盖掉。
+ */
+function saveResultOf(receipt: string, resp: Response): Promise<RawSaveResult> {
+  return receiptOf(receipt, resp, (body) => {
+    const { ok, hash, warnings } = shaped(receipt, body, SAVE_RECEIPT);
+    return { ok, hash, ...(warnings?.length ? { warnings } : {}) };
+  });
+}
 
-export function hashOf(json: unknown): string | null {
-  const hash = (json as { hash?: unknown } | null)?.hash;
-  return typeof hash === 'string' ? hash : null;
+const savedReceipt = (what: string): string => nameWith(what, '已经存上，可回执');
+const createdReceipt = (what: string): string => nameWith(what, '已经建好，可回执');
+
+/** 写操作的结果。存上了、只是回执读不懂时 result 是 null，receiptProblem 写着哪里没读懂。 */
+export interface Receipted<R> {
+  result: R | null;
+  receiptProblem: string;
+}
+
+/** 等写操作做完。回执读不懂不算失败，交回 null 和原因，由调用方照存上了收尾；别的错误照抛。 */
+export async function receipted<R>(write: Promise<R>): Promise<Receipted<R>> {
+  try {
+    return { result: await write, receiptProblem: '' };
+  } catch (error) {
+    if (error instanceof ReceiptUnreadable) return { result: null, receiptProblem: error.message };
+    throw error;
+  }
 }
 
 function rawWriteFields(content: string, baseHash: string | null): { content: string; base_hash?: string } {
   return baseHash === null ? { content } : { content, base_hash: baseHash };
 }
 
-async function readRawConfig(path: string, token: string): Promise<RawText> {
+const RAW_TEXT = { content: TEXT, hash: TEXT };
+
+// 正文或指纹对不上形状就报格式不对：拿空串顶上，编辑器摆出来的是一份空文件；拿 null 顶上，保存时不带指纹，把真文件整份盖掉。
+async function readRawConfig(what: string, path: string, token: string): Promise<RawText> {
   const resp = await apiFetch(path, { token });
-  const json = await resp.json();
-  return { content: typeof json.content === 'string' ? json.content : '', hash: hashOf(json) };
+  const { content, hash } = shaped(what, await resp.json(), RAW_TEXT);
+  return { content, hash };
 }
 
-async function writeRawConfig(path: string, token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+async function writeRawConfig(
+  what: string, path: string, token: string, content: string, baseHash: string | null,
+): Promise<RawSaveResult> {
   const resp = await apiFetch(path, {
     method: 'PUT',
     token,
     json: rawWriteFields(content, baseHash),
   });
-  return saveResultOf(await resp.json());
+  return saveResultOf(savedReceipt(what), resp);
 }
 
 const pathPart = (value: string): string => encodeURIComponent(value);
@@ -399,11 +537,11 @@ export async function getNodes(token: string): Promise<AdminNode[]> {
 }
 
 export function getConfigRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/config/raw', token);
+  return readRawConfig('models.yaml 原文', '/admin/config/config/raw', token);
 }
 
 export function updateConfigRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/config/raw', token, yaml, baseHash);
+  return writeRawConfig('models.yaml', '/admin/config/config/raw', token, yaml, baseHash);
 }
 
 // ── Multi-provider config ──
@@ -529,14 +667,22 @@ export interface ProviderProfiles {
 }
 
 // 界面不硬编码各家支持什么参数、发哪种格式 —— provider 类自己声明，这里只搬运。
+// 缺了的表按空表算，老后端可能还没有它；在却不是对象就报格式不对：补成空表，界面会当这几家什么都不支持。
+const PROVIDER_PROFILES = {
+  options: optional(OBJECT),
+  wire_formats: optional(OBJECT),
+  host_profiles: optional(OBJECT),
+  default_vision: optional(OBJECT),
+};
+
 export async function getProviderProfiles(token: string): Promise<ProviderProfiles> {
   const resp = await apiFetch('/config/provider-options', { token });
-  const body = await resp.json();
+  const body = shaped('渠道参数清单', await resp.json(), PROVIDER_PROFILES);
   return {
-    options: (body?.options || {}) as ProviderOptionsCatalog,
-    wireFormats: (body?.wire_formats || {}) as Record<string, string>,
-    hostProfiles: (body?.host_profiles || {}) as Record<string, string[]>,
-    defaultVision: (body?.default_vision || {}) as Record<string, boolean>,
+    options: (body.options ?? {}) as ProviderOptionsCatalog,
+    wireFormats: (body.wire_formats ?? {}) as Record<string, string>,
+    hostProfiles: (body.host_profiles ?? {}) as Record<string, string[]>,
+    defaultVision: (body.default_vision ?? {}) as Record<string, boolean>,
   };
 }
 
@@ -553,8 +699,7 @@ export async function listUpstreamModels(
     token,
     json: data,
   });
-  const body = await resp.json();
-  return Array.isArray(body?.models) ? body.models.map(String) : [];
+  return shaped('模型列表', await resp.json(), { models: TEXT_LIST }).models;
 }
 
 export async function upsertProvider(
@@ -662,22 +807,29 @@ export interface PolicyFile {
   hash: string | null;
 }
 
-// 拿不到 policy 字段就给空文档：调用方按对象用，返回 undefined 会让渲染直接炸。
-const policyFileOf = (data: any): PolicyFile => ({ policy: (data && data.policy) || {}, hash: hashOf(data) });
+// 补成空文档的话，页面会把每一类都摆成「没有规则」，照着存一次就把整份策略清空了。
+const POLICY_FILE = { policy: OBJECT, hash: TEXT };
+
+const policyFileOf = (what: string, data: unknown): PolicyFile => {
+  const { policy, hash } = shaped(what, data, POLICY_FILE);
+  return { policy: policy as PolicyDoc, hash };
+};
 
 export async function getPolicy(token: string): Promise<PolicyFile> {
   const resp = await apiFetch('/config/policy', { token });
-  return policyFileOf(await resp.json());
+  return policyFileOf('服务端策略', await resp.json());
 }
 
-/** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。baseHash 是读到时的指纹，中途被别处改过就 409。 */
+/** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。baseHash 是读到时的指纹，中途被别处改过就 409。
+ *  存上了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function updatePolicy(token: string, policy: PolicyDoc, baseHash: string | null): Promise<PolicyFile> {
   const resp = await apiFetch('/config/policy', {
     method: 'PUT',
     token,
     json: baseHash === null ? { policy } : { policy, base_hash: baseHash },
   });
-  return policyFileOf(await resp.json());
+  const what = '策略已经存上，可回执';
+  return receiptOf(what, resp, body => policyFileOf(what, body));
 }
 
 // ── bot 登录账号（经 supervisor 转发给平台的账号运维）──
@@ -779,10 +931,22 @@ export function ownedByAnotherInstance(
   return instanceOwning(platformId, account, instances.filter((row) => !row.current));
 }
 
+const CONSOLE_INSTANCE = {
+  id: NON_EMPTY_TEXT,
+  label: TEXT,
+  path: TEXT,
+  current: BOOLEAN,
+  idx: optional(NUMBER),
+  platform: optional(TEXT),
+  account: optional(TEXT),
+  provisioning: optional(OBJECT),
+};
+
+// 读不懂就抛，不能当成单实例：清单为空时 ownedByAnotherInstance 一律放行，双登拦不住。
 export async function getInstances(token: string): Promise<ConsoleInstance[]> {
   const resp = await apiFetch('/instances', { token });
-  const data = await resp.json();
-  return Array.isArray(data?.instances) ? data.instances : [];
+  const body = shaped('实例列表', await resp.json(), {});
+  return shapedRows('实例列表', body.instances, CONSOLE_INSTANCE, 'instances') as ConsoleInstance[];
 }
 
 /** 新实例落点。序号决定端口，前缀决定它挂在域名的哪一层。 */
@@ -871,6 +1035,8 @@ export interface ShareGroupOverview {
   reason: string;
   current: string | null;
   groups: ShareGroup[];
+  /** 非空 = 实例清单读不懂，查不了谁在用哪个组：这时各组的 members 是不知道，不是没人。老后端没有这一项。 */
+  members_problem?: string;
   archives: string[];
 }
 
@@ -889,37 +1055,56 @@ export function isValidShareGroupName(name: string): boolean {
   return SHARE_GROUP_NAME.test(name);
 }
 
-const normalizeShareGroups = (raw: any): ShareGroupOverview => ({
-  available: Boolean(raw?.available),
-  reason: typeof raw?.reason === 'string' ? raw.reason : '',
-  current: typeof raw?.current === 'string' && raw.current ? raw.current : null,
-  groups: Array.isArray(raw?.groups) ? raw.groups.map((group: any) => ({
-    name: String(group?.name ?? ''),
-    members: Array.isArray(group?.members) ? group.members.map((member: any) => ({
-      id: String(member?.id ?? ''),
-      label: String(member?.label ?? member?.id ?? ''),
-      current: Boolean(member?.current),
-    })) : [],
-    created_at: typeof group?.created_at === 'string' ? group.created_at : '',
-    created_by: typeof group?.created_by === 'string' ? group.created_by : '',
-  })) : [],
-  archives: Array.isArray(raw?.archives) ? raw.archives.map(String) : [],
-});
+const SHARE_GROUP_OVERVIEW = {
+  available: BOOLEAN,
+  reason: TEXT,
+  current: nullable(TEXT),
+  members_problem: optional(TEXT),
+  archives: TEXT_LIST,
+};
+const SHARE_GROUP = { name: NON_EMPTY_TEXT, created_at: TEXT, created_by: TEXT };
+const SHARE_GROUP_MEMBER = { id: NON_EMPTY_TEXT, label: TEXT, current: BOOLEAN };
+const SHARE_GROUP_CHANGE = { group: NON_EMPTY_TEXT, archived: optional(TEXT), copied_env: optional(TEXT_LIST) };
 
+// 回执是改完才发的：读不懂不等于没改成，报错得先说已经做完，免得人当成失败再点一次。
+const SHARE_GROUP_RECEIPT = '共享配置组的操作已经做完，可回执';
+
+function readShareGroups(what: string, raw: unknown, path = ''): ShareGroupOverview {
+  const overview = shaped(what, raw, SHARE_GROUP_OVERVIEW, path);
+  const groupsPath = at(path, 'groups');
+  return {
+    available: overview.available,
+    reason: overview.reason,
+    current: overview.current || null,
+    groups: shapedRows(what, overview.groups, SHARE_GROUP, groupsPath).map((group, index) => ({
+      name: group.name,
+      members: shapedRows(what, group.members, SHARE_GROUP_MEMBER, at(at(groupsPath, index), 'members'))
+        .map(({ id, label, current }) => ({ id, label, current })),
+      created_at: group.created_at,
+      created_by: group.created_by,
+    })),
+    members_problem: overview.members_problem,
+    archives: overview.archives,
+  };
+}
+
+/** 后端拒绝时照常抛 ApiError；改完了却读不懂回执时抛 ReceiptUnreadable。 */
 async function changeShareGroup(path: string, token: string, init: RequestOptions): Promise<ShareGroupChange> {
   const resp = await apiFetch(path, { ...init, token });
-  const json = await resp.json();
-  return {
-    group: String(json?.group ?? ''),
-    archived: typeof json?.archived === 'string' ? json.archived : '',
-    copied_env: Array.isArray(json?.copied_env) ? json.copied_env.map(String) : [],
-    overview: normalizeShareGroups(json?.overview),
-  };
+  return receiptOf(SHARE_GROUP_RECEIPT, resp, (body) => {
+    const change = shaped(SHARE_GROUP_RECEIPT, body, SHARE_GROUP_CHANGE);
+    return {
+      group: change.group,
+      archived: change.archived ?? '',
+      copied_env: change.copied_env ?? [],
+      overview: readShareGroups(SHARE_GROUP_RECEIPT, change.overview, 'overview'),
+    };
+  });
 }
 
 export async function getShareGroups(token: string): Promise<ShareGroupOverview> {
   const resp = await apiFetch('/share-groups', { token });
-  return normalizeShareGroups(await resp.json());
+  return readShareGroups('共享配置组', await resp.json());
 }
 
 export function createShareGroup(token: string, name: string): Promise<ShareGroupChange> {
@@ -1081,7 +1266,7 @@ export async function clearNodeFallbacks(
 }
 
 export function getRuntimeRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/runtime/raw', token);
+  return readRawConfig('runtime.yaml 原文', '/admin/config/runtime/raw', token);
 }
 
 export interface RuntimeFile extends RawText {
@@ -1090,15 +1275,13 @@ export interface RuntimeFile extends RawText {
   path: string;
 }
 
+// 来源认不出时不能当成仓库默认：结构化表单会从空文档写起，本实例那份里别的键就丢了。
+const RUNTIME_FILE = { ...RAW_TEXT, source: oneOf('default', 'override'), path: TEXT };
+
 export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
   const resp = await apiFetch('/admin/config/runtime/raw', { token });
-  const json = await resp.json();
-  return {
-    content: typeof json.content === 'string' ? json.content : '',
-    hash: hashOf(json),
-    source: json.source === 'override' ? 'override' : 'default',
-    path: typeof json.path === 'string' ? json.path : '',
-  };
+  const { content, hash, source, path } = shaped('runtime.yaml 原文', await resp.json(), RUNTIME_FILE);
+  return { content, hash, source, path };
 }
 
 /** 删掉本实例的 runtime.yaml，全部参数回到仓库默认。 */
@@ -1111,15 +1294,15 @@ export async function resetRuntime(token: string): Promise<ConfigRemoveResult> {
 }
 
 export function updateRuntimeRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/runtime/raw', token, yaml, baseHash);
+  return writeRawConfig('runtime.yaml', '/admin/config/runtime/raw', token, yaml, baseHash);
 }
 
 export function getPolicyRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/policy/raw', token);
+  return readRawConfig('policy.yaml 原文', '/admin/config/policy/raw', token);
 }
 
 export function updatePolicyRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/policy/raw', token, yaml, baseHash);
+  return writeRawConfig('policy.yaml', '/admin/config/policy/raw', token, yaml, baseHash);
 }
 
 // ── Memory & conversation context ──
@@ -1139,17 +1322,21 @@ export interface MemoryNamespace {
   /** memory_book：节点在 memory_book 里自己命名的记忆库，不属于任何会话。 */
   kind: 'conversation' | 'subject' | 'memory_book' | 'orphan';
   subject: string;
+  /** 读得出来的条数，不含 unreadable_books 里那几本。 */
   entry_count: number;
   books: string[];
+  /** 读不出来的记忆本名。老后端没有这一项，那时读不出来的本是悄悄跳过的。 */
+  unreadable_books: string[];
   updated_at: string;
   owner: MemoryOwner;
 }
 
+/** 后端只核了 book 和 constant。id、content、keywords 是记忆本里手写的原样，不一定是字符串：显示时照注入时的读法认。 */
 export interface MemoryEntry {
-  id: string;
+  id: unknown;
   book: string;
-  content: string;
-  keywords?: string[];
+  content: unknown;
+  keywords?: unknown;
   constant?: boolean;
   enabled?: boolean;
   priority?: number;
@@ -1160,16 +1347,61 @@ export interface MemoryEntry {
   updated_at?: string;
 }
 
-export async function getMemoryOverview(token: string): Promise<MemoryNamespace[]> {
-  const resp = await apiFetch('/admin/config/memory/overview', { token });
-  return (await resp.json()).namespaces || [];
+const MEMORY_OWNER = { kind: TEXT, label: TEXT };
+
+/** 读不出来的一本记忆。problem 只有位置和问题，不带文件内容。 */
+export interface UnreadableMemoryBook {
+  book: string;
+  problem: string;
 }
 
-export async function getMemoryEntries(token: string, namespace: string): Promise<MemoryEntry[]> {
+export interface MemoryEntries {
+  entries: MemoryEntry[];
+  /** 这几本读不出来，里面的条目不在 entries 里。 */
+  unreadable_books: UnreadableMemoryBook[];
+}
+
+const MEMORY_NAMESPACE = {
+  key: NON_EMPTY_TEXT,
+  namespace: TEXT,
+  kind: TEXT,
+  subject: TEXT,
+  entry_count: NUMBER,
+  books: TEXT_LIST,
+  unreadable_books: optional(TEXT_LIST),
+  updated_at: TEXT,
+};
+
+// 条目的其余字段是记忆本里手写的原样，只核后端自己填的那几项。
+const MEMORY_ENTRY = { book: NON_EMPTY_TEXT, constant: BOOLEAN };
+
+const UNREADABLE_MEMORY_BOOK = { book: NON_EMPTY_TEXT, problem: TEXT };
+
+// 读不懂就抛：补成空表，页面会说「还没有任何记忆」「0 条」。
+export async function getMemoryOverview(token: string): Promise<MemoryNamespace[]> {
+  const what = '记忆来源列表';
+  const resp = await apiFetch('/admin/config/memory/overview', { token });
+  const body = shaped(what, await resp.json(), {});
+  return shapedRows(what, body.namespaces, MEMORY_NAMESPACE, 'namespaces').map((row, index) => ({
+    ...row,
+    unreadable_books: row.unreadable_books ?? [],
+    owner: shaped(what, row.owner, MEMORY_OWNER, at(at('namespaces', index), 'owner')),
+  })) as unknown as MemoryNamespace[];
+}
+
+export async function getMemoryEntries(token: string, namespace: string): Promise<MemoryEntries> {
+  const what = '记忆条目列表';
   const resp = await apiFetch(
     `/admin/config/memory/${encodeURIComponent(namespace)}/entries`, { token },
   );
-  return (await resp.json()).entries || [];
+  const body = shaped(what, await resp.json(), {});
+  const unreadable = body.unreadable_books === undefined
+    ? []
+    : shapedRows(what, body.unreadable_books, UNREADABLE_MEMORY_BOOK, 'unreadable_books');
+  return {
+    entries: shapedRows(what, body.entries, MEMORY_ENTRY, 'entries') as unknown as MemoryEntry[],
+    unreadable_books: unreadable.map(({ book, problem }) => ({ book, problem })),
+  };
 }
 
 export async function saveMemoryEntry(
@@ -1217,9 +1449,24 @@ export interface MaterialScope {
   current_account?: boolean;
 }
 
+const CONVERSATION_ROW = {
+  session_id: NON_EMPTY_TEXT,
+  conversation_key: TEXT,
+  channel: TEXT,
+  bytes: NUMBER,
+  updated_at: NUMBER,
+  owner: nullable(OBJECT),
+  current_account: optional(BOOLEAN),
+};
+
 export async function getConversations(token: string): Promise<ConversationRow[]> {
+  const what = '会话列表';
   const resp = await apiFetch('/admin/conversations', { token });
-  return (await resp.json()).conversations || [];
+  const body = shaped(what, await resp.json(), {});
+  return shapedRows(what, body.conversations, CONVERSATION_ROW, 'conversations').map((row, index) => ({
+    ...row,
+    owner: row.owner === null ? null : shaped(what, row.owner, MEMORY_OWNER, at(at('conversations', index), 'owner')),
+  })) as unknown as ConversationRow[];
 }
 
 export async function getConversationMessages(
@@ -1448,11 +1695,11 @@ export async function importStickers(
 }
 
 export function getSchedulesRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/schedules/raw', token);
+  return readRawConfig('schedules.yaml 原文', '/admin/config/schedules/raw', token);
 }
 
 export function updateSchedulesRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/schedules/raw', token, yaml, baseHash);
+  return writeRawConfig('schedules.yaml', '/admin/config/schedules/raw', token, yaml, baseHash);
 }
 
 export interface NodeFileInfo {
@@ -1474,11 +1721,11 @@ export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
 }
 
 export function getNodeFileRaw(token: string, filename: string): Promise<RawText> {
-  return readRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token);
+  return readRawConfig(`节点文件 ${filename} 的原文`, `/admin/config/node-files/${pathPart(filename)}/raw`, token);
 }
 
 export function updateNodeFileRaw(token: string, filename: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token, content, baseHash);
+  return writeRawConfig(`节点文件 ${filename}`, `/admin/config/node-files/${pathPart(filename)}/raw`, token, content, baseHash);
 }
 
 /** 改过的仓库默认文件恢复成默认；本实例自己加的直接删。没改过的仓库默认删不掉，后端回 409。 */
@@ -1491,11 +1738,11 @@ export async function deleteNodeFile(token: string, filename: string): Promise<C
 }
 
 export function getNodeRaw(token: string, nodeId: string): Promise<RawText> {
-  return readRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token);
+  return readRawConfig(`节点 ${nodeId} 的原文`, `/admin/config/nodes/${pathPart(nodeId)}/raw`, token);
 }
 
 export function updateNodeRaw(token: string, nodeId: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token, yaml, baseHash);
+  return writeRawConfig(`节点 ${nodeId}`, `/admin/config/nodes/${pathPart(nodeId)}/raw`, token, yaml, baseHash);
 }
 
 export async function createNode(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
@@ -1504,7 +1751,7 @@ export async function createNode(token: string, data: AdminCreatePayload): Promi
     token,
     json: data,
   });
-  return saveResultOf(await resp.json());
+  return saveResultOf(createdReceipt(`节点 ${data.id}`), resp);
 }
 
 export async function deleteNode(token: string, nodeId: string): Promise<ConfigRemoveResult> {
@@ -1521,11 +1768,11 @@ export async function getTools(token: string): Promise<AdminTool[]> {
 }
 
 export function getToolRaw(token: string, name: string): Promise<RawText> {
-  return readRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token);
+  return readRawConfig(`工具 ${name} 的源码`, `/admin/config/tools/${pathPart(name)}/raw`, token);
 }
 
 export function updateToolRaw(token: string, name: string, script: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token, script, baseHash);
+  return writeRawConfig(`工具 ${name}`, `/admin/config/tools/${pathPart(name)}/raw`, token, script, baseHash);
 }
 
 export async function createTool(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
@@ -1534,7 +1781,7 @@ export async function createTool(token: string, data: AdminCreatePayload): Promi
     token,
     json: data,
   });
-  return saveResultOf(await resp.json());
+  return saveResultOf(createdReceipt(`工具 ${data.id}`), resp);
 }
 
 export async function deleteTool(token: string, name: string): Promise<ConfigRemoveResult> {
@@ -1563,9 +1810,27 @@ export interface DrawtoolsBundle {
   prompts: Record<string, DrawtoolsRawFile>;
 }
 
+const DRAWTOOLS_FILE = {
+  ...RAW_TEXT,
+  exists: BOOLEAN,
+  using_example: BOOLEAN,
+  path: TEXT,
+  example_path: optional(TEXT),
+};
+
+// 和原文编辑器一样：哪一份的正文或指纹对不上形状就整包报格式不对，不拿空串、null 顶上。
 export async function getDrawtoolsBundle(token: string): Promise<DrawtoolsBundle> {
+  const what = '绘图配置';
   const resp = await apiFetch('/admin/config/drawtools', { token });
-  return resp.json();
+  const body = shaped(what, await resp.json(), { prompts: OBJECT });
+  const fileAt = (path: string, value: unknown): DrawtoolsRawFile => shaped(what, value, DRAWTOOLS_FILE, path);
+  return {
+    settings: fileAt('settings', body.settings),
+    character_tags: fileAt('character_tags', body.character_tags),
+    prompts: Object.fromEntries(
+      Object.entries(body.prompts).map(([name, value]) => [name, fileAt(at('prompts', name), value)]),
+    ),
+  };
 }
 
 export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean; created: string[] }> {
@@ -1574,19 +1839,19 @@ export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean
 }
 
 export function getDrawtoolsSettingsRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/drawtools/settings/raw', token);
+  return readRawConfig('绘图 settings.yaml 原文', '/admin/config/drawtools/settings/raw', token);
 }
 
 export function updateDrawtoolsSettingsRaw(token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/drawtools/settings/raw', token, content, baseHash);
+  return writeRawConfig('绘图 settings.yaml', '/admin/config/drawtools/settings/raw', token, content, baseHash);
 }
 
 export function getDrawtoolsCharactersRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/drawtools/characters/raw', token);
+  return readRawConfig('绘图 character_tags.yaml 原文', '/admin/config/drawtools/characters/raw', token);
 }
 
 export function updateDrawtoolsCharactersRaw(token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/drawtools/characters/raw', token, content, baseHash);
+  return writeRawConfig('绘图 character_tags.yaml', '/admin/config/drawtools/characters/raw', token, content, baseHash);
 }
 
 export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
@@ -1595,11 +1860,11 @@ export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
 }
 
 export function getDrawtoolsPromptRaw(token: string, name: string): Promise<RawText> {
-  return readRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token);
+  return readRawConfig(`绘图提示词 ${name} 的原文`, `/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token);
 }
 
 export function updateDrawtoolsPromptRaw(token: string, name: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content, baseHash);
+  return writeRawConfig(`绘图提示词 ${name}`, `/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content, baseHash);
 }
 
 export async function getSkills(token: string): Promise<AdminSkill[]> {
@@ -1607,12 +1872,12 @@ export async function getSkills(token: string): Promise<AdminSkill[]> {
   return resp.json();
 }
 
-export function getSkillRaw(token: string, name: string): Promise<RawText> {
-  return readRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token);
+export function getSkillRaw(token: string, dir: string): Promise<RawText> {
+  return readRawConfig(`技能 ${dir} 的原文`, `/admin/config/skills/${pathPart(dir)}/raw`, token);
 }
 
-export function updateSkillRaw(token: string, name: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token, content, baseHash);
+export function updateSkillRaw(token: string, dir: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`技能 ${dir}`, `/admin/config/skills/${pathPart(dir)}/raw`, token, content, baseHash);
 }
 
 export async function createSkill(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
@@ -1621,11 +1886,11 @@ export async function createSkill(token: string, data: AdminCreatePayload): Prom
     token,
     json: data,
   });
-  return saveResultOf(await resp.json());
+  return saveResultOf(createdReceipt(`技能 ${data.id}`), resp);
 }
 
-export async function deleteSkill(token: string, name: string): Promise<any> {
-  const resp = await apiFetch(`/admin/config/skills/${pathPart(name)}`, {
+export async function deleteSkill(token: string, dir: string): Promise<any> {
+  const resp = await apiFetch(`/admin/config/skills/${pathPart(dir)}`, {
     method: 'DELETE',
     token,
   });
@@ -1638,11 +1903,11 @@ export async function getMcpClients(token: string): Promise<McpClient[]> {
 }
 
 export function getMcpClientsRaw(token: string): Promise<RawText> {
-  return readRawConfig('/admin/config/mcp-clients/raw', token);
+  return readRawConfig('mcp.yaml 原文', '/admin/config/mcp-clients/raw', token);
 }
 
 export function updateMcpClientsRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
-  return writeRawConfig('/admin/config/mcp-clients/raw', token, yaml, baseHash);
+  return writeRawConfig('mcp.yaml', '/admin/config/mcp-clients/raw', token, yaml, baseHash);
 }
 
 export interface RestartInProgress {
@@ -1982,42 +2247,60 @@ export interface PlatformCatalog {
   current: string | null;
 }
 
+const PLATFORM_SUMMARY = {
+  id: NON_EMPTY_TEXT,
+  display_name: TEXT,
+  short_name: TEXT,
+  id_shape: TEXT,
+  has_config: BOOLEAN,
+  hooks: TEXT_LIST,
+  capabilities: optional(OBJECT),
+  entrypoints: optional(TEXT_LIST),
+  connection_peer: optional(TEXT),
+  connection_hint: optional(TEXT),
+};
+const PLATFORM_CHANNEL = { name: NON_EMPTY_TEXT, kind: TEXT, hashed: BOOLEAN };
+
 export async function getPlatforms(token: string): Promise<PlatformCatalog> {
   const resp = await apiFetch('/platforms', { token });
-  const json = await resp.json();
-  return {
-    platforms: Array.isArray(json.platforms) ? json.platforms : [],
-    current: typeof json.current === 'string' && json.current ? json.current : null,
-  };
+  const body = shaped('平台清单', await resp.json(), { current: optional(nullable(NON_EMPTY_TEXT)) });
+  const platforms = shapedRows('平台清单', body.platforms, PLATFORM_SUMMARY, 'platforms').map((row, index) => ({
+    ...row,
+    channels: shapedRows('平台清单', row.channels, PLATFORM_CHANNEL, at(at('platforms', index), 'channels')),
+  }));
+  return { platforms: platforms as unknown as PlatformSummary[], current: body.current ?? null };
 }
 
 const platformConfigPath = (platformId: string, leaf: string): string =>
   `/platforms/${encodeURIComponent(platformId)}/config/${leaf}`;
 const featuresConfigPath = (leaf: string): string => `/features/config/${leaf}`;
 
-// 不复用 readRawConfig：那个 helper 不给 exists，
-// 于是「还没接管」和「接管了但是空的」在界面上长得一样。
-async function readConfigFile(path: string, token: string): Promise<ConfigRawFile> {
+// 比 readRawConfig 多一个 exists：没有它，「还没接管」和「接管了但是空的」在界面上长得一样。
+const CONFIG_RAW_FILE = { ...RAW_TEXT, exists: BOOLEAN };
+
+async function readConfigFile(what: string, path: string, token: string): Promise<ConfigRawFile> {
   const resp = await apiFetch(path, { token });
-  const json = await resp.json();
-  return {
-    content: typeof json.content === 'string' ? json.content : '',
-    hash: hashOf(json),
-    exists: Boolean(json.exists),
-  };
+  const { content, hash, exists } = shaped(what, await resp.json(), CONFIG_RAW_FILE);
+  return { content, hash, exists };
 }
 
-/** 整份写回。后端拒绝无人消费的键（400）、文件中途被别处改过（409），错误会带着原因抛出来。 */
+// 平台和全局设置的写回总带 warnings（没有提醒是空表），和原文编辑器的回执不同。
+const CONFIG_SAVE_RECEIPT = { ok: BOOLEAN, hash: TEXT, warnings: TEXT_LIST };
+
+/** 整份写回。后端拒绝无人消费的键（400）、文件中途被别处改过（409），错误会带着原因抛出来；回执读不懂抛 ReceiptUnreadable。 */
 async function writeConfigFile(
-  path: string, token: string, content: string, baseHash: string | null,
+  what: string, path: string, token: string, content: string, baseHash: string | null,
 ): Promise<ConfigSaveResult> {
   const resp = await apiFetch(path, {
     method: 'PUT',
     token,
     json: rawWriteFields(content, baseHash),
   });
-  const json = await resp.json();
-  return { ok: Boolean(json.ok), hash: hashOf(json), warnings: warningsOf(json) };
+  const receipt = savedReceipt(what);
+  return receiptOf(receipt, resp, (body) => {
+    const { ok, hash, warnings } = shaped(receipt, body, CONFIG_SAVE_RECEIPT);
+    return { ok, hash, warnings };
+  });
 }
 
 async function readJson<T>(path: string, token: string): Promise<T> {
@@ -2026,13 +2309,13 @@ async function readJson<T>(path: string, token: string): Promise<T> {
 }
 
 export function getPlatformRaw(token: string, platformId: string): Promise<ConfigRawFile> {
-  return readConfigFile(platformConfigPath(platformId, 'raw'), token);
+  return readConfigFile(`平台 ${platformId} 的配置原文`, platformConfigPath(platformId, 'raw'), token);
 }
 
 export function updatePlatformRaw(
   token: string, platformId: string, content: string, baseHash: string | null,
 ): Promise<ConfigSaveResult> {
-  return writeConfigFile(platformConfigPath(platformId, 'raw'), token, content, baseHash);
+  return writeConfigFile(`平台 ${platformId} 的配置`, platformConfigPath(platformId, 'raw'), token, content, baseHash);
 }
 
 export function getPlatformState(token: string, platformId: string): Promise<ConfigLiveState> {
@@ -2045,11 +2328,11 @@ export function getPlatformSchema(token: string, platformId: string): Promise<Co
 }
 
 export function getFeaturesRaw(token: string): Promise<ConfigRawFile> {
-  return readConfigFile(featuresConfigPath('raw'), token);
+  return readConfigFile('features.yaml 原文', featuresConfigPath('raw'), token);
 }
 
 export function updateFeaturesRaw(token: string, content: string, baseHash: string | null): Promise<ConfigSaveResult> {
-  return writeConfigFile(featuresConfigPath('raw'), token, content, baseHash);
+  return writeConfigFile('features.yaml', featuresConfigPath('raw'), token, content, baseHash);
 }
 
 export function getFeaturesState(token: string): Promise<FeaturesLiveState> {
@@ -2358,10 +2641,23 @@ export async function getSessionHistory(sessionId: string, query: SessionHistory
   return data;
 }
 
+const CHILD_SESSION = {
+  session_id: NON_EMPTY_TEXT,
+  parent_session_id: optional(TEXT),
+  route_parent_session_id: optional(TEXT),
+  node_id: optional(TEXT),
+  context_key: optional(TEXT),
+  context_mode: optional(TEXT),
+  status: optional(TEXT),
+  task_id: optional(TEXT),
+  started_at: optional(TEXT),
+  updated_at: optional(TEXT),
+  completed_at: optional(TEXT),
+};
+
 export async function getSessionChildren(sessionId: string): Promise<ChildSessionInfo[]> {
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/children`);
-  const data = await resp.json();
-  return Array.isArray(data) ? data : [];
+  return shapedRows('子会话列表', await resp.json(), CHILD_SESSION);
 }
 
 /** 会话里（含入口分支）还在排队或在跑的任务。挂起等子任务的不算。 */
@@ -2377,10 +2673,23 @@ export interface SessionRunningTask {
   parent_session_id: string;
 }
 
+const RUNNING_TASK = {
+  task_id: NON_EMPTY_TEXT,
+  node_id: TEXT,
+  status: TEXT,
+  created_at: TEXT,
+  caller_task_id: TEXT,
+  is_user_entry: BOOLEAN,
+  source_inbound_seq: optional(nullable(NUMBER)),
+  branch_session_id: TEXT,
+  parent_session_id: TEXT,
+};
+
+// 补成空表就是「什么都没在跑」：会话的生成中标记会被错清掉。
 export async function getSessionRunningTasks(sessionId: string): Promise<SessionRunningTask[]> {
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/running_tasks`);
-  const data = await resp.json();
-  return Array.isArray(data?.tasks) ? data.tasks : [];
+  const body = shaped('运行中的任务列表', await resp.json(), {});
+  return shapedRows('运行中的任务列表', body.tasks, RUNNING_TASK, 'tasks') as SessionRunningTask[];
 }
 
 // ── 运行诊断 ──
@@ -2418,9 +2727,13 @@ export async function getRuntimeStatus(token: string): Promise<RuntimeStatus> {
   return resp.json();
 }
 
+const LOG_FILE = { name: NON_EMPTY_TEXT, size: NUMBER, modified: NUMBER };
+
+// 补成空表就是「还没有日志文件」。
 export async function listLogFiles(token: string): Promise<LogFileInfo[]> {
   const resp = await apiFetch('/admin/runtime/logs', { token });
-  return (await resp.json()).files || [];
+  const body = shaped('日志列表', await resp.json(), {});
+  return shapedRows('日志列表', body.files, LOG_FILE, 'files');
 }
 
 export async function readLogTail(

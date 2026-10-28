@@ -58,6 +58,17 @@ const HistoryBar = ({ history, onLoadOlder, onRetryHistory }: Pick<MessageListV2
   );
 };
 
+// The child-node panel shows the last list that was read; without this line a failed read looks like "no children".
+const ChildrenNotice = ({ history, onRetryHistory }: Pick<MessageListV2Props, 'history' | 'onRetryHistory'>) => {
+  if (!history?.childrenError) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 px-4 py-2 text-xs" role="alert">
+      <span className="text-[var(--duties-danger)]">子节点列表没读到：{history.childrenError}</span>
+      {onRetryHistory && <Button size="sm" tone="quiet" onClick={onRetryHistory}>重试</Button>}
+    </div>
+  );
+};
+
 const EmptyState = ({ history, onRetryHistory }: Pick<MessageListV2Props, 'history' | 'onRetryHistory'>) => {
   if (history?.loading) {
     return <p className="text-sm text-[var(--duties-tertiary)]" role="status">正在加载历史消息…</p>;
@@ -122,7 +133,8 @@ export const MessageListV2 = ({ messages, toolsById, history, onLoadOlder, onRet
 
   if (messages.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center p-6 text-center">
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+        <ChildrenNotice history={history} onRetryHistory={onRetryHistory} />
         <EmptyState history={history} onRetryHistory={onRetryHistory} />
       </div>
     );
@@ -132,6 +144,7 @@ export const MessageListV2 = ({ messages, toolsById, history, onLoadOlder, onRet
     <div ref={containerRef} className="h-full overflow-y-auto" onScroll={handleScroll}>
       <div className="mx-auto max-w-3xl">
         <HistoryBar history={history} onLoadOlder={onLoadOlder} onRetryHistory={onRetryHistory} />
+        <ChildrenNotice history={history} onRetryHistory={onRetryHistory} />
         {messages.map((message) => (
           <MessageCard key={message.id} message={message} toolsById={toolsById} />
         ))}

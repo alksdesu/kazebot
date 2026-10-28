@@ -11,7 +11,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -24,6 +23,7 @@ from engine.node import (
     effective_node_type,
     example_base_name,
     example_node_name,
+    known_node_ids,
     node_file,
     read_node_definition,
     template_node_name,
@@ -307,21 +307,11 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"删除 {p.name} 失败：{exc}") from exc
 
-    def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-        if not text.startswith("---\n"):
-            return {}, text
-        end = text.find("\n---\n", 4)
-        if end < 0:
-            return {}, text
-        head = text[4:end]
-        body = text[end + 5:]
-        try:
-            meta = yaml.safe_load(head) or {}
-        except Exception:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return meta, body
+    def _skill_check(content: str) -> list[str]:
+        """SKILL.md 的 frontmatter 和加载时同一套读法：写坏的存下去只会被跳过，注入里没有它。"""
+        from engine.builtin.knowledge_inject import check_skill_text
+
+        return check_skill_text(content)
 
     # ----- Nodes -----
     def _node_source(path: Path) -> str:
@@ -376,12 +366,16 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "internal": declares_internal(data),
                     # yaml 里写的 id。和文件名不一致时它是个摆设，改了也不会换节点。
                     "declared_id": declared if declared and declared != nid else "",
+                    # engine 实际认的旧 id：被同名文件或排在前面的节点占掉的不算，模板和示例没有。
+                    "aliases": list(known_node_ids(workspace_root, nid)[1:]),
                     "name": data.get("name", ""),
                     # 实际按哪种节点跑：没写 type 的是 ai，和 engine 判入口用的是同一个值。
                     "type": effective_node_type(data) if definition is not None else "",
                     "model": data.get("model", ""),
                     # 节点文件里写的渠道，没写是空串（跟随全局活跃渠道）。
                     "provider": str(data.get("provider") or "").strip(),
+                    # 节点文件里写的地址，没写是空串。
+                    "base_url": str(data.get("base_url") or "").strip(),
                     "tool_access": ta_raw,
                     "skills": data.get("skills", {}),
                     "description": data.get("description", ""),
@@ -700,27 +694,10 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.get("/skills")
     def list_skills() -> list[dict[str, Any]]:
-        from engine.builtin.knowledge_inject import skill_enabled
+        """每个技能目录一行，dir 是目录名，读、写、删都认它。读不了、frontmatter 写坏的那行带 problem。"""
+        from engine.builtin.knowledge_inject import skill_rows
 
-        skills_dir = _skills_dir()
-        if not skills_dir.is_dir():
-            return []
-        res = []
-        for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-            try:
-                text = skill_md.read_text(encoding="utf-8")
-                meta, body = _parse_skill_frontmatter(text)
-                res.append({
-                    "name": str(meta.get("name") or skill_md.parent.name),
-                    "description": str(meta.get("description") or ""),
-                    "enabled": skill_enabled(meta),
-                    "strategy": str(meta.get("strategy") or "normal"),
-                    "keywords": [str(k) for k in (meta.get("keywords") or []) if isinstance(k, str)],
-                    "body_preview": body.strip()[:200] if body else "",
-                })
-            except Exception:
-                res.append({"name": skill_md.parent.name, "error": "parse failed"})
-        return res
+        return skill_rows(workspace_root, preview_chars=200)
 
     @router.get("/skills/{name}/raw")
     def get_skill_raw(name: str) -> dict[str, Any]:
@@ -728,14 +705,16 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/skills/{name}/raw")
     def update_skill_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        return _write_text(_safe_path(_skills_dir(), name) / "SKILL.md", payload.content, payload.base_hash)
+        return _write_text(
+            _safe_path(_skills_dir(), name) / "SKILL.md", payload.content, payload.base_hash, check=_skill_check,
+        )
 
     @router.post("/skills")
     def create_skill(payload: NodeCreate) -> dict[str, Any]:
         md = _safe_path(_skills_dir(), payload.id) / "SKILL.md"
         if md.exists():
             raise HTTPException(status_code=409, detail="Skill already exists")
-        return _create_text(md, payload.content)
+        return _create_text(md, payload.content, check=_skill_check)
 
     @router.delete("/skills/{name}")
     def delete_skill(name: str) -> dict[str, Any]:
@@ -996,8 +975,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def memory_entries(namespace: str) -> dict[str, Any]:
         from engine import memory_admin
 
-        entries = _memory_call(memory_admin.list_entries, workspace_root, _namespace_arg(namespace))
-        return {"entries": entries}
+        listing = _memory_call(memory_admin.list_entries, workspace_root, _namespace_arg(namespace))
+        return {"entries": listing.entries, "unreadable_books": listing.unreadable_books}
 
     @router.post("/memory/{namespace}/entries")
     def memory_upsert(namespace: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:

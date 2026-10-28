@@ -20,7 +20,7 @@ from platforms.registry import platform_config_path
 from providers import registry
 from providers.base import ProviderResponse
 from supervisor.admin_api import create_admin_router
-from supervisor.instances import save_instance
+from supervisor.instances import InstanceDirectoryError, save_instance
 from supervisor.operations.service import OperationsService
 
 
@@ -235,6 +235,36 @@ def test_a_prefix_the_roster_never_heard_of_marks_nobody_current(tmp_path, monke
     rows = operations.instances()
     assert [row["id"] for row in rows] == ["rong", "koki"]
     assert not any(row["current"] for row in rows)
+
+
+BROKEN_ROSTER = "instances:\n  - id: koki\n    account: qq-SECRET-account: x\n"
+
+
+def test_an_unreadable_roster_is_not_listed_as_a_single_instance(tmp_path, monkeypatch):
+    # 当成单实例补一行「当前实例」，别的实例就从切换器里消失了，看着像只开了这一个。
+    roster = tmp_path / "instances.yaml"
+    roster.write_text(BROKEN_ROSTER, encoding="utf-8")
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(roster))
+    monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/koki")
+    operations, _ = service(tmp_path)
+
+    with pytest.raises(InstanceDirectoryError) as caught:
+        operations.instances()
+
+    assert caught.value.reason == f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here"
+
+
+def test_the_instance_endpoint_says_why_the_roster_cannot_be_listed(operations_api, tmp_path, monkeypatch):
+    client, _ = operations_api
+    roster = tmp_path / "instances.yaml"
+    roster.write_text(BROKEN_ROSTER, encoding="utf-8")
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(roster))
+
+    response = client.get("/v1/operations/instances", headers={"Authorization": "Bearer synthetic-operations-token"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here"}
+    assert "qq-SECRET" not in response.text
 
 
 @pytest.mark.parametrize("age", [120, -3600])

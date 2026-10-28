@@ -143,7 +143,7 @@ class TestMemoryEntries:
         namespace = conversation_namespace(_CONV_KEY)
 
         catalog = {item["id"]: item for item in load_memory_catalog(tmp_path, memory_book=namespace, _use_cache=False)}
-        listed = {item["id"]: item for item in memory_admin.list_entries(tmp_path, namespace)}
+        listed = {item["id"]: item for item in memory_admin.list_entries(tmp_path, namespace).entries}
 
         assert set(catalog) == {"pinned", "plain"}
         assert (catalog["pinned"]["constant"], catalog["plain"]["constant"]) == (True, False)
@@ -163,7 +163,7 @@ class TestMemoryEntries:
     def test_cleanup_protects_exactly_the_constant_ones(self, raw: str, protected: bool) -> None:
         entry = _entry("old", constant=raw, created_at="2020-01-01T00:00:00+00:00")
 
-        expired = _memory_entry_expired(entry, "ns", time.time(), {}, lambda _cache, _ns, _eid: "")
+        expired = _memory_entry_expired(entry, "ns", time.time(), {})
 
         assert expired is (not protected)
 
@@ -173,7 +173,7 @@ class TestMemoryEntries:
 
         memory_admin.upsert_entry(tmp_path, namespace, payload)
 
-        [stored] = memory_admin.list_entries(tmp_path, namespace)
+        [stored] = memory_admin.list_entries(tmp_path, namespace).entries
         assert (stored["constant"], stored["enabled"]) == (False, False)
         raw = yaml.safe_load((tmp_path / "data" / "memory" / namespace / "people.yaml").read_text(encoding="utf-8"))
         assert (raw["entries"][0]["constant"], raw["entries"][0]["enabled"]) == (False, False)

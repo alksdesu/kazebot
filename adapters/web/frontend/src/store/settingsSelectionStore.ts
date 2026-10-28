@@ -6,7 +6,7 @@
 import { create } from 'zustand';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
-import type { AdminApproval, AdminNode, AdminSkill, AdminTool, McpClient } from '../api/supervisorClient';
+import { skillDir, type AdminApproval, type AdminNode, type AdminSkill, type AdminTool, type McpClient } from '../api/supervisorClient';
 
 export interface SettingsSelectionState {
   systemLogs: string[];
@@ -62,7 +62,9 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set, ge
   },
   setAllToolNames: (names) => set({ allToolNames: names }),
   setSelectedSkill: (skill) => {
-    if (get().selectedSkill?.name !== skill?.name && !confirmNavigation()) return;
+    const current = get().selectedSkill;
+    // 按目录认是不是同一个技能：两个目录的 frontmatter 可以写同一个 name。
+    if ((current ? skillDir(current) : null) !== (skill ? skillDir(skill) : null) && !confirmNavigation()) return;
     set({ selectedSkill: skill });
   },
   setSelectedMcpClient: (client) => {

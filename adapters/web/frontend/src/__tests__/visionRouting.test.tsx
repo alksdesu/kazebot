@@ -3,7 +3,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, getRuntimeFile, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
+import { ApiError, getRuntimeFile, ReceiptUnreadable, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
 import { VisionRouting, normalizeMode } from '../console/VisionRouting';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -133,6 +133,19 @@ describe('保存', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存路由' }));
 
     expect(await screen.findByText('已保存。下一条带图消息就按新规矩走。routing.vision.entry_node_id 指向的节点不存在')).toBeTruthy();
+  });
+
+  // 写已经落盘了：说成失败，档位停在没存的样子，人会再存一次。
+  it('回执没读懂时照存上了说，回执的事另起一行', async () => {
+    vi.mocked(updateRuntimeRaw).mockRejectedValue(new ReceiptUnreadable('runtime.yaml 已经存上，可回执格式不对：缺 hash'));
+    render(<VisionRouting />);
+    await ready();
+    fireEvent.change(picker(), { target: { value: 'false' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存路由' }));
+
+    expect(await screen.findByText('已保存。下一条带图消息就按新规矩走。')).toBeTruthy();
+    expect(screen.getByText('runtime.yaml 已经存上，可回执格式不对：缺 hash')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '保存路由' })).toBeDisabled();
   });
 
   it('写失败时说出来，不假装存上了', async () => {

@@ -145,6 +145,26 @@ class TestMoveMemory:
         assert outcome.route_keys_changed == 0
         assert _routes(routes) == {"real_conversation_keys": {OTHER: OTHER_REAL}}
 
+    @pytest.mark.parametrize("text", ['{"conv_old/e1" "2026-01-01"}', "[]"])
+    def test_an_unreadable_hit_cache_is_left_alone_and_the_move_still_happens(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, text: str,
+    ) -> None:
+        # 读不懂当成空表虽然不会写回，可命中缓存没跟着改名这件事谁都不知道；修好以后旧前缀会被清理当孤儿删掉。
+        old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
+        (memory_root(tmp_path) / old_ns).mkdir(parents=True)
+        cache = hit_cache.hit_cache_path(tmp_path)
+        cache.write_text(text, encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger=hit_cache.logger.name):
+            outcome = move_memory(workspace=tmp_path, platform=MATRIX, plan=self._plan(tmp_path))
+
+        assert outcome.moved_dirs == [(old_ns, new_ns)]
+        assert (memory_root(tmp_path) / new_ns).is_dir()
+        assert outcome.hit_keys_rewritten == 0 and outcome.hit_cache_problem
+        assert cache.read_text(encoding="utf-8") == text
+        assert (outcome.backup_dir / cache.name).read_text(encoding="utf-8") == text
+        assert f"{old_ns} -> {new_ns}" in caplog.text
+
     def test_the_caller_can_do_without_the_backup(self, tmp_path: Path) -> None:
         old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
         (memory_root(tmp_path) / old_ns).mkdir(parents=True)

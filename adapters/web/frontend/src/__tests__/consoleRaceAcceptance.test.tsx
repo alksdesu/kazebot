@@ -44,7 +44,8 @@ const nodeRaw = (id: string, temperature: number) => ({
   content: `id: ${id}\nprovider: relay\nprovider_options:\n  temperature: ${temperature}\n`,
   hash: `${id}-1`,
 });
-const memoryNamespace = (key: string, label: string): api.MemoryNamespace => ({ key, namespace: key, kind: 'conversation', subject: '', entry_count: 1, books: [], updated_at: '', owner: { kind: 'group', label } });
+const memoryNamespace = (key: string, label: string): api.MemoryNamespace => ({ key, namespace: key, kind: 'conversation', subject: '', entry_count: 1, books: [], unreadable_books: [], updated_at: '', owner: { kind: 'group', label } });
+const memoryEntries = (...entries: api.MemoryEntry[]): api.MemoryEntries => ({ entries, unreadable_books: [] });
 const memoryEntry = (content: string): api.MemoryEntry => ({ id: `id-${content}`, book: 'main', content, keywords: [], constant: false, source: 'manual' });
 const scopeStatus = (target = ''): api.ScopeStatus => ({
   current_scope: '10001', live_scope: '', bot_alive: false, ambiguous_sources: [],
@@ -77,7 +78,7 @@ beforeEach(() => {
   vi.mocked(api.setActiveProvider).mockResolvedValue({ ...providers(), active_provider: 'spare' });
   vi.mocked(api.deleteProvider).mockResolvedValue(providers());
   vi.mocked(api.getMemoryOverview).mockResolvedValue([memoryNamespace('ns-a', '来源甲'), memoryNamespace('ns-b', '来源乙')]);
-  vi.mocked(api.getMemoryEntries).mockResolvedValue([]);
+  vi.mocked(api.getMemoryEntries).mockResolvedValue(memoryEntries());
   vi.mocked(api.saveMemoryEntry).mockResolvedValue(memoryEntry('已保存'));
   vi.mocked(api.getConversations).mockResolvedValue([]);
   vi.mocked(api.getConversationMessages).mockResolvedValue({ total: 0, messages: [] });
@@ -190,12 +191,12 @@ describe('记忆来源与上下文读取', () => {
     expect(screen.queryByText('会话旧账号')).not.toBeInTheDocument(); expect(screen.getByText('新身份来源')).toBeInTheDocument();
   });
   it.each(['resolve', 'reject'] as const)('来源切换拒绝旧条目的迟到 %s', async outcome => {
-    const old = deferred<api.MemoryEntry[]>();
-    vi.mocked(api.getMemoryEntries).mockImplementation(async (_auth, source) => source === 'ns-a' ? old.promise : [memoryEntry('乙来源内容')]);
+    const old = deferred<api.MemoryEntries>();
+    vi.mocked(api.getMemoryEntries).mockImplementation(async (_auth, source) => source === 'ns-a' ? old.promise : memoryEntries(memoryEntry('乙来源内容')));
     render(<MemoryPage />); fireEvent.click(await screen.findByRole('button', { name: /来源甲/ }));
     expect(screen.getByLabelText('内容')).toBeDisabled(); fireEvent.click(screen.getByRole('button', { name: /来源乙/ }));
     await screen.findByText('乙来源内容');
-    await act(async () => outcome === 'resolve' ? old.resolve([memoryEntry('甲来源内容')]) : old.reject(Error('甲来源失败')));
+    await act(async () => outcome === 'resolve' ? old.resolve(memoryEntries(memoryEntry('甲来源内容'))) : old.reject(Error('甲来源失败')));
     expect(screen.getByText('乙来源内容')).toBeInTheDocument(); expect(screen.queryByText('甲来源内容')).not.toBeInTheDocument();
     expect(screen.queryByText('甲来源失败')).not.toBeInTheDocument(); expect(screen.getByLabelText('内容')).toBeEnabled();
   });

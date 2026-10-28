@@ -12,6 +12,7 @@ from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     conversation_namespace,
+    memory_book_files,
     memory_dir,
     namespace_conversation_key,
     task_memory_namespace,
@@ -524,7 +525,7 @@ def _book_names(workspace_root: Path | None, namespace: str) -> list[str]:
     if workspace_root is None:
         return []
     directory = memory_dir(workspace_root, namespace)
-    return sorted(path.stem for path in directory.glob("*.yaml")) if directory.is_dir() else []
+    return [path.stem for path in memory_book_files(directory)]
 
 
 def _task_kind_is_node(task: Any) -> bool:

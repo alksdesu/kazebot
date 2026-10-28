@@ -104,7 +104,7 @@ function stubBackend(): string[] {
     seen.push(url);
     if (url.endsWith('/config/schema')) return json(OTHER_SCHEMA);
     if (url.endsWith('/config/state')) return json({ published: false, applied: false, file: {}, state: null });
-    if (url.endsWith('/config/raw')) return json({ content: '', exists: false });
+    if (url.endsWith('/config/raw')) return json({ content: '', hash: '', exists: false });
     return json({});
   }));
   return seen;
@@ -114,7 +114,7 @@ const pathsOf = (seen: readonly string[], leaf: string) => seen.filter((url) => 
 
 /** 没说本实例跑哪个平台的清单：平台组照旧把整张清单都列出来。 */
 const registry = (platforms: PlatformDescriptor[], settled: boolean): PlatformRegistryState =>
-  ({ platforms, current: null, running: platforms, settled });
+  ({ platforms, current: null, running: platforms, settled, error: '' });
 
 beforeEach(() => {
   localStorage.clear();
@@ -224,6 +224,41 @@ describe('从后端拉清单', () => {
     expect(allPlatforms()).toEqual([QQ_NAPCAT]);
   });
 
+  // 退回内置的平台照旧，可页面得说一声：内置里没有的平台认不出，本实例跑哪个也只能猜。
+  it('拉不到时记下原因', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: '注册表挂了' }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    })));
+
+    render(<Probe />);
+
+    await waitFor(() => expect(platformRegistryState().error).toBe('500 注册表挂了'));
+    expect(platformRegistryState().settled).toBe(true);
+    expect(allPlatforms()).toEqual([QQ_NAPCAT]);
+  });
+
+  it('读回来对不上形状也记下原因，不当成后端没有别的平台', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async () => json({ current: 'otherchat' })));
+
+    render(<Probe />);
+
+    await waitFor(() => expect(platformRegistryState().error).toBe('平台清单格式不对：缺 platforms'));
+    expect(allPlatforms()).toEqual([QQ_NAPCAT]);
+    expect(currentPlatformId()).toBeNull();
+  });
+
+  it('拉到了就没有原因可说', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async () => json({ platforms: [OTHER_ROW], current: 'otherchat' })));
+
+    render(<Probe />);
+
+    await waitFor(() => expect(platformRegistryState().settled).toBe(true));
+    expect(platformRegistryState().error).toBe('');
+  });
+
   it('没登录就不拉，也不假装清单已经到了', async () => {
     const fetchMock = vi.fn(async () => json({ platforms: [OTHER_ROW] }));
     vi.stubGlobal('fetch', fetchMock);
@@ -283,7 +318,7 @@ describe('页签解析', () => {
   });
 
   it('本实例不跑的平台页解析不出来 —— 它的页根本不在页签表里', () => {
-    const state = { platforms: [QQ_NAPCAT, OTHERCHAT], current: 'qq', running: [QQ_NAPCAT], settled: true };
+    const state = { platforms: [QQ_NAPCAT, OTHERCHAT], current: 'qq', running: [QQ_NAPCAT], settled: true, error: '' };
     expect(resolveSettingsTab('platform-otherchat', state))
       .toMatchObject({ pending: false, tab: { id: 'general' } });
     expect(resolveSettingsTab('platform-qq', state)).toMatchObject({ pending: false, tab: { id: 'platform-qq' } });
@@ -409,6 +444,42 @@ describe('没登记过的平台页', () => {
 
     expect(screen.getByRole('heading', { name: 'otherchat' })).toBeInTheDocument();
     expect(screen.getByText(/平台清单里已经没有「otherchat」了/)).toBeInTheDocument();
+  });
+});
+
+describe('平台清单没读到', () => {
+  it('内置就有的平台页照常画，另交代一句是按内置的描述画的', () => {
+    platformConsoleStore('qq').setState({ live: null, loading: false, draft: {} });
+    settlePlatforms('500 注册表挂了');
+    const Page = platformPageComponent('qq');
+
+    render(<Page />);
+
+    expect(screen.getByRole('heading', { name: 'QQ · NapCat', level: 1 })).toBeInTheDocument();
+    expect(screen.getByText('平台清单没读到：500 注册表挂了。这一页先按内置的平台描述显示。')).toHaveAttribute('role', 'alert');
+  });
+
+  it('内置里没有的平台页说是清单没读到，不说后端换了版本', () => {
+    settlePlatforms('500 注册表挂了');
+    const Page = platformPageComponent('otherchat');
+
+    render(<Page />);
+
+    expect(screen.getByText('平台清单没读到：500 注册表挂了。内置的平台里没有「otherchat」，刷新页面再试。'))
+      .toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/可能是后端换了版本/)).toBeNull();
+  });
+
+  it('清单读成过，这一次没读到也不说退回了内置', () => {
+    platformConsoleStore('qq').setState({ live: null, loading: false, draft: {} });
+    adoptPlatforms([QQ_NAPCAT], 'qq');
+    settlePlatforms('500 注册表挂了');
+    const Page = platformPageComponent('qq');
+
+    render(<Page />);
+
+    expect(platformRegistryState().error).toBe('');
+    expect(screen.queryByText(/平台清单没读到/)).toBeNull();
   });
 });
 

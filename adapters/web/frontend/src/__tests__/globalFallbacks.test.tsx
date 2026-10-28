@@ -300,12 +300,12 @@ describe('保存之后先按写进去的算', () => {
   const serveDiverged = (): void => {
     let reads = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'PUT') return json({ ok: true, warnings: [] });
+      if (init?.method === 'PUT') return json({ ok: true, hash: 'h9', warnings: [] });
       if (String(input).endsWith('/config/state')) {
         return json({ published: true, applied: false, file: {}, state: { values: {}, paths: {} }, platforms: [] });
       }
       reads += 1;
-      return json({ content: reads === 1 ? 'version: 1\n' : 'version: 2\n', exists: true });
+      return json({ content: reads === 1 ? 'version: 1\n' : 'version: 2\n', hash: `h${reads}`, exists: true });
     }));
   };
 
