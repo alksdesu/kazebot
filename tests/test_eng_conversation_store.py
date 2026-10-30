@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -9,8 +10,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from engine import conversation_store
 from engine.builtin.preempt import _inject_preempt_message
-from engine.conversation_store import ConversationStore, ConversationWriter, HistoryCopy, Message, MessageType
+from engine.conversation_store import (
+    ConversationStore,
+    ConversationWriter,
+    HistoryCopy,
+    Message,
+    MessageType,
+    WriteFailure,
+)
 from engine.inference.ai_step import _shadow_write
 from engine.inference.loop_state import conversation_writer, flush_conversation_writes
 from engine.node import Node
@@ -39,27 +48,37 @@ def test_the_writer_keeps_submission_order_and_flush_waits_for_all_of_it(tmp_pat
     assert asyncio.run(run()) == [f"m{index}" for index in range(20)]
 
 
-def test_a_failed_write_is_logged_and_later_writes_still_land(tmp_path: Path, monkeypatch, caplog) -> None:
+def test_a_write_that_keeps_failing_is_retried_then_recorded_and_later_writes_still_land(
+    tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    monkeypatch.setattr(conversation_store, "_WRITE_RETRY_DELAYS", (0.0, 0.0))
     store = ConversationStore(tmp_path)
     original = store.append
+    attempts: list[str] = []
 
     def flaky(session_id: str, message: Message) -> None:
+        attempts.append(message.id)
         if message.id == "bad":
-            raise OSError("disk full")
+            raise OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "session.jsonl"))
         original(session_id, message)
 
     monkeypatch.setattr(store, "append", flaky)
     writer = ConversationWriter(store)
 
-    async def run() -> None:
+    async def run() -> list[WriteFailure]:
         writer.submit("session", Message(id="bad", role="user", content="x"))
         writer.submit("session", Message(id="good", role="user", content="y"))
         await writer.flush()
+        return writer.take_failures()
 
-    with caplog.at_level(logging.ERROR, logger="engine.conversation_store"):
-        asyncio.run(run())
+    with caplog.at_level(logging.WARNING, logger="engine.conversation_store"):
+        failures = asyncio.run(run())
 
+    assert attempts == ["bad", "bad", "bad", "good"]
     assert [message.id for message in ConversationStore(tmp_path).load("session")] == ["good"]
+    assert failures == [WriteFailure("session", "bad", "OSError: No space left on device")]
+    assert str(tmp_path) not in failures[0].reason
+    assert writer.take_failures() == []
     assert "conversation write failed" in caplog.text
 
 

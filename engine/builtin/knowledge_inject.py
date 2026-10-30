@@ -2312,12 +2312,12 @@ class KnowledgeInjector:
         ctx.extra["memory_dynamic_messages"] = memory_dynamic
 
         if ctx.extra.get("apply_injection"):
-            _rebuild_prompt_messages(ctx)
+            await _rebuild_prompt_messages(ctx)
             return hook_result(modified=True)
         return hook_result(modified=bool(skill_static or skill_dynamic or memory_static or memory_dynamic))
 
 
-def _rebuild_prompt_messages(ctx: Any) -> None:
+async def _rebuild_prompt_messages(ctx: Any) -> None:
     """Rebuild ctx.messages with all prompt injections currently in ctx.extra.
 
     Why: the previous prompt rebuild helper was shared by both knowledge paths and
@@ -2331,7 +2331,9 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
     from engine.project_root import ISOLATION_CONTEXT_KEY
 
     task_context = getattr(ctx.rctx, "task_context", None) or {}
-    rebuilt, is_block_mode = assemble_messages_with_injections(
+    # 组装会读当轮的文本附件，放在线程里；ctx 只在事件循环上改
+    rebuilt, is_block_mode = await asyncio.to_thread(
+        assemble_messages_with_injections,
         workspace_root=ctx.rctx.workspace_root,
         system_prompt=list(ctx.extra.get("system_prompt") or []),
         history=list(ctx.extra.get("history") or []),

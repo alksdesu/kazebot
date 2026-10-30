@@ -261,7 +261,7 @@ def overflow_view(messages: list[dict[str, Any]], ls: Any) -> list[dict[str, Any
     return with_task_digest(messages, view, ls)
 
 
-def provider_messages(
+async def provider_messages(
     view: list[dict[str, Any]],
     *,
     formatter: Any,
@@ -269,8 +269,12 @@ def provider_messages(
     workspace_root: Any,
     strip_images: bool,
 ) -> list[dict[str, Any]]:
-    """把请求视图转成某个 provider 能收的消息：格式转换、file:// 图片转 base64，模型不收图时剥掉图片。"""
-    prepared = prepare_messages_for_llm(_build_messages_for_provider(view, formatter, provider), workspace_root)
+    """把请求视图转成某个 provider 能收的消息：格式转换、file:// 图片转 base64，模型不收图时剥掉图片。
+
+    读图、压缩和编码在线程里做，不占事件循环。
+    """
+    built = _build_messages_for_provider(view, formatter, provider)
+    prepared = await asyncio.to_thread(prepare_messages_for_llm, built, workspace_root)
     return strip_image_blocks(prepared) if strip_images else prepared
 
 
@@ -357,7 +361,7 @@ async def record_response_usage(ls: Any, resp: Any, llm_messages: list[dict[str,
 def digest_provider_call(ls: Any, step: int) -> Any:
     """任务进度摘要用的那次请求：节点自己的 provider，不带工具，等待期间照常响应取消和抢占。"""
     async def call(messages: list[dict[str, Any]]) -> Any:
-        prepared = provider_messages(
+        prepared = await provider_messages(
             messages, formatter=ls.formatter, provider=ls.provider,
             workspace_root=ls.rctx.workspace_root, strip_images=True,
         )
@@ -407,7 +411,7 @@ async def _overflow_retry_messages(ls: Any, step: int, resp: Any, strip_images: 
         if outcome is DigestOutcome.CANCELLED:
             return _RETRY_CANCELLED
         if outcome is DigestOutcome.CREATED:
-            return provider_messages(
+            return await provider_messages(
                 request_view(ls.messages, ls), formatter=ls.formatter, provider=ls.provider,
                 workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
             )
@@ -424,7 +428,7 @@ async def _overflow_retry_messages(ls: Any, step: int, resp: Any, strip_images: 
         "node_id": ls.node.id, "step": step,
         "cleared": cleared, "error": resp.error or "",
     })
-    return provider_messages(
+    return await provider_messages(
         retry_view, formatter=ls.formatter, provider=ls.provider,
         workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
     )
@@ -442,7 +446,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     tools_arg = ls.openai_tools if ls.openai_tools else None
     # ls.messages 是运行时状态，只在副本上转换；build_llm_messages 跳过 _ephemeral，保留 _dynamic
     strip_images = _node_strips_images(ls.node)
-    llm_messages = provider_messages(
+    llm_messages = await provider_messages(
         request_view(ls.messages, ls), formatter=ls.formatter, provider=ls.provider,
         workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
     )

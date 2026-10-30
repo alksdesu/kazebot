@@ -5,8 +5,11 @@
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -71,3 +74,60 @@ class TestCleanupRespectsTheFloor:
         runtime.media._cleanup_old_qq_attachments()
 
         assert not path.exists()
+
+
+class TestCleanupRunsOffTheEventLoop:
+    def test_inbound_rounds_walk_the_folders_in_a_thread_and_only_one_of_them_cleans(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("ONEBOT_IMAGE_CACHE_TTL_SECONDS", "60")
+        runtime = load_runtime(monkeypatch, tmp_path)
+        path = _attachment(tmp_path)
+        stale = time.time() - 120
+        os.utime(path, (stale, stale))
+        loop_thread = threading.get_ident()
+        walks: list[int] = []
+        real_remove = runtime.media._remove_expired_qq_attachments
+
+        def recorded(now: float) -> None:
+            walks.append(threading.get_ident())
+            real_remove(now)
+
+        monkeypatch.setattr(runtime.media, "_remove_expired_qq_attachments", recorded)
+        runtime.state._adapter.last_attachment_cleanup_at = 0.0
+
+        async def two_inbound_rounds() -> None:
+            await asyncio.gather(
+                runtime.media._cleanup_old_qq_attachments_in_thread(),
+                runtime.media._cleanup_old_qq_attachments_in_thread(),
+            )
+
+        asyncio.run(two_inbound_rounds())
+
+        assert not path.exists()
+        assert len(walks) == 1 and loop_thread not in walks
+
+    def test_the_hourly_cleanup_task_walks_the_folders_in_a_thread(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        runtime = load_runtime(monkeypatch, tmp_path)
+        loop_thread = threading.get_ident()
+        walks: list[int] = []
+        monkeypatch.setattr(
+            runtime.media, "_remove_expired_qq_attachments", lambda now: walks.append(threading.get_ident()),
+        )
+        runtime.state._adapter.last_attachment_cleanup_at = 0.0
+
+        async def first_round() -> None:
+            task = asyncio.create_task(runtime.lifecycle._attachment_cleanup_forever())
+            for _ in range(500):
+                if walks:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(first_round())
+
+        assert walks and loop_thread not in walks

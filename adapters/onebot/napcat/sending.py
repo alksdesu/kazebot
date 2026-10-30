@@ -546,10 +546,15 @@ def _planned_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
     return outbound.native_emoji_segment(QQ_NAPCAT.id, str(segment.get("url") or ""))
 
 
+def _base64_source(raw: bytes) -> str:
+    """OneBot 认的 base64:// 内联来源。大文件编码要几十毫秒，协程里放到线程里调。"""
+    return "base64://" + base64.b64encode(raw).decode("ascii")
+
+
 async def _read_planned_sticker(segment: Dict[str, Any]) -> str:
     raw = await emotes._sticker_delivery().load(segment)
     # 图库是几个号共用的，NapCat 容器里没有它的挂载，只能把图内容直接发过去。
-    return "base64://" + base64.b64encode(raw).decode("ascii")
+    return await asyncio.to_thread(_base64_source, raw)
 
 
 async def _materialize_sticker_segments(segments: List[Dict[str, Any]]) -> Message:

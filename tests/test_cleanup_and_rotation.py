@@ -30,6 +30,8 @@ from platforms.maintenance import SCOPE_HOST, SCOPE_WORKSPACE
 class TestSignalsRotation:
     @pytest.fixture(autouse=True)
     def _reset_bridge(self, monkeypatch: pytest.MonkeyPatch):
+        # 前面的测试还排着的信号写完时也会给轮转计数加一
+        assert bridge.flush_signal_writes()
         monkeypatch.setattr(bridge, "_bridge_installed", False)
         monkeypatch.setattr(bridge, "_SIGNALS_LOG", None)
         monkeypatch.setattr(bridge, "_writes_since_rotate_check", 0)
@@ -49,10 +51,12 @@ class TestSignalsRotation:
 
         for i in range(40):
             bus.emit(Signal(name="test.event", payload={"i": i, "pad": "x" * 40}))
+        assert bridge.flush_signal_writes()
 
         assert (tmp_path / "signals.jsonl.1").exists()
         # 轮转把 active 改名走了，下一条信号会重建它 —— 关键是它不再背着全部历史。
         bus.emit(Signal(name="test.event", payload={"i": "after"}))
+        assert bridge.flush_signal_writes()
         assert (tmp_path / "signals.jsonl").stat().st_size < 200
 
     def test_rotated_content_is_not_lost(self, tmp_path: Path, monkeypatch) -> None:
@@ -60,6 +64,7 @@ class TestSignalsRotation:
 
         for i in range(40):
             bus.emit(Signal(name="test.event", payload={"i": i, "pad": "x" * 40}))
+        assert bridge.flush_signal_writes()
 
         rotated = (tmp_path / "signals.jsonl.1").read_text(encoding="utf-8")
         assert "test.event" in rotated
@@ -68,6 +73,7 @@ class TestSignalsRotation:
         bus = self._install(tmp_path, monkeypatch, max_bytes=10 * 1024 * 1024)
 
         bus.emit(Signal(name="test.event", payload={"i": 1}))
+        assert bridge.flush_signal_writes()
 
         assert not (tmp_path / "signals.jsonl.1").exists()
 
@@ -76,6 +82,7 @@ class TestSignalsRotation:
 
         for i in range(200):
             bus.emit(Signal(name="test.event", payload={"i": i, "pad": "x" * 40}))
+        assert bridge.flush_signal_writes()
 
         assert not (tmp_path / "signals.jsonl.3").exists()
 
@@ -88,13 +95,16 @@ class TestSignalsRotation:
         monkeypatch.setattr(bridge, "rotate_event_log", lambda *a, **k: checks.append(1))
         bus = SignalBus()
         bridge.install_event_bridge(bus, log_dir=tmp_path)
+        assert bridge.flush_signal_writes()
         checks.clear()
 
         for i in range(9):
             bus.emit(Signal(name="test.event", payload={"i": i}))
+        assert bridge.flush_signal_writes()
 
         assert checks == []
         bus.emit(Signal(name="test.event", payload={"i": 9}))
+        assert bridge.flush_signal_writes()
         assert len(checks) == 1
 
     def test_install_checks_the_size_left_by_the_previous_process(self, tmp_path: Path, monkeypatch) -> None:
@@ -102,6 +112,7 @@ class TestSignalsRotation:
         (tmp_path / "signals.jsonl").write_text("x" * 500, encoding="utf-8")
 
         self._install(tmp_path, monkeypatch, max_bytes=200, every=10_000)
+        assert bridge.flush_signal_writes()
 
         assert (tmp_path / "signals.jsonl.1").exists()
 
@@ -123,6 +134,7 @@ class TestSignalsRotation:
         with caplog.at_level(logging.WARNING):
             bus.emit(Signal(name="test.event", payload={"i": 1}))
             bus.emit(Signal(name="test.event", payload={"i": 2}))
+            assert bridge.flush_signal_writes()
 
         assert any("rotation failed" in r.getMessage() for r in caplog.records)
         # 两条都要落盘：轮转坏了不等于信号丢了。

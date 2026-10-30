@@ -41,6 +41,24 @@ def eventlog_lock_path(path: Path) -> Path:
     return path.with_name(path.name + _LOCK_SUFFIX)
 
 
+def append_lines(path: Path, data: bytes) -> None:
+    """Append whole lines to an append-only log.
+
+    A writer that died mid-line leaves a torn last line behind. Starting on a fresh
+    line loses only that line instead of gluing the first line written now onto it.
+    """
+    with path.open("a+b") as stream:
+        if not data:
+            return
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        if size:
+            stream.seek(size - 1)
+            if stream.read(1) != b"\n":
+                data = b"\n" + data
+        stream.write(data)
+
+
 def _windows_pid_is_alive(pid: int) -> bool:
     """Probe a Windows process without sending it any signal.
 

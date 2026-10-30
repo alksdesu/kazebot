@@ -356,7 +356,7 @@ class FallbackProviderHandler:
                 )
 
                 # 格式转换按备用渠道自己的 provider 走：Responses/Gemini 绕过 L2，其余经 formatter
-                _fb_messages = provider_messages(
+                _fb_messages = await provider_messages(
                     view, formatter=_formatter, provider=fb_provider, workspace_root=workspace_root,
                     strip_images=node_strips_images or not fb_supports_vision,
                 )

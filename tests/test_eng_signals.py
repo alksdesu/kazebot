@@ -30,6 +30,7 @@ def _install(tmp_path: Path, **kwargs: object) -> SignalBus:
 
 
 def _entries(tmp_path: Path) -> list[dict]:
+    assert bridge.flush_signal_writes()
     return [json.loads(line) for line in (tmp_path / "signals.jsonl").read_text(encoding="utf-8").splitlines()]
 
 

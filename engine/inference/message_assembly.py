@@ -83,6 +83,7 @@ def assemble_messages_with_injections(
     当轮输入按它渲染，同一条输入当轮发出去的和之后重载的才一字不差。
     isolation 是 task_context 里的隔离说明：隔离副本里的任务在动态区多一段 [ISOLATION]，排在技能和记忆之前；
     其余任务的提示词一字不变。
+    带文本附件时要读盘，协程里放到线程里调。
     """
     skill_static = list(skill_static or [])
     skill_dynamic = list(skill_dynamic or [])
@@ -265,6 +266,7 @@ def assemble_initial_messages(
     返回 (messages, is_block_mode, system_prompt_blocks)。
     system_prompt_blocks 是 assemble_prompt 的原始输出，供后续 preempt 注入使用。
     project_root 是任务的项目根，渲染 {{project_root}}；没给就等于 workspace_root。
+    要读 include 进来的提示词片段和当轮的文本附件，协程里放到线程里调。
     """
     prompt_vars: dict[str, str] = {
         "node_id": node.id,

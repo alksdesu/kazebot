@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,12 +15,14 @@ from toolbox.registry import ToolRegistry
 from providers.base import BaseProvider
 from ..node import Node
 from ..context_store import save_context_snapshot, write_context_snapshot
-from ..conversation_store import ConversationWriter
+from ..conversation_store import ConversationWriter, WriteFailure
 
 if TYPE_CHECKING:
     from ..context import RunContext
     from .tool_format import ToolFormatter
 
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 #  辅助函数
@@ -30,6 +33,10 @@ TERMINAL_TOOLS = frozenset({"finish", "ask"})
 
 # 工具产出图片时补的那条 user 消息；运行期 _meta 和落盘 message_type 用同一个值，按它认出这不是新的用户输入
 TOOL_RESULT_ATTACHMENT_TYPE = "tool_result_attachment"
+
+CONVERSATION_WRITE_FAILED = "conversation_write_failed"
+# 事件里最多列这么多条消息 id，条数照实写在 failed_count
+_REPORTED_MESSAGE_IDS = 20
 
 
 def _short(s: str, n: int) -> str:
@@ -222,10 +229,49 @@ def conversation_writer(rctx: Any) -> ConversationWriter | None:
 
 
 async def flush_conversation_writes(rctx: Any) -> None:
-    """等本任务提交过的对话写入全部落盘。"""
+    """等本任务提交过的对话写入全部落盘。重试过仍没写进去的发一条会话事件报出来，任务照常往下走。"""
     writer = getattr(rctx, "conversation_writer", None)
-    if isinstance(writer, ConversationWriter):
-        await writer.flush()
+    if not isinstance(writer, ConversationWriter):
+        return
+    await writer.flush()
+    failures = writer.take_failures()
+    if failures:
+        await _report_write_failures(rctx, failures)
+
+
+async def _report_write_failures(rctx: Any, failures: list[WriteFailure]) -> None:
+    emit = getattr(rctx, "emit_event", None)
+    for payload in _write_failure_payloads(failures, task_id=str(getattr(rctx, "task_id", "") or "")):
+        delivered = False
+        if callable(emit):
+            # 上报点多在 finally 里，这里抛出去会顶掉任务本来的结果
+            try:
+                delivered = bool(await emit(CONVERSATION_WRITE_FAILED, payload))
+            except Exception:
+                logger.debug("conversation_write_failed event could not be sent", exc_info=True)
+        if not delivered:
+            logger.warning("conversation write failure was not reported to the supervisor: %s", payload["message"])
+
+
+def _write_failure_payloads(failures: list[WriteFailure], *, task_id: str = "") -> list[dict[str, Any]]:
+    """每个会话一条 conversation_write_failed 的 payload，message 是给人看的一句话。"""
+    by_session: dict[str, list[WriteFailure]] = {}
+    for failure in failures:
+        by_session.setdefault(failure.session_id, []).append(failure)
+    payloads: list[dict[str, Any]] = []
+    for session_id, items in by_session.items():
+        reason = "；".join(dict.fromkeys(item.reason for item in items))
+        payload: dict[str, Any] = {
+            "message": f"对话历史有 {len(items)} 条没写进会话 {session_id}：{reason}",
+            "session_id": session_id,
+            "failed_count": len(items),
+            "message_ids": [item.message_id for item in items[:_REPORTED_MESSAGE_IDS]],
+            "reason": reason,
+        }
+        if task_id:
+            payload["task_id"] = task_id
+        payloads.append(payload)
+    return payloads
 
 
 def compact_target_session_id(ls: _LoopState) -> str:

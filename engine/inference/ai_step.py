@@ -68,7 +68,7 @@ from .pseudo_handlers import (
 
 from ..context_store import load_context_snapshot
 from ..dispatch_batch import AWAIT_KEY, DispatchLimits, DispatchTimeouts
-from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
+from ..attachments import abuild_multimodal_content, payload_attachments, screen_attachments
 from ..conversation_store import Message, MessageType
 from ..isolation_notice import task_isolation
 from ..node import Node
@@ -1709,11 +1709,12 @@ async def _execute_real_tools(
             # from ConversationStore. How: keep the exact multimodal message in
             # a variable, append it, then shadow-write it. Purpose: persist tool
             # image results across task boundaries without changing prompt text.
+            _tool_att_content = await abuild_multimodal_content(
+                "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
+            )
             _tool_att_msg = {
                 "role": "user",
-                "content": build_multimodal_content(
-                    "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
-                ),
+                "content": _tool_att_content,
                 # 运行期也要认得出这不是新的用户输入：重复调用检测按它决定要不要接着往前数
                 "_meta": {"message_type": TOOL_RESULT_ATTACHMENT_TYPE},
             }
@@ -2206,7 +2207,9 @@ async def run_ai_node(
         except Exception:
             step_count = 0
     else:
-        messages, _is_block_mode, system_prompt = assemble_initial_messages(
+        # 组装会读当轮的文本附件和 include 进来的提示词片段
+        messages, _is_block_mode, system_prompt = await asyncio.to_thread(
+            assemble_initial_messages,
             workspace_root=rctx.workspace_root,
             runtime_cfg=runtime_cfg,
             node=node,

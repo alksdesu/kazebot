@@ -391,7 +391,7 @@ class TestAssembly:
             extra={"system_prompt": [_PERSONA, _NODE_TURN], "history": list(_HISTORY), "instruction_text": "now"},
         )
 
-        _rebuild_prompt_messages(ctx)
+        asyncio.run(_rebuild_prompt_messages(ctx))
 
         assert ISOLATION_OPEN in _dynamic(ctx.messages) and info["path"] in _dynamic(ctx.messages)
 

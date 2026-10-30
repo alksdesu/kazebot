@@ -158,10 +158,10 @@ def _live_round(task_id: str, step: int, content: str) -> list[dict[str, Any]]:
 
 def _send(view: list[dict[str, Any]], workspace: Path) -> list[str]:
     """一份请求视图转成 native 渠道收到的消息，每条序列化成一个字符串，前缀按它逐条比。"""
-    sent = provider_messages(
+    sent = asyncio.run(provider_messages(
         view, formatter=create_tool_formatter("native"), provider=SimpleNamespace(name="test"),
         workspace_root=workspace, strip_images=False,
-    )
+    ))
     return [json.dumps(message, ensure_ascii=False, sort_keys=True) for message in sent]
 
 

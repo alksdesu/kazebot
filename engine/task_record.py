@@ -21,6 +21,7 @@ from pathlib import Path
 
 from engine.compaction_plan import _tool_call_ids, record_dict, record_meta, record_task_id
 from engine.compact import is_tool_result_message
+from engine.eventlog_rotation import append_lines
 
 log = logging.getLogger(__name__)
 
@@ -182,8 +183,7 @@ def write_task_record(ws_root: Path, record: TaskRecord) -> None:
     transcript_dir.mkdir(parents=True, exist_ok=True)
     path = transcript_dir / f"{record.session_id}.jsonl"
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        append_lines(path, (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8"))
     except Exception as e:
         log.error("Failed to write task record %s: %s", record.task_id, e)
 

@@ -97,9 +97,27 @@ def _touch_attachment_files(attachments: Iterable[Any]) -> None:
 def _cleanup_old_qq_attachments(now: float | None = None) -> None:
     """清理 QQ 会话附件目录中的过期文件；默认保留 IMAGE_CACHE_TTL_SECONDS。"""
     now = time.time() if now is None else now
+    if _claim_attachment_cleanup(now):
+        _remove_expired_qq_attachments(now)
+
+
+async def _cleanup_old_qq_attachments_in_thread() -> None:
+    """协程里用的 _cleanup_old_qq_attachments：间隔在事件循环上判，遍历目录放到线程里。"""
+    now = time.time()
+    if _claim_attachment_cleanup(now):
+        await asyncio.to_thread(_remove_expired_qq_attachments, now)
+
+
+def _claim_attachment_cleanup(now: float) -> bool:
+    """离上次清理够一个间隔就记下这次的时间并返回 True。在事件循环上调，同时到的几条入站只有一条去清。"""
     if now - state._adapter.last_attachment_cleanup_at < models._ATTACHMENT_CLEANUP_INTERVAL_SEC:
-        return
+        return False
     state._adapter.last_attachment_cleanup_at = now
+    return True
+
+
+def _remove_expired_qq_attachments(now: float) -> None:
+    """删掉 QQ 会话目录里过期的文件和删空的目录。要遍历全部 QQ 附件，协程里放到线程里调。"""
     root = Path(CLONOTH_WORKSPACE) / "data" / "attachments"
     if not root.exists():
         return
@@ -487,7 +505,8 @@ async def _read_source_bytes(client: httpx.AsyncClient, source: str, *, max_byte
         if len(encoded) > 4 * ((max_bytes + 2) // 3):
             raise ValueError("too_large")
         try:
-            content = base64.b64decode(encoded, validate=True)
+            # 上限是 file_max_bytes（默认 50MB），在事件循环上解码会卡住这个号的收发
+            content = await asyncio.to_thread(base64.b64decode, encoded, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise ValueError("invalid_content") from exc
         if len(content) > max_bytes:
@@ -636,7 +655,7 @@ async def _file_sources_to_attachments(
     if not live.enable_file_input or not file_sources:
         return result, errors
 
-    _cleanup_old_qq_attachments()
+    await _cleanup_old_qq_attachments_in_thread()
     workspace = Path(CLONOTH_WORKSPACE)
     att_dir = workspace / "data" / "attachments" / conversation_key.replace(":", "_")
     try:
@@ -676,7 +695,7 @@ async def _image_sources_to_attachments(
     if not live.enable_image_input or not image_sources:
         return result, errors
 
-    _cleanup_old_qq_attachments()
+    await _cleanup_old_qq_attachments_in_thread()
     workspace = Path(CLONOTH_WORKSPACE)
     att_dir = workspace / "data" / "attachments" / conversation_key.replace(":", "_")
     try:

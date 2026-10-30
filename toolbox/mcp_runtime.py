@@ -1260,7 +1260,8 @@ async def call_tool(
     # serialize the result through the MCP-aware helper that saves oversized
     # images to disk and returns AttachmentCollector-compatible metadata.
     # Purpose: keep tool history compact while still exposing generated files.
-    result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
+    # Decoding multi-megabyte base64 and writing the image file would stall the engine's event loop.
+    result, attachments = await asyncio.to_thread(_to_plain_mcp_result, workspace_root, client_id, res)
     # [AutoC 2026-05-31] Why: MCP SDK results have provider-specific content
     # payloads, but the engine now consumes a unified ok/data/error contract.
     # How: flatten text, image, and resource parts into data.result while keeping

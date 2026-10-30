@@ -260,7 +260,7 @@ async def _attachment_cleanup_forever() -> None:
     """定期清理 QQ 附件目录。原来只在有图片/文件下载时才顺手清一次，长期不收图就永远不清。"""
     while True:
         try:
-            media._cleanup_old_qq_attachments()
+            await media._cleanup_old_qq_attachments_in_thread()
         except asyncio.CancelledError:
             raise
         except Exception:

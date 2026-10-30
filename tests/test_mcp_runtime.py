@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,3 +89,42 @@ def test_call_tool_spills_large_mcp_image_content_to_attachment_path(tmp_path: P
         "data": small_image,
         "mimeType": "image/png",
     }
+
+
+def test_call_tool_saves_large_images_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """Decoding and writing a multi-megabyte image must not stall the engine's event loop."""
+    image_bytes = b"\x89PNG\r\n\x1a\n" + (b"image-bytes" * 800)
+    expected_rel_path = f"data/attachments/mcp/painter/{hashlib.md5(image_bytes).hexdigest()[:12]}.png"
+    fake_result = SimpleNamespace(
+        content=[SimpleNamespace(type="image", data=base64.b64encode(image_bytes).decode("ascii"), mimeType="image/png")],
+        isError=False,
+    )
+
+    class FakeSession:
+        async def call_tool(self, tool_name: str, arguments: dict) -> SimpleNamespace:
+            return fake_result
+
+    mcp_runtime.upsert_client(tmp_path, {"id": "painter", "transport": "stdio", "command": "fake-mcp-server"})
+
+    @asynccontextmanager
+    async def fake_connect(plan):
+        yield mcp_runtime._Connection(session=FakeSession())
+
+    loop_thread = threading.get_ident()
+    saved_on: list[int] = []
+    real_save = mcp_runtime._save_large_mcp_image_part
+
+    def recorded_save(*args, **kwargs):
+        saved_on.append(threading.get_ident())
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_runtime, "_connect", fake_connect)
+    monkeypatch.setattr(mcp_runtime, "_save_large_mcp_image_part", recorded_save)
+
+    result = asyncio.run(mcp_runtime.call_tool(tmp_path, "painter", "draw", {}))
+
+    assert saved_on and loop_thread not in saved_on
+    assert (tmp_path / expected_rel_path).read_bytes() == image_bytes
+    assert result["data"]["attachments"] == [
+        {"path": expected_rel_path, "name": expected_rel_path.rsplit("/", 1)[-1], "type": "image"},
+    ]

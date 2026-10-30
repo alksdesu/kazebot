@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes as _mimetypes
@@ -261,8 +262,10 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         if selected_paths:
             allowed_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, selected_paths)
             if allowed_paths:
-                selected_atts = _select_attachments(
-                    ls.collected_attachments, allowed_paths,
+                # 点名的文件不在已收集的附件里时整份读进来另存一份，大小不限
+                selected_atts = await asyncio.to_thread(
+                    _select_attachments,
+                    list(ls.collected_attachments), allowed_paths,
                     workspace_root=ls.rctx.workspace_root,
                     session_id=ls.rctx.session_id,
                 )
@@ -355,8 +358,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         if terminal_name == "finish":
             if explicit_paths is not None:
                 if explicit_paths:
-                    final_atts = _select_attachments(
-                        ls.collected_attachments, explicit_paths,
+                    final_atts = await asyncio.to_thread(
+                        _select_attachments,
+                        list(ls.collected_attachments), explicit_paths,
                         workspace_root=ls.rctx.workspace_root,
                         session_id=ls.rctx.session_id,
                     )

@@ -32,7 +32,7 @@ from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
-from .attachments import build_multimodal_content, payload_attachments, screen_attachments
+from .attachments import abuild_multimodal_content, payload_attachments, screen_attachments
 from .context import RunContext, TaskLease
 from .model import (
     create_llm_http_client,
@@ -1132,7 +1132,7 @@ async def _bounded_dispatch_items(
     return bounded
 
 
-def _dispatch_result_message(
+async def _dispatch_result_message(
     item: Mapping[str, Any],
     *,
     route_meta: Mapping[str, Any],
@@ -1144,7 +1144,7 @@ def _dispatch_result_message(
     """一条异步委派结果落盘的样子：正文是子节点的原始结果，带附件时存发给模型的同一份多模态内容。"""
     text = str(item.get("text") or "")
     attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else None
-    content: Any = build_multimodal_content(text, attachments, workspace_root=ws_root) if attachments else text
+    content = await abuild_multimodal_content(text, attachments, workspace_root=ws_root)
     return Message(
         id=str(uuid.uuid4()),
         role="user",
@@ -1462,26 +1462,26 @@ async def _run_node_task(
         _dispatch_items = await _bounded_dispatch_items(rctx, runtime_cfg, _dispatch_items)
     if _conv_store and not is_resume and (_dispatch_items or instruction or input_attachments):
         _target_sid = child_session_id or session_id
-        _input_messages = [
-            _dispatch_result_message(
-                _item, route_meta=_route_meta, tool_status=_async_tool_status,
-                ws_root=ws_root, node_id=node.id, task_id=task_id,
-            )
-            for _item in _dispatch_items
-        ] or [Message(
-            id=str(uuid.uuid4()),
-            role="user",
-            # 带附件时落盘发给模型的同一份多模态内容，本任务后续步骤重载历史还看得到图
-            content=(
-                build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
-                if input_attachments else instruction
-            ),
-            message_type=_inbound_message_type or MessageType.USER_INPUT,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            meta=_inbound_message_meta(input_data, _route_meta, _async_tool_status),
-            source_node_id=node.id,
-            source_task_id=task_id,
-        )]
+        if _dispatch_items:
+            _input_messages = [
+                await _dispatch_result_message(
+                    _item, route_meta=_route_meta, tool_status=_async_tool_status,
+                    ws_root=ws_root, node_id=node.id, task_id=task_id,
+                )
+                for _item in _dispatch_items
+            ]
+        else:
+            _input_messages = [Message(
+                id=str(uuid.uuid4()),
+                role="user",
+                # 带附件时落盘发给模型的同一份多模态内容，本任务后续步骤重载历史还看得到图
+                content=await abuild_multimodal_content(instruction, input_attachments, workspace_root=ws_root),
+                message_type=_inbound_message_type or MessageType.USER_INPUT,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                meta=_inbound_message_meta(input_data, _route_meta, _async_tool_status),
+                source_node_id=node.id,
+                source_task_id=task_id,
+            )]
         for _input_message in _input_messages:
             conversation_writer(rctx).submit(_target_sid, _input_message)
 

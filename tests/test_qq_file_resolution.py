@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -279,6 +280,27 @@ def test_reported_nonzero_size_rejects_truncated_download(runtime, tmp_path, con
 
 def test_invalid_base64_reports_decoding_error(runtime, tmp_path):
     _assert_rejected(tmp_path, _receive(runtime, {"name": "report.txt", "file": "base64://not valid!"}), "无法解码")
+
+
+def test_an_inline_base64_file_is_decoded_off_the_event_loop(runtime, tmp_path, monkeypatch):
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    class _RecordingBase64:
+        def b64decode(self, *args, **kwargs):
+            threads.append(threading.get_ident())
+            return base64.b64decode(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(base64, name)
+
+    monkeypatch.setattr(runtime.media, "base64", _RecordingBase64())
+    content = b"inline report"
+
+    received = _receive(runtime, {"name": "report.txt", "file": "base64://" + base64.b64encode(content).decode("ascii")})
+
+    _assert_file(tmp_path, received, content)
+    assert threads and loop_thread not in threads
 
 
 @pytest.mark.parametrize("kind", ["reported", "metadata", "http", "base64", "local"])

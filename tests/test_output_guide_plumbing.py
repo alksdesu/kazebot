@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import OrderedDict
 from pathlib import Path
@@ -141,7 +142,7 @@ class TestLayout:
             },
         )
 
-        _rebuild_prompt_messages(ctx)
+        asyncio.run(_rebuild_prompt_messages(ctx))
 
         assert has_static_guide(ctx.messages) and "【可用表情】甲、乙" in _dynamic(ctx.messages)
 

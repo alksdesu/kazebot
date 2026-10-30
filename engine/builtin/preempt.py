@@ -8,7 +8,7 @@ from engine.conversation_routing import render_user_input, routing_meta
 
 from typing import Any
 
-from engine.attachments import build_multimodal_content
+from engine.attachments import abuild_multimodal_content
 from engine.inference.loop_state import conversation_writer, flush_conversation_writes
 from engine.isolation_notice import isolation_parts
 from engine.memory_subjects import resolve_load_subjects
@@ -163,14 +163,7 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
             "_dynamic": True,
         })
 
-    if new_attachments:
-        content: Any = build_multimodal_content(
-            new_instruction,
-            new_attachments,
-            workspace_root=ls.rctx.workspace_root,
-        )
-    else:
-        content = new_instruction
+    content = await abuild_multimodal_content(new_instruction, new_attachments, workspace_root=ls.rctx.workspace_root)
     message_id = str(uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
     meta = {

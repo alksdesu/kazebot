@@ -6,10 +6,12 @@ Before sending to the LLM provider, file:// refs are resolved to base64 data URL
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
 import mimetypes
+import os
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -166,6 +168,18 @@ def _decode_text_file(raw: bytes) -> str | None:
         return None
 
 
+def _read_text_head(path: Path) -> tuple[bytes, int]:
+    """文本附件开头至多 _TEXT_FILE_MAX_BYTES + 1 字节，和按它算的文件大小。
+
+    stat 之后文件还可能被写大：多读的那一个字节用来认出超了上限，不把整份读进内存。
+    """
+    with path.open("rb") as stream:
+        head = stream.read(_TEXT_FILE_MAX_BYTES + 1)
+        if len(head) <= _TEXT_FILE_MAX_BYTES:
+            return head, len(head)
+        return head, max(len(head), os.fstat(stream.fileno()).st_size)
+
+
 def is_allowed_attachment_path(rel_path: str) -> bool:
     """附件只能是工作区 data/ 下的相对路径。
 
@@ -293,11 +307,14 @@ def attachments_to_content_parts(
                     continue
                 try:
                     file_size = full_path.stat().st_size
+                    head = b""
+                    if file_size <= _TEXT_FILE_MAX_BYTES:
+                        head, file_size = _read_text_head(full_path)
                     if file_size <= _TEXT_FILE_MAX_BYTES:
                         # 入站白名单放行 pdf/docx/zip 等二进制格式，errors="replace" 会把它们
                         # 解成满屏替换字符灌进 prompt。判不出文本就只给路径，与 read_file
                         # 的处理保持一致（它遇到二进制也是只报类型、不给内容）。
-                        decoded = _decode_text_file(full_path.read_bytes())
+                        decoded = _decode_text_file(head)
                         if decoded is None:
                             parts.append({
                                 "type": "text",
@@ -371,6 +388,17 @@ def build_multimodal_content(
     parts: list[dict[str, Any]] = [{"type": "text", "text": _annotated}]
     parts.extend(att_parts)
     return parts
+
+
+async def abuild_multimodal_content(
+    text: str,
+    attachments: list[dict[str, Any]] | None,
+    workspace_root: Path | None = None,
+) -> list[dict[str, Any]] | str:
+    """协程里用的 build_multimodal_content：读文本附件是阻塞 I/O，放到线程里；没有附件原样给回 text。"""
+    if not attachments:
+        return text
+    return await asyncio.to_thread(build_multimodal_content, text, attachments, workspace_root=workspace_root)
 
 
 def _is_image_part(part: Any) -> bool:

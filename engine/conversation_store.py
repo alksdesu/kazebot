@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
 import config_layout
+from engine.eventlog_rotation import append_lines
 from file_lock import exclusive_lock
 
 logger = logging.getLogger(__name__)
@@ -170,20 +172,6 @@ _LOCK_STRIPE_CHARS = 2
 _COPY_CHUNK_BYTES = 1 << 20
 
 
-def _append_lines(path: Path, data: bytes) -> None:
-    """追加若干整行。上次写到一半就崩了的话先补换行，半行只坏它自己，不吞掉这次写的第一条。"""
-    with path.open("a+b") as stream:
-        if not data:
-            return
-        stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        if size:
-            stream.seek(size - 1)
-            if stream.read(1) != b"\n":
-                data = b"\n" + data
-        stream.write(data)
-
-
 def _readable_messages(data: bytes) -> Iterator[Message]:
     """data 里读得出来的消息：切行、跳过空行和读不出的行都和 ConversationStore.load 一样。"""
     for line in io.TextIOWrapper(io.BytesIO(data), encoding="utf-8"):
@@ -317,7 +305,7 @@ class ConversationStore:
             if self._cache_stamps.get(session_id) != self._file_stamp(path):
                 self.invalidate_cache(session_id)
             try:
-                _append_lines(path, encoded)
+                append_lines(path, encoded)
             except Exception:
                 self.invalidate_cache(session_id)
                 raise
@@ -334,7 +322,7 @@ class ConversationStore:
         ).encode("utf-8")
         with self._locked(session_id):
             try:
-                _append_lines(path, encoded)
+                append_lines(path, encoded)
             finally:
                 self.invalidate_cache(session_id)
 
@@ -563,7 +551,7 @@ class ConversationStore:
     def _install_unlocked(staged: Path, target: Path) -> bool:
         """把暂存文件装进 target，返回是不是整份换上去的；target 只剩读不出的残行时接在后面。调用方持有 target 的文件锁。"""
         if target.exists() and target.stat().st_size > 0:
-            _append_lines(target, staged.read_bytes())
+            append_lines(target, staged.read_bytes())
             return False
         os.replace(staged, target)
         return True
@@ -595,34 +583,88 @@ class ConversationStore:
         self._cache_stamps.pop(session_id, None)
 
 
+@dataclass(frozen=True)
+class WriteFailure:
+    """重试过仍没写进去的一条消息。reason 给人看，不带文件路径。"""
+
+    session_id: str
+    message_id: str
+    reason: str
+
+
+# OSError 多半是一时的（杀毒软件占着文件、磁盘抖一下），按这几个间隔各再试一次
+_WRITE_RETRY_DELAYS: tuple[float, ...] = (0.2, 1.0)
+
+
+def _failure_reason(error: BaseException) -> str:
+    """失败原因：OSError 的 str 带着文件的绝对路径，只取类名和 strerror。"""
+    if isinstance(error, OSError):
+        return f"{type(error).__name__}: {error.strerror}" if error.strerror else type(error).__name__
+    text = str(error).strip()
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 class ConversationWriter:
     """一个任务的对话写入：按提交顺序在后台线程里追加，事件循环不等磁盘。
 
-    读同一份历史之前、任务结果交回 supervisor 之前都要先 flush。
+    读同一份历史之前、任务结果交回 supervisor 之前都要先 flush。重试过仍没写进去的记下来，由 take_failures 取走上报。
+    一条重试完仍失败后，后面的只试一次不再等，写成功一条再恢复重试：磁盘一直坏着时积压的写入不必每条等一轮。
     """
 
     def __init__(self, store: ConversationStore) -> None:
         self.store = store
         self._last: asyncio.Future | None = None
+        self._failures: list[WriteFailure] = []
+        # 只在 _write 里读写，不加锁：上一条写完下一条才开始
+        self._retries_suspended = False
 
     def submit(self, session_id: str, message: Message) -> None:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            self._write(session_id, message)
+            self._record(self._write(session_id, message))
             return
         self._last = asyncio.ensure_future(self._write_after(self._last, session_id, message))
 
     async def _write_after(self, previous: asyncio.Future | None, session_id: str, message: Message) -> None:
         if previous is not None and not previous.done():
             await asyncio.wait({previous})
-        await asyncio.to_thread(self._write, session_id, message)
+        # 线程里只写盘，失败交回事件循环上记：失败清单只在循环线程上改
+        self._record(await asyncio.to_thread(self._write, session_id, message))
 
-    def _write(self, session_id: str, message: Message) -> None:
-        try:
-            self.store.append(session_id, message)
-        except Exception:
-            logger.exception("conversation write failed: session=%s message=%s", session_id, message.id)
+    def _write(self, session_id: str, message: Message) -> WriteFailure | None:
+        delays = iter(() if self._retries_suspended else _WRITE_RETRY_DELAYS)
+        while True:
+            try:
+                self.store.append(session_id, message)
+                self._retries_suspended = False
+                return None
+            except OSError as error:
+                delay = next(delays, None)
+                if delay is None:
+                    self._retries_suspended = True
+                    return self._failed(session_id, message, error)
+                logger.warning(
+                    "conversation write failed, retrying in %.1fs: session=%s message=%s (%s)",
+                    delay, session_id, message.id, _failure_reason(error),
+                )
+                time.sleep(delay)
+            except Exception as error:
+                return self._failed(session_id, message, error)
+
+    @staticmethod
+    def _failed(session_id: str, message: Message, error: Exception) -> WriteFailure:
+        logger.error("conversation write failed: session=%s message=%s", session_id, message.id, exc_info=error)
+        return WriteFailure(session_id, str(message.id or ""), _failure_reason(error))
+
+    def _record(self, failure: WriteFailure | None) -> None:
+        if failure is not None:
+            self._failures.append(failure)
+
+    def take_failures(self) -> list[WriteFailure]:
+        """还没上报的写失败，取走就清空，同一批不会报第二次。在事件循环上调。"""
+        failures, self._failures = self._failures, []
+        return failures
 
     async def flush(self) -> None:
         last = self._last

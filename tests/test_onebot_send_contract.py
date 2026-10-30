@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from dataclasses import dataclass, field
 import importlib
@@ -1115,6 +1116,47 @@ def _merge_bot_images(tmp_path: Path) -> tuple[Path, Path]:
     return first_image, second_image
 
 
+def test_a_forward_batch_identity_is_read_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    first_image, second_image = _merge_bot_images(tmp_path)
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    real_identity = runtime.outbound_attachments._forward_batch_identity
+
+    def recorded(attachments: Any) -> str:
+        threads.append(threading.get_ident())
+        return real_identity(attachments)
+
+    monkeypatch.setattr(runtime.outbound_attachments, "_forward_batch_identity", recorded)
+
+    class Bot:
+        self_id = "1"
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+        async def call_api(self, name: str, **kwargs: Any):
+            self.calls.append((name, len(kwargs["messages"])))
+            return {"message_id": 99}
+
+    bot = Bot()
+    target = {"type": "group", "group_id": 5}
+    context = DeliveryContext(event_id="forward-identity", idempotency_key="id:forward-identity")
+
+    assert asyncio.run(runtime.outbound_attachments._try_send_images_as_forward(
+        bot, target, [{"path": str(first_image)}, {"path": str(second_image)}], send_context=context,
+    )) is True
+
+    assert threads and loop_thread not in threads
+    assert bot.calls == [("send_group_forward_msg", 2)]
+    identity = "forward:" + hashlib.sha256("|".join(
+        image_content_identity(image.read_bytes()) for image in (first_image, second_image)
+    ).encode("utf-8")).hexdigest()
+    child = context.child(identity)
+    key = runtime.sending.make_idempotency_key(target, identity, event_id=child.idempotency_key or child.event_id)
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state(key)) == "sent"
+
+
 def test_forward_merge_falls_back_to_one_by_one_on_permanent_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -1266,6 +1308,52 @@ def test_file_upload_crash_lease_replays_and_commits_content_claim(
     assert bot.calls == 1
     assert asyncio.run(runtime.state._adapter.outbound_idempotency.state(key)) == "sent"
 
+
+@pytest.mark.parametrize("name", ["photo.png", "report.bin"])
+def test_attachment_bytes_are_read_and_encoded_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    attachment = tmp_path / name
+    attachment.write_bytes(b"attachment payload")
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    def on_thread(function: Any) -> Any:
+        def recorded(*args: Any) -> Any:
+            threads.append(threading.get_ident())
+            return function(*args)
+        return recorded
+
+    monkeypatch.setattr(
+        runtime.outbound_attachments, "_read_attachment", on_thread(runtime.outbound_attachments._read_attachment),
+    )
+    monkeypatch.setattr(runtime.sending, "_base64_source", on_thread(runtime.sending._base64_source))
+
+    class Bot:
+        self_id = "7"
+        def __init__(self):
+            self.files: list[str] = []
+        async def send_group_msg(self, *, group_id: int, message: Any):
+            self.files.append(message["data"]["file"] if isinstance(message, dict) else message[0]["data"]["file"])
+            return {"message_id": 88}
+        async def call_api(self, api: str, **kwargs: Any):
+            assert api == "upload_group_file"
+            self.files.append(kwargs["file"])
+            return {"message_id": 89}
+
+    bot = Bot()
+    message_id = asyncio.run(runtime.outbound_attachments._send_attachment_path(
+        bot, {"type": "group", "group_id": 1}, attachment,
+        send_context=DeliveryContext(event_id=f"evt-{name}", idempotency_key=f"id:evt-{name}"),
+    ))
+
+    assert len(threads) == 2 and loop_thread not in threads
+    if name.endswith(".png"):
+        assert message_id == "88" and bot.files == [str(attachment.resolve())]
+    else:
+        assert message_id == "89"
+        assert bot.files == ["base64://" + base64.b64encode(b"attachment payload").decode("ascii")]
 
 
 def test_force_replay_context_bypasses_previous_onebot_sent_claim(

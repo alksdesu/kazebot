@@ -276,7 +276,7 @@ async def test_knowledge_rebuild_and_preempt_keep_tail_after_replaced_guide(tmp_
         "output_guide": GUIDE,
     })
     rctx.task_context["output_guide"] = GUIDE
-    _rebuild_prompt_messages(ctx)
+    await _rebuild_prompt_messages(ctx)
     loop = SimpleNamespace(
         rctx=rctx, messages=ctx.messages, history=history, system_prompt=system, is_block_mode=False,
         node=Node(id="entry", type="ai"), runtime_cfg={},

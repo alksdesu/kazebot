@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import base64
 import contextlib
 import hashlib
 import time
@@ -68,6 +67,24 @@ def _attachment_filename(attachment: Any) -> str:
     return ""
 
 
+def _read_attachment(path: Path, is_image: bool) -> tuple[bytes, str]:
+    """整份读出要发的附件，连同去重用的内容标识。文件最大几十 MB，协程里放到线程里调。"""
+    raw = path.read_bytes()
+    if is_image:
+        return raw, image_content_identity(raw)
+    return raw, f"file:sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _forward_batch_identity(image_attachments: List[Any]) -> str:
+    """合并转发这一批图的去重标识，要把每张图整份读出来算，协程里放到线程里调。"""
+    identities = []
+    for attachment in image_attachments:
+        path = _resolve_attachment_path(attachment)
+        if path is not None:
+            identities.append(image_content_identity(path.read_bytes()))
+    return "forward:" + hashlib.sha256("|".join(identities).encode("utf-8")).hexdigest()
+
+
 async def _send_attachment_path(
     bot: Bot,
     target: Dict[str, Any],
@@ -81,13 +98,13 @@ async def _send_attachment_path(
     display_name = filename or path.name
     if not path.exists():
         raise SendContractError(f"attachment does not exist: {path}")
-    raw_bytes = path.read_bytes()
+    is_image = path.suffix.lower() in common._IMAGE_SUFFIXES
+    raw_bytes, identity = await asyncio.to_thread(_read_attachment, path, is_image)
     context = send_context or OutboundSendContext(
         conversation_key=str(target.get("conversation_key") or "")
     )
 
-    if path.suffix.lower() in common._IMAGE_SUFFIXES:
-        identity = image_content_identity(raw_bytes)
+    if is_image:
         context = context.child(identity)
         key = make_idempotency_key(
             target, identity, event_id=context.idempotency_key or context.event_id,
@@ -103,7 +120,7 @@ async def _send_attachment_path(
             return f"idempotent:{key}"
         errors: list[BaseException] = []
         file_path = str(path.resolve())
-        encoded = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+        encoded = await asyncio.to_thread(sending._base64_source, raw_bytes)
         attempts = (
             MessageSegment.image(file=file_path),
             MessageSegment.image(file=encoded),
@@ -151,7 +168,6 @@ async def _send_attachment_path(
         )
         return message_id
 
-    identity = f"file:sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
     context = context.child(identity)
     key = make_idempotency_key(
         target, identity, event_id=context.idempotency_key or context.event_id,
@@ -165,7 +181,7 @@ async def _send_attachment_path(
         )
     if not claim.acquired:
         return f"idempotent:{key}"
-    file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+    file_str = await asyncio.to_thread(sending._base64_source, raw_bytes)
 
     async def upload_file() -> Any:
         await state._adapter.features.check_send(bot, target)
@@ -257,13 +273,7 @@ async def _try_send_images_as_forward(
         nodes.append(node)
     if len(nodes) < 2:
         return False
-    batch_identity = "forward:" + hashlib.sha256(
-        "|".join(
-            image_content_identity((_resolve_attachment_path(att) or Path()).read_bytes())
-            for att in image_attachments
-            if _resolve_attachment_path(att) is not None
-        ).encode("utf-8")
-    ).hexdigest()
+    batch_identity = await asyncio.to_thread(_forward_batch_identity, image_attachments)
     context = send_context.child(batch_identity) if send_context else OutboundSendContext()
     key = make_idempotency_key(
         target, batch_identity, event_id=context.idempotency_key or context.event_id,

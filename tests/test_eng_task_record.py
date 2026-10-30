@@ -152,3 +152,13 @@ def test_the_turn_summary_copy_keeps_the_completion_fields(tmp_path: Path) -> No
     assert (copy.completed_at, copy.model, copy.provider, copy.channel) == (
         original.completed_at, original.model, original.provider, original.channel,
     )
+
+
+def test_a_record_appended_after_a_torn_last_line_is_still_read(tmp_path: Path) -> None:
+    write_task_record(tmp_path, TaskRecord(task_id="first", session_id="s", node_id="n"))
+    with (tmp_path / "data" / "transcripts" / "s.jsonl").open("ab") as stream:
+        stream.write(b'{"task_id": "torn", "session_id": "s", "no')
+
+    write_task_record(tmp_path, TaskRecord(task_id="second", session_id="s", node_id="n"))
+
+    assert [record.task_id for record in load_task_records(tmp_path, "s")] == ["first", "second"]

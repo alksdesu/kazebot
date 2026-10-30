@@ -11,6 +11,7 @@ Purpose: provide forensic evidence for intermittent provider errors without
 modifying any core code path.
 """
 
+import asyncio
 import inspect
 import json
 import logging
@@ -50,6 +51,20 @@ def _build_payload_for_snapshot(provider: Any, llm_msgs: Any) -> dict[str, Any]:
     return provider._build_payload(llm_msgs, **extra)
 
 
+def _save_snapshot(snap_dir: Path, filename: str, snapshot: dict[str, Any]) -> None:
+    """Write one snapshot and keep only the newest _MAX_SNAPSHOTS. Blocking I/O."""
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    with open(snap_dir / filename, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+
+    existing = sorted(snap_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    for old in existing[:-_MAX_SNAPSHOTS]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 class ErrorSnapshotHandler:
     """Save a JSON snapshot when the LLM provider returns a non-OK response."""
 
@@ -66,7 +81,6 @@ class ErrorSnapshotHandler:
             rctx = ctx.rctx
             workspace = Path(getattr(rctx, "workspace_root", "."))
             snap_dir = workspace / "data" / _SNAP_DIR_NAME
-            snap_dir.mkdir(parents=True, exist_ok=True)
 
             ts = datetime.now(timezone.utc)
             sid = str(getattr(rctx, "session_id", "") or "")[:8]
@@ -108,17 +122,8 @@ class ErrorSnapshotHandler:
                 "converted_payload": converted_payload,
             }
 
-            snap_path = snap_dir / filename
-            with open(snap_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
-
-            # Housekeeping: keep newest N snapshots
-            existing = sorted(snap_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
-            for old in existing[:-_MAX_SNAPSHOTS]:
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
+            # Encoding the whole message list and pruning the folder would stall every task on this event loop.
+            await asyncio.to_thread(_save_snapshot, snap_dir, filename, snapshot)
 
             logger.info("error_snapshot: saved %s (%d msgs, error=%s)",
                         filename, len(messages), snapshot["error"][:80])

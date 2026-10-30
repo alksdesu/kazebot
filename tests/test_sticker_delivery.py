@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -481,6 +482,26 @@ def test_a_library_sticker_goes_out_as_an_inline_emoji_image(runtime):
     assert segment["type"] == "image"
     assert segment["data"]["file"] == "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
     assert segment["data"]["sub_type"] == 1 and segment["data"]["summary"] == "[表情]"
+
+
+def test_a_library_sticker_is_encoded_off_the_event_loop(runtime, monkeypatch):
+    _, _, path = add_image(runtime)
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    encode = runtime.sending._base64_source
+
+    def recorded(raw):
+        threads.append(threading.get_ident())
+        return encode(raw)
+
+    monkeypatch.setattr(runtime.sending, "_base64_source", recorded)
+    bot = Bot(runtime)
+
+    asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
+
+    [[segment]] = bot.sent
+    assert segment["data"]["file"] == "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
+    assert threads and loop_thread not in threads
 
 
 def _legacy_and_current_plans(digest, content, favourite):
