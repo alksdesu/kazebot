@@ -97,6 +97,54 @@ class TestRedaction:
         assert "abc" not in redact("token=abcdef")
 
 
+class TestShortAndQuotedSecrets:
+    @pytest.mark.parametrize(("line", "masked"), [
+        ("password=abc12", "password=******"),
+        ("password: 1234", "password: ******"),
+        ("X-Api-Key: abc", "X-Api-Key: ******"),
+        ("secret = pw", "secret = ******"),
+        ("Authorization: x1", "Authorization: ******"),
+        ("token=short", "token=******"),
+    ])
+    def test_a_short_value_is_masked_where_it_stands(self, line: str, masked: str) -> None:
+        # 短口令以前原样进日志：就地打码有键名作证，不怕把普通短词当密钥
+        assert redact(line) == masked
+
+    @pytest.mark.parametrize(("text", "secret"), [
+        ('{"password": "hunter2xyz"}', "hunter2xyz"),
+        ("{'api_key': 'relay-abcdefghij'}", "relay-abcdefghij"),
+        ('{\\"password\\": \\"hunter2xyz\\"}', "hunter2xyz"),
+        ('password: "correct horse battery"', "horse battery"),
+        ('password: "hunter2xyz', "hunter2xyz"),
+    ])
+    def test_quoted_keys_and_values_are_masked(self, text: str, secret: str) -> None:
+        # JSON 和 dict 原样打进日志是常事：引号包着的键以前认不出来，引号里带空格的值以前只打掉第一段
+        assert secret not in redact(text)
+
+    def test_a_short_number_under_a_token_key_is_a_limit_not_a_secret(self) -> None:
+        assert redact("access_token=12345") == "access_token=12345"
+        assert "123456" not in redact("access_token=123456")
+
+    @pytest.mark.parametrize("line", ["max_token=100000", "min_password=8", "prompt_tokens=123456"])
+    def test_rules_and_usage_are_left_alone(self, line: str) -> None:
+        assert redact(line) == line
+
+    def test_masking_twice_changes_nothing(self) -> None:
+        once = redact('password=abc12 token=relay-abcdefghijklmn {"secret": "x"} Authorization: Bearer abcdef123456')
+
+        assert redact(once) == once
+
+    def test_the_auth_scheme_word_is_kept(self) -> None:
+        assert redact("Authorization: Bearer abcdef123456") == "Authorization: Bearer ******"
+
+    def test_an_empty_value_does_not_swallow_the_next_line(self) -> None:
+        assert redact("PASSWORD=\nOTHER=value") == "PASSWORD=\nOTHER=value"
+
+    def test_short_values_are_not_handed_out_for_substring_replacement(self) -> None:
+        # assigned_values 的结果拿去按子串替换整份导出，太短的会把不相干的字也抹掉
+        assert assigned_values("password=abc12\ntoken=relay-abcdefghij\n") == ["relay-abcdefghij"]
+
+
 class TestListing:
     def test_only_log_files_show_up(self, tmp_path: Path) -> None:
         (tmp_path / "engine-1.log").write_text("a", encoding="utf-8")

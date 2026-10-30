@@ -29,6 +29,8 @@ from platforms.protection import (  # noqa: E402
     CORE_OUTBOUND_DENY,
     CORE_READ_FLOOR,
     CORE_WRITE_FLOOR,
+    ENV_PROCESS,
+    env_scope,
     normalize_relative,
     outbound_deny_patterns,
     outbound_deny_reason,
@@ -135,10 +137,23 @@ class TestDeclarationsAreChecked:
         {"name": "app_secret", "label": "x", "file": "data/../vault_token"},
         {"name": "app_secret", "label": "x", "file": "data\\vault_token"},
         {"name": "app_secret", "label": "x", "file": "data//vault_token"},
+        # 一个字符串会被当成一串单字母的别名
+        {"name": "app_secret", "label": "x", "env": "VAULT_APP_SECRET", "host_env": "VAULT_SDK_SECRET"},
+        {"name": "app_secret", "label": "x", "host_env": ("vault_sdk_secret",)},
+        {"name": "app_secret", "label": "x", "host_env": ("",)},
+        {"name": "app_secret", "label": "x", "host_env": ("VAULT_SDK_SECRET", "VAULT_SDK_SECRET")},
+        {"name": "app_secret", "label": "x", "env": "VAULT_APP_SECRET", "host_env": ("VAULT_APP_SECRET",)},
+        {"name": "app_secret", "label": "x", "file": "data/vault_key", "file_env": "VAULT_KEY_FILE", "host_env": ("VAULT_KEY_FILE",)},
     ])
-    def test_a_malformed_secret_is_refused(self, kwargs: dict[str, str]) -> None:
+    def test_a_malformed_secret_is_refused(self, kwargs: dict[str, object]) -> None:
         with pytest.raises(ValueError):
             SecretField(**kwargs)
+
+    def test_a_secrets_host_aliases_are_frozen_into_a_tuple(self) -> None:
+        secret = SecretField("app_secret", "x", env="VAULT_APP_SECRET", host_env=["VAULT_SDK_SECRET"])
+
+        assert secret.host_env == ("VAULT_SDK_SECRET",)
+        assert SecretField("app_secret", "x").host_env == ()
 
     @pytest.mark.parametrize("extra", [
         {"secrets": (SecretField("token", "a"), SecretField("token", "b"))},
@@ -172,6 +187,13 @@ class TestDeclarationsAreChecked:
         },
         {"host_secret_env": ("VAULT_PORT",), "instance_env": ("VAULT_PORT",)},
         {"host_secret_env": ("VAULT_CONFIG",), "config_path": "config/vault.yaml", "config_env": "VAULT_CONFIG"},
+        # 密钥项的别名和平台的宿主密钥合在一起查：同一个名字只能归一处
+        {"host_secret_env": ("VAULT_SDK_TOKEN",), "secrets": (SecretField("app_secret", "a", host_env=("VAULT_SDK_TOKEN",)),)},
+        {"secrets": (
+            SecretField("app_secret", "a", host_env=("VAULT_ALIAS",)), SecretField("signing", "s", host_env=("VAULT_ALIAS",)),
+        )},
+        {"secrets": (SecretField("app_secret", "a", env="VAULT_A"), SecretField("signing", "s", host_env=("VAULT_A",)))},
+        {"secrets": (SecretField("app_secret", "a", host_env=("VAULT_PORT",)),), "instance_env": ("VAULT_PORT",)},
     ])
     def test_a_malformed_host_secret_declaration_is_refused(self, extra: dict) -> None:
         # 实例身份先判：和身份重名的那一项永远轮不到按宿主密钥算，声明了也白写。
@@ -225,9 +247,16 @@ class TestQqDeclarations:
         assert {secret.env for secret in QQ_NAPCAT.secrets if secret.env} == QQ_SECRET_ENVS
 
     def test_the_secrets_nonebot_reads_itself_are_declared_too(self) -> None:
-        # bot.py 不经手这几个，NoneBot 的 OneBot V11 适配器直接从环境读；令牌别名还盖过 bot.py 交进去的那把。
-        assert set(QQ_NAPCAT.host_secret_env) == QQ_HOST_SECRET_ENVS
+        # NoneBot 的 OneBot V11 适配器直接从环境读这几个；令牌别名记在连接令牌那一项上，告警和 bot.py 才知道它盖的是哪一项。
+        assert QQ_NAPCAT.host_env_names() == QQ_HOST_SECRET_ENVS
+        assert QQ_NAPCAT.secret("access_token").host_env == ("ONEBOT_V11_ACCESS_TOKEN",)
+        assert set(QQ_NAPCAT.host_secret_env) == QQ_HOST_SECRET_ENVS - {"ONEBOT_V11_ACCESS_TOKEN"}
         assert secret_env_names([QQ_NAPCAT]) == QQ_SECRET_ENVS | QQ_HOST_SECRET_ENVS
+
+    @pytest.mark.parametrize("name", sorted(QQ_HOST_SECRET_ENVS))
+    def test_the_host_secrets_stay_process_settings(self, name: str) -> None:
+        # 只认进程环境：manage_secret 不写它们，建共享组也不抄
+        assert env_scope(name).kind == ENV_PROCESS
 
     def test_the_auto_files_are_the_ones_the_adapter_already_writes(self) -> None:
         assert set(secret_file_patterns(QQ_NAPCAT, environ={})) == QQ_SECRET_FILES
@@ -627,6 +656,25 @@ class TestSubprocessEnvironment:
         monkeypatch.setenv("VAULT_SDK_TOKEN", "do-not-leak")
 
         assert "VAULT_SDK_TOKEN" not in safe_subprocess_env()
+
+    def test_a_secrets_host_alias_is_stripped_and_stays_a_process_setting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        aliased = PlatformDescriptor(
+            id="aliased", display_name="Aliased", short_name="A",
+            secrets=(SecretField("app_secret", "应用密钥", env="ALIASED_APP_SECRET", host_env=("ALIASED_SDK_SECRET",)),),
+        )
+        register_platform(aliased)
+        try:
+            monkeypatch.setenv("ALIASED_SDK_SECRET", "do-not-leak")
+            monkeypatch.setenv("aliased_sdk_secret", "do-not-leak")
+
+            env = safe_subprocess_env()
+
+            assert "ALIASED_SDK_SECRET" not in {key.upper() for key in env}
+            assert "do-not-leak" not in env.values()
+            assert "ALIASED_SDK_SECRET" in secret_env_names()
+            assert env_scope("ALIASED_SDK_SECRET").kind == ENV_PROCESS
+        finally:
+            unregister_platform(aliased.id)
 
     def test_host_secrets_are_stripped_even_when_the_process_env_hook_is_broken(
         self, monkeypatch: pytest.MonkeyPatch,

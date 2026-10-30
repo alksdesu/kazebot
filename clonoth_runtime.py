@@ -238,7 +238,7 @@ def _read_runtime_layer(path: Path, shape: Mapping[str, Any]) -> dict[str, Any]:
     try:
         text = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise RuntimeConfigError(f"读不了：{exc}") from exc
+        raise RuntimeConfigError(f"读不了：{config_layout.config_error_text(exc)}") from exc
     return parse_runtime_text(text, shape)
 
 
@@ -713,8 +713,59 @@ def _judgement_failed(subject: str, exc: Exception) -> str:
     return f"判断 {subject} 能不能用时出错（{type(exc).__name__}）"
 
 
+class _ToolEnvView:
+    """工具子进程看得到的进程环境：safe_subprocess_env() 剥掉的变量算看不到。判定时问到、被挡下的名字按顺序记在 blocked 里。"""
+
+    def __init__(self) -> None:
+        # 放在函数里导入：toolbox._common 顶上就导入了本模块。
+        from toolbox._common import safe_subprocess_env
+
+        visible = {name.upper() for name in safe_subprocess_env()}
+        self._hidden = {name.upper() for name in os.environ} - visible
+        self.blocked: list[str] = []
+
+    def __call__(self, name: str) -> bool:
+        key = str(name or "").strip()
+        hidden = key.upper() in self._hidden
+        if hidden and key not in self.blocked:
+            self.blocked.append(key)
+        return hidden
+
+
+# 告警过「key 只设在服务进程环境里」、至今还是这样的 (工作区, 工具)：门控每一步都重判，同一处只记一次，好了再犯再记。
+_ENV_ONLY_WARNED: set[tuple[str, str]] = set()
+_ENV_ONLY_LOCK = threading.Lock()
+
+
+def _note_env_only_key(root: Path, subject: str, names: list[str] | None) -> None:
+    marker = (str(root), subject)
+    with _ENV_ONLY_LOCK:
+        if names is None:
+            _ENV_ONLY_WARNED.discard(marker)
+            return
+        if marker in _ENV_ONLY_WARNED:
+            return
+        _ENV_ONLY_WARNED.add(marker)
+    _log.warning(
+        "%s 按没配算：%s 只设在服务进程的环境里，工具子进程拿不到（*_API_KEY 和平台密钥变量不传给工具），"
+        "写进本实例 .env 或 config/secrets.env 才用得上",
+        subject, "、".join(names),
+    )
+
+
+def _status_seen_by_tools(
+    root: Path, subject: str, judge: Callable[[Callable[[str], bool] | None], ImageToolStatus],
+) -> ImageToolStatus:
+    """judge 按工具子进程看得到的环境判一次。判成没配、换成整个进程环境却配得上时照样算没配，并告警一次。"""
+    hidden = _ToolEnvView()
+    status = judge(hidden)
+    env_only = status.unconfigured and bool(hidden.blocked) and judge(None).available
+    _note_env_only_key(root, subject, hidden.blocked if env_only else None)
+    return status
+
+
 def image_tool_status(workspace_root: Path, tool_name: str) -> ImageToolStatus:
-    """这个生图工具现在能不能跑通，和工具子进程同一份 resolve_image_channel。"""
+    """这个生图工具现在能不能跑通，和工具子进程同一份 resolve_image_channel，按工具子进程看得到的环境判。"""
     name = str(tool_name or "").strip()
     slot = IMAGE_TOOL_SLOTS.get(name)
     if not slot:
@@ -723,13 +774,17 @@ def image_tool_status(workspace_root: Path, tool_name: str) -> ImageToolStatus:
     module = _image_channel_module(root)
     if module is None:
         return ImageToolStatus()
-    try:
-        channel = module.resolve_image_channel(slot, root=root)
-    except Exception as exc:
-        return ImageToolStatus(problem=_judgement_failed(name, exc))
-    if channel.error:
-        return ImageToolStatus(problem=channel.error)
-    return ImageToolStatus(available=bool(channel.usable))
+
+    def judge(hidden_env: Callable[[str], bool] | None) -> ImageToolStatus:
+        try:
+            channel = module.resolve_image_channel(slot, root=root, hidden_env=hidden_env)
+        except Exception as exc:
+            return ImageToolStatus(problem=_judgement_failed(name, exc))
+        if channel.error:
+            return ImageToolStatus(problem=channel.error)
+        return ImageToolStatus(available=bool(channel.usable))
+
+    return _status_seen_by_tools(root, name, judge)
 
 
 def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
@@ -752,9 +807,10 @@ def novelai_status(workspace_root: Path) -> ImageToolStatus:
 
     判定借 drawtools 自己那份 —— 它按工作区变量找 config/drawtools，supervisor 早把那组变量
     钉在本工作区上。settings.example.yaml 里 api_key 是空串，回退到示例不会判成已配。
+    key 按工具子进程看得到的环境找：只设在服务进程环境里的那份工具拿不到，算没配。
     """
-    module = load_module_from(
-        Path(workspace_root) / "tools" / "drawtools" / "common.py", "clonoth_drawtools_common")
+    root = Path(workspace_root)
+    module = load_module_from(root / "tools" / "drawtools" / "common.py", "clonoth_drawtools_common")
     if module is None:
         return ImageToolStatus()
     try:
@@ -763,10 +819,14 @@ def novelai_status(workspace_root: Path) -> ImageToolStatus:
         return ImageToolStatus(problem=str(exc))
     except Exception as exc:
         return ImageToolStatus(problem=_judgement_failed("NovelAI", exc))
-    try:
-        return ImageToolStatus(available=bool(module.resolve_api_key(settings)))
-    except Exception as exc:
-        return ImageToolStatus(problem=_judgement_failed("NovelAI", exc))
+
+    def judge(hidden_env: Callable[[str], bool] | None) -> ImageToolStatus:
+        try:
+            return ImageToolStatus(available=bool(module.resolve_api_key(settings, hidden_env=hidden_env)))
+        except Exception as exc:
+            return ImageToolStatus(problem=_judgement_failed("NovelAI", exc))
+
+    return _status_seen_by_tools(root, "NovelAI", judge)
 
 
 def novelai_available(workspace_root: Path) -> bool:
@@ -1259,10 +1319,8 @@ def _parse_policy_config(path: Path) -> dict[str, Any] | None:
         text = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         return None
-    except UnicodeDecodeError as exc:
-        raise _ConfigUnusable(f"不是 UTF-8 文本：{exc}") from exc
-    except OSError as exc:
-        raise _ConfigUnusable(f"读不了：{exc}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _ConfigUnusable(f"读不了：{config_layout.config_error_text(exc)}") from exc
     try:
         return parse_policy_text(text)
     except ValueError as exc:

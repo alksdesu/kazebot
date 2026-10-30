@@ -16,9 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import config_layout
+
 log = logging.getLogger(__name__)
 
-REGISTRY_FILE = "worktrees.json"
+# 相对工作区的位置。读不出来的原因用这个名字说：原因会交给模型、进诊断，绝对路径不往外带。
+REGISTRY_FILE = "data/worktrees.json"
 VERSION = 1
 
 CREATING = "creating"
@@ -56,7 +59,7 @@ def parse_time(text: Any) -> datetime | None:
 
 
 def registry_path(workspace_root: Path | str) -> Path:
-    return Path(workspace_root) / "data" / REGISTRY_FILE
+    return Path(workspace_root) / REGISTRY_FILE
 
 
 def _clean_entry(raw: Any) -> dict[str, Any] | None:
@@ -105,7 +108,7 @@ class WorktreeRegistry:
                 self._mark_loaded_locked()
                 return
             except OSError as exc:
-                message = f"{self.path} 读不出来：{exc}"
+                message = f"{REGISTRY_FILE} 读不出来：{config_layout.config_error_text(exc)}"
                 if not self.unreadable or message != self.load_error:
                     log.error("%s; the worktree registry reads as empty and is not written until it can be read", message)
                 self.load_error = message
@@ -118,7 +121,9 @@ class WorktreeRegistry:
                 if not isinstance(items, dict):
                     raise ValueError("没有 worktrees 映射")
             except (UnicodeDecodeError, ValueError) as exc:
-                self.load_error = f"{self.path} 格式不对（{exc}），已改名留存，登记从空表开始"
+                # JSON 的报错只有位置；解码错误按 config_error_text 说，不带解码器原话
+                problem = config_layout.config_error_text(exc) if isinstance(exc, UnicodeDecodeError) else str(exc)
+                self.load_error = f"{REGISTRY_FILE} 格式不对（{problem}），已改名留存，登记从空表开始"
                 log.error("%s", self.load_error)
                 with contextlib.suppress(OSError):
                     os.replace(self.path, self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}"))

@@ -22,6 +22,7 @@ from clonoth_runtime import (
 )
 import config_layout
 from engine.node import canonical_node_id, known_node_ids
+from toolbox.redaction import mask
 
 from .types import (
     ActiveProviderSecret,
@@ -93,17 +94,12 @@ def check_models_text(text: str) -> list[str]:
     return []
 
 
-def _redact_api_key(api_key: str) -> tuple[bool, str]:
-    k = (api_key or "").strip()
-    if not k:
+def _api_key_shown(raw: Any) -> tuple[bool, str]:
+    """(配没配, 打码后的样子)。引用先展开：${MISSING} 引到的是一把用不了的钥匙，变量名也不往外说。"""
+    key = _resolve_env_value(str(raw or ""))
+    if not key:
         return False, ""
-    # Environment reference (recommended)
-    if k.startswith("${") and k.endswith("}") and len(k) > 3:
-        var = k[2:-1].strip()
-        return True, f"<env:{var}>"
-    if len(k) <= 4:
-        return True, "****"
-    return True, "****" + k[-4:]
+    return True, mask(key)
 
 
 class ConfigStore:
@@ -142,7 +138,7 @@ class ConfigStore:
         except FileNotFoundError:
             return dict(_EMPTY_CONFIG)
         except (OSError, UnicodeDecodeError) as exc:
-            raise ConfigUnreadable(f"读不了：{exc}") from exc
+            raise ConfigUnreadable(f"读不了：{config_layout.config_error_text(exc)}") from exc
         return _parse_models_text(text)
 
     def _load_locked(self) -> None:
@@ -249,8 +245,7 @@ class ConfigStore:
             self._load_locked()
 
     def _openai_public(self, openai: OpenAIConfigSecret) -> OpenAIConfigPublic:
-        # present 按展开后判断：${MISSING} 引用得到的是一把用不了的钥匙。
-        present, _ = _redact_api_key(_resolve_env_value(openai.api_key))
+        present, _ = _api_key_shown(openai.api_key)
         return OpenAIConfigPublic(
             base_url=_resolve_env_value(openai.base_url),
             model=_resolve_env_value(openai.model),
@@ -356,7 +351,7 @@ class ConfigStore:
     def _public_block(self, val: dict[str, Any], name: str = "") -> dict[str, Any]:
         # raw 一并给出去：编辑器回填展开值再保存，就把 ${VAR} 这层间接烧死在 models.yaml 里了。
         # api_key 没有 raw —— 那等于用明文换掉旁边的脱敏串。
-        present, redacted = _redact_api_key(_resolve_env_value(val.get("api_key", "")))
+        present, redacted = _api_key_shown(val.get("api_key", ""))
         declared = str(val.get("type") or "").strip().lower()
         return {
             "base_url": _resolve_env_value(val.get("base_url", "")),
@@ -563,7 +558,7 @@ class ConfigStore:
             for spec in SYSTEM_MODEL_SLOTS:
                 block = configured.get(spec.key)
                 block = block if isinstance(block, dict) else {}
-                present, redacted = _redact_api_key(_resolve_env_value(str(block.get("api_key") or "")))
+                present, redacted = _api_key_shown(block.get("api_key"))
                 slots.append({
                     "key": spec.key,
                     "label": spec.label,

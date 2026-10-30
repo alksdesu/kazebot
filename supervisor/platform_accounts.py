@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+import config_layout
 from engine.conversation_migration import RekeyConflict
 from engine.memory_hit_cache import HitCacheUnreadable, read_hit_cache
 from platforms.account_ops import AccountConflict, AccountOps, AccountOpsError, AccountRequestInvalid, AccountUnreachable
@@ -91,7 +92,11 @@ def _remember_account(state: SupervisorState, platform: PlatformDescriptor, acco
     try:
         record_account(state.workspace_root, prefix=url_prefix(), platform_id=platform.id, account=text)
     except (OSError, InstanceDirectoryError) as exc:
-        reason = exc.reason if isinstance(exc, InstanceDirectoryError) else str(exc)
+        if isinstance(exc, InstanceDirectoryError):
+            reason = exc.reason
+        else:
+            # 系统报的写错误连着绝对路径，只留原因；代码自己抛的照原话
+            reason = config_layout.config_error_text(exc) if exc.strerror else str(exc)
         _log.warning("实例清单没记上 %s 的新账号 %s：%s", platform.id, text, reason)
         return {"roster_error": f"号已经换上，但没记进实例清单，别的实例拦不住同一个号重复登录：{reason}"}
     return {}

@@ -396,8 +396,9 @@ async def test_the_caller_preview_hides_its_secrets_too(tmp_path: Path) -> None:
     ("", "：文件是空的"),
     ("- existing.node\n", "：顶层不是 key: value 的映射"),
     ("id: boss\nkind: skill\n", "不是能用的节点定义：kind 写的是 skill"),
-    ("id: boss\ntype: ai\ndelegate_targets: existing.node\n", "delegate_targets 不是列表"),
-    ("id: boss\ntype: ai\ndelegate_targets:\n  first: existing.node\n", "delegate_targets 不是列表"),
+    # 引擎把不是列表的 delegate_targets 当没写，替人改成列表等于改了它原来的意思
+    ("id: boss\ntype: ai\ndelegate_targets: existing.node\n", "delegate_targets 不是列表，引擎按没写算，改成列表再加"),
+    ("id: boss\ntype: ai\ndelegate_targets:\n  first: existing.node\n", "delegate_targets 不是列表，引擎按没写算，改成列表再加"),
 ])
 async def test_a_caller_that_cannot_be_updated_says_why(tmp_path: Path, text: str, said: str) -> None:
     # 新节点已经落盘，调用方改不成要照实说；原因只带位置和问题，坏掉的那一行可能就是密钥。
@@ -522,6 +523,271 @@ async def test_a_failed_policy_check_on_the_caller_does_not_hide_the_new_node(tm
     # 没有 supervisor 写的原因时只报异常类型，异常文本里的内部地址不交给模型
     assert result["data"]["caller_error"] == "config/nodes/boss.yaml 送审没走完：RuntimeError"
     assert (tmp_path / "config" / "nodes" / "boss.yaml").read_bytes() == before
+
+
+def _caller_file(root: Path, text: str, *, newline: str = "\n") -> Path:
+    """按字节写调用方节点：write_text 在 Windows 上会把 \\n 换成 \\r\\n，逐字节比对就失真了。"""
+    path = root / "config" / "nodes" / "boss.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.replace("\n", newline).encode("utf-8"))
+    return path
+
+
+_COMMENTED_CALLER = (
+    "# 总调度，改之前先问一声\n"
+    "id: boss\n"
+    "type: ai\n"
+    "\n"
+    "prompt: |\n"
+    "  第一段\n"
+    "\n"
+    "  第二段\n"
+    "delegate_targets:\n"
+    "  - existing.node  # 老的那个\n"
+    "\n"
+    "# 工具权限\n"
+    "tool_access:\n"
+    "  mode: all\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_the_caller_file_only_gains_the_new_line(tmp_path: Path) -> None:
+    # 整份 safe_dump 回去会洗掉注释和空行、按字母重排键，手写的节点文件加一个下派目标就面目全非。
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, _COMMENTED_CALLER)
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    written = boss.read_bytes().decode("utf-8")
+    assert written == _COMMENTED_CALLER.replace(
+        "  - existing.node  # 老的那个\n", "  - existing.node  # 老的那个\n  - helper\n",
+    )
+    assert ctx.requested[1][1]["content_len"] == len(written)
+    preview = yaml.safe_load(ctx.requested[1][1]["content_preview"])
+    assert list(preview) == ["id", "type", "prompt", "delegate_targets", "tool_access"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("before", "after"), [
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\nmax_steps: 5\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n  - helper\nmax_steps: 5\n",
+        id="indented",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets:\n- existing.node\nmax_steps: 5\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n- existing.node\n- helper\nmax_steps: 5\n",
+        id="zero_indent",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n  - >-\n    folded.node\nmax_steps: 5\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n  - >-\n    folded.node\n  - helper\nmax_steps: 5\n",
+        id="block_scalar_last_item",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets: [existing.node]  # 一行写完\n",
+        "id: boss\ntype: ai\ndelegate_targets: [existing.node, helper]  # 一行写完\n",
+        id="flow",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets: [existing.node,]\n",
+        "id: boss\ntype: ai\ndelegate_targets: [existing.node, helper]\n",
+        id="flow_trailing_comma",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets: []\n",
+        "id: boss\ntype: ai\ndelegate_targets: [helper]\n",
+        id="flow_empty",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets:\nmax_steps: 5\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - helper\nmax_steps: 5\n",
+        id="empty",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets: ~  # 以后再加\n",
+        "id: boss\ntype: ai\ndelegate_targets:  # 以后再加\n  - helper\n",
+        id="tilde",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - helper\n",
+        id="missing",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - helper\n",
+        id="missing_without_trailing_newline",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\naliases:\n- old.boss\n",
+        "id: boss\ntype: ai\naliases:\n- old.boss\ndelegate_targets:\n- helper\n",
+        id="missing_follows_the_files_list_indent",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\n...\n",
+        "id: boss\ntype: ai\ndelegate_targets:\n  - helper\n...\n",
+        id="document_end_marker",
+    ),
+])
+async def test_each_way_of_writing_the_list_gains_one_item(tmp_path: Path, before: str, after: str) -> None:
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, before)
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True, result["data"]["caller_error"]
+    assert boss.read_bytes().decode("utf-8") == after
+
+
+@pytest.mark.asyncio
+async def test_a_name_yaml_would_read_as_a_number_is_quoted(tmp_path: Path) -> None:
+    # 不带引号的 123 读出来是数，引擎只认字符串的下派目标，等于没加。
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n")
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "123", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    assert boss.read_bytes().decode("utf-8") == "id: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n  - '123'\n"
+    assert yaml.safe_load(boss.read_text(encoding="utf-8"))["delegate_targets"] == ["existing.node", "123"]
+
+
+@pytest.mark.asyncio
+async def test_a_bom_at_the_start_is_kept(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, "\ufeffid: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n")
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    assert boss.read_bytes() == "\ufeffid: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n  - helper\n".encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_crlf_line_endings_are_kept(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, "# 总调度\nid: boss\ntype: ai\ndelegate_targets: []\n", newline="\r\n")
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    assert boss.read_bytes() == "# 总调度\r\nid: boss\r\ntype: ai\r\ndelegate_targets: [helper]\r\n".encode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "said"), [
+    pytest.param("id: boss\ntype: ai\ndelegate_targets: [\n  existing.node,\n]\n", "跨行的 [...]", id="multi_line_flow"),
+    pytest.param(
+        "id: boss\ntype: ai\ndelegate_targets: []\ndelegate_targets: [existing.node]\n", "写了不止一次", id="duplicate_key",
+    ),
+    # 锚点那份跟着变，别处引用它的键也会多出这一项
+    pytest.param(
+        "id: boss\ntype: ai\nshared: &targets [existing.node]\ndelegate_targets: *targets\n", "锚点、别名或合并键", id="alias",
+    ),
+    pytest.param(
+        "id: boss\ntype: ai\nbase: &base\n  delegate_targets: [existing.node]\n<<: *base\n", "锚点、别名或合并键", id="merge_key",
+    ),
+    pytest.param("{id: boss, type: ai, delegate_targets: [existing.node]}\n", "一行的 {...}", id="flow_root"),
+    pytest.param("id: boss\rtype: ai\ndelegate_targets: []\n", "单独的回车符", id="lone_carriage_return"),
+])
+async def test_a_list_that_cannot_be_edited_in_place_is_left_alone(tmp_path: Path, text: str, said: str) -> None:
+    # 只改这一项做不到时宁可不改：整份重写会洗掉注释，猜着改可能改到别的键上。
+    _seed(tmp_path)
+    boss = _caller_file(tmp_path, text)
+    before = boss.read_bytes()
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["caller_updated"] is False
+    assert data["caller_error"].startswith("调用方节点 boss（config/nodes/boss.yaml）的 delegate_targets 没法只改这一项：")
+    assert said in data["caller_error"]
+    assert data["caller_error"].endswith("；没有改它")
+    assert len(ctx.requested) == 1
+    assert boss.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_a_caller_changed_between_the_two_reads_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 校验的那份定义和要改的原文对不上，照原文加一行写回去就不是审批人看到的内容了。
+    from engine.builtin import agent_manage
+
+    _seed(tmp_path, caller="boss")
+    boss = tmp_path / "config" / "nodes" / "boss.yaml"
+    before = boss.read_bytes()
+    read = agent_manage.read_node_definition
+
+    def stale_read(path: Path) -> tuple[dict[str, Any] | None, str]:
+        data, problem = read(path)
+        if Path(path).name == "boss.yaml" and data is not None:
+            data = {**data, "max_steps": 99}
+        return data, problem
+
+    monkeypatch.setattr(agent_manage, "read_node_definition", stale_read)
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is False
+    assert "读的时候文件被改过" in result["data"]["caller_error"]
+    assert len(ctx.requested) == 1
+    assert boss.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_a_bundled_default_caller_is_copied_into_the_instance_with_one_line_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 仓库默认那份不动，改动落成 config/nodes/ 里的同名覆盖，覆盖里照样是原文加一行。
+    code = tmp_path / "code"
+    monkeypatch.setattr(config_layout, "CODE_ROOT", code)
+    default = code / "defaults" / "nodes" / "boss.yaml"
+    default.parent.mkdir(parents=True)
+    text = "# 仓库自带的调度节点\nid: boss\ntype: ai\ndelegate_targets:\n  - existing.node\n"
+    default.write_bytes(text.encode("utf-8"))
+    workspace = tmp_path / "ws"
+    _seed(workspace)
+    ctx = _Ctx(workspace, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    assert ctx.requested[1][1]["path"] == "config/nodes/boss.yaml"
+    override = workspace / "config" / "nodes" / "boss.yaml"
+    assert override.read_bytes().decode("utf-8") == text + "  - helper\n"
+    assert default.read_bytes().decode("utf-8") == text
+
+
+@pytest.mark.asyncio
+async def test_the_new_node_keeps_the_templates_key_order(tmp_path: Path) -> None:
+    # 按字母重排后 prompt 会被挤到中间，和模板对照着看就对不上了。
+    _seed(tmp_path)
+    _write(tmp_path, "config/nodes", "tmpl", {
+        "type": "ai", "id": "tmpl", "prompt": "p", "tool_access": {"mode": "all"}, "delegate_targets": [],
+    })
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl"}, ctx)
+
+    assert result["ok"] is True
+    written = yaml.safe_load((tmp_path / "config" / "nodes" / "helper.yaml").read_text(encoding="utf-8"))
+    assert list(written) == [
+        "type", "id", "prompt", "tool_access", "delegate_targets", "name", "persistent", "memory_book",
+    ]
+    # 送审预览和落盘那份同一个键序，审批人对照着看
+    assert list(yaml.safe_load(ctx.requested[0][1]["content_preview"])) == list(written)
 
 
 class _SupervisorCtx(_Ctx):

@@ -35,7 +35,7 @@ STARTUP_ENV: frozenset[str] = frozenset({
 })
 # NoneBot 和它的 OneBot V11 适配器自己读的配置项，适配器另认 ONEBOT_V11_ 前缀的别名。
 # HOST、PORT、ONEBOT_ACCESS_TOKEN 是平台声明的实例身份，ONEBOT_API_ROOTS 和它的别名按 _ROOTS 后缀算实例身份，都不列；
-# 令牌别名和上报签名密钥是密钥，写在平台描述的 host_secret_env 里，钩子坏了工具子进程也照样剥掉。
+# 令牌别名和上报签名密钥是密钥，写在平台描述里（access_token 的 host_env、host_secret_env），钩子坏了工具子进程也照样剥掉。
 HOST_ENV: frozenset[str] = frozenset({
     "ENVIRONMENT",
     "DRIVER",

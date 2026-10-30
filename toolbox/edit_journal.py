@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from clonoth_runtime import get_int, load_runtime_config
 from engine.tool_outputs import session_dir_name
 from file_lock import exclusive_lock
@@ -424,16 +425,20 @@ class EditJournal:
     def _load_manifest(task_dir: Path) -> dict[str, Any] | None:
         """没有 manifest 返回 None；读不出来或格式不对抛 JournalCorrupt。"""
         path = task_dir / _MANIFEST
+        # 原因会交给模型、进日志，按工作区里的位置说，不带绝对路径
+        where = f"{file_state.JOURNAL_DIR}/{task_dir.parent.name}/{task_dir.name}/{_MANIFEST}"
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
             return None
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise JournalCorrupt(f"{path} 读不出来（{exc}）") from exc
+        except UnicodeDecodeError as exc:
+            raise JournalCorrupt(f"{where} 读不出来（{config_layout.config_error_text(exc)}）") from exc
+        except json.JSONDecodeError as exc:
+            raise JournalCorrupt(f"{where} 读不出来（{exc}）") from exc
         if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
-            raise JournalCorrupt(f"{path} 格式不对")
+            raise JournalCorrupt(f"{where} 格式不对")
         return data
 
     @staticmethod

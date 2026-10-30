@@ -114,7 +114,7 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _error_response(str(exc), path=path, conflict=True)
     except OSError as exc:
         await file_state.abandon_edit(ctx, grant)
-        return _error_response(f"写入失败：{exc}", path=path)
+        return _error_response(f"写入 {path} 失败：{config_layout.config_error_text(exc)}", path=path)
     if written.stamp is None:
         await file_state.abandon_edit(ctx, grant)
         return _error_response(written.gate.stale_message, path=path, **stale_fields(written.gate))

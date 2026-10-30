@@ -18,6 +18,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from clonoth_runtime import get_int, load_runtime_config, parse_bool, switch_arg
 
 from .. import edit_journal, file_state
@@ -724,7 +725,7 @@ async def _replace_one(
         return
     except OSError as exc:
         await file_state.abandon_edit(ctx, grant)
-        report.skip(display, f"读写文件失败：{exc}")
+        report.skip(display, f"读写文件失败：{config_layout.config_error_text(exc)}")
         return
     tx = await settle_transaction(ctx, grant, tx)
     if tx.status == "too_large":

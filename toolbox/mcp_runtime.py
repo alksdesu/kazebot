@@ -184,7 +184,7 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return _default_config()
     except (OSError, UnicodeDecodeError) as exc:
-        raise McpConfigError(f"读不了：{exc}") from exc
+        raise McpConfigError(f"读不了：{config_layout.config_error_text(exc)}") from exc
     return _parse_mcp_text(text)
 
 

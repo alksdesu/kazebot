@@ -371,12 +371,69 @@ class TestNovelaiAvailability:
 
         assert novelai_available(root)
 
-    def test_the_env_variable_counts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # 判定跑在灌过 .env 的 supervisor、engine 里；工具子进程那边剥掉了它，由 resolve_api_key 自己再读 .env。
+    def test_a_key_only_in_the_service_environment_does_not_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # systemd Environment= 里的 NOVELAI_API_KEY 到不了工具子进程（*_API_KEY 都被剥掉），说可用就得真拿得到
+        from clonoth_runtime import novelai_available, novelai_status
+        from engine.builtin.image_gen_gating import disabled_draw_nodes
+
+        monkeypatch.setenv("NOVELAI_API_KEY", "from-env")
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        with caplog.at_level(logging.WARNING, logger="clonoth_runtime"):
+            assert not novelai_available(root)
+            assert novelai_status(root).unconfigured
+            assert "draw.novelai_planner" in disabled_draw_nodes(root)
+
+        [warning] = [record.getMessage() for record in caplog.records if "NovelAI 按没配算" in record.getMessage()]
+        assert "NOVELAI_API_KEY" in warning and "from-env" not in warning
+        assert ".env" in warning and "config/secrets.env" in warning
+
+    def test_a_variable_the_tools_still_see_counts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # api_key_env 指向一个不会被剥掉的名字，工具子进程照样从环境里拿得到
+        from clonoth_runtime import novelai_available
+
+        monkeypatch.setenv("CLONOTH_TEST_NAI_KEY", "from-env")
+        root = _drawtools_workspace(
+            tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n  api_key_env: CLONOTH_TEST_NAI_KEY\n",
+        )
+
+        assert novelai_available(root)
+
+    def test_the_warning_is_given_once_and_again_after_a_fix_is_lost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # 门控每一步都重判：同一处只记一次，配好了再丢才再记
         from clonoth_runtime import novelai_available
 
         monkeypatch.setenv("NOVELAI_API_KEY", "from-env")
         root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        with caplog.at_level(logging.WARNING, logger="clonoth_runtime"):
+            assert not novelai_available(root)
+            assert not novelai_available(root)
+            (root / ".env").write_text("NOVELAI_API_KEY=from-file\n", encoding="utf-8")
+            assert novelai_available(root)
+            (root / ".env").unlink()
+            assert not novelai_available(root)
+
+        assert sum("NovelAI 按没配算" in record.getMessage() for record in caplog.records) == 2
+
+    def test_a_reference_in_settings_is_resolved_the_way_the_tool_does(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 引用没设就是没配：字面量 ${...} 当 key 发出去只会被 NovelAI 拒掉
+        from clonoth_runtime import novelai_available
+
+        monkeypatch.delenv("CLONOTH_TEST_NAI_REF", raising=False)
+        root = _drawtools_workspace(
+            tmp_path, _GEMINI_MAIN, "api:\n  api_key: '${CLONOTH_TEST_NAI_REF}'\n  api_key_env: CLONOTH_TEST_NAI_UNSET\n",
+        )
+
+        assert not novelai_available(root)
+
+        (root / ".env").write_text("CLONOTH_TEST_NAI_REF=nai-from-ref\n", encoding="utf-8")
 
         assert novelai_available(root)
 
@@ -408,6 +465,46 @@ class TestNovelaiAvailability:
         from clonoth_runtime import novelai_available
 
         assert not novelai_available(_workspace(tmp_path, _GEMINI_MAIN))
+
+
+class TestImageToolsAsTheToolSeesThem:
+    """生图工具也是子进程：OPENAI_API_KEY、OPENAI_BASE_URL 只设在服务进程环境里时，工具拿不到，门控得照实摘掉。"""
+
+    _NO_MAIN = "version: 1\nprovider: gemini\n"
+
+    def test_a_channel_only_in_the_service_environment_is_unconfigured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from clonoth_runtime import image_tool_status
+        from engine.builtin.image_gen_gating import disabled_image_tools
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env-only")
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://gw.example.com/v1")
+        root = _drawtools_workspace(tmp_path, self._NO_MAIN, None)
+
+        with caplog.at_level(logging.WARNING, logger="clonoth_runtime"):
+            assert image_tool_status(root, "gpt_image_2").unconfigured
+            assert "gpt_image_2" in disabled_image_tools(root)
+
+        [warning] = [record.getMessage() for record in caplog.records if "gpt_image_2 按没配算" in record.getMessage()]
+        assert "OPENAI_API_KEY" in warning and "sk-env-only" not in warning
+
+    def test_the_same_channel_in_the_instance_dotenv_is_usable(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(tmp_path, self._NO_MAIN, None)
+        (root / ".env").write_text(
+            "OPENAI_API_KEY=sk-from-dotenv\nOPENAI_BASE_URL=https://gw.example.com/v1\n", encoding="utf-8",
+        )
+
+        from clonoth_runtime import image_tool_status
+
+        assert image_tool_status(root, "gpt_image_2").available
+
+    def test_a_channel_configured_in_models_yaml_needs_no_environment(self, tmp_path: Path) -> None:
+        from clonoth_runtime import image_tool_status
+
+        root = _drawtools_workspace(tmp_path, _OPENAI_MAIN, None)
+
+        assert image_tool_status(root, "gpt_image_2").available
 
 
 class TestDisabledDrawNodes:

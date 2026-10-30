@@ -54,9 +54,10 @@ def test_api_key_has_no_raw_counterpart(store):
     assert "api_key_raw" not in openai
     assert "api_key" not in openai
     assert openai["api_key_present"] is True
-    assert openai["api_key_redacted"] == "****efgh"
+    # 不到 16 个字符的整段打码，尾巴占了它一大截。
+    assert openai["api_key_redacted"] == "******"
     # 明文写在 yaml 里的那份同样只留尾 4 位。
-    assert plaintext["api_key_redacted"] == "****7890"
+    assert plaintext["api_key_redacted"] == "******7890"
 
 
 def test_fallback_entries_never_carry_their_api_key(store):
@@ -66,8 +67,42 @@ def test_fallback_entries_never_carry_their_api_key(store):
     # 备选条目允许写自己的 key，读接口一路原样透传过就是把它交给前端。
     assert "api_key" not in relay
     assert relay["api_key_present"] is True
-    assert relay["api_key_redacted"] == "****9876"
+    assert relay["api_key_redacted"] == "******9876"
     assert "sk-fallback-secret-9876" not in str(fallbacks)
+
+
+def _relay_store(tmp_path, api_key: str) -> ConfigStore:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "version: 1\nprovider: relay\nrelay:\n  type: openai\n  base_url: https://relay.example.com/v1\n"
+        f"  api_key: '{api_key}'\n  model: m\n",
+        encoding="utf-8",
+    )
+    return ConfigStore(path=path)
+
+
+@pytest.mark.parametrize("raw", ["$ENV{RELAY_KEY_NEW|RELAY_KEY_OLD}", "${RELAY_KEY_NEW|RELAY_KEY_OLD}", "$ENV{RELAY_KEY_OLD}"])
+def test_every_reference_form_is_expanded_before_it_is_shown(tmp_path, monkeypatch, raw: str) -> None:
+    # 节点文件那套 $ENV{NEW|OLD} 回退写法照抄进 models.yaml 也得认，变量名不往外说
+    monkeypatch.delenv("RELAY_KEY_NEW", raising=False)
+    monkeypatch.setenv("RELAY_KEY_OLD", "sk-relay-old-0123456789")
+
+    relay = _relay_store(tmp_path, raw).get_providers_public()["providers"]["relay"]
+
+    assert relay["api_key_present"] is True
+    assert relay["api_key_redacted"] == "******6789"
+    assert "RELAY_KEY" not in str(relay)
+
+
+def test_a_reference_to_nothing_is_reported_as_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("RELAY_KEY_NEW", raising=False)
+    monkeypatch.delenv("RELAY_KEY_OLD", raising=False)
+
+    relay = _relay_store(tmp_path, "$ENV{RELAY_KEY_NEW|RELAY_KEY_OLD}").get_providers_public()["providers"]["relay"]
+
+    assert relay["api_key_present"] is False
+    assert relay["api_key_redacted"] == ""
+    assert "RELAY_KEY" not in str(relay)
 
 
 def test_fallback_entries_expand_and_keep_raw_like_provider_blocks(store):

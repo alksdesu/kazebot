@@ -45,11 +45,15 @@ from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescr
 from platforms.registry import register_platform, unregister_platform  # noqa: E402
 from supervisor.operations.service import OperationsService  # noqa: E402
 from toolbox._common import safe_subprocess_env  # noqa: E402
+from toolbox.redaction import HIDDEN  # noqa: E402
 
 BRIDGE_ENV = "ONEBOT_FORWARD_BRIDGE_TOKEN"
 WEBUI_ENV = "NAPCAT_WEBUI_TOKEN"
 QQ_SECRET_ENVS = ("ONEBOT_ACCESS_TOKEN", BRIDGE_ENV, "ONEBOT_CONVERSATION_HASH_SECRET", WEBUI_ENV)
 QQ_FILE_ENVS = ("ONEBOT_FORWARD_BRIDGE_TOKEN_FILE", "ONEBOT_CONVERSATION_HASH_SECRET_FILE")
+ACCESS_ENV = "ONEBOT_ACCESS_TOKEN"
+ACCESS_ALIAS = "ONEBOT_V11_ACCESS_TOKEN"
+QQ_HOST_ENVS = tuple(sorted(QQ_NAPCAT.host_env_names()))
 
 VAULT = PlatformDescriptor(
     id="vault",
@@ -63,7 +67,8 @@ VAULT = PlatformDescriptor(
 
 @pytest.fixture(autouse=True)
 def _clean_secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (*QQ_SECRET_ENVS, *QQ_FILE_ENVS, "VAULT_SIGNING", "CLONOTH_QQ_CONFIG_PATH"):
+    host_envs = (*QQ_HOST_ENVS, *(name.lower() for name in QQ_HOST_ENVS))
+    for name in (*QQ_SECRET_ENVS, *QQ_FILE_ENVS, *host_envs, "VAULT_SIGNING", "CLONOTH_QQ_CONFIG_PATH"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -425,10 +430,12 @@ class TestDiagnosticsRedaction:
 
         secrets = set(service._configured_secrets())
 
-        assert {"31415926", "2718.2818"} <= secrets
-        # 太短的按子串替换会抹掉不相干的数字；token 那一档底下多是上限；开关不是口令
-        assert not {"1234", "200000", "True"} & secrets
+        # 口令那一档不设最短长度：短的只按独立成词换，抹不到不相干的数字
+        assert {"31415926", "2718.2818", "1234"} <= secrets
+        # max_tokens 是上限；开关不是口令
+        assert not {"200000", "True"} & secrets
         assert "31415926" not in service._clean("login failed for 31415926", tuple(secrets))
+        assert service._clean("pin 1234 rejected, 12345 retries", tuple(secrets)) == f"pin {HIDDEN} rejected, 12345 retries"
 
     def test_auto_generated_secret_files_are_left_out(self, tmp_path: Path) -> None:
         # 里面可能只是模式标记，收进来会把日志里的这个词也抹成 [已隐藏]。
@@ -439,6 +446,55 @@ class TestDiagnosticsRedaction:
 
     def test_no_empty_string_is_ever_redacted(self, tmp_path: Path) -> None:
         assert "" not in self._secrets(_workspace(tmp_path))
+
+    def test_a_one_character_token_in_the_environment_only_goes_where_it_stands_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("CLONOTH_TEST_X_TOKEN", "k")
+        service = OperationsService(SimpleNamespace(workspace_root=_workspace(tmp_path)))
+        secrets = service._configured_secrets()
+        report = {"id": "0123456789abcdef0123456789abcdef", "checks": [{"detail": "retry k of kk", "latency_ms": 1}]}
+
+        cleaned = service._clean(report, secrets)
+
+        assert "k" in secrets
+        assert cleaned["id"] == report["id"]
+        assert cleaned["checks"][0]["detail"] == f"retry {HIDDEN} of kk"
+        assert cleaned["checks"][0]["latency_ms"] == 1
+
+    def test_a_short_number_under_a_token_name_in_the_environment_is_not_collected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 收进来的话导出里每个独立的 1 都被抹掉；这类多是开关和次数
+        monkeypatch.setenv("CLONOTH_TEST_X_TOKEN", "1")
+        service = OperationsService(SimpleNamespace(workspace_root=_workspace(tmp_path)))
+        secrets = service._configured_secrets()
+
+        assert "1" not in secrets
+        assert service._clean({"detail": "retry 1 of 3"}, secrets) == {"detail": "retry 1 of 3"}
+
+    def test_a_declared_secret_is_judged_by_the_tier_of_its_name(self, tmp_path: Path) -> None:
+        # 转发桥令牌按 token 档算，短数字不收；会话哈希密钥按口令档算，多短都收
+        root = _workspace(tmp_path, config=_qq(forward_bridge_token="42", conversation_hash_secret="17"))
+
+        secrets = set(self._secrets(root))
+
+        assert "17" in secrets
+        assert "42" not in secrets
+
+    def test_rule_values_are_not_taken_for_secrets(self, vault, tmp_path: Path) -> None:
+        # 收了 strict 的话，报告里每个 strict 都会被抹成 [已隐藏]
+        root = _workspace(tmp_path)
+        (root / "config").mkdir()
+        (root / "config" / "vault.yaml").write_text(
+            "webhook:\n  password: pw-in-vault-config\n  password_policy: strict\n  password_min_length: 1234567\n",
+            encoding="utf-8",
+        )
+
+        secrets = set(self._secrets(root))
+
+        assert "pw-in-vault-config" in secrets
+        assert not {"strict", "1234567"} & secrets
 
 
 def _adapter(monkeypatch: pytest.MonkeyPatch, workspace: Path, **env: str) -> Any:
@@ -512,6 +568,41 @@ class TestAdapterStartup:
             f"{BRIDGE_ENV} is ignored: data/platform_secrets.yaml qq.forward_bridge_token takes precedence",
         )
 
+    def test_a_token_alias_the_config_file_overrides_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # bot.py 把配置文件那份按字段名和别名一起交给 NoneBot，环境里的别名那份不生效。
+        workspace = _workspace(tmp_path, config=_qq(access_token="cfg-access-value"))
+
+        warnings = _config_module(_adapter(monkeypatch, workspace, **{ACCESS_ALIAS: "alias-access-value"})).SECRET_CONFIG_WARNINGS
+
+        assert warnings == (f"{ACCESS_ALIAS} is ignored: data/platform_secrets.yaml qq.access_token takes precedence",)
+        assert not any("access-value" in message for message in warnings)
+
+    def test_a_token_alias_equal_to_the_config_file_is_fine(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        workspace = _workspace(tmp_path, config=_qq(access_token="same-access-value"))
+
+        warnings = _config_module(_adapter(monkeypatch, workspace, **{ACCESS_ALIAS: "same-access-value"})).SECRET_CONFIG_WARNINGS
+
+        assert warnings == ()
+
+    def test_a_token_alias_alone_is_fine(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        warnings = _config_module(_adapter(monkeypatch, _workspace(tmp_path), **{ACCESS_ALIAS: "alias-access-value"})).SECRET_CONFIG_WARNINGS
+
+        assert warnings == ()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows 的环境变量名本来就不分大小写")
+    def test_a_lowercase_token_alias_counts_like_nonebot_reads_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = _workspace(tmp_path, config=_qq(access_token="cfg-access-value"))
+
+        warnings = _config_module(
+            _adapter(monkeypatch, workspace, **{ACCESS_ALIAS.lower(): "alias-access-value"}),
+        ).SECRET_CONFIG_WARNINGS
+
+        assert warnings == (f"{ACCESS_ALIAS} is ignored: data/platform_secrets.yaml qq.access_token takes precedence",)
+
     def test_a_token_only_in_the_process_environment_is_flagged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -553,6 +644,96 @@ class TestAdapterStartup:
 
         assert "cfg-bridge-value" not in caplog.text
         assert "env-bridge-value" not in caplog.text
+
+
+class TestWhatNoneBotReads:
+    """NoneBot 的额外配置项只认当前目录下 .env 和 .env.{environment} 里出现过的键，值先取进程环境、没有再取文件。
+
+    只设在进程环境里的令牌和别名它都不读，令牌来自进程环境时的告警照这个算。
+    """
+
+    @pytest.fixture
+    def nonebot_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        pytest.importorskip("nonebot.config")
+        cwd = tmp_path / "nonebot-cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        return cwd
+
+    @staticmethod
+    def _warnings(monkeypatch: pytest.MonkeyPatch, workspace: Path, **env: str) -> tuple[str, ...]:
+        return _config_module(_adapter(monkeypatch, workspace, **env)).SECRET_CONFIG_WARNINGS
+
+    def test_an_alias_only_in_the_process_environment_is_not_read(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (nonebot_cwd / ".env").write_text(f"{ACCESS_ENV}=\n", encoding="utf-8")
+        env = {ACCESS_ENV: "env-access-value", ACCESS_ALIAS: "other-access-value"}
+
+        assert self._warnings(monkeypatch, _workspace(tmp_path), **env) == ()
+
+    def test_an_alias_in_the_dotenv_nonebot_reads_is_reported_when_it_differs(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (nonebot_cwd / ".env").write_text(
+            f"{ACCESS_ENV}=env-access-value\n{ACCESS_ALIAS}=dotenv-access-value\n", encoding="utf-8",
+        )
+
+        warnings = self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"})
+
+        assert warnings == (f"{ACCESS_ENV} is ignored: NoneBot prefers {ACCESS_ALIAS}",)
+        assert not any("access-value" in message for message in warnings)
+
+    def test_an_alias_in_the_dotenv_with_the_same_value_is_fine(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (nonebot_cwd / ".env").write_text(f"{ACCESS_ALIAS}=env-access-value\n", encoding="utf-8")
+
+        assert self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"}) == ()
+
+    @pytest.mark.parametrize(("environment", "dotenv"), [(None, ".env.prod"), ("dev", ".env.dev")])
+    def test_the_dotenv_of_the_current_environment_counts_too(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: str | None, dotenv: str,
+    ) -> None:
+        # 没设 ENVIRONMENT 时 NoneBot 按 prod 算；键名不分大小写
+        if environment is not None:
+            monkeypatch.setenv("ENVIRONMENT", environment)
+        (nonebot_cwd / ".env").write_text(f"{ACCESS_ENV}=\n", encoding="utf-8")
+        (nonebot_cwd / dotenv).write_text(f"{ACCESS_ALIAS.lower()}=dotenv-access-value\n", encoding="utf-8")
+
+        warnings = self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"})
+
+        assert warnings == (f"{ACCESS_ENV} is ignored: NoneBot prefers {ACCESS_ALIAS}",)
+
+    def test_the_dotenv_of_another_environment_is_not_read(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ENVIRONMENT", "dev")
+        (nonebot_cwd / ".env").write_text(f"{ACCESS_ENV}=\n", encoding="utf-8")
+        (nonebot_cwd / ".env.prod").write_text(f"{ACCESS_ALIAS}=prod-access-value\n", encoding="utf-8")
+
+        assert self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"}) == ()
+
+    def test_a_token_only_in_the_process_environment_is_never_seen_by_nonebot(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 只写在 systemd 的 Environment= 里的令牌 NoneBot 不读，NapCat 连上来就不验令牌
+        warnings = self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"})
+
+        [message] = warnings
+        assert message.startswith(f"{ACCESS_ENV} is set only in the process environment")
+        assert message.endswith(f"put it in {Path.cwd() / '.env'} or data/platform_secrets.yaml qq.access_token")
+        assert "env-access-value" not in message
+
+    @pytest.mark.parametrize("line", [f"{ACCESS_ENV}=env-access-value", f"{ACCESS_ENV.lower()}=", ACCESS_ENV])
+    def test_a_token_listed_in_the_dotenv_is_fine(
+        self, nonebot_cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str,
+    ) -> None:
+        # 文件里写了这个键，值是空的也行：NoneBot 照样认这个键，值从进程环境取
+        (nonebot_cwd / ".env").write_text(f"{line}\n", encoding="utf-8")
+
+        assert self._warnings(monkeypatch, _workspace(tmp_path), **{ACCESS_ENV: "env-access-value"}) == ()
 
 
 def test_the_forward_tool_reads_nothing_but_the_declaration() -> None:

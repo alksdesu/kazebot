@@ -225,7 +225,7 @@ def secret_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> f
     names: set[str] = set()
     for platform in _platforms(platforms):
         names.update(secret.env for secret in platform.secrets if secret.env)
-        names.update(platform.host_secret_env)
+        names.update(platform.host_env_names())
     return frozenset(names)
 
 
@@ -338,8 +338,8 @@ def instance_env_names(platforms: Iterable[PlatformDescriptor] | None = None) ->
 
 
 def _platform_process_env(platform: PlatformDescriptor) -> frozenset[str]:
-    """平台进程只从进程环境读的名字：描述里声明的宿主密钥，加上 process_env 钩子报的。"""
-    return frozenset(platform.host_secret_env) | _hook_process_env(platform)
+    """平台进程只从进程环境读的名字：描述里声明的宿主密钥和密钥别名，加上 process_env 钩子报的。"""
+    return platform.host_env_names() | _hook_process_env(platform)
 
 
 def _hook_process_env(platform: PlatformDescriptor) -> frozenset[str]:

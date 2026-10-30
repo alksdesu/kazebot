@@ -61,8 +61,12 @@ def _creator_fields(schedule: dict) -> dict[str, str]:
 #  schedules.yaml CRUD
 # ---------------------------------------------------------------------------
 
+# 相对工作区的位置。读不懂的原因用这个名字说：原因会交给模型、进日志，绝对路径不往外带。
+SCHEDULES_FILE = "data/schedules.yaml"
+
+
 def schedules_path(workspace_root: Path) -> Path:
-    return Path(workspace_root) / "data" / "schedules.yaml"
+    return Path(workspace_root) / SCHEDULES_FILE
 
 
 def load_schedules(workspace_root: Path) -> list[dict[str, Any]]:
@@ -106,7 +110,7 @@ def check_schedules_text(text: str) -> list[str]:
         raise ValueError(f"YAML 解析失败：{config_layout.yaml_error_text(exc)}") from exc
     warnings: list[str] = []
     seen: set[str] = set()
-    for index, item in enumerate(_schedule_entries(data, "data/schedules.yaml"), 1):
+    for index, item in enumerate(_schedule_entries(data, SCHEDULES_FILE), 1):
         if not isinstance(item, dict):
             warnings.append(f"第 {index} 条不是映射，调度时会跳过")
             continue
@@ -156,7 +160,8 @@ def _report_unreadable(path: Path, exc: Exception) -> None:
         if path in _unreadable_stamps and _unreadable_stamps[path] == stamp:
             return
         _unreadable_stamps[path] = stamp
-    log.warning("[scheduler] %s 读不懂，修好之前一条定时任务都不会触发：%s", path, exc)
+    reason = str(exc) if isinstance(exc, ScheduleFileUnreadable) else f"{SCHEDULES_FILE} 读不懂：{type(exc).__name__}"
+    log.warning("[scheduler] %s，修好之前一条定时任务都不会触发", reason)
 
 
 def _schedule_entries(data: Any, where: str) -> list[Any]:
@@ -182,9 +187,9 @@ def _read_schedule_file(path: Path) -> list[dict[str, Any]]:
     try:
         document = config_layout.load_yaml_text(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ScheduleFileUnreadable(f"{path} 读不懂：{config_layout.config_error_text(exc)}") from exc
+        raise ScheduleFileUnreadable(f"{SCHEDULES_FILE} 读不懂：{config_layout.config_error_text(exc)}") from exc
     try:
-        items = _schedule_entries(document, str(path))
+        items = _schedule_entries(document, SCHEDULES_FILE)
     except ValueError as exc:
         raise ScheduleFileUnreadable(str(exc)) from exc
     return [item for item in items if isinstance(item, dict)]

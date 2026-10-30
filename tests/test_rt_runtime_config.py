@@ -141,6 +141,25 @@ class TestABrokenLayer:
 
         assert "config/runtime.yaml" in runtime_config_error(ws)
 
+    @pytest.mark.parametrize("make", ["directory", "not-utf8"])
+    def test_an_unreadable_layer_is_named_without_its_path_or_the_decoder_wording(
+        self, ws: Path, code_root: Path, make: str,
+    ) -> None:
+        # 原因进健康检查和诊断导出：OSError 原文带着绝对路径，解码错误带着解码器原话
+        path = config_layout.runtime_path(ws)
+        if make == "directory":
+            path.mkdir(parents=True)
+        else:
+            path.write_bytes(b"engine:\n  max_steps: 7\n# \xff\n")
+
+        error = runtime_config_error(ws)
+
+        assert error.startswith("config/runtime.yaml 用不了，这一层按没写算：读不了：")
+        assert str(ws) not in error
+        assert "codec" not in error
+        if make == "not-utf8":
+            assert error.endswith("不是 UTF-8 编码（第 26 个字节）")
+
     @pytest.mark.parametrize("broken,reason", [
         ("engine:\n  token: sk-SECRET-runtime: x\n", "YAML 解析失败：第 2 行第 27 列：mapping values are not allowed here"),
         ("engine:\n  max_steps: !!int sk-SECRET-runtime\n", "YAML 解析失败：第 2 行第 14 列：值不是合法的 int"),

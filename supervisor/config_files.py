@@ -44,15 +44,27 @@ def value_at(document: Any, path: str) -> Any:
 
 
 def read_raw(path: Path) -> dict[str, Any]:
-    """原文连同指纹。指纹按落盘的原始字节算，空串表示文件还不存在。"""
+    """原文连同指纹。指纹按落盘的原始字节算，空串表示文件还不存在。
+
+    读不出来、不是 UTF-8 都按 500 拒绝，detail 只有文件名和问题，不带绝对路径和解码器原话。
+    """
     try:
         data = path.read_bytes()
     except FileNotFoundError:
         # 「还没接管」是正常状态，不是错误。刻意不回落到示例文件：
         # 那份是默认值，被当成当前配置保存下去就等于悄悄盖掉 .env 里的设置。
         return {"content": "", "exists": False, "hash": ""}
-    text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    return {"content": text, "exists": True, "hash": config_layout.bytes_hash(data)}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"{path.name} 读不了：{config_layout.config_error_text(exc)}") from exc
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"{path.name} 读不了：{config_layout.config_error_text(exc)}") from exc
+    return {
+        "content": text.replace("\r\n", "\n").replace("\r", "\n"),
+        "exists": True,
+        "hash": config_layout.bytes_hash(data),
+    }
 
 
 def parse_mapping(content: str) -> dict[str, Any]:
@@ -82,4 +94,6 @@ def write_raw(path: Path, content: str, *, base_hash: str | None = None) -> str:
     except config_layout.ConfigConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"写入 {path.name} 失败，原文件没动：{exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"写入 {path.name} 失败，原文件没动：{config_layout.config_error_text(exc)}",
+        ) from exc

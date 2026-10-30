@@ -16,6 +16,7 @@ from adapters._shared.env import env_first, env_float, env_int, split_list
 from adapters.onebot.maintenance import reply_attachment_cache_file
 import config_layout
 from clonoth_runtime import (
+    SECRET_FROM_CONFIG,
     SECRET_FROM_ENV,
     PlatformSecret,
     load_platform_secrets,
@@ -24,7 +25,7 @@ from clonoth_runtime import (
     undeclared_platform_secrets,
 )
 from platforms.builtin import QQ_NAPCAT
-from platforms.descriptor import STATE_ALIASES, STATE_ROUTES
+from platforms.descriptor import STATE_ALIASES, STATE_ROUTES, SecretField
 from platforms.registry import platform_profiles_path, platform_secret_file, platform_state_path
 from workspace import resolve_workspace_root
 
@@ -172,8 +173,66 @@ def _secret_file(name: str) -> str:
     return str(path)
 
 
+def _host_env_value(name: str) -> str:
+    """进程环境里这个名字的值，名字不分大小写；本实例 .env 早由 bot.py 灌进了进程环境。
+
+    只拿来和配置文件那份比：那份由 bot.py 交给 init，不管 NoneBot 读没读到这个名字，它都不生效。
+    """
+    wanted = name.upper()
+    for key, value in os.environ.items():
+        if key.upper() == wanted and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _nonebot_extra_settings() -> dict[str, str]:
+    """NoneBot 当额外配置项收进来的键（小写）和它拿到的值。
+
+    键只认当前目录下 .env 和 .env.{environment} 里出现过的，不分大小写，environment 按 NoneBot 自己的 Env 判；
+    值先取进程环境，没有再取文件里的。只设在进程环境里的键它不读。
+    """
+    # 用到才导入：导入 nonebot 会重配 loguru 的输出，本模块也在 NoneBot 之外被导入
+    from nonebot.config import Env
+
+    from_files: dict[str, str] = {}
+    for path in (Path(".env"), Path(f".env.{Env().environment}")):
+        if path.is_file():
+            for key, value in dotenv_values(path, encoding="utf-8").items():
+                from_files[key.lower()] = value or ""
+    process = {key.lower(): value for key, value in os.environ.items()}
+    return {key: process.get(key, value) for key, value in from_files.items()}
+
+
+def _nonebot_token_warnings(spec: SecretField, secret: PlatformSecret, section: str) -> list[str]:
+    """NoneBot 自己读的那项令牌：它实际拿到的和这里认的对不上，或者根本拿不到时说出来。"""
+    if secret.source == SECRET_FROM_CONFIG:
+        # 配置文件那份由 bot.py 按字段名和别名一并交给 init，盖过环境里的别名
+        return [
+            f"{alias} is ignored: {section}.{spec.name} takes precedence"
+            for alias in spec.host_env
+            if _host_env_value(alias) not in ("", secret.value)
+        ]
+    if secret.source != SECRET_FROM_ENV:
+        return []
+    settings = _nonebot_extra_settings()
+    aliased = [alias for alias in spec.host_env if settings.get(alias.lower(), "").strip()]
+    if not aliased and spec.env.lower() not in settings:
+        return [
+            f"{spec.env} is set only in the process environment, where NoneBot does not look for it, "
+            f"so NapCat connects without a token check: put it in {Path.cwd() / '.env'} or {section}.{spec.name}"
+        ]
+    return [
+        f"{spec.env} is ignored: NoneBot prefers {alias}"
+        for alias in aliased
+        if settings[alias.lower()].strip() != secret.value
+    ]
+
+
 def _secret_config_warnings() -> tuple[str, ...]:
-    """qq 段里拼错被无视的键、被它盖住的 env、照旧写在模型配置里的 platforms 段。不在启动时说出来，改了不见效还查不出原因。"""
+    """qq 段里拼错被无视的键、被它盖住的 env 和别名、NoneBot 读不到或读到另一份的令牌、照旧写在模型配置里的 platforms 段。
+
+    不在启动时说出来，改了不见效还查不出原因。只说哪个名字被无视、生效的是哪一份，令牌的值不进告警。
+    """
     section = f"{config_layout.PLATFORM_SECRETS_FILE} {QQ_NAPCAT.id}"
     warnings: list[str] = []
     if stray_platforms_section(CLONOTH_WORKSPACE):
@@ -185,8 +244,12 @@ def _secret_config_warnings() -> tuple[str, ...]:
     if unknown:
         warnings.append(f"{section} has keys QQ does not read: {', '.join(unknown)}")
     for spec in QQ_NAPCAT.secrets:
-        if _secret(spec.name).env_shadowed:
+        secret = _secret(spec.name)
+        if secret.env_shadowed:
             warnings.append(f"{spec.env} is ignored: {section}.{spec.name} takes precedence")
+        # 带宿主别名的那项是 NoneBot 自己读的：字段名和别名都按它的额外配置项认
+        if spec.host_env:
+            warnings.extend(_nonebot_token_warnings(spec, secret, section))
     return tuple(warnings)
 
 

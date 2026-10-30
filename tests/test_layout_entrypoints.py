@@ -247,7 +247,7 @@ class TestTheBotMigratesBeforeItConnects:
             tmp_path, _FULL_MAIN, config="platforms:\n  qq:\n    access_token: from-config\n",
         )
 
-        assert result["init"] == [{"onebot_access_token": "from-config"}]
+        assert result["init"] == [{"onebot_access_token": "from-config", "onebot_v11_access_token": "from-config"}]
         home = tmp_path / "deploy"
         assert (home / "data" / ".config_layout.json").is_file()
         secrets = yaml.safe_load((home / "data" / "platform_secrets.yaml").read_text(encoding="utf-8"))

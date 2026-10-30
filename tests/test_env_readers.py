@@ -379,13 +379,13 @@ class TestTheQqHook:
         assert result.stdout.split() == ["process", "qq", "False"]
 
 
-def _nonebot_config_names() -> set[str]:
-    """装着的 NoneBot 和 OneBot V11 适配器认的配置项，按环境变量的写法大写，别名也算。"""
+def _nonebot_config_fields() -> dict[str, set[str]]:
+    """装着的 NoneBot 和 OneBot V11 适配器认的配置项和各自的别名，按环境变量的写法大写。"""
     spec = importlib.machinery.PathFinder.find_spec("nonebot")
     if spec is None or not spec.submodule_search_locations:
         pytest.skip("没装 NoneBot")
     root = Path(next(iter(spec.submodule_search_locations)))
-    names: set[str] = set()
+    fields: dict[str, set[str]] = {}
     for rel, classes in (("config.py", {"Env", "Config"}), ("adapters/onebot/v11/config.py", {"Config"})):
         path = root / rel
         if not path.is_file():
@@ -398,13 +398,22 @@ def _nonebot_config_names() -> set[str]:
                     continue
                 if statement.target.id.startswith("_"):
                     continue
-                names.add(statement.target.id.upper())
+                aliases = fields.setdefault(statement.target.id.upper(), set())
                 if isinstance(statement.value, ast.Call):
-                    names.update(
+                    aliases.update(
                         str(keyword.value.value).upper()
                         for keyword in statement.value.keywords
                         if keyword.arg == "alias" and isinstance(keyword.value, ast.Constant)
                     )
+    return fields
+
+
+def _nonebot_config_names() -> set[str]:
+    """装着的 NoneBot 和 OneBot V11 适配器认的配置项，按环境变量的写法大写，别名也算。"""
+    names: set[str] = set()
+    for field_name, aliases in _nonebot_config_fields().items():
+        names.add(field_name)
+        names.update(aliases)
     return names
 
 
@@ -419,7 +428,16 @@ class TestTheBotHostSettings:
         assert qq_process_env.HOST_ENV <= _nonebot_config_names()
 
     def test_the_declared_host_secrets_are_real_settings(self) -> None:
-        assert set(QQ_NAPCAT.host_secret_env) <= _nonebot_config_names()
+        assert QQ_NAPCAT.host_env_names() <= _nonebot_config_names()
+
+    def test_a_secrets_host_aliases_are_the_ones_nonebot_gives_its_field(self) -> None:
+        # bot.py 按字段名和这些别名一起把配置文件里的令牌交给 init，别名对不上就盖不住环境里那份。
+        fields = _nonebot_config_fields()
+        aliased = [spec for spec in QQ_NAPCAT.secrets if spec.host_env]
+
+        assert aliased
+        for spec in aliased:
+            assert set(spec.host_env) <= fields.get(spec.env, set()), spec.name
 
     def test_every_secret_the_bot_host_reads_is_stripped_from_tools(self) -> None:
         # NoneBot 自己从环境读的令牌、签名密钥：平台描述漏一个，工具子进程里 echo 一下就出来了。

@@ -270,4 +270,4 @@ async def manage_secret(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
             return _unset(instance_file, shared_file, name, scope)
         return _set(instance_file, shared_file, name, args.get("value"), scope)
     except OSError as exc:
-        return _error("failed to update secrets: " + str(exc))
+        return _error("failed to update secrets: " + config_layout.config_error_text(exc))

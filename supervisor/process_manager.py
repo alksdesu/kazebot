@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from clonoth_runtime import env_bool, get_bool, get_float, get_int, load_runtime_config
+from toolbox.redaction import redact
 
 
 def _timestamp() -> str:
@@ -268,6 +269,8 @@ class ProcessManager:
     _BACKOFF_CAP_SEC = 30.0
     _MAX_FAILURES = 5
     _TAIL_CHARS = 800
+    # 先按整行多取这么多打码再截：从键名中间截断的话，后面的值就认不出是密钥了。
+    _TAIL_REDACT_CHARS = 4096
 
     def start_watchdog(self, on_event=None) -> None:
         """engine 掉了自动重拉。退避重试，连续失败就停手等人来看。
@@ -312,13 +315,17 @@ class ProcessManager:
                 health.next_retry_at = 0.0
 
     def _tail_log(self, proc: ManagedProcess) -> str:
+        """退出前日志的最后一截，打过码：它进控制台的运行页和 engine_died、engine_gave_up 事件。"""
         if proc.log_path is None or not proc.log_path.exists():
             return ""
         try:
             text = proc.log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        return text[-self._TAIL_CHARS:].strip()
+        window = text[-self._TAIL_REDACT_CHARS:]
+        if len(window) < len(text):
+            window = window[window.find("\n") + 1:]
+        return redact(window)[-self._TAIL_CHARS:].strip()
 
     def _watchdog_loop(self) -> None:
         while not self._stopped:

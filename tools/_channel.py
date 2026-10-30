@@ -12,7 +12,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 
@@ -288,30 +288,36 @@ def _is_provider_block(value: object) -> bool:
     return isinstance(value, dict) and any(k in value for k in ("base_url", "api_key", "model", "type"))
 
 
-class _ConfigView:
-    """工作区的 .env 与共享密钥、模型渠道配置 config/models.yaml 和平台密钥 data/platform_secrets.yaml。"""
+def _env_ref_names(text: str) -> str | None:
+    """整值写成 $ENV{A|B} 或 ${A|B} 时里面的变量名列表，不是引用是 None。认法和 clonoth_runtime.resolve_env_ref 一样（测试拿同一张表比对两份）。"""
+    if text.startswith("$ENV{") and text.endswith("}"):
+        return text[len("$ENV{"):-1]
+    if text.startswith("${") and text.endswith("}") and len(text) > len("${}"):
+        return text[len("${"):-1]
+    return None
 
-    def __init__(self, *, root: Path | None = None) -> None:
+
+class _EnvView:
+    """工作区的 .env 与共享密钥文件，盖在进程环境底下。"""
+
+    def __init__(self, *, root: Path | None = None, hidden_env: Callable[[str], bool] | None = None) -> None:
         # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
         # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
-        base = Path(root) if root is not None else Path.cwd()
-        shared, self._instance_env = _dotenv_layers(base)
+        self._base = Path(root) if root is not None else Path.cwd()
+        shared, self._instance_env = _dotenv_layers(self._base)
         self._dotenv = {**shared, **self._instance_env}
-        models = _models_document(base)
-        self._config = models.data
-        # models.yaml 读不了又没有上一份时的原因。调用方先报它：空配置下报「没配 key」是在误导人。
-        self.models_problem = models.problem
-        # 读不了按空表算、不沿用上一份，和主进程的 load_platform_secrets 同一个回退。
-        self._platform_secrets = read_yaml_document(
-            base.joinpath(*_PLATFORM_SECRETS_FILE), label="/".join(_PLATFORM_SECRETS_FILE), keep_last_good=False,
-        ).data
+        # 主进程替工具判能不能用时给：它认作工具子进程看不到的进程环境变量（safe_subprocess_env 剥掉的那些）按没设算。
+        self._hidden_env = hidden_env
+
+    def _sees(self, key: str) -> bool:
+        return self._hidden_env is None or not self._hidden_env(key)
 
     def env(self, key: str) -> str:
-        return (os.environ.get(key, "") or self._dotenv.get(key, "")).strip()
+        return ((os.environ.get(key, "") if self._sees(key) else "") or self._dotenv.get(key, "")).strip()
 
     def instance_env(self, key: str) -> str:
         """进程环境 > 本实例 .env，不看共享密钥文件。"""
-        return (os.environ.get(key, "") or self._instance_env.get(key, "")).strip()
+        return ((os.environ.get(key, "") if self._sees(key) else "") or self._instance_env.get(key, "")).strip()
 
     def first_env(self, names: str) -> str:
         """取第一个有值的变量。仓库的节点文件在用 $ENV{NEW|OLD} 这种回退写法。"""
@@ -323,10 +329,33 @@ class _ConfigView:
 
     def _deref(self, value: object) -> str:
         text = str(value or "").strip()
-        for head in ("${", "$ENV{"):
-            if text.startswith(head) and text.endswith("}") and len(text) > len(head) + 1:
-                return self.first_env(text[len(head):-1].strip())
-        return text
+        names = _env_ref_names(text)
+        return text if names is None else self.first_env(names)
+
+
+def resolve_env_ref(
+    value: object, *, root: Path | None = None, hidden_env: Callable[[str], bool] | None = None,
+) -> str:
+    """整值写成 ${VAR}、$ENV{NEW|OLD} 的换成变量的值，没设是空串，别的原样返回。
+
+    变量按进程环境 > 本实例 .env > 共享密钥文件 config/secrets.env 找；root、hidden_env 同 _EnvView。
+    """
+    return _EnvView(root=root, hidden_env=hidden_env)._deref(value)
+
+
+class _ConfigView(_EnvView):
+    """_EnvView 加上模型渠道配置 config/models.yaml 和平台密钥 data/platform_secrets.yaml。"""
+
+    def __init__(self, *, root: Path | None = None, hidden_env: Callable[[str], bool] | None = None) -> None:
+        super().__init__(root=root, hidden_env=hidden_env)
+        models = _models_document(self._base)
+        self._config = models.data
+        # models.yaml 读不了又没有上一份时的原因。调用方先报它：空配置下报「没配 key」是在误导人。
+        self.models_problem = models.problem
+        # 读不了按空表算、不沿用上一份，和主进程的 load_platform_secrets 同一个回退。
+        self._platform_secrets = read_yaml_document(
+            self._base.joinpath(*_PLATFORM_SECRETS_FILE), label="/".join(_PLATFORM_SECRETS_FILE), keep_last_good=False,
+        ).data
 
     def platform_secret(self, platform_id: str, name: str, env: str = "") -> str:
         """和主进程同一个顺序：data/platform_secrets.yaml 的 <id>.<name> > 环境变量 > 本实例 .env。
@@ -354,8 +383,8 @@ def platform_secret(platform_id: str, name: str, env: str = "", *, root: Path | 
 class Channel(_ConfigView):
     """一个 system_models 槽位的配置视图。"""
 
-    def __init__(self, slot: str, *, root: Path | None = None) -> None:
-        super().__init__(root=root)
+    def __init__(self, slot: str, *, root: Path | None = None, hidden_env: Callable[[str], bool] | None = None) -> None:
+        super().__init__(root=root, hidden_env=hidden_env)
         self.slot = (slot or "").strip().lower()
         block = (self._config.get("system_models") or {}) if isinstance(self._config, dict) else {}
         block = block.get(self.slot) if isinstance(block, dict) else None
@@ -569,16 +598,20 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
 
 
 def resolve_image_channel(
-    slot: str, *, root: Path | None = None, model_override: str = "",
+    slot: str,
+    *,
+    root: Path | None = None,
+    model_override: str = "",
+    hidden_env: Callable[[str], bool] | None = None,
 ) -> ImageChannel:
-    """生图槽位的完整解析。工具和提示词注入共用这一份，判定才不会打架。
+    """生图槽位的完整解析。工具和提示词注入共用这一份，判定才不会打架；hidden_env 同 _EnvView。
 
     model 不跟着主渠道借：那边配的是聊天模型，生图端点认不了。
     """
     spec = IMAGE_SLOTS.get((slot or "").strip().lower())
     if spec is None:
         return ImageChannel()
-    channel = Channel(slot, root=root)
+    channel = Channel(slot, root=root, hidden_env=hidden_env)
     # 槽位和主渠道都写在 models.yaml 里，读不了就别只凭环境变量拼一条渠道去发计费请求。
     if channel.models_problem:
         return ImageChannel(error=channel.models_problem)

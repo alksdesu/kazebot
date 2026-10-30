@@ -106,3 +106,39 @@ def test_repo_node_syntax_resolves_through_config_store(monkeypatch):
     monkeypatch.setenv("DRAW_PLANNER_MODEL", "planner-model")
 
     assert config_resolve("$ENV{DRAW_TAG_MODEL|DRAW_PLANNER_MODEL}") == "planner-model"
+
+
+# 调用方都先去掉首尾空白再交进来，表里只放去过空白的写法。
+_REFERENCE_FORMS = [
+    "plain-value", "", "${REF_SET}", "${REF_UNSET}", "$ENV{REF_SET}", "$ENV{REF_UNSET}",
+    "$ENV{REF_UNSET|REF_SET}", "${REF_UNSET|REF_SET}", "$ENV{}", "${}", "${ REF_SET }",
+    "$ENV{ REF_UNSET | REF_SET }", "prefix-${REF_SET}", "${REF_SET}-suffix", "$ENV{REF_SET", "$ENV{REF_SET}}",
+]
+
+
+@pytest.mark.parametrize("text", _REFERENCE_FORMS)
+def test_the_tool_side_resolver_reaches_the_runtime_verdict(text, tmp_path, monkeypatch):
+    # 工具那份导不了 clonoth_runtime，照它的语义另写：同一张表两边结论必须一样，$ENV{} 也得展开成空串
+    monkeypatch.setenv("REF_SET", "value-from-env")
+    monkeypatch.delenv("REF_UNSET", raising=False)
+
+    assert _channel.resolve_env_ref(text, root=tmp_path) == resolve_env_ref(text)
+
+
+def test_the_tool_side_resolver_reads_both_dotenv_layers(tmp_path, monkeypatch):
+    monkeypatch.delenv("REF_LAYERED", raising=False)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "secrets.env").write_text("REF_LAYERED=from-group\n", encoding="utf-8")
+
+    assert _channel.resolve_env_ref("${REF_LAYERED}", root=tmp_path) == "from-group"
+
+    (tmp_path / ".env").write_text("REF_LAYERED=from-instance\n", encoding="utf-8")
+
+    assert _channel.resolve_env_ref("$ENV{REF_LAYERED}", root=tmp_path) == "from-instance"
+
+
+def test_a_variable_hidden_from_tools_is_not_read_from_the_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("REF_HIDDEN", "from-process")
+
+    assert _channel.resolve_env_ref("${REF_HIDDEN}", root=tmp_path, hidden_env=lambda name: name == "REF_HIDDEN") == ""
+    assert _channel.resolve_env_ref("${REF_HIDDEN}", root=tmp_path) == "from-process"

@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,20 @@ from supervisor.log_access import LogReader
 from supervisor.platform_api import platform_health
 from supervisor.reminders.service import REMINDER_SETTINGS
 from toolbox import mcp_runtime
-from toolbox.redaction import HIDDEN, MIN_SECRET_CHARS, NUMERIC_SECRET_KEY, SENSITIVE_KEY, assigned_values, redact
+from toolbox.redaction import (
+    HIDDEN,
+    MIN_SECRET_CHARS,
+    SECRET_ENV_NAME,
+    Hide,
+    ValueHider,
+    assigned_values,
+    counts_as_secret,
+    counts_token_usage,
+    hide_level,
+    hides_entry,
+    redact,
+    secret_values,
+)
 
 # 平台没声明自己的排查提示时用的说法。
 _CONNECTION_HINT = "检查平台账号登录和适配进程的连接配置"
@@ -43,6 +57,11 @@ _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 # 写坏的那一行上，值前面常多出 YAML 不许打头的记号，后面常多出冒号或收尾的括号。
 _YAML_LEADING_NOISE = "*&!%@`[{|>"
 _YAML_TRAILING_NOISE = ":]}"
+
+
+def _declared_secret(value: str, name: str) -> bool:
+    """声明成密钥的这个名字下，value 算不算密钥。名字本身认不出档位的按 token 档算：声明了就是密钥。"""
+    return counts_as_secret(value, max(Hide.TEXT, hide_level(name)), usage=counts_token_usage(name))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -115,71 +134,59 @@ class OperationsService:
 
     def _configured_secrets(self) -> tuple[str, ...]:
         values: set[str] = set()
-
-        def collect(item: Any, sensitive: bool = False, numeric: bool = False) -> None:
-            if isinstance(item, dict):
-                for key, value in item.items():
-                    name = str(key)
-                    collect(
-                        value,
-                        sensitive or bool(SENSITIVE_KEY.search(name)),
-                        numeric or bool(NUMERIC_SECRET_KEY.search(name)),
-                    )
-            elif isinstance(item, list):
-                for value in item:
-                    collect(value, sensitive, numeric)
-            elif sensitive and isinstance(item, str):
-                resolved = resolve_env_ref(item)
-                if resolved:
-                    values.add(resolved)
-            elif numeric and isinstance(item, (int, float)) and not isinstance(item, bool):
-                # 口令常是纯数字；太短的不收，按子串替换会把导出里不相干的数字也抹掉
-                digits = str(item)
-                if len(digits) >= MIN_SECRET_CHARS:
-                    values.add(digits)
-
         for path in self._secret_bearing_files():
             try:
                 raw = path.read_bytes()
             except OSError:
                 continue
             try:
-                collect(config_layout.load_yaml_text(raw.decode("utf-8")))
+                values.update(secret_values(config_layout.load_yaml_text(raw.decode("utf-8")), resolve=resolve_env_ref))
             except (UnicodeDecodeError, yaml.YAMLError):
                 values.update(self._values_on_broken_lines(raw.decode("utf-8", errors="replace")))
+        # 下面三处的值和按键名收的一样过 counts_as_secret：文字开关、token 档的短数字收进来，导出里每个独立的 1、on 都会被抹掉。
         # 平台声明的密钥不一定叫 token/secret，按声明再收一遍；被密钥文件盖住的那个 env 值也收。
         # 自动生成的密钥文件不收：代码从不打印它们，里面也可能只是模式标记，抹掉反而丢排障线索。
         platform_secrets = load_platform_secrets(self.root)
         for platform in all_platforms():
             for spec in platform.secrets:
-                values.add(platform_secret(self.root, platform, spec.name, secrets=platform_secrets).value)
+                value = platform_secret(self.root, platform, spec.name, secrets=platform_secrets).value
+                if _declared_secret(value, spec.env or spec.name):
+                    values.add(value)
         # 宿主库自己读的令牌别名不一定以 TOKEN/SECRET 结尾，按工具子进程剥掉的那份名单收。
         for name in secret_env_names():
-            values.add(os.environ.get(name, "").strip())
+            value = os.environ.get(name, "").strip()
+            if _declared_secret(value, name):
+                values.add(value)
         # 共享密钥文件不灌进进程环境，得单独收一遍。
         shared = config_layout.shared_secrets(self.root)
         for source in (os.environ, shared):
             for key, value in source.items():
-                if re.search(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY)$", key, re.I) and value:
+                if SECRET_ENV_NAME.search(key) and counts_as_secret(value, hide_level(key), usage=counts_token_usage(key)):
                     values.add(value)
         values.discard("")
         return tuple(sorted(values, key=len, reverse=True))
 
-    def _clean(self, value: Any, secrets: tuple[str, ...] = ()) -> Any:
-        if isinstance(value, dict):
-            return {
-                self._clean(str(key), secrets): (HIDDEN if SENSITIVE_KEY.search(str(key)) else self._clean(item, secrets))
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [self._clean(item, secrets) for item in value]
-        if isinstance(value, str):
-            text = value.replace(str(self.root), "<workspace>")
-            for secret in secrets:
-                if secret:
-                    text = text.replace(secret, HIDDEN)
-            return redact(text)
-        return value
+    def _clean(self, value: Any, secrets: Iterable[str] = ()) -> Any:
+        """导出前的样子：工作区路径换成 <workspace>，收到的密钥值换成 HIDDEN，其余过 redact。
+
+        密钥键下的项按 hides_entry 整项藏，和 mask_sensitive 一个口径：空值、布尔、开关、token 档的短数字和用量照给。
+        """
+        hider = ValueHider(secrets)
+        workspace = str(self.root)
+
+        def clean_entry(key: Any, entry: Any) -> Any:
+            return HIDDEN if hides_entry(key, entry) else clean(entry)
+
+        def clean(item: Any) -> Any:
+            if isinstance(item, dict):
+                return {clean(str(key)): clean_entry(key, entry) for key, entry in item.items()}
+            if isinstance(item, list):
+                return [clean(entry) for entry in item]
+            if isinstance(item, str):
+                return redact(hider(item.replace(workspace, "<workspace>")))
+            return item
+
+        return clean(value)
 
     @staticmethod
     def _probe_options(provider_class: Any) -> dict[str, Any]:

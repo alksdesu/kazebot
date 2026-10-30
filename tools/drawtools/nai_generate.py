@@ -92,6 +92,7 @@ if __name__ == "__main__":
     from common import (
         DrawtoolsConfigUnreadable,
         PresetNotFoundError,
+        api_key_env_name,
         load_settings,
         require_preset,
         resolve_api_key,
@@ -176,7 +177,11 @@ if __name__ == "__main__":
 
     api_key = resolve_api_key(settings)
     if not api_key:
-        fail("NovelAI API key is missing. Set NOVELAI_API_KEY or config/drawtools/settings.yaml api.api_key")
+        # 只设在服务进程环境里的 *_API_KEY 到不了工具子进程，让人往工具读得到的地方写。
+        fail(
+            f"NovelAI API key is missing. Put {api_key_env_name(settings) or 'NOVELAI_API_KEY'}=<key> in this instance's .env "
+            "or config/secrets.env, or set api.api_key in config/drawtools/settings.yaml"
+        )
     base_url = resolve_base_url(settings)
     api_url = f"{base_url}/ai/generate-image"
 

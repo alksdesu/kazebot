@@ -379,6 +379,21 @@ class TestTheConsoleIsTold:
         assert switched["account"] == _NEW_ACCOUNT and str(failure) in switched["roster_error"]
         assert pinned["ok"] is True and str(failure) in pinned["roster_error"]
 
+    def test_a_system_write_error_is_told_without_its_absolute_path(
+        self, state: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report = state.workspace_root / "data" / "instance_account.yaml"
+
+        def refuse(*_args: Any, **_kwargs: Any) -> bool:
+            raise PermissionError(13, "Permission denied", str(report))
+
+        monkeypatch.setattr(platform_accounts, "record_account", refuse)
+
+        switched = asyncio.run(platform_accounts.switch_account(state, QQ_NAPCAT, self._Ops(), _NEW_ACCOUNT))
+
+        assert switched["roster_error"].endswith("：Permission denied")
+        assert str(state.workspace_root) not in switched["roster_error"]
+
     def test_a_clean_record_adds_nothing(self, state: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(platform_accounts, "record_account", lambda *_args, **_kwargs: True)
 

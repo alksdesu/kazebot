@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from toolbox.redaction import hides_entry
+
 from .tool_result_formatters import (
     ToolResultFormatContext,
     format_tool_result_by_structure,
@@ -112,9 +114,6 @@ def _summary_line(text: Any, limit: int = 120) -> str:
     return line
 
 
-_SENSITIVE_ARG_RE = re.compile(r"(api[_-]?key|token|secret|password|authorization|bearer)", re.IGNORECASE)
-
-
 def _brief_args(args: dict | None, *, value_limit: int = 30) -> str:
     """Build a compact fallback argument summary for tools without custom rules."""
     # [summary-args 2026-05-19] Why: the fallback rule requested by operators is
@@ -127,7 +126,7 @@ def _brief_args(args: dict | None, *, value_limit: int = 30) -> str:
         return ""
     key, value = next(iter(args.items()))
     key_text = _clip_one_line(key, 24)
-    if _SENSITIVE_ARG_RE.search(str(key)):
+    if hides_entry(key, value):
         value_text = "<redacted>"
     elif isinstance(value, (dict, list, tuple)):
         try:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import config_layout
 from engine.conversation_migration import ConversationRekey, RekeyConflict, RekeyCount
 from engine.materials.storage import materials_index_path, rekey_materials
 
@@ -83,8 +84,17 @@ def rekey_conversation_stores(
         except RekeyConflict:
             raise
         except Exception as exc:
-            raise ConversationStoreError(f"{store.label}（{path}）改写失败：{exc}") from exc
+            raise ConversationStoreError(
+                f"{store.label}（{config_layout.logical_path(workspace, path)}）改写失败：{_failure_text(exc)}",
+            ) from exc
     return results
+
+
+def _failure_text(exc: Exception) -> str:
+    """改写失败的原因交给控制台：系统报的读写错误只留原因，不带绝对路径和解码器原话；库自己写的原因照给。"""
+    if isinstance(exc, UnicodeDecodeError) or (isinstance(exc, OSError) and exc.strerror):
+        return config_layout.config_error_text(exc)
+    return str(exc) or type(exc).__name__
 
 
 def store_counts_payload(results: Mapping[str, RekeyCount]) -> dict[str, dict[str, Any]]:

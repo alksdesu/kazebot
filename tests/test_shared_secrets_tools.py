@@ -674,6 +674,25 @@ class TestDrawtoolsApiKey:
     def test_nothing_configured_is_an_empty_key(self, root: Path) -> None:
         assert drawtools_common.resolve_api_key({"api": {"api_key_env": "NOBODY_SET_THIS"}}) == ""
 
+    def test_a_variable_the_tool_cannot_see_is_skipped(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 主进程替工具判可用：服务进程环境里有、工具子进程里被剥掉的按没设算，只剩两层 dotenv
+        monkeypatch.setenv("NOVELAI_API_KEY", "k-env")
+
+        assert drawtools_common.resolve_api_key({}, hidden_env=lambda name: name == "NOVELAI_API_KEY") == "k-shared"
+        assert drawtools_common.resolve_api_key({}) == "k-env"
+
+    def test_a_reference_in_settings_is_expanded(self, root: Path) -> None:
+        (root / ".env").write_text("NAI_FROM_REF=k-ref\n", encoding="utf-8")
+
+        assert drawtools_common.resolve_api_key({"api": {"api_key": "${NAI_FROM_REF}"}}) == "k-ref"
+        assert drawtools_common.resolve_api_key({"api": {"api_key": "$ENV{NAI_NEWER|NAI_FROM_REF}"}}) == "k-ref"
+
+    @pytest.mark.parametrize("ref", ["${NOBODY_SET_THIS}", "$ENV{NOBODY_SET_THIS|NOR_THIS}"])
+    def test_a_reference_to_nothing_counts_as_not_written(self, root: Path, ref: str) -> None:
+        # 没设就往下找 api_key_env，引用的原文不当 key 发出去
+        assert drawtools_common.resolve_api_key({"api": {"api_key": ref}}) == "k-shared"
+        assert drawtools_common.resolve_api_key({"api": {"api_key": ref, "api_key_env": "NOBODY_SET_EITHER"}}) == ""
+
     def test_a_rotated_group_key_is_picked_up_without_a_restart(self, root: Path) -> None:
         assert drawtools_common.resolve_api_key({}) == "k-shared"
 

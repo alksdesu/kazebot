@@ -210,13 +210,14 @@ def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
 
 def test_a_configured_access_token_is_handed_to_nonebot(tmp_path: Path) -> None:
     # NoneBot 只从环境变量读它；data/platform_secrets.yaml 那份不递过去，NapCat 连上来就被拒。
+    # 适配器读到别名就不看字段名，所以别名也交一份，环境里的别名才盖不过配置文件。
     result = _run_main(
         tmp_path,
         config="qq:\n  access_token: from-config\n",
         extra_env={"ONEBOT_ACCESS_TOKEN": "from-env"},
     )
 
-    assert result["init"] == [{"onebot_access_token": "from-config"}]
+    assert result["init"] == [{"onebot_access_token": "from-config", "onebot_v11_access_token": "from-config"}]
 
 
 def test_an_environment_access_token_is_left_to_nonebot(tmp_path: Path) -> None:

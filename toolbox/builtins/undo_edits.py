@@ -354,14 +354,16 @@ def _probe(
     try:
         snapshot = file_state.take_snapshot(Path(entry.path))
     except OSError as exc:
-        return _Plan("skip", f"读不了这个文件（{exc}）"), None
+        return _Plan("skip", f"读不了这个文件（{config_layout.config_error_text(exc)}）"), None
     plan = _plan(entry, snapshot, force=force)
     if plan.action != "restore":
         return plan, None
     try:
         return plan, journal.load_pre_image(session, task_id, entry)
-    except (ValueError, OSError) as exc:
+    except ValueError as exc:
         return _Plan("skip", str(exc)), None
+    except OSError as exc:
+        return _Plan("skip", f"编辑日志里的原文件内容读不出来（{config_layout.config_error_text(exc)}）"), None
 
 
 def _restore_locked(path: Path, data: bytes, snapshot: file_state.FileSnapshot, mode: int | None) -> file_state.Stamp:
@@ -475,7 +477,7 @@ async def _apply_undo(
     except ValueError as exc:
         return _FileOutcome(entry, SKIPPED, f"编辑日志用不了（{exc}）")
     except OSError as exc:
-        return _FileOutcome(entry, SKIPPED, f"读写文件失败（{exc}）")
+        return _FileOutcome(entry, SKIPPED, f"读写文件失败（{config_layout.config_error_text(exc)}）")
 
 
 async def _settle(ctx: ToolContext, grant: file_state.EditGrant, outcome: _FileOutcome) -> _FileOutcome:
@@ -599,7 +601,7 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         # accumulate 子节点自己的会话下也可能有保留期内的记录，一并列出
         tasks = await asyncio.to_thread(journal.tasks_in, (root, scope.session))
     except OSError as exc:
-        return _error(f"编辑日志读不出来（{exc}）")
+        return _error(f"编辑日志读不出来（{config_layout.config_error_text(exc)}）")
 
     if action == "list":
         retention_days = await asyncio.to_thread(lambda: journal.retention_days)

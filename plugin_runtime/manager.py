@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from plugin_sdk import PluginAPI, PluginExecutionError, RequestContext
+from toolbox.redaction import hide_values, redact, secret_values
 
 logger = logging.getLogger(__name__)
 RUNTIME_STALE_SECONDS = 30  # 15 missed 2s heartbeats → process is dead
@@ -34,30 +35,16 @@ _scope: ContextVar[dict[str, Any]] = ContextVar("plugin_scope", default={})
 _loading: ContextVar[bool] = ContextVar("plugin_loading", default=False)
 _managers: dict[tuple[int, str], "PluginManager"] = {}
 _managers_lock = threading.RLock()
-_SENSITIVE = re.compile(r"key|token|secret|password|authorization|cookie|credential", re.I)
+# Plugin settings often call a credential just "key"; the shared table leaves that word out, elsewhere it names cache keys.
+_PLUGIN_SECRET_KEY = re.compile(r"key", re.I)
 
 
 def _secret_values(value: Any) -> set[str]:
-    secrets: set[str] = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if _SENSITIVE.search(str(key)) and isinstance(item, str) and item:
-                secrets.add(item)
-                if item.lower().startswith("bearer "):
-                    secrets.add(item[7:])
-            secrets.update(_secret_values(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            secrets.update(_secret_values(item))
-    return secrets
+    return secret_values(value, also=_PLUGIN_SECRET_KEY)
 
 
 def _diagnostic(phase: str, exc: BaseException, secrets: set[str] | None = None) -> dict:
-    message = str(exc)
-    for secret in sorted(secrets or (), key=len, reverse=True):
-        message = message.replace(secret, "[redacted]")
-    message = re.sub(r"(?i)(bearer\s+)[^\s,'\"}]+", r"\1[redacted]", message)
-    message = re.sub(r"(?i)((?:api[_-]?key|token|secret|password|authorization|cookie)\s*['\"]?\s*[:=]\s*['\"]?)[^\s,'\"}]+", r"\1[redacted]", message)
+    message = redact(hide_values(str(exc), secrets or ()))
     return {
         "phase": phase, "type": type(exc).__name__, "message": message[:2000],
         "frames": [{"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}

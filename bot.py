@@ -115,9 +115,11 @@ def main() -> None:
     # 每次重启都静默吞掉几条群消息。
     wait_supervisor(_SUPERVISOR_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
 
-    # NoneBot 只从环境变量读连接令牌，写在 data/platform_secrets.yaml 的那份得显式交给它。
-    access = platform_secret(resolve_workspace_root(_REPO_ROOT), QQ_NAPCAT, "access_token")
-    nonebot.init(**({"onebot_access_token": access.value} if access.source == SECRET_FROM_CONFIG else {}))
+    # NoneBot 只从环境读令牌，配置文件那份得交给 init：别名读到就盖过字段名，init 的同名项又盖过 .env，所以每个别名也交一份。
+    spec = QQ_NAPCAT.secret("access_token")
+    access = platform_secret(resolve_workspace_root(_REPO_ROOT), QQ_NAPCAT, spec.name)
+    overrides = {name.lower(): access.value for name in (spec.env, *spec.host_env)}
+    nonebot.init(**(overrides if access.source == SECRET_FROM_CONFIG else {}))
     _bridge_stdlib_logging()
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)

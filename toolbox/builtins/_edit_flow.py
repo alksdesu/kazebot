@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
+import config_layout
+
 from .. import edit_journal, file_state
 from .._common import request_guard, resolve_under_allowed_roots
 from ..context import project_origin_of, project_root_of
@@ -254,7 +256,7 @@ async def run_text_edit(
         raise EditRefused(edit_error_response(str(exc), path, conflict=True)) from None
     except OSError as exc:
         await file_state.abandon_edit(ctx, target.grant)
-        raise EditRefused(edit_error_response(f"读写文件失败：{exc}", path)) from None
+        raise EditRefused(edit_error_response(f"读写 {path} 失败：{config_layout.config_error_text(exc)}", path)) from None
     tx = await settle_transaction(ctx, target.grant, tx)
     if tx.status == "missing":
         raise EditRefused(edit_error_response(f"文件不存在：{path}", path))

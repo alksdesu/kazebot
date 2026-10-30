@@ -403,3 +403,29 @@ def test_generation_can_use_one_definition_snapshot(tmp_path):
     store.configure("example", enabled=True, config={}, selectors={}, base_hash=item["desired_hash"])
     assert store.generation(snapshot) == generation
     assert store.generation() != generation
+
+
+@pytest.mark.parametrize("make", ["not-utf8", "unreadable"])
+def test_a_plugin_file_that_cannot_be_read_says_why_without_its_path(tmp_path, monkeypatch, make):
+    # 原因进控制台的插件页：读文件的报错带着绝对路径，解码错误带着解码器原话
+    store = PluginStore(tmp_path)
+    store.directory.mkdir(parents=True)
+    path = store.directory / "example.py"
+    if make == "not-utf8":
+        path.write_bytes(b"\xff\xfe" + SOURCE.encode("utf-8"))
+    else:
+        path.write_text(SOURCE, encoding="utf-8")
+        real_read_bytes = Path.read_bytes
+
+        def refuse(self):
+            if self == path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", refuse)
+
+    [definition] = [item for item in store.definitions() if item["id"] == "example"]
+
+    reason = {"not-utf8": "不是 UTF-8 编码（第 1 个字节）", "unreadable": "Permission denied"}[make]
+    assert definition["error"] == f"插件文件读不了：{reason}"
+    assert str(tmp_path) not in definition["error"]

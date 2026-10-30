@@ -27,7 +27,7 @@ from adapters.onebot.live_config import LIVE_KEYS  # noqa: E402
 from clonoth_runtime import SYSTEM_MODEL_SLOTS  # noqa: E402
 from platforms import protection  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
-from platforms.descriptor import HOOK_PROCESS_ENV, PlatformDescriptor  # noqa: E402
+from platforms.descriptor import HOOK_PROCESS_ENV, PlatformDescriptor, SecretField  # noqa: E402
 from platforms.protection import (  # noqa: E402
     BASIS_DECLARED,
     BASIS_INJECTED,
@@ -231,7 +231,7 @@ class TestWhereEachVariableBelongs:
     def test_what_the_qq_side_reads_at_start_up_is_its_own(self, name: str) -> None:
         assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_SETTING, QQ_NAPCAT.id)
 
-    @pytest.mark.parametrize("name", sorted(QQ_NAPCAT.host_secret_env))
+    @pytest.mark.parametrize("name", sorted(QQ_NAPCAT.host_env_names()))
     def test_a_secret_the_bot_host_reads_itself_is_a_qq_process_setting(self, name: str) -> None:
         # NoneBot 只读进程环境和自己目录下的 .env，写进共享密钥文件谁也读不到。
         assert env_scope(name) == EnvScope(ENV_PROCESS, BASIS_SETTING, QQ_NAPCAT.id)
@@ -349,6 +349,18 @@ class TestPlatformProcessEnvHooks:
         assert env_scope("x_sdk_token", [other]).kind == ENV_PROCESS
         assert "X_SDK_TOKEN" in process_env_names([other])
 
+    def test_a_secrets_host_alias_needs_no_hook(self, fresh_hook_warnings: None) -> None:
+        other = PlatformDescriptor(
+            id="x", display_name="X", short_name="X",
+            hooks={HOOK_PROCESS_ENV: "clonoth_no_such_process_env_module"},
+            secrets=(SecretField("token", "令牌", env="X_TOKEN", host_env=("X_SDK_TOKEN",)),),
+        )
+
+        assert env_scope("X_SDK_TOKEN", [other]) == EnvScope(ENV_PROCESS, BASIS_SETTING, "x")
+        assert env_scope("X_TOKEN", [other]) == EnvScope(ENV_INSTANCE, BASIS_DECLARED, "x")
+        assert "X_SDK_TOKEN" in process_env_names([other])
+        assert is_shareable_env("X_SDK_TOKEN", [other]) is False
+
     def test_declared_host_secrets_survive_a_broken_hook(
         self, fresh_hook_warnings: None, caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -364,7 +376,7 @@ class TestPlatformProcessEnvHooks:
         assert scope == EnvScope(ENV_PROCESS, BASIS_SETTING, "x")
         assert any("process_env" in record.getMessage() for record in caplog.records)
 
-    @pytest.mark.parametrize("name", sorted(QQ_NAPCAT.host_secret_env))
+    @pytest.mark.parametrize("name", sorted(QQ_NAPCAT.host_env_names()))
     def test_the_qq_token_aliases_survive_a_broken_qq_hook(self, fresh_hook_warnings: None, name: str) -> None:
         # 钩子报的设置退回共享，令牌别名不能跟着退：manage_secret 会把它写进组里的共享密钥文件。
         broken = dataclasses.replace(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ _REPO_ROOT = DRAWTOOLS_DIR.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
     sys.path.insert(0, str(_REPO_ROOT))
 import config_layout  # noqa: E402
-from tools._channel import YamlDocument, dotenv_values, read_yaml_document  # noqa: E402
+from tools._channel import YamlDocument, dotenv_values, read_yaml_document, resolve_env_ref  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
@@ -217,37 +218,50 @@ def set_selected_preset(preset_ref: str) -> dict[str, Any]:
         if unreadable:
             # 整份写回去的是默认值或上一份，手写到一半的那份就被盖掉了
             raise DrawtoolsConfigUnreadable(f"{unreadable}。先在控制台的原文编辑器里修好再切换")
-        settings = _with_defaults(document.data)
-        target = require_preset(settings, preset_ref)
+        target = require_preset(_with_defaults(document.data), preset_ref)
         target_id = str(target.get("id") or "").strip()
         if not target_id:
             raise ValueError("preset has no id")
-        settings.setdefault("params", {})["selected_preset_id"] = target_id
+        # 只改选中的那一项：补上的默认值写进去，升级改了默认也到不了这个实例；还没有自己那份时照模板那份写，预设要靠它才找得到。
+        own = copy.deepcopy(document.data)
+        params = own.get("params")
+        if not isinstance(params, dict):
+            params = own["params"] = {}
+        params["selected_preset_id"] = target_id
         # 用户运行期选择写入实例的 settings.yaml；仓库只维护 settings.example.yaml，升级不会覆盖用户配置。
         config_layout.write_locked(
             SETTINGS_PATH,
-            yaml.safe_dump(settings, allow_unicode=True, sort_keys=False),
+            yaml.safe_dump(own, allow_unicode=True, sort_keys=False),
             mode=config_layout.private_mode_for(WORKSPACE_ROOT, SETTINGS_PATH),
         )
     return target
 
 
-def resolve_api_key(settings: dict[str, Any]) -> str:
-    # settings.yaml 优先：用户在 settings.yaml 里显式写了 api_key 就以它为准，
-    # 仅当为空时才回退到环境变量（api_key_env 指定的变量名，默认 NOVELAI_API_KEY）。
-    # 避免部署环境里遗留的同名环境变量静默覆盖用户配置。
+def api_key_env_name(settings: dict[str, Any]) -> str:
+    """没在 settings.yaml 写 api_key 时去找的那个变量名，默认 NOVELAI_API_KEY。"""
     api_cfg = settings.get("api") if isinstance(settings.get("api"), dict) else {}
-    key = str(api_cfg.get("api_key") or "").strip()
+    return str(api_cfg.get("api_key_env") or "NOVELAI_API_KEY").strip()
+
+
+def resolve_api_key(settings: dict[str, Any], *, hidden_env: Callable[[str], bool] | None = None) -> str:
+    """NovelAI 的 key：settings.yaml 的 api.api_key 优先，没写才找 api_key_env 指的变量。
+
+    部署环境里遗留的同名环境变量不能静默盖掉用户写在 settings.yaml 里的。api_key 写成 ${VAR} 时按变量取值，
+    变量没设按没写算，引用本身不当 key 发出去。hidden_env 是主进程替工具判可用时给的：它认作工具子进程看不到的变量按没设算。
+    """
+    api_cfg = settings.get("api") if isinstance(settings.get("api"), dict) else {}
+    key = resolve_env_ref(api_cfg.get("api_key"), root=WORKSPACE_ROOT, hidden_env=hidden_env)
     if key:
         return key
-    env_name = str(api_cfg.get("api_key_env") or "NOVELAI_API_KEY").strip()
-    if env_name:
-        value = os.environ.get(env_name, "").strip()
-        if value:
-            return value
-        # 工具子进程的环境里 *_API_KEY 被剥掉了，本实例 .env 和共享密钥文件得自己读；共享组里别的实例配上的这边也用得上。
-        return dotenv_values(WORKSPACE_ROOT).get(env_name, "")
-    return ""
+    env_name = api_key_env_name(settings)
+    if not env_name:
+        return ""
+    visible = hidden_env is None or not hidden_env(env_name)
+    value = os.environ.get(env_name, "").strip() if visible else ""
+    if value:
+        return value
+    # 工具子进程的环境里 *_API_KEY 被剥掉了，本实例 .env 和共享密钥文件得自己读；共享组里别的实例配上的这边也用得上。
+    return dotenv_values(WORKSPACE_ROOT).get(env_name, "")
 
 
 def resolve_base_url(settings: dict[str, Any]) -> str:

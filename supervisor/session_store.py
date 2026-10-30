@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from engine.child_session_retention import retention_hold
 from engine.conversation_migration import ConversationRekey, RekeyCount
 
@@ -45,6 +46,8 @@ from ._helpers import SessionInfo, _now
 
 logger = logging.getLogger(__name__)
 
+# 相对工作区的位置。读不出来的原因用这个名字说：原因进诊断、控制台和日志，绝对路径不往外带。
+SESSION_REGISTRY_FILE = "data/sessions.json"
 _ENTRY_BRANCH_NODE = "__entry_branch__"
 _ACCUMULATE = "accumulate"
 
@@ -104,7 +107,10 @@ class SessionStore:
             logger.info("sessions.json not found; will be created on first session")
             return {}, {}, {}, {}
         except OSError as exc:
-            self._refuse_writes(f"{self._path} 读不出来（{exc}），这次运行不写它，会话登记从空表开始；修好后重启")
+            self._refuse_writes(
+                f"{SESSION_REGISTRY_FILE} 读不出来（{config_layout.config_error_text(exc)}），"
+                "这次运行不写它，会话登记从空表开始；修好后重启"
+            )
             return {}, {}, {}, {}
         try:
             text = raw.decode("utf-8").strip()
@@ -203,14 +209,17 @@ class SessionStore:
 
     def _set_aside_corrupt(self, exc: Exception) -> None:
         aside = self._path.with_name(f"{self._path.name}.corrupt-{int(time.time())}")
+        # JSON 的报错只有位置；解码错误按 config_error_text 说，不带解码器原话
+        problem = config_layout.config_error_text(exc) if isinstance(exc, UnicodeDecodeError) else str(exc)
         try:
             os.replace(self._path, aside)
         except OSError as move_exc:
             self._refuse_writes(
-                f"{self._path} 格式不对（{exc}），改名留存也失败了（{move_exc}），这次运行不写它，会话登记从空表开始"
+                f"{SESSION_REGISTRY_FILE} 格式不对（{problem}），改名留存也失败了（{config_layout.config_error_text(move_exc)}），"
+                "这次运行不写它，会话登记从空表开始"
             )
             return
-        self.load_error = f"{self._path} 格式不对（{exc}），已改名为 {aside.name} 留存，会话登记从空表开始"
+        self.load_error = f"{SESSION_REGISTRY_FILE} 格式不对（{problem}），已改名为 {aside.name} 留存，会话登记从空表开始"
         logger.error("%s", self.load_error)
 
     def reload(self) -> LoadedRegistry:
@@ -462,7 +471,7 @@ class SessionStore:
                 return count
             snapshot = self._changed_locked()
         if not self.flush_snapshot(snapshot):
-            raise OSError(f"sessions.json: rekeyed registry could not be written to {self._path}")
+            raise OSError(f"{SESSION_REGISTRY_FILE}: rekeyed registry could not be written")
         return count
 
 
@@ -495,7 +504,7 @@ def _last_active_moment(entry: dict[str, Any]) -> datetime:
 
 
 def session_registry_path(workspace_root: Path) -> Path:
-    return Path(workspace_root) / "data" / "sessions.json"
+    return Path(workspace_root) / SESSION_REGISTRY_FILE
 
 
 def rekey_session_registry(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
@@ -567,7 +576,7 @@ def _read_registry(path: Path) -> dict[str, Any] | None:
         return None
     data = json.loads(raw)
     if not isinstance(data, dict):
-        raise ValueError(f"sessions.json root is {type(data).__name__}, expected an object: {path}")
+        raise ValueError(f"sessions.json root is {type(data).__name__}, expected an object")
     return data
 
 

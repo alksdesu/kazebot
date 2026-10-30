@@ -214,6 +214,27 @@ class TestTheEngineCopyOfThePolicy:
         assert "按内置默认策略的 extra_roots 算" in warning
         assert "上一份" not in warning
 
+    @pytest.mark.parametrize("make", ["directory", "not-utf8"])
+    def test_an_unreadable_file_is_named_without_its_path_or_the_decoder_wording(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, make: str,
+    ) -> None:
+        path = config_layout.policy_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if make == "directory":
+            path.mkdir()
+        else:
+            path.write_bytes(b"version: 1\n# \xff\n")
+
+        with caplog.at_level(logging.WARNING, logger=clonoth_runtime._log.name):
+            clonoth_runtime.load_policy_config(tmp_path)
+
+        [warning] = _policy_warnings(caplog)
+        assert "用不了，文件工具和项目说明按内置默认策略的 extra_roots 算：读不了：" in warning
+        assert str(tmp_path) not in warning
+        assert "codec" not in warning
+        if make == "not-utf8":
+            assert warning.endswith("不是 UTF-8 编码（第 14 个字节）")
+
     def test_an_empty_file_counts_as_unusable_like_in_the_policy_engine(self, tmp_path: Path) -> None:
         path = self._seed(tmp_path)
         clonoth_runtime.load_policy_config(tmp_path)

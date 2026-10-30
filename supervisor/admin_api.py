@@ -358,7 +358,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except config_layout.ConfigBackupError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"写入 {target.name} 失败，原文件没动：{exc}") from exc
+            raise HTTPException(
+                status_code=500, detail=f"写入 {target.name} 失败，原文件没动：{config_layout.config_error_text(exc)}",
+            ) from exc
         result: dict[str, Any] = {"ok": True, "hash": new_hash, "path": _rel(target)}
         if warnings:
             result["warnings"] = warnings
@@ -397,7 +399,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         try:
             return config_layout.remove_config_file(p)
         except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"删除 {p.name} 失败：{exc}") from exc
+            raise HTTPException(status_code=500, detail=f"删除 {p.name} 失败：{config_layout.config_error_text(exc)}") from exc
 
     def _skill_check(content: str) -> list[str]:
         """SKILL.md 的 frontmatter 和加载时同一套读法：写坏的存下去只会被跳过，注入里没有它。"""

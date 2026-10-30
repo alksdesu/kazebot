@@ -288,6 +288,29 @@ class TestFailures:
 
         assert EditJournal(tmp_path).tasks("sess-j") == []
 
+    @pytest.mark.parametrize(("body", "said"), [
+        (b"{ not json", "读不出来（Expecting property name"),
+        (b"\xff\xfe{}", "读不出来（不是 UTF-8 编码（第 1 个字节））"),
+        (b"[]", "格式不对"),
+    ])
+    def test_a_corrupt_manifest_is_named_by_its_place_in_the_workspace(
+        self, tmp_path: Path, body: bytes, said: str,
+    ) -> None:
+        # 原因进日志、交给 undo_edits 的结果：绝对路径和解码器原话不带
+        path = seed(tmp_path / "f.txt", b"one\n")
+        change(scope(tmp_path), path, b"two\n")
+        task_dir = EditJournal(tmp_path).task_dir("sess-j", "task-1")
+        (task_dir / "manifest.json").write_bytes(body)
+
+        with pytest.raises(JournalCorrupt) as caught:
+            EditJournal._load_manifest(task_dir)
+
+        message = str(caught.value)
+        assert message.startswith(f"data/edit_journal/{task_dir.parent.name}/{task_dir.name}/manifest.json ")
+        assert said in message
+        assert str(tmp_path) not in message
+        assert "codec" not in message
+
     def test_a_corrupt_manifest_is_started_over_on_the_next_change(self, tmp_path: Path) -> None:
         path = seed(tmp_path / "f.txt", b"one\n")
         change(scope(tmp_path), path, b"two\n")

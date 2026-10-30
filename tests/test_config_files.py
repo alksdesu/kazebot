@@ -9,7 +9,8 @@ from fastapi import HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from supervisor.config_files import parse_mapping, value_at  # noqa: E402
+from supervisor import config_files  # noqa: E402
+from supervisor.config_files import parse_mapping, read_raw, value_at, write_raw  # noqa: E402
 
 _DOCUMENT = {"extensions": {"sticker": {"auto_accept": False, "groups": [1, 2]}, "echo": None}, "mode": "all"}
 
@@ -53,3 +54,46 @@ def test_a_refusal_names_the_place_and_leaves_no_content_on_its_chain(content: s
     assert (caught.value.status_code, caught.value.detail) == (400, detail)
     for link in (caught.value.__cause__, caught.value.__context__):
         assert link is not None and "sk-SECRET" not in str(link)
+
+
+class TestReadingTheFileOnDisk:
+    def test_a_missing_file_is_not_taken_over_yet(self, tmp_path: Path) -> None:
+        assert read_raw(tmp_path / "qq.yaml") == {"content": "", "exists": False, "hash": ""}
+
+    def test_a_file_that_is_not_utf8_is_refused_with_the_reason(self, tmp_path: Path) -> None:
+        # 以前解码异常没人接，控制台只拿到一句光秃秃的服务器错误
+        path = tmp_path / "qq.yaml"
+        path.write_bytes(b"queue:\n  workers: 2\n# \xff\n")
+
+        with pytest.raises(HTTPException) as caught:
+            read_raw(path)
+
+        assert caught.value.status_code == 500
+        assert caught.value.detail == "qq.yaml 读不了：不是 UTF-8 编码（第 23 个字节）"
+
+    def test_a_file_that_cannot_be_read_is_refused_without_its_absolute_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "qq.yaml"
+        path.mkdir()
+
+        with pytest.raises(HTTPException) as caught:
+            read_raw(path)
+
+        assert caught.value.status_code == 500
+        assert caught.value.detail.startswith("qq.yaml 读不了：")
+        assert str(tmp_path) not in caught.value.detail
+
+    def test_a_failed_write_says_why_without_the_absolute_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / "qq.yaml"
+
+        def refuse(target: Path, *_args: object, **_kwargs: object) -> str:
+            raise PermissionError(13, "Permission denied", str(target))
+
+        monkeypatch.setattr(config_files.config_layout, "write_config_text", refuse)
+
+        with pytest.raises(HTTPException) as caught:
+            write_raw(path, "queue: {}\n")
+
+        assert caught.value.status_code == 500
+        assert caught.value.detail == "写入 qq.yaml 失败，原文件没动：Permission denied"

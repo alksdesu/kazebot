@@ -245,6 +245,8 @@ class TestNaiGenerate:
 
         assert code == 1, stderr
         assert result["error"].startswith("NovelAI API key is missing"), result
+        # 工具子进程里 *_API_KEY 被剥掉了，叫人设环境变量等于叫人设一个工具读不到的地方
+        assert "CLONOTH_TEST_UNSET_NOVELAI_KEY=<key> in this instance's .env or config/secrets.env" in result["error"]
 
 
 @contextmanager

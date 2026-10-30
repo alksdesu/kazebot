@@ -780,6 +780,11 @@ class TestUnreadableRegistry:
             other = _session(restarted, "qq_group:2002")
 
         assert "读不出来" in restarted._session_store.load_error
+        # 原因进诊断和控制台：按工作区里的位置说，OSError 原文里的绝对路径不带
+        assert restarted._session_store.load_error.startswith(
+            "data/sessions.json 读不出来（the file is locked by another process）",
+        )
+        assert str(tmp_path) not in restarted._session_store.load_error
         assert sid not in restarted.sessions and other in restarted.sessions
         assert path.read_text(encoding="utf-8") == before
         assert any("not written while it cannot be read" in r.getMessage() for r in caplog.records)
@@ -815,6 +820,12 @@ class TestUnreadableRegistry:
         assert aside.name in state._session_store.load_error
         assert any(aside.name in r.getMessage() for r in caplog.records)
         assert sid in json.loads(path.read_text(encoding="utf-8"))
+        load_error = state._session_store.load_error
+        assert load_error.startswith("data/sessions.json 格式不对（")
+        assert str(tmp_path) not in load_error
+        assert "codec" not in load_error
+        if isinstance(broken, bytes):
+            assert "不是 UTF-8 编码（第 1 个字节）" in load_error
 
     def test_a_corrupt_registry_that_cannot_be_moved_is_not_overwritten_either(
         self, tmp_path: Path, monkeypatch,
@@ -832,7 +843,8 @@ class TestUnreadableRegistry:
         assert store.load() == ({}, {}, {}, {})
         store.upsert_entry("user", _user_row())
 
-        assert "改名留存也失败了" in store.load_error
+        assert "改名留存也失败了（in use）" in store.load_error
+        assert str(tmp_path) not in store.load_error
         assert store.read_only
         assert path.read_text(encoding="utf-8") == "{ not json"
         # 不写不算写失败：分支合并、子会话清理照常走，登记这次只在内存里

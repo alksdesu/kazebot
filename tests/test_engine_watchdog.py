@@ -130,6 +130,43 @@ class TestRespawn:
         assert health["last_exit_code"] == 13
         assert "PermissionError" in health["last_log"]
 
+    def _die_with_log(self, pm: ProcessManager, tmp_path: Path, text: str) -> list[tuple[str, dict]]:
+        seen: list[tuple[str, dict]] = []
+        pm._on_event = lambda kind, payload: seen.append((kind, payload))
+        pm.start_engine()
+        log = tmp_path / "logs" / "engine-1.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_bytes(text.encode("utf-8"))
+        pm.engines[0].log_path = log
+        pm.engines[0].popen.die(1)
+        pm._watchdog_tick()
+        return seen
+
+    def test_a_secret_in_the_tail_is_masked_on_the_runtime_page_and_in_the_event(
+        self, pm: ProcessManager, tmp_path: Path,
+    ) -> None:
+        # 日志尾巴进控制台的运行页和 engine_died 事件，崩溃前打出来的请求参数里常带着 key
+        seen = self._die_with_log(
+            pm, tmp_path, "Traceback (most recent call last):\nRuntimeError: upstream refused api_key=relay-crash-secret-0001\n",
+        )
+
+        last_log = pm.worker_health()["engine-1"]["last_log"]
+        assert "relay-crash-secret" not in last_log
+        assert "upstream refused api_key=" in last_log
+        died = next(payload for kind, payload in seen if kind == "engine_died")
+        assert "relay-crash-secret" not in died["tail"]
+
+    def test_a_key_cut_off_by_the_tail_is_still_masked(self, pm: ProcessManager, tmp_path: Path) -> None:
+        # 只截最后那段再打码的话，键名被截掉的那个值就认不出是密钥了
+        kept = "boundary-value-0001"
+        after = "\n" + "y" * (pm._TAIL_CHARS - len(kept) - 2) + "\n"
+        text = "x" * 2000 + "\napi_key=relay-" + kept + after
+        assert text[-pm._TAIL_CHARS:].startswith(kept)
+
+        self._die_with_log(pm, tmp_path, text)
+
+        assert "boundary-value" not in pm.worker_health()["engine-1"]["last_log"]
+
 
 class TestBackoff:
     def _crash_no_retry(self, pm: ProcessManager, name: str = "engine-1") -> None:

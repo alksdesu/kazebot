@@ -516,3 +516,28 @@ class TestAnUnreadableFile:
         assert str(caught.value).endswith(f"读不懂：{reason}")
         for link in (caught.value, caught.value.__cause__, caught.value.__context__):
             assert link is not None and "sk-SECRET" not in str(link)
+
+    @pytest.mark.parametrize(("body", "said"), [
+        (b"schedules: [unclosed\n", "data/schedules.yaml 读不懂：第 "),
+        (b"schedules:\n  - id: a\n# \xff\n", "data/schedules.yaml 读不懂：不是 UTF-8 编码（第 "),
+        (b"- id: a\n", "data/schedules.yaml 顶层要写成映射"),
+        (b"schedules: nope\n", "data/schedules.yaml 里的 schedules 要写成列表"),
+    ])
+    def test_the_reason_names_the_file_by_its_place_in_the_workspace(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, body: bytes, said: str,
+    ) -> None:
+        # 原因经定时任务工具交给模型、每分钟进一次日志：绝对路径和解码器原话都不往外带
+        path = schedules_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(body)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.scheduler"):
+            assert load_schedules(tmp_path) == []
+        with pytest.raises(scheduler.ScheduleFileUnreadable) as caught:
+            scheduler.read_schedules(tmp_path)
+
+        assert str(caught.value).startswith(said)
+        assert str(tmp_path) not in str(caught.value)
+        assert "codec" not in str(caught.value)
+        assert said in caplog.text
+        assert str(tmp_path) not in caplog.text

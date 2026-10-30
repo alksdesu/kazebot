@@ -775,10 +775,32 @@ class TestInventory:
         self._seed_every_store(state)
         session_registry_path(state.workspace_root).write_text("{not json", encoding="utf-8")
 
-        with pytest.raises(ConversationStoreError, match="会话注册表"):
+        with pytest.raises(ConversationStoreError, match="会话注册表") as caught:
             rekey_conversation_stores(state.workspace_root, ConversationRekey({OLD: NEW}), apply=True)
 
         assert load_schedules(state.workspace_root)[0]["conversation_key"] == OLD
+        # 原因回给控制台：文件按工作区里的位置说
+        assert str(caught.value).startswith("会话注册表（data/sessions.json）改写失败：")
+        assert str(state.workspace_root) not in str(caught.value)
+
+    def test_a_store_that_cannot_be_read_names_the_reason_not_the_absolute_path(
+        self, state: SupervisorState, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._seed_every_store(state)
+        registry = session_registry_path(state.workspace_root)
+        real_read_text = Path.read_text
+
+        def locked(self: Path, *args: object, **kwargs: object) -> str:
+            if self == registry:
+                raise PermissionError(13, "the file is locked by another process", str(registry))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", locked)
+
+        with pytest.raises(ConversationStoreError) as caught:
+            rekey_conversation_stores(state.workspace_root, ConversationRekey({OLD: NEW}), apply=False)
+
+        assert str(caught.value) == "会话注册表（data/sessions.json）改写失败：the file is locked by another process"
 
     def test_a_conflict_is_reported_as_it_is(self, tmp_path: Path) -> None:
         service = MaterialService(tmp_path)

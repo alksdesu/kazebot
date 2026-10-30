@@ -56,6 +56,42 @@ def test_switch_by_alias_persists_target_id(settings_path: Path) -> None:
     assert written["params"]["selected_preset_id"] == "cute"
 
 
+def test_switching_writes_back_only_the_selection(settings_path: Path) -> None:
+    # 补上的默认值写进实例那份，升级改了默认也到不了这个实例
+    common.set_selected_preset("萌")
+
+    written = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    expected = {**_SETTINGS, "params": {**_SETTINGS["params"], "selected_preset_id": "cute"}}
+    assert written == expected
+
+
+def test_switching_to_the_built_in_preset_adds_no_default_sections(settings_path: Path) -> None:
+    settings_path.write_text("api:\n  api_key_env: MY_NAI_KEY\n", encoding="utf-8")
+
+    target = common.set_selected_preset(common.DEFAULT_PRESET["id"])
+
+    assert target["id"] == common.DEFAULT_PRESET["id"]
+    written = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    assert written == {"api": {"api_key_env": "MY_NAI_KEY"}, "params": {"selected_preset_id": common.DEFAULT_PRESET["id"]}}
+
+
+def test_switching_without_an_own_file_copies_the_template_with_the_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # 实例还没有自己那份时预设只在模板里，照模板那份写，切过去的预设下次才找得到
+    example = tmp_path / "settings.example.yaml"
+    example.write_text(yaml.safe_dump(_SETTINGS, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    own = tmp_path / "settings.yaml"
+    monkeypatch.setattr(common, "SETTINGS_PATH", own)
+    monkeypatch.setattr(common, "SETTINGS_EXAMPLE_PATH", example)
+
+    common.set_selected_preset("cute")
+
+    written = yaml.safe_load(own.read_text(encoding="utf-8"))
+    assert written == {**_SETTINGS, "params": {**_SETTINGS["params"], "selected_preset_id": "cute"}}
+    assert yaml.safe_load(example.read_text(encoding="utf-8")) == _SETTINGS
+
+
 def test_selected_preset_falls_back_when_ref_unknown(settings_path: Path) -> None:
     settings = common.load_settings()
     preset = common.selected_preset(settings, "不存在")

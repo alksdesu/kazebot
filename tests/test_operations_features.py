@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 import sys
 import threading
@@ -21,8 +22,8 @@ from supervisor.operations.service import OperationsService
 PLAIN = PlatformDescriptor(id="plainchat", display_name="Plain", short_name="P")
 
 
-def service(root):
-    secret = SimpleNamespace(provider="missing", model="", api_key="secret-test-key")
+def service(root, api_key="secret-test-key"):
+    secret = SimpleNamespace(provider="missing", model="", api_key=api_key)
     state = SimpleNamespace(
         workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
         feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret, load_error=""),
@@ -117,6 +118,101 @@ def test_diagnostics_redacts_and_reports_real_unavailable_worker(tmp_path):
     assert operations.get_report(report["id"]) == report
     with pytest.raises(ValueError):
         operations.get_report("../../config")
+
+
+@pytest.mark.parametrize("api_key", ["c", "1", "x"])
+def test_a_one_character_channel_key_leaves_the_report_readable(tmp_path, api_key):
+    # 本地模型常配 x、1 这类占位 key：按子串替换会把 checks、created_at 这些键名和报告号抹坏，控制台读不出、导出链接也断了
+    operations = service(tmp_path, api_key=api_key)
+
+    report = asyncio.run(operations.diagnose())
+
+    assert {"id", "created_at", "status", "checks"} <= set(report)
+    assert re.fullmatch(r"[0-9a-f]{32}", report["id"])
+    assert all({"name", "status", "detail"} <= set(item) for item in report["checks"])
+    assert operations.get_report(report["id"]) == report
+
+
+def test_a_short_channel_key_is_hidden_where_it_stands_alone(tmp_path):
+    operations = service(tmp_path, api_key="k9")
+    logs = tmp_path / "data/logs"
+    logs.mkdir(parents=True)
+    (logs / "test.log").write_text("401 for key k9 on relay-k9x\n", encoding="utf-8")
+
+    report = asyncio.run(operations.diagnose(include_logs=True))
+
+    assert "401 for key [已隐藏] on relay-k9x" in report["logs"]["test.log"]
+
+
+def test_a_switch_under_a_secret_key_does_not_wipe_every_true_and_on(tmp_path, monkeypatch):
+    # .env 的值全是字符串：开关挂在密钥键下也不当密钥收，不然导出里每个独立的 true、on 都被抹掉
+    nodes = tmp_path / "config" / "nodes"
+    nodes.mkdir(parents=True)
+    (nodes / "relay.yaml").write_text(
+        'type: ai\napi_key: "on"\nallow_credentials: "true"\ntoken: "off"\npassword: relay-real-secret-0001\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RELAY_TOKEN", "yes")
+    operations = service(tmp_path)
+    logs = tmp_path / "data/logs"
+    logs.mkdir(parents=True)
+    (logs / "test.log").write_text(
+        "cors allow_credentials=true, websocket on, retry yes, cache off; relay said relay-real-secret-0001\n",
+        encoding="utf-8",
+    )
+
+    report = asyncio.run(operations.diagnose(include_logs=True))
+
+    assert (
+        "cors allow_credentials=true, websocket on, retry yes, cache off; relay said [已隐藏]"
+        in report["logs"]["test.log"]
+    )
+
+
+def test_a_short_number_counts_under_a_password_but_not_under_a_token(tmp_path, monkeypatch):
+    # token 档的短数字多是开关和次数，收进来导出里每个独立的 1 都被抹掉；口令档不设最短长度
+    nodes = tmp_path / "config" / "nodes"
+    nodes.mkdir(parents=True)
+    (nodes / "relay.yaml").write_text('type: ai\ntoken: "1"\npassword: 4321\n', encoding="utf-8")
+    monkeypatch.setenv("RELAY_TOKEN", "1")
+    operations = service(tmp_path)
+
+    secrets = operations._configured_secrets()
+
+    assert "1" not in secrets
+    assert "4321" in secrets
+    assert operations._clean("retry 1 of 3, pin 4321 rejected", secrets) == "retry 1 of 3, pin [已隐藏] rejected"
+
+
+def test_a_token_budget_in_a_node_file_is_usage_not_a_secret(tmp_path):
+    # 收进来的话，导出里每个独立的 128000 都会被抹掉
+    nodes = tmp_path / "config" / "nodes"
+    nodes.mkdir(parents=True)
+    (nodes / "planner.yaml").write_text("type: ai\nthinking:\n  budget_tokens: 128000\n", encoding="utf-8")
+    operations = service(tmp_path)
+
+    secrets = operations._configured_secrets()
+
+    assert "128000" not in secrets
+    assert operations._clean("thinking budget 128000 used", secrets) == "thinking budget 128000 used"
+
+
+def test_entries_under_a_secret_key_are_judged_like_mask_sensitive_in_the_export(tmp_path):
+    # 空值、布尔、开关、token 档的短数字和用量照给，看得出配没配、开没开、用了多少；其余整项藏
+    operations = service(tmp_path)
+
+    cleaned = operations._clean({
+        "api_key": None, "use_token": True, "client_secret": "off", "password": "", "token": "12", "bot_token": 12,
+        "usage": {"prompt_tokens": 152340}, "credentials": "relay-x", "db_password": "x", "access_token": 123456789,
+        "headers": {"api_key": {"value": "relay-y"}, "tokens": ["abcdefgh"]}, "auth": {"password": "x"}, "model": "m",
+    })
+
+    assert cleaned == {
+        "api_key": None, "use_token": True, "client_secret": "off", "password": "", "token": "12", "bot_token": 12,
+        "usage": {"prompt_tokens": 152340}, "credentials": "[已隐藏]", "db_password": "[已隐藏]",
+        "access_token": "[已隐藏]", "headers": {"api_key": "[已隐藏]", "tokens": "[已隐藏]"},
+        "auth": {"password": "[已隐藏]"}, "model": "m",
+    }
 
 
 def test_fleet_status_uses_the_live_convention_and_applied_fingerprint(tmp_path):

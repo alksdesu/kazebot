@@ -397,6 +397,24 @@ class TestWriteFile:
 
         assert write(ctx, "dir", "x")["ok"] is False
 
+    def test_a_failed_write_names_the_file_without_its_absolute_path(
+        self, ctx: _Ctx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 原因原样交给模型：OSError 的原文带着工作区的绝对路径和临时文件名
+        write_module = importlib.import_module("toolbox.builtins.write_file")
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise PermissionError(13, "Permission denied", str(tmp_path / "notes" / ".f.txt.1234.tmp"))
+
+        monkeypatch.setattr(write_module, "_commit", refuse)
+
+        result = write(ctx, "notes/f.txt", "new\n")
+
+        assert result["ok"] is False
+        assert result["error"] == "写入 notes/f.txt 失败：Permission denied"
+        assert str(tmp_path) not in result["data"]["result"]
+        assert not (tmp_path / "notes" / "f.txt").exists()
+
     @pytest.mark.parametrize(
         "name,content,label",
         [
@@ -545,6 +563,24 @@ class TestApplyDiffIsAllOrNothing:
 
         assert result["ok"] is False
         assert "文件不存在" in result["error"]
+
+    def test_a_failed_read_or_write_names_the_file_without_its_absolute_path(
+        self, ctx: _Ctx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        edit_flow = importlib.import_module("toolbox.builtins._edit_flow")
+        path = seed(tmp_path / "f.txt", b"alpha\n")
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(edit_flow, "transact_text", refuse)
+
+        result = diff(ctx, "f.txt", edit("alpha", "beta"))
+
+        assert result["ok"] is False
+        assert result["error"] == "读写 f.txt 失败：Permission denied"
+        assert str(tmp_path) not in result["data"]["result"]
+        assert path.read_bytes() == b"alpha\n"
 
     def test_a_binary_file_is_refused(self, ctx: _Ctx, tmp_path: Path) -> None:
         path = seed(tmp_path / "blob.bin", b"\xff\xfe\x00\x01")

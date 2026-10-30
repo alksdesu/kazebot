@@ -1229,6 +1229,26 @@ def test_a_file_broken_before_the_first_read_means_no_clients(tmp_path: Path, se
     assert mcp_runtime.list_clients(root) == []
 
 
+@pytest.mark.parametrize("make", ["directory", "not-utf8"])
+def test_an_unreadable_file_is_named_without_its_path_or_the_decoder_wording(tmp_path: Path, make: str) -> None:
+    # 原因进控制台的 MCP 页、日志和交给模型的结果
+    root = tmp_path / "fresh"
+    path = config_layout.mcp_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if make == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b"clients: {}\n# \xff\n")
+
+    error = mcp_runtime.config_error(root)
+
+    assert error.startswith(f"{config_layout.MCP_FILE} 用不了，现在按没有客户端算：读不了：")
+    assert str(tmp_path) not in error
+    assert "codec" not in error
+    if make == "not-utf8":
+        assert error.endswith("不是 UTF-8 编码（第 15 个字节）")
+
+
 def test_a_client_whose_listing_hangs_times_out_without_holding_up_the_others(ws: Path, server: _FakeServer) -> None:
     mcp_runtime.upsert_client(ws, {**_SPEC, "id": "web"})
     _serve_ping(server)

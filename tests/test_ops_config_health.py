@@ -246,7 +246,7 @@ def test_a_key_on_the_broken_line_of_models_yaml_is_hidden_in_the_export(tmp_pat
 def test_a_session_registry_that_could_not_be_read_says_it_is_not_written(tmp_path: Path) -> None:
     # 启动时读不出来就从空表开始、这次运行不写：不报出来的话，人只会看到旧对话都另开了新会话
     operations = service(tmp_path)
-    reason = "data/sessions.json 读不出来（PermissionError），这次运行不写它，会话登记从空表开始；修好后重启"
+    reason = "data/sessions.json 读不出来（Permission denied），这次运行不写它，会话登记从空表开始；修好后重启"
     operations.state._session_store = SimpleNamespace(load_error=reason, read_only=True)
 
     item = check(asyncio.run(operations.diagnose()), "会话登记")
@@ -257,7 +257,10 @@ def test_a_session_registry_that_could_not_be_read_says_it_is_not_written(tmp_pa
 
 def test_a_session_registry_set_aside_points_at_the_kept_copy(tmp_path: Path) -> None:
     operations = service(tmp_path)
-    reason = "data/sessions.json 格式不对，已改名为 sessions.json.corrupt-1 留存，会话登记从空表开始"
+    reason = (
+        "data/sessions.json 格式不对（Expecting value: line 1 column 1 (char 0)），"
+        "已改名为 sessions.json.corrupt-1 留存，会话登记从空表开始"
+    )
     operations.state._session_store = SimpleNamespace(load_error=reason, read_only=False)
 
     item = check(asyncio.run(operations.diagnose()), "会话登记")

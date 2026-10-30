@@ -715,6 +715,9 @@ class TestUnknownWorktree:
         assert "登记文件读不出来" in refused.result["error"] and "不会退回原仓库里接着做" in refused.result["error"]
         assert fresh.status == TaskStatus.failed and "登记文件读不出来" in fresh.result["error"]
         assert "去掉 isolation 和 repo" in fresh.result["error"]
+        # 原因会交给模型：按工作区里的位置说，OSError 原文里的绝对路径不带
+        assert "data/worktrees.json 读不出来：the file is locked by another process" in fresh.result["error"]
+        assert str(env.ws) not in fresh.result["error"]
         with pytest.raises(RegistryUnreadable):
             service.registry.put({"id": "t-new", "state": "creating", "owners": ["t-new"]})
         assert real_read_bytes(path) == kept
@@ -1117,7 +1120,20 @@ class TestRestart:
 
         assert service.registry.entries() == []
         assert "格式不对" in service.registry.load_error
+        assert service.registry.load_error.startswith("data/worktrees.json 格式不对（")
+        assert str(env.ws) not in service.registry.load_error
         assert [item.name for item in path.parent.iterdir() if item.name.startswith("worktrees.json.corrupt-")]
+
+    def test_a_registry_that_is_not_utf8_is_named_without_the_decoder_wording(self, env: Env) -> None:
+        path = registry_path(env.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xff\xfe{}")
+
+        service = WorktreeService(env.state)
+
+        assert service.registry.entries() == []
+        assert service.registry.load_error.startswith("data/worktrees.json 格式不对（不是 UTF-8 编码（第 1 个字节））")
+        assert "codec" not in service.registry.load_error
 
 
 def test_the_runtime_keys_have_their_documented_defaults(env: Env) -> None:

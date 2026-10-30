@@ -309,6 +309,24 @@ class TestBrokenBeforeItWasEverRead:
         assert "读不了" in store.load_error
         assert store.get_openai_secret().model == "gpt-4o-mini"
 
+    @pytest.mark.parametrize("make", ["directory", "not-utf8"])
+    def test_the_reason_carries_neither_the_path_nor_the_decoder_wording(self, tmp_path: Path, make: str) -> None:
+        # 原因进控制台的模型页、诊断和日志
+        path = tmp_path / "config" / "models.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if make == "directory":
+            path.mkdir()
+        else:
+            path.write_bytes(b"version: 1\n# \xff\n")
+
+        error = ConfigStore(path=path, workspace_root=tmp_path).load_error
+
+        assert "读不了：" in error
+        assert str(tmp_path) not in error
+        assert "codec" not in error
+        if make == "not-utf8":
+            assert "读不了：不是 UTF-8 编码（第 14 个字节）" in error
+
     @BROKEN_FILES
     def test_channel_edits_stay_refused(self, tmp_path: Path, broken: str) -> None:
         path = _write(tmp_path / "config" / "models.yaml", broken)

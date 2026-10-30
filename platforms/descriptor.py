@@ -222,6 +222,9 @@ class SecretField:
     file: str = ""
     # 改那份自动文件位置的环境变量。只给已经在用它的平台，新平台不加。
     file_env: str = ""
+    # 平台宿主库自己从进程环境读的这一项的别名，读到就盖过交给它的值，比如 NoneBot 适配器认的 ONEBOT_V11_ACCESS_TOKEN。
+    # 值来自配置文件时入口按这些名字一并交给宿主库；工具子进程里照样剥掉，manage_secret 不写、共享组不抄。
+    host_env: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _KEY_NAME.match(self.name):
@@ -237,6 +240,21 @@ class SecretField:
             check_workspace_glob(self.file, what=f"secret {self.name!r} file")
             if self.file.startswith(_CONFIG_DIR):
                 raise ValueError(f"secret {self.name!r} file must not live under config/: {self.file!r}")
+        self._check_host_env()
+
+    def _check_host_env(self) -> None:
+        if isinstance(self.host_env, str):
+            raise ValueError(f"secret {self.name!r} host_env must list env names, not be a single string")
+        aliases = tuple(self.host_env)
+        bad = [alias for alias in aliases if not isinstance(alias, str) or not _ENV_NAME.match(alias)]
+        if bad:
+            raise ValueError(f"secret {self.name!r} host env names must be UPPER_SNAKE_CASE: {bad}")
+        if len(aliases) != len(set(aliases)):
+            raise ValueError(f"duplicate host env names in secret {self.name!r}")
+        own = sorted(set(aliases) & {self.env, self.file_env})
+        if own:
+            raise ValueError(f"secret {self.name!r} lists its own env names as host aliases: {own}")
+        object.__setattr__(self, "host_env", aliases)
 
 
 @dataclass(frozen=True)
@@ -277,7 +295,7 @@ class PlatformDescriptor:
     capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
     # 平台自己的密钥：连接令牌、AppSecret 这类。读取顺序是 data/platform_secrets.yaml 的 <平台 id> 段 > env > 自动生成的文件。
     secrets: tuple[SecretField, ...] = ()
-    # 平台宿主库自己从环境变量读、没有 SecretField 的密钥，比如 NoneBot 适配器认的令牌别名。
+    # 平台宿主库自己从环境变量读、没有 SecretField 的密钥，比如 NoneBot 适配器认的上报签名密钥；某项密钥的别名记在它的 host_env 上。
     # 工具子进程里照样剥掉；这些名字只认进程环境，manage_secret 不写、共享组不抄。
     host_secret_env: tuple[str, ...] = ()
     # 其他夹着凭据的文件（glob，相对工作区），比如排队的账号操作里带着管理员令牌。
@@ -373,12 +391,20 @@ class PlatformDescriptor:
         bad = [name for name in names if not isinstance(name, str) or not _ENV_NAME.match(name)]
         if bad:
             raise ValueError(f"platform {self.id!r} host secret env names must be UPPER_SNAKE_CASE: {bad}")
-        if len(names) != len(set(names)):
+        declared = names + [alias for secret in self.secrets for alias in secret.host_env]
+        if len(declared) != len(set(declared)):
             raise ValueError(f"duplicate host secret env names in platform {self.id!r}")
         # env_scope 先判实例身份：两边都写的名字只会被当成实例身份，声明自相矛盾。
-        clash = sorted(set(names) & self.identity_env_names())
+        clash = sorted(set(declared) & self.identity_env_names())
         if clash:
             raise ValueError(f"platform {self.id!r} declares host secret env names that are already instance identity: {clash}")
+
+    def host_env_names(self) -> frozenset[str]:
+        """平台宿主库自己从进程环境读的密钥变量名：各项密钥的 host_env，加上没有 SecretField 的 host_secret_env。"""
+        names = set(self.host_secret_env)
+        for secret in self.secrets:
+            names.update(secret.host_env)
+        return frozenset(names)
 
     def identity_env_names(self) -> frozenset[str]:
         """这个平台声明成实例身份的环境变量：instance_env、密钥和它自动文件的位置，挪配置、资料和状态文件用的那几个。"""

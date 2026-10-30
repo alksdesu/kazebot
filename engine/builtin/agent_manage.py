@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
@@ -28,6 +29,7 @@ from engine.node import (
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
 from toolbox.redaction import mask_sensitive
+from toolbox.text_files import normalize_newlines
 
 log = logging.getLogger(__name__)
 
@@ -97,7 +99,8 @@ def _yaml_preview(definition: dict[str, Any]) -> str:
     模板和调用方节点是模型读不到的文件，审批 details 却会进事件流、控制台和调试工具。
     """
     masked = mask_sensitive(definition)
-    return yaml.safe_dump(masked, default_flow_style=False, allow_unicode=True)[:_PREVIEW_CHARS]
+    # 键序和落盘那份一致，审批人对照着看
+    return yaml.safe_dump(masked, default_flow_style=False, allow_unicode=True, sort_keys=False)[:_PREVIEW_CHARS]
 
 
 class _CallerUpdate(NamedTuple):
@@ -107,6 +110,140 @@ class _CallerUpdate(NamedTuple):
     already_listed: bool = False
     denied: str = ""
     error: str = ""
+
+
+_DELEGATE_TARGETS = "delegate_targets"
+_NULL_TAG = "tag:yaml.org,2002:null"
+
+
+class _TargetsUneditable(ValueError):
+    """delegate_targets 没法只改这一项、其余原文不动地加上新名字。消息只有位置和问题，不带原文。"""
+
+
+def _node_text(path: Path) -> str:
+    """节点文件原文：严格按 UTF-8 解码，开头的 BOM 留着，CRLF 统一成 LF（写回时 write_config_text 照原文件的换行写）。"""
+    try:
+        text = normalize_newlines(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _TargetsUneditable(f"读不了：{config_layout.config_error_text(exc)}") from None
+    if "\r" in text:
+        raise _TargetsUneditable("文件里有单独的回车符，按行改不准")
+    return text
+
+
+def _rendered_target(name: str) -> str:
+    """name 写成 YAML 标量的样子：123、yes、on 这类会被读成别的类型的名字带上引号。"""
+    return yaml.safe_dump([name], allow_unicode=True, default_flow_style=False)[len("- "):].rstrip("\n")
+
+
+def _list_indent(root: yaml.MappingNode) -> int:
+    """文件里顶层块列表的「- 」比键多缩进几格，新写的列表照着来；一个都没有按两格。"""
+    for key, value in root.value:
+        if isinstance(value, yaml.SequenceNode) and not value.flow_style and value.value:
+            return max(0, value.start_mark.column - key.start_mark.column)
+    return 2
+
+
+def _line_end(text: str, index: int) -> int:
+    end = text.find("\n", index)
+    return len(text) if end == -1 else end
+
+
+def _appended_targets(text: str, root: yaml.MappingNode, item: str) -> str:
+    """没写 delegate_targets：在顶层映射末尾补上这个键和一项，放在文档结束记号之前。"""
+    margin = " " * root.value[0][0].start_mark.column
+    block = f"{margin}{_DELEGATE_TARGETS}:\n{margin}{' ' * _list_indent(root)}- {item}\n"
+    position = root.end_mark.index
+    if position and text[position - 1] != "\n":
+        block = "\n" + block
+    return text[:position] + block + text[position:]
+
+
+def _filled_targets(text: str, root: yaml.MappingNode, key: yaml.Node, value: yaml.Node, item: str) -> str:
+    """delegate_targets 空着或写的 ~、null：键那一行去掉空值、留着行尾注释，下一行接上新的一项。"""
+    line_start = text.rfind("\n", 0, key.start_mark.index) + 1
+    line_end = _line_end(text, key.end_mark.index)
+    if value.end_mark.index > line_end:
+        raise _TargetsUneditable("delegate_targets 的空值没写在键那一行")
+    line = (text[line_start:value.start_mark.index].rstrip() + text[value.end_mark.index:line_end]).rstrip()
+    margin = " " * (key.start_mark.column + _list_indent(root))
+    return text[:line_start] + line + f"\n{margin}- {item}" + text[line_end:]
+
+
+def _block_target_added(text: str, value: yaml.SequenceNode, item: str) -> str:
+    """逐行写的列表：新的一项接在最后一项后面，「- 」对齐第一项；最后一项后面的空行和注释留给下一个键。"""
+    margin = " " * value.start_mark.column
+    position = value.value[-1].end_mark.index
+    if text[position - 1] == "\n":
+        # 最后一项是块标量，结尾已经换过行
+        return text[:position] + f"{margin}- {item}\n" + text[position:]
+    end = _line_end(text, position)
+    return text[:end] + f"\n{margin}- {item}" + text[end:]
+
+
+def _flow_target_added(text: str, value: yaml.SequenceNode, item: str) -> str:
+    """一行写完的 [...]：补在收尾的 ] 前面。跨行的不改：中间夹着注释时补的位置拿不准。"""
+    if value.start_mark.line != value.end_mark.line:
+        raise _TargetsUneditable("delegate_targets 写成了跨行的 [...]")
+    close = value.end_mark.index - 1
+    if text[close] != "]":
+        raise _TargetsUneditable("delegate_targets 的 [...] 不是以 ] 收尾")
+    if not value.value:
+        opening = text.rfind("[", value.start_mark.index, close)
+        if opening == -1:
+            raise _TargetsUneditable("delegate_targets 的 [...] 找不到开头")
+        return text[:opening + 1] + item + text[close:]
+    position = value.value[-1].end_mark.index
+    tail = text[position:close].strip()
+    if tail == ",":
+        comma = text.index(",", position, close)
+        return text[:comma + 1] + " " + item + text[comma + 1:]
+    if tail:
+        raise _TargetsUneditable("delegate_targets 的 [...] 末尾有认不出的内容")
+    return text[:position] + ", " + item + text[position:]
+
+
+def _inserted_target(text: str, root: yaml.MappingNode, key: yaml.Node, value: yaml.Node, item: str) -> str:
+    if isinstance(value, yaml.ScalarNode) and value.tag == _NULL_TAG:
+        return _filled_targets(text, root, key, value, item)
+    if not isinstance(value, yaml.SequenceNode):
+        raise _TargetsUneditable("delegate_targets 不是列表")
+    if value.flow_style:
+        return _flow_target_added(text, value, item)
+    return _block_target_added(text, value, item)
+
+
+def _with_delegate_target(text: str, data: dict[str, Any], name: str) -> str:
+    """只在 delegate_targets 里多出 name 的原文：注释、空行、键的顺序和别的值逐字不动。
+
+    data 是 read_node_definition 读到的定义，原文解析出来和它不一样（读的时候被改过）就不改。
+    改完重新解析，必须正好是 data 加上这一项，锚点、别名、合并键让别处跟着变的都不改。改不了抛 _TargetsUneditable。
+    """
+    try:
+        current = config_layout.load_yaml_text(text)
+        root = yaml.compose(text, Loader=config_layout.ConfigLoader)
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise _TargetsUneditable(f"读不出来：{config_layout.config_error_text(exc)}") from None
+    if current != data:
+        raise _TargetsUneditable("读的时候文件被改过")
+    if not isinstance(root, yaml.MappingNode) or root.flow_style:
+        raise _TargetsUneditable("整份节点写成了一行的 {...}")
+    pairs = [
+        (key, value) for key, value in root.value
+        if isinstance(key, yaml.ScalarNode) and key.value == _DELEGATE_TARGETS
+    ]
+    if len(pairs) > 1:
+        raise _TargetsUneditable("delegate_targets 写了不止一次")
+    item = _rendered_target(name)
+    updated = _inserted_target(text, root, *pairs[0], item) if pairs else _appended_targets(text, root, item)
+    expected = {**data, _DELEGATE_TARGETS: [*(data.get(_DELEGATE_TARGETS) or []), name]}
+    try:
+        written = config_layout.load_yaml_text(updated)
+    except yaml.YAMLError:
+        written = None
+    if written != expected:
+        raise _TargetsUneditable("改完对不上原来的内容，可能用了锚点、别名或合并键")
+    return updated
 
 
 async def _add_delegate_target(ctx: ToolContext, caller_node_id: str, name: str) -> _CallerUpdate:
@@ -126,15 +263,23 @@ async def _add_delegate_target(ctx: ToolContext, caller_node_id: str, name: str)
         return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）：{problem}")
     if problem:
         return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）不是能用的节点定义：{problem}")
-    targets = caller_data.get("delegate_targets")
+    targets = caller_data.get(_DELEGATE_TARGETS)
     if targets is None:
         targets = []
     if not isinstance(targets, list):
-        return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）的 delegate_targets 不是列表，没有改它")
+        return _CallerUpdate(
+            error=f"调用方节点 {caller_node_id}（{where}）的 delegate_targets 不是列表，引擎按没写算，改成列表再加；没有改它",
+        )
     if name in targets:
         return _CallerUpdate(updated=True, already_listed=True)
-    caller_data["delegate_targets"] = [*targets, name]
-    caller_yaml = yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True)
+    try:
+        # 只动这一项：整份 safe_dump 回去会洗掉注释、按字母重排键
+        caller_yaml = _with_delegate_target(_node_text(caller_path), caller_data, name)
+    except _TargetsUneditable as exc:
+        return _CallerUpdate(
+            error=f"调用方节点 {caller_node_id}（{where}）的 delegate_targets 没法只改这一项：{exc}；没有改它",
+        )
+    caller_data[_DELEGATE_TARGETS] = [*targets, name]
     try:
         # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
         # 和写节点定义一样送策略，不能因为「只加一行」就免检。
@@ -256,7 +401,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # Step 5: 写入新节点 yaml
     # 节点定义里有 prompt、模型和 tool_access，落一份就等于加一条新的执行路径，
     # 和 write_file 写 config/nodes/** 是同一件事，走同一道策略。
-    _node_yaml = yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True)
+    _node_yaml = yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
     _rel_target = f"{config_layout.NODES_DIR}/{name}.yaml"
     _op, err = await request_guard(
         ctx,

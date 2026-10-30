@@ -86,5 +86,5 @@ def test_admin_endpoint_still_redacts_rather_than_hiding(store):
     # /config/providers 有令牌门，那边保留尾 4 位是给管理员认渠道用的。
     openai = store.get_providers_public()["providers"]["openai"]
 
-    assert openai["api_key_redacted"] == "****efgh"
+    assert openai["api_key_redacted"] == "******efgh"
     assert "api_key" not in openai

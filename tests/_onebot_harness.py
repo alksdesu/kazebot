@@ -33,6 +33,21 @@ _PATH_OVERRIDES = (
 )
 
 
+def _real_nonebot_config() -> types.ModuleType | None:
+    """装着的 NoneBot 的 nonebot.config，没装给 None。
+
+    插件按 NoneBot 自己的 Env 判它读哪份 .env.{environment}，这一项不能打桩；没装时用到它的用例自己跳过。
+    """
+    try:
+        return importlib.import_module("nonebot.config")
+    except ImportError:
+        return None
+
+
+# 收集阶段就导入一次：等第一次打桩时才导入的话，真 nonebot 什么时候进 sys.modules 跟用例顺序有关。
+_NONEBOT_CONFIG = _real_nonebot_config()
+
+
 def adapter_source() -> str:
     """插件入口、状态类和 napcat 本体的全部源码，给静态接线检查用。"""
     paths = [_ADAPTER_ROOT / "onebot_plugin.py", _ADAPTER_ROOT / "adapter.py", *sorted((_ADAPTER_ROOT / "napcat").glob("*.py"))]
@@ -136,6 +151,8 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         "nonebot.adapters.onebot.v11.exception": exception,
         "nonebot.rule": rule,
     }
+    if _NONEBOT_CONFIG is not None:
+        modules["nonebot.config"] = _NONEBOT_CONFIG
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 

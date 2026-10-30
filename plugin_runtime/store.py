@@ -284,7 +284,10 @@ class PluginStore:
                     raw = path.read_bytes()
                     source_hash = config_layout.bytes_hash(raw)
                     metadata = inspect_source(raw.decode("utf-8-sig"), path.name)
-            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            except (OSError, UnicodeError) as exc:
+                # 读文件的报错带着绝对路径，解码错误带着解码器原话，只留问题本身
+                error = f"插件文件读不了：{config_layout.config_error_text(exc)}"
+            except (ValueError, TypeError) as exc:
                 error = str(exc)
             entry = settings.get(plugin_id, {})
             if not isinstance(entry, dict):
