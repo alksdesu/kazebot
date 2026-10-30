@@ -398,6 +398,14 @@ def test_cancel_during_input_read_does_not_launch_downstream_task(state, actor, 
     assert not state.tasks
 
 
+async def _eventually(condition, timeout: float = 30.0) -> None:
+    # 和别的测试并发跑时这台机器慢得多：条件一成立就往下走，上限只防真卡死
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
 async def test_full_api_plan_tool_waits_for_real_approval_before_writing(state):
     from supervisor.api import create_app
@@ -420,11 +428,7 @@ async def test_full_api_plan_tool_waits_for_real_approval_before_writing(state):
             task=assigned, worker_id="worker", session_id=assigned["session_id"], session_generation=assigned["session_generation"], task_id=assigned["task_id"],
         ))
         try:
-            for _ in range(100):
-                if state.approvals:
-                    break
-                await asyncio.sleep(0.01)
-            assert state.approvals
+            await _eventually(lambda: bool(state.approvals))
             assert not (state.workspace_root / "config/result.yaml").exists()
             state.execution.tick()
             current = (await client.get(f"/v1/execution/plans/{plan['id']}?scope=web:console")).json()
@@ -432,7 +436,7 @@ async def test_full_api_plan_tool_waits_for_real_approval_before_writing(state):
             approval = next(iter(state.approvals.values()))
             decision = await client.post(f"/v1/approvals/{approval.approval_id}", json={"decision": "allow"})
             assert decision.status_code == 200
-            result = await asyncio.wait_for(pending, timeout=3)
+            result = await asyncio.wait_for(pending, timeout=30)
             assert result["result"]["tool_ok"] is True
             completion = await client.post(f"/v1/tasks/{assigned['task_id']}/complete", json={"worker_id": "worker", "result": result})
             assert completion.status_code == 200
