@@ -20,9 +20,10 @@ from _node_prompts import assembled_prompt  # noqa: E402
 _NODES = _ROOT / "defaults" / "nodes"
 _SHARED = "_orchestrator.md"
 _QQ = "_platform_qq.md"
-_ENTRIES = ("qq.orchestrator", "qq.orchestrator.example")
+_QQ_ENTRIES = ("qq.orchestrator", "qq.orchestrator.example")
+_ENTRIES = (*_QQ_ENTRIES, "bootstrap.shell_orchestrator")
 _PSEUDO_TOOLS = frozenset({"finish", "ask", "switch_node"})
-# 共享规则教模型去调的工具，两个入口的白名单都得有。只被提到的（read_image）不算。
+# 共享规则教模型去调的工具，每个入口的白名单都得有。只被提到的（read_image）不算。
 _TAUGHT_TOOLS = frozenset({
     "web_search", "read_web", "stocktool_quote", "stocktool_history",
     "create_schedule", "list_schedules", "delete_schedule", "request_restart", "cancel_active_tasks",
@@ -82,13 +83,20 @@ class TestQQFragment:
 
 
 class TestEntryNodes:
-    @pytest.mark.parametrize("node_id", _ENTRIES)
-    def test_both_entries_assemble_the_shared_rules_then_the_qq_fragment(self, node_id: str) -> None:
+    @pytest.mark.parametrize("node_id", _QQ_ENTRIES)
+    def test_both_qq_entries_assemble_the_shared_rules_then_the_qq_fragment(self, node_id: str) -> None:
         prompt = assembled_prompt(node_id)
 
         assert "{{include:" not in prompt
         assert _fragment(_SHARED).strip() in prompt and _fragment(_QQ).strip() in prompt
         assert prompt.index(_fragment(_SHARED).strip()) < prompt.index(_fragment(_QQ).strip())
+
+    def test_the_web_and_terminal_entry_assembles_the_shared_rules_without_the_qq_fragment(self) -> None:
+        prompt = assembled_prompt("bootstrap.shell_orchestrator")
+
+        assert "{{include:" not in prompt
+        assert _fragment(_SHARED).strip() in prompt and _fragment(_QQ).strip() not in prompt
+        assert "qq_forward" not in _allowlist("bootstrap.shell_orchestrator")
 
     @pytest.mark.parametrize("node_id", _ENTRIES)
     def test_every_tool_the_shared_rules_teach_is_granted(self, node_id: str) -> None:
@@ -98,5 +106,5 @@ class TestEntryNodes:
         directive = f"{{{{include:{_QQ}}}}}"
         including = [path.stem for path in sorted(_NODES.glob("*.yaml")) if directive in path.read_text(encoding="utf-8")]
 
-        assert set(_ENTRIES) <= set(including)
+        assert set(_QQ_ENTRIES) <= set(including)
         assert [node_id for node_id in including if "qq_forward" not in _allowlist(node_id)] == []

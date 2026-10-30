@@ -79,7 +79,7 @@ class TestTheIntentNodeShipsWired:
 
         listed = {n["id"] for n in _discover_switchable_nodes(_ROOT, "qq.orchestrator")}
 
-        assert "chat.vision" in listed
+        assert "bootstrap.coder" in listed
 
     def test_the_shipped_node_asks_for_finish(self) -> None:
         node = load_node(_ROOT, "chat.intent")

@@ -1,10 +1,9 @@
+# 窄白名单的 QQ 入口：没有读写文件、执行命令这类工具，也不委派编程助手。要用就复制成 config/nodes/qq.orchestrator.yaml
 id: qq.orchestrator
 type: ai
 name: "QQ 综合入口"
-description: "QQ Bot 综合入口。支持联网搜索、定时任务、重启、取消任务，并可委派项目/命令相关任务。"
+description: "QQ Bot 综合入口。聊天、联网搜索、提醒和定时任务、记忆，生图委派绘图节点。"
 delegate_targets:
-  - bootstrap.executor
-  - bootstrap.cmd_reviewer
   - draw.novelai_planner
   - draw.image_gen
 tool_access:

@@ -2,6 +2,12 @@ id: bootstrap.coder
 type: ai
 name: "编程助手"
 description: "编程节点。读写代码、搜索、执行命令，独立完成编程任务；改动较大时请代码审查节点复核。"
+# 并进来的执行节点、命令审核节点的旧 id：会话、定时任务、委派清单里还写着它们的照样找到这里
+aliases:
+  - bootstrap.executor
+  - bootstrap.cmd_reviewer
+# 两个入口都委派它，不写就会从网页入口下拉和 switch_node 里消失
+selectable: true
 tool_mode: native
 todo: true
 # 一段最多 150 步；到步数或运行时长上限收尾后，在同一会话自动接着做（轮数见 engine.auto_continue.max_rounds）

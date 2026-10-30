@@ -89,8 +89,7 @@ CLONOTH_BASE_URL = env_first("CLONOTH_BASE_URL", "CLONOTH_SUPERVISOR_URL", defau
 # 附件、记忆、admin token 于是静默落到两个地方。
 CLONOTH_WORKSPACE = str(resolve_workspace_root(Path(__file__).resolve().parents[2]))
 
-# 入口节点 ID。默认使用 QQ 综合入口，兼顾联网搜索、调度、重启和取消任务。
-# 如需搜索-only 安全窄入口，可显式设置 CLONOTH_ENTRY_NODE=chat.web_search。
+# 入口节点 ID，默认 QQ 综合入口。窄入口是把 defaults/nodes/qq.orchestrator.example.yaml 复制成 config/nodes/qq.orchestrator.yaml，不是换节点 id。
 ENTRY_NODE_ID = env_first("CLONOTH_ENTRY_NODE", "ONEBOT_ENTRY_NODE_ID", default="qq.orchestrator")
 
 # QQ 收藏表情 AI 可见名称文件路径。默认使用该文件给 AI 注入可用表情名。

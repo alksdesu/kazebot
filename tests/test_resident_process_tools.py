@@ -150,7 +150,7 @@ class TestStart:
                 plain.safety_level, plain.reason, getattr(plain, "sensitive", False),
             )
 
-    @pytest.mark.parametrize("node_id", ["bootstrap.executor", "no.such.node"])
+    @pytest.mark.parametrize("node_id", ["chat.vision", "no.such.node"])
     def test_a_node_that_cannot_run_commands_cannot_start_one(self, tmp_path: Path, node_id: str) -> None:
         http = _Supervisor()
         ctx = _Ctx(tmp_path, http, node_id=node_id)
@@ -421,13 +421,13 @@ class TestRegistration:
 
     def test_only_the_coder_ships_with_them(self, tmp_path: Path) -> None:
         coder = load_node(tmp_path, "bootstrap.coder")
-        executor = load_node(tmp_path, "bootstrap.executor")
-        reviewer = load_node(tmp_path, "bootstrap.code_reviewer")
+        others = [load_node(tmp_path, node_id) for node_id in (
+            "bootstrap.code_reviewer", "qq.orchestrator", "bootstrap.shell_orchestrator",
+        )]
 
-        assert coder is not None and executor is not None and reviewer is not None
+        assert coder is not None and None not in others
         assert all(tool_allowed(coder, name) for name in PROCESS_TOOLS)
-        assert not tool_allowed(executor, "start_process") and not tool_allowed(executor, "execute_command")
-        assert not any(tool_allowed(reviewer, name) for name in PROCESS_TOOLS)
+        assert not any(tool_allowed(node, name) for node in others for name in PROCESS_TOOLS)
 
 
 def test_the_qq_approval_card_says_resident(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

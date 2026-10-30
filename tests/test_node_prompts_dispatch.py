@@ -21,9 +21,7 @@ from engine.inference.pseudo_tools import _ask_spec, _dispatch_tool_name, _finis
 _NODES = _ROOT / "defaults" / "nodes"
 # 用户自己在改的共享片段，不归这里管
 _EXCLUDED = frozenset({"_shared.md"})
-_DELEGATING = (
-    "bootstrap.coder", "bootstrap.executor", "bootstrap.shell_orchestrator", "qq.orchestrator", "qq.orchestrator.example",
-)
+_DELEGATING = ("bootstrap.coder", "bootstrap.shell_orchestrator", "qq.orchestrator", "qq.orchestrator.example")
 
 
 def _prompt_files() -> list[Path]:
@@ -44,17 +42,8 @@ def test_no_prompt_teaches_the_removed_dispatch_node_tool(path: Path) -> None:
 def test_the_scan_covers_the_prompts_that_used_to_teach_it() -> None:
     names = {path.name for path in _prompt_files()}
 
-    assert {"bootstrap.executor.yaml", "bootstrap.shell_orchestrator.yaml", "_orchestrator.md"} <= names
+    assert {"bootstrap.shell_orchestrator.yaml", "_orchestrator.md"} <= names
     assert names.isdisjoint(_EXCLUDED)
-
-
-def test_the_executor_sends_commands_to_the_reviewer_and_waits() -> None:
-    prompt = assembled_prompt("bootstrap.executor")
-    reviewer_tool = _dispatch_tool_name("bootstrap.cmd_reviewer")
-
-    assert reviewer_tool == "dispatch_to_bootstrap_cmd_reviewer"
-    assert reviewer_tool in prompt
-    assert "wait: true" in prompt
 
 
 @pytest.mark.parametrize("node_id", _DELEGATING)

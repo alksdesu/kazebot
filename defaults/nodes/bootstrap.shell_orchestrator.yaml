@@ -1,69 +1,73 @@
 id: bootstrap.shell_orchestrator
 type: ai
 name: "入口交互节点"
-description: "面向用户的入口 AI 节点。判断当前请求是直接回复，还是委派给下游节点处理。"
+description: "网页和终端界面的默认入口。聊天、联网搜索、提醒和定时任务、记忆，工程活委派编程助手，生图委派绘图节点。"
 delegate_targets:
-  - bootstrap.executor
-  - bootstrap.cmd_reviewer
+  - bootstrap.coder
+  - draw.novelai_planner
+  - draw.image_gen
+# 和 QQ 入口同一份白名单，只少了 QQ 专属的 qq_forward
 tool_access:
   mode: allowlist
   allow:
     - search_context_archive
     - read_context_archive
+    - draft_execution_plan
+    - inspect_execution_plan
+    - revise_execution_plan
+    - create_reminder
+    - list_reminders
+    - update_reminder
+    - community
+    - materials_document
+    - materials_chat_search
+    - materials_structure
+    - materials_image_versions
+    - materials_generate
+    - web_search
+    - read_web
+    - stocktool_quote
+    - stocktool_history
     - request_restart
     - create_schedule
     - list_schedules
     - delete_schedule
     - cancel_active_tasks
+    - write_file
+    - read_file
+    - read_image
+    - manage_secret
+    - apply_diff
+    - create_or_update_skill
+    - create_or_update_tool
+    - delete_skill
+    - list_dir
+    - clonoth_debug
+    - list_mcp_clients
+    - save_memory
+    - search_in_files
+    - execute_command
+    - delete_mcp_client
+    - list_memories
+    - create_or_update_mcp_client
+    - get_context_window
+    - list_skills
+    - reload_tools
+    - remote_exec
+    - create_agent
+    - delete_memory
+    - sci_calc
 skills:
   mode: none
 prompt: |
   {{include:_persona.md}}
   {{include:_shared.md}}
 
-  # Role: Shell Orchestrator
+  # Role: Orchestrator
 
-  你是入口交互节点 {{node_name}}（{{node_id}}）。
+  你是网页和终端界面的入口节点 {{node_name}}（{{node_id}}）。
 
-  当前任务在本轮用户消息中给出。
-
-  ## 能力
-
-  你可以使用以下方式完成任务：
-
-  - **finish**：有最终答案时提交结果。
-  - **ask**：信息不足时向调用方提问。
-  - **委派工具（dispatch_to_<目标>）**：每个下游节点一个，例如 `dispatch_to_bootstrap_executor`，工具说明里写了目标节点能做什么。后续要用到结果时设 `wait: true`，当前任务挂起，结果交回来后你接着处理；不需要结果时用默认的异步委派，结果之后作为一条新消息送达。
-  - **switch_node**：切换会话的对话节点。切换后用户的后续消息将直接由目标节点处理（见 switch_node 工具定义中的 target 列表）。
-  - **直接工具调用**：你的 function calling 工具列表中有的工具可以直接调用。
-
-  你可以在一轮里同时发出多个委派，同一轮的多个 wait 委派并行执行、结果一起回来。每次给出清晰、具体、可执行的指令。wait 委派和 finish 不要放在同一轮，结果回来之前 finish 不会执行。
-
-  ## 判断优先级
-
-  收到任务后，按以下顺序判断：
-
-  1. 闲聊、能力询问、概念讨论等不需要真实操作的问题，使用 finish 直接回复。
-  2. 你的工具列表中有能处理此请求的工具，且信息充足，直接调用工具。
-  3. 信息不足，使用 ask 向调用方补问必要信息。
-  4. 其余情况，用委派工具交给合适的下游节点。
-
-  ## 直接回复的场景
-
-  - 寒暄、闲聊、致谢、告别。
-  - 纯概念讨论、建议、头脑风暴。
-  - 不需要读取当前仓库真实状态的轻量问答。
-  - 调用方询问你是否具备某项能力，根据你实际拥有的工具列表和委派目标直接回答。
-
-  ## 必须委派到下游的场景
-
-  - 需要基于当前项目真实文件、代码、配置做判断。
-  - 需要使用你自己没有的工具。
-  - 需要多步执行。
-
-  ## 最终回复
-
-  当你决定回复时，使用 finish 给出有用的回答。不要提及内部节点、dispatch 等机制细节。调用方不需要知道这些。
+  {{include:_orchestrator.md}}
 
   # %%DYNAMIC%%
 

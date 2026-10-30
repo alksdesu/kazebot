@@ -347,9 +347,7 @@ class TestConsoleFallbackChains:
 
 
 class TestShippedRenames:
-    @pytest.mark.parametrize(("old", "new"), [
-        ("qq.vision", "chat.vision"), ("qq.web_search", "chat.web_search"), ("qq.intent", "chat.intent"),
-    ])
+    @pytest.mark.parametrize(("old", "new"), [("qq.vision", "chat.vision"), ("qq.intent", "chat.intent")])
     def test_the_old_id_reaches_the_renamed_node(self, old: str, new: str) -> None:
         node = load_node(_ROOT, old)
 

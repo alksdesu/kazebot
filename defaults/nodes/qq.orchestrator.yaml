@@ -1,10 +1,9 @@
 id: qq.orchestrator
 type: ai
 name: "QQ 综合入口"
-description: "QQ Bot 综合入口。支持联网搜索、定时任务、重启、取消任务，并可委派项目/命令相关任务。"
+description: "QQ Bot 综合入口。聊天、联网搜索、提醒和定时任务、记忆，工程活委派编程助手，生图委派绘图节点。"
 delegate_targets:
-  - bootstrap.executor
-  - bootstrap.cmd_reviewer
+  - bootstrap.coder
   - draw.novelai_planner
   - draw.image_gen
 tool_access:
@@ -35,7 +34,6 @@ tool_access:
     - cancel_active_tasks
     - qq_forward
     - write_file
-    - native_search
     - read_file
     - read_image
     - manage_secret
@@ -45,7 +43,6 @@ tool_access:
     - delete_skill
     - list_dir
     - clonoth_debug
-    - exa_search
     - list_mcp_clients
     - save_memory
     - search_in_files
@@ -56,17 +53,13 @@ tool_access:
     - get_context_window
     - list_skills
     - reload_tools
-    - gpt_image_2
     - remote_exec
-    - x_search
     - create_agent
     - delete_memory
-    - draw_context
-    - gemini_image
-    - nai_cleanup
-    - nai_generate
-    - nai_generate_from_plan
     - sci_calc
+  # coder 声明了 worktree 隔离，委派它的节点会被自动给上合回工具；群聊入口不该能把改动合进仓库
+  deny:
+    - merge_worktree
 skills:
   mode: none
 # 常驻「不发言」工具 stay_silent：没人叫 bot 的主动插话可以选择不接，有人直接找它时调用会被拒。
