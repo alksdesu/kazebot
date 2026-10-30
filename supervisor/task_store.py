@@ -814,6 +814,7 @@ class TaskStoreMixin:
         # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
         branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
         branch_base_count = int(fork_meta.get("base_count") or 0)
+        _branch_error = str(fork_meta.get("error") or "")
         self._cancelled_sessions.discard(branch_session_id)
         # 收集当前活跃 task 摘要，注入给入口节点 AI 判断
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
@@ -968,6 +969,9 @@ class TaskStoreMixin:
         elif _fork_error:
             # 调用方的历史复制不了：同样建出来再判失败，不让它从空历史开始
             self._fail_task_locked(task, error=_fork_error)
+        elif _branch_error:
+            # 这段对话的历史没进入口分支：这一轮看不到前文，同样不让它接着做
+            self._fail_task_locked(task, error=f"没能开始：{_branch_error}")
         else:
             _worktrees.register_child_locked(task, _worktree_plan)
         # Emit transient inbound_accepted so Bot can advance watermark

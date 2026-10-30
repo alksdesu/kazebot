@@ -234,35 +234,14 @@ class SessionMixin:
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         fork_meta: dict[str, Any] = {"copied": 0, "base_count": 0, "base_last_id": ""}
         try:
-            try:
-                fork_result = store.fork(parent, branch_session_id, include_system=True)
-            except TypeError:
-                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore.fork 签名。
-                # 原因：supervisor 层必须能在 engine store 还未完全升级时通过 py_compile
-                # 和本地运行。做法：手动复制父 session 的全部消息，等价实现 include_system=True。
-                # 目的：不修改 engine 层文件，也能得到 merge 所需的 branch 基准长度。
-                source_messages = list(store.load(parent))
-                if store.message_count(branch_session_id) == 0 and source_messages:
-                    store.append_batch(branch_session_id, source_messages)
-                    fork_result = {
-                        "copied": len(source_messages),
-                        "base_count": len(source_messages),
-                        "base_last_id": getattr(source_messages[-1], "id", "") if source_messages else "",
-                    }
-                else:
-                    branch_count = store.message_count(branch_session_id)
-                    fork_result = {"copied": 0, "base_count": branch_count, "base_last_id": ""}
-            if isinstance(fork_result, dict):
-                fork_meta.update({
-                    "copied": int(fork_result.get("copied") or 0),
-                    "base_count": int(fork_result.get("base_count") or 0),
-                    "base_last_id": str(fork_result.get("base_last_id") or ""),
-                })
-            else:
-                copied = int(fork_result or 0)
-                fork_meta.update({"copied": copied, "base_count": copied})
+            # 这里持着全局锁：按字节整份复制，条数只数父会话上次以来追加的，不把长历史逐条解析再写一遍
+            copied = store.copy_history(parent, branch_session_id)
+            fork_meta.update({"copied": copied.copied, "base_count": copied.count, "base_last_id": copied.last_id})
         except Exception as exc:
-            fork_meta["error"] = str(exc)
+            logger.warning(
+                "copying the history of %s into entry branch %s failed", parent[:12], branch_session_id, exc_info=True,
+            )
+            fork_meta["error"] = f"复制这段对话的历史时读写出错（{type(exc).__name__}），可以稍后重试"
         # 合并起点也记进登记表：supervisor 重启后任务都不在了，合并没收束的分支只能从这里知道从哪条往后是新的
         self._session_store.set_entry_field(
             branch_session_id, "base_count", int(fork_meta.get("base_count") or 0), flush=False,

@@ -1,7 +1,8 @@
-"""对话存储：后台按序写、读之前先落盘、半行不吞下一条、锁文件不随会话数增长。"""
+"""对话存储：后台按序写、读之前先落盘、半行不吞下一条、锁文件不随会话数增长，整份复制历史时只数新追加的行。"""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from engine.builtin.preempt import _inject_preempt_message
-from engine.conversation_store import ConversationStore, ConversationWriter, Message, MessageType
+from engine.conversation_store import ConversationStore, ConversationWriter, HistoryCopy, Message, MessageType
 from engine.inference.ai_step import _shadow_write
 from engine.inference.loop_state import conversation_writer, flush_conversation_writes
 from engine.node import Node
@@ -244,3 +245,130 @@ def test_fork_still_copies_everything_but_system_messages_once(tmp_path: Path) -
     assert store.fork("parent", "child") == 0
     assert [message.id for message in ConversationStore(tmp_path).load("child")] == ["ask", "answer"]
     assert _staged_files(tmp_path) == []
+
+
+def _count_parsing(monkeypatch) -> list[str]:
+    """从这以后每解析出一条消息就记下它的 id。"""
+    parse = Message.from_dict.__func__
+    parsed: list[str] = []
+
+    def counting(cls, data):
+        message = parse(cls, data)
+        parsed.append(message.id)
+        return message
+
+    monkeypatch.setattr(Message, "from_dict", classmethod(counting))
+    return parsed
+
+
+def test_copy_history_copies_the_file_as_it_is_system_messages_included(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+
+    copied = store.copy_history("parent", "branch")
+
+    assert copied == HistoryCopy(count=3, last_id="answer", copied=3)
+    assert (tmp_path / "branch.jsonl").read_bytes() == (tmp_path / "parent.jsonl").read_bytes()
+    assert [message.id for message in ConversationStore(tmp_path).load("branch")] == ["sys", "ask", "answer"]
+    assert _staged_files(tmp_path) == []
+
+
+def test_copy_history_counts_exactly_what_load_will_read(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    # 内容里原样的行分隔符不算换行，\r\n 算；空行、读不出的行和半行都跳过
+    separator = json.dumps({"id": "sep", "role": "user", "content": "a\u2028b"}, ensure_ascii=False)
+    with (tmp_path / "parent.jsonl").open("ab") as stream:
+        stream.write(b"\n   \nnot json\n[1, 2]\n" + separator.encode("utf-8") + b"\n")
+        stream.write(b'{"id": "crlf", "role": "user", "content": "x"}\r\n{"id": "torn", "role": "us')
+
+    copied = store.copy_history("parent", "branch")
+
+    loaded = ConversationStore(tmp_path).load("branch")
+    assert [message.id for message in loaded] == ["sys", "ask", "answer", "sep", "crlf"]
+    assert (copied.count, copied.last_id) == (len(loaded), loaded[-1].id)
+
+
+def test_copy_history_after_appends_only_reads_the_new_lines(tmp_path: Path, monkeypatch) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    store.copy_history("parent", "first")
+    store.append_batch("parent", [
+        Message(id="more", role="user", content="接着问"), Message(id="reply", role="assistant", content="接着答"),
+    ])
+    parsed = _count_parsing(monkeypatch)
+
+    copied = store.copy_history("parent", "second")
+
+    assert parsed == ["more", "reply"]
+    assert copied == HistoryCopy(count=5, last_id="reply", copied=5)
+
+
+def test_a_rewritten_source_is_counted_from_what_was_written(tmp_path: Path, monkeypatch) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    store.copy_history("parent", "first")
+    kept = store.load("parent")[1:]
+    store.replace_all("parent", [Message(id="summary", role="user", content="前情提要"), *kept])
+    parsed = _count_parsing(monkeypatch)
+
+    copied = store.copy_history("parent", "second")
+
+    assert parsed == []
+    assert copied == HistoryCopy(count=3, last_id="answer", copied=3)
+    assert [message.id for message in ConversationStore(tmp_path).load("second")] == ["summary", "ask", "answer"]
+
+
+def test_a_file_rewritten_on_the_same_inode_is_counted_again(tmp_path: Path) -> None:
+    # 删了再建可能拿回同一个 inode 号：之前数过的那段换了内容，就得从头数
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    store.copy_history("parent", "first")
+    replacement = "".join(
+        json.dumps(Message(id=f"new-{index}", role="user", content="换过的内容" * 20).to_dict(), ensure_ascii=False) + "\n"
+        for index in range(4)
+    ).encode("utf-8")
+    with (tmp_path / "parent.jsonl").open("r+b") as stream:
+        stream.write(replacement)
+        stream.truncate()
+
+    copied = store.copy_history("parent", "second")
+
+    assert copied == HistoryCopy(count=4, last_id="new-3", copied=4)
+
+
+def test_copy_history_leaves_a_target_with_messages_alone(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    store.append("branch", Message(id="own", role="user", content="自己的"))
+
+    copied = store.copy_history("parent", "branch")
+
+    assert copied == HistoryCopy(count=1, last_id="own", copied=0)
+    assert [message.id for message in ConversationStore(tmp_path).load("branch")] == ["own"]
+    assert _staged_files(tmp_path) == []
+
+
+def test_copy_history_from_a_source_without_messages_writes_nothing(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    (tmp_path / "blank.jsonl").write_text("\nnot json\n", encoding="utf-8")
+
+    assert store.copy_history("nobody", "first") == HistoryCopy(0, "", 0)
+    assert store.copy_history("blank", "second") == HistoryCopy(0, "", 0)
+    assert not (tmp_path / "first.jsonl").exists() and not (tmp_path / "second.jsonl").exists()
+    assert _staged_files(tmp_path) == []
+
+
+def test_an_installed_fork_is_counted_from_what_was_staged(tmp_path: Path, monkeypatch) -> None:
+    # 异步 fork 委派的 agent 会话一装好，紧接着就要从它建入口分支
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    staged = store.stage_fork("parent")
+    store.install_fork(staged, "agent")
+    ConversationStore.discard_fork(staged)
+    parsed = _count_parsing(monkeypatch)
+
+    copied = store.copy_history("agent", "branch")
+
+    assert parsed == []
+    assert copied == HistoryCopy(count=2, last_id="answer", copied=2)

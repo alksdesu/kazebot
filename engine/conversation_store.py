@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
 import tempfile
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 
 import config_layout
 from file_lock import exclusive_lock
@@ -138,7 +141,7 @@ class ConversationChangedError(RuntimeError):
 
 @dataclass(frozen=True)
 class StagedFork:
-    """暂存好的一份 fork 副本：同目录下的临时文件（没有可复制的消息时为 None）和里面的消息条数。
+    """暂存好的一份 fork 副本：同目录下的临时文件（没有可复制的消息时为 None）、里面的消息条数和最后一条的 id。
 
     source_found 为 False 表示来源会话还没有对话文件。
     """
@@ -147,10 +150,24 @@ class StagedFork:
     path: Path | None
     count: int
     source_found: bool
+    last_id: str = ""
+
+
+@dataclass(frozen=True)
+class HistoryCopy:
+    """copy_history 的结果：目标会话开头来自来源会话的那段前缀有几条、最后一条的 id，这次实际复制进去几条。
+
+    目标原本就有读得出来的消息时不复制，前缀按它已有的那些算，copied 为 0。
+    """
+
+    count: int
+    last_id: str
+    copied: int
 
 
 _LOCK_DIR_NAME = ".locks"
 _LOCK_STRIPE_CHARS = 2
+_COPY_CHUNK_BYTES = 1 << 20
 
 
 def _append_lines(path: Path, data: bytes) -> None:
@@ -165,6 +182,94 @@ def _append_lines(path: Path, data: bytes) -> None:
             if stream.read(1) != b"\n":
                 data = b"\n" + data
         stream.write(data)
+
+
+def _readable_messages(data: bytes) -> Iterator[Message]:
+    """data 里读得出来的消息：切行、跳过空行和读不出的行都和 ConversationStore.load 一样。"""
+    for line in io.TextIOWrapper(io.BytesIO(data), encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield Message.from_dict(json.loads(line))
+        except Exception:
+            continue
+
+
+@dataclass(frozen=True)
+class _Tally:
+    """对话文件前 size 个字节里读得出来的消息条数和最后一条的 id。
+
+    edge 是 size 之前最多 _TALLY_EDGE_BYTES 个字节：文件删了重建可能拿回同一个 inode 号，靠它认出前面换过内容。
+    """
+
+    inode: int
+    size: int
+    edge: bytes
+    count: int
+    last_id: str
+
+
+# 对话文件只会往后追加或整份替换（替换就换 inode）：按文件记着数过的那段，之后只数新追加的行
+_TALLY_EDGE_BYTES = 256
+_TALLY_LIMIT = 1024
+_tallies: OrderedDict[str, _Tally] = OrderedDict()
+_tallies_guard = threading.Lock()
+
+
+def _tally_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _remember_tally(path: Path, stream: BinaryIO, info: os.stat_result, count: int, last_id: str) -> _Tally:
+    """记下 path 前 info.st_size 个字节数出来的结果。stream 是这个文件以二进制打开的句柄，用来取 edge。"""
+    edge_start = max(0, info.st_size - _TALLY_EDGE_BYTES)
+    stream.seek(edge_start)
+    tally = _Tally(info.st_ino, info.st_size, stream.read(info.st_size - edge_start), count, last_id)
+    key = _tally_key(path)
+    with _tallies_guard:
+        _tallies[key] = tally
+        _tallies.move_to_end(key)
+        while len(_tallies) > _TALLY_LIMIT:
+            _tallies.popitem(last=False)
+    return tally
+
+
+def _forget_tally(path: Path) -> None:
+    with _tallies_guard:
+        _tallies.pop(_tally_key(path), None)
+
+
+def _tally_unlocked(path: Path) -> _Tally | None:
+    """数文件里读得出来的消息，文件不在给 None。上次数过的那段原样还在时只数后面新追加的。调用方持有这个会话的文件锁。"""
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        _forget_tally(path)
+        return None
+    with stream:
+        info = os.fstat(stream.fileno())
+        with _tallies_guard:
+            known = _tallies.get(_tally_key(path))
+        start, count, last_id = 0, 0, ""
+        if known is not None and known.inode == info.st_ino and known.size <= info.st_size:
+            stream.seek(known.size - len(known.edge))
+            if stream.read(len(known.edge)) == known.edge:
+                start, count, last_id = known.size, known.count, known.last_id
+        stream.seek(start)
+        for message in _readable_messages(stream.read(info.st_size - start)):
+            count += 1
+            last_id = str(message.id or "")
+        return _remember_tally(path, stream, info, count, last_id)
+
+
+def _remember_written(path: Path, count: int, last_id: str) -> None:
+    """整份写好的文件按写进去的消息记下条数，下次不用从头数；记不下来就忘掉旧的，下次从头数。调用方持有这个会话的文件锁。"""
+    try:
+        with path.open("rb") as stream:
+            _remember_tally(path, stream, os.fstat(stream.fileno()), count, last_id)
+    except OSError:
+        _forget_tally(path)
 
 
 class ConversationStore:
@@ -278,6 +383,7 @@ class ConversationStore:
         with self._locked(session_id):
             path.unlink(missing_ok=True)
             self.invalidate_cache(session_id)
+            _forget_tally(path)
 
     def delete_if_idle_since(self, session_id: str, cutoff: float) -> bool:
         """文件最后一次修改早于 cutoff（epoch 秒）才删，返回删没删。判断和删除在同一把锁里，刚写进来的不会被删。"""
@@ -290,6 +396,7 @@ class ConversationStore:
                 return False
             path.unlink(missing_ok=True)
             self.invalidate_cache(session_id)
+            _forget_tally(path)
             return True
 
     def replace_all(self, session_id: str, messages: list[Message]) -> None:
@@ -301,6 +408,7 @@ class ConversationStore:
                 self.invalidate_cache(session_id)
                 raise ConversationChangedError(f"conversation changed before replacement: {session_id}")
             temporary: Path | None = None
+            written = [message for message in messages if not message.ephemeral]
             try:
                 # 换行固定写 \n：追加走字节写，Windows 上文本模式会写成 \r\n，同一个文件就混了两种换行
                 with tempfile.NamedTemporaryFile(
@@ -308,14 +416,14 @@ class ConversationStore:
                     prefix=f".{path.name}.", suffix=".tmp", delete=False,
                 ) as stream:
                     temporary = Path(stream.name)
-                    for message in messages:
-                        if not message.ephemeral:
-                            stream.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
+                    for message in written:
+                        stream.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, path)
                 temporary = None
                 self.invalidate_cache(session_id)
+                _remember_written(path, len(written), str(written[-1].id or "") if written else "")
             except Exception:
                 self.invalidate_cache(session_id)
                 raise
@@ -378,7 +486,7 @@ class ConversationStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             raise
-        return StagedFork(source_session_id, temporary, len(messages), found)
+        return StagedFork(source_session_id, temporary, len(messages), found, str(messages[-1].id or ""))
 
     def install_fork(self, staged: StagedFork, target_session_id: str) -> int:
         """把暂存的副本装进 target，返回装进去的消息条数；target 已有读得出来的消息就不装，返回 0。
@@ -392,13 +500,73 @@ class ConversationStore:
             if self._has_messages_unlocked(path):
                 return 0
             try:
-                if path.exists() and path.stat().st_size > 0:
-                    _append_lines(path, staged.path.read_bytes())
-                else:
-                    os.replace(staged.path, path)
+                if self._install_unlocked(staged.path, path):
+                    _remember_written(path, staged.count, staged.last_id)
             finally:
                 self.invalidate_cache(target_session_id)
         return staged.count
+
+    def copy_history(self, source_session_id: str, target_session_id: str) -> HistoryCopy:
+        """把 source 的对话文件原样整份复制进 target，system 消息也在内，返回 target 开头来自 source 的那段前缀。
+
+        target 已有读得出来的消息时不复制，装法同 install_fork。按字节复制、不逐条解析再写一遍；条数和最后一条的 id
+        按文件记着，source 上次数过之后只是往后追加的话只数新追加的行。读写出错照常抛出。
+        """
+        source = self._data_dir / f"{source_session_id}.jsonl"
+        target = self._data_dir / f"{target_session_id}.jsonl"
+        copied = HistoryCopy(0, "", 0)
+        staged: Path | None = None
+        try:
+            with self._locked(source_session_id):
+                tally = _tally_unlocked(source)
+                if tally is not None and tally.count:
+                    staged = self._snapshot_unlocked(source, tally.size)
+                    copied = HistoryCopy(tally.count, tally.last_id, tally.count)
+            with self._locked(target_session_id):
+                existing = _tally_unlocked(target) if self._has_messages_unlocked(target) else None
+                if existing is not None:
+                    return HistoryCopy(existing.count, existing.last_id, 0)
+                if staged is not None:
+                    try:
+                        if self._install_unlocked(staged, target):
+                            _remember_written(target, copied.count, copied.last_id)
+                    finally:
+                        self.invalidate_cache(target_session_id)
+            return copied
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+
+    def _snapshot_unlocked(self, source: Path, size: int) -> Path:
+        """把 source 的前 size 个字节原样写进同目录的临时文件，返回它的路径。调用方持有 source 的文件锁。"""
+        temporary: Path | None = None
+        try:
+            # 不 fsync：调用方可能正持着别的锁等这一步，掉电丢的只是副本，来源还在
+            with source.open("rb") as reader, tempfile.NamedTemporaryFile(
+                mode="wb", dir=self._data_dir, prefix=".fork.", suffix=".tmp", delete=False,
+            ) as writer:
+                temporary = Path(writer.name)
+                remaining = size
+                while remaining > 0:
+                    chunk = reader.read(min(remaining, _COPY_CHUNK_BYTES))
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    remaining -= len(chunk)
+        except Exception:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
+        return temporary
+
+    @staticmethod
+    def _install_unlocked(staged: Path, target: Path) -> bool:
+        """把暂存文件装进 target，返回是不是整份换上去的；target 只剩读不出的残行时接在后面。调用方持有 target 的文件锁。"""
+        if target.exists() and target.stat().st_size > 0:
+            _append_lines(target, staged.read_bytes())
+            return False
+        os.replace(staged, target)
+        return True
 
     @staticmethod
     def discard_fork(staged: StagedFork) -> None:
