@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar
@@ -265,18 +265,20 @@ def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, An
     return out
 
 
-def list_clients(workspace_root: Path) -> list[dict[str, Any]]:
-    cfg = _load_raw_config(workspace_root)
-    clients = cfg.get("clients") or {}
+def public_clients(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """配置里的客户端按 engine 的读法规整，按 id 排：开关按 parse_bool 认，transport 认不出按 stdio，命令、参数、地址都是字符串。"""
+    clients = config.get("clients") or {}
     if not isinstance(clients, dict):
         return []
+    return [
+        _normalize_public_spec(client_id, spec)
+        for client_id, spec in sorted(clients.items())
+        if isinstance(spec, dict)
+    ]
 
-    out: list[dict[str, Any]] = []
-    for client_id in sorted(clients.keys()):
-        spec = clients.get(client_id)
-        if isinstance(spec, dict):
-            out.append(_normalize_public_spec(client_id, spec))
-    return out
+
+def list_clients(workspace_root: Path) -> list[dict[str, Any]]:
+    return public_clients(_load_raw_config(workspace_root))
 
 
 def get_client_spec(workspace_root: Path, client_id: str) -> dict[str, Any]:

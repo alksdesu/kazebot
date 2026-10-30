@@ -211,14 +211,41 @@ class TestTheChecksThemselves:
             check_mcp_text(text)
 
 
+_STDIO_FS = {
+    "id": "fs", "enabled": True, "share_sessions": False, "transport": "stdio", "command": "npx", "args": [], "env": {},
+}
+
+
 class TestTheMcpClientList:
     def test_the_clients_in_the_file_are_listed_under_their_ids(self, admin, ws: Path) -> None:
-        _write(config_layout.mcp_path(ws), "clients:\n  web:\n    url: http://x\n  fs:\n    command: npx\n    id: other\n")
+        _write(
+            config_layout.mcp_path(ws),
+            "clients:\n  web:\n    transport: http\n    url: http://x\n  fs:\n    command: npx\n    id: other\n",
+        )
 
         response = admin("GET", "/mcp-clients")
 
         assert response.status_code == 200, response.text
-        assert response.json() == [{"command": "npx", "id": "fs"}, {"url": "http://x", "id": "web"}]
+        assert response.json() == [_STDIO_FS, {
+            "id": "web", "enabled": True, "share_sessions": False, "transport": "streamable_http",
+            "url": "http://x", "headers": {},
+        }]
+
+    def test_values_are_read_the_way_the_engine_reads_them(self, admin, ws: Path) -> None:
+        # 原样回文件内容的话，enabled: "off" 在页面上是真值，运行期却是关着的
+        _write(
+            config_layout.mcp_path(ws),
+            "clients:\n  fs:\n    enabled: 'off'\n    transport: STDIO\n    command: npx\n    args: [1, -y]\n"
+            "    env: {PORT: 8080}\n  web:\n    url: http://x\n",
+        )
+
+        listed = {client["id"]: client for client in admin("GET", "/mcp-clients").json()}
+
+        assert listed["fs"]["enabled"] is False
+        assert (listed["fs"]["args"], listed["fs"]["env"]) == (["1", "-y"], {"PORT": "8080"})
+        # 没写 transport 的按 stdio 起，url 用不上，和运行期一样
+        assert (listed["web"]["transport"], listed["web"]["command"]) == ("stdio", "")
+        assert "url" not in listed["web"]
 
     def test_clients_written_as_a_list_are_listed_too(self, admin, ws: Path) -> None:
         # 运行期认这种写法，控制台不能把它显示成没有客户端。
@@ -227,7 +254,7 @@ class TestTheMcpClientList:
         response = admin("GET", "/mcp-clients")
 
         assert response.status_code == 200, response.text
-        assert response.json() == [{"command": "npx", "id": "fs"}]
+        assert response.json() == [_STDIO_FS]
 
     def test_no_file_means_no_clients(self, admin) -> None:
         response = admin("GET", "/mcp-clients")
@@ -256,4 +283,17 @@ class TestTheMcpClientList:
 
         assert opened.status_code == 200 and opened.json()["content"] == "clients: [unclosed\n"
         assert saved.status_code == 200, saved.text
-        assert admin("GET", "/mcp-clients").json() == [{"command": "npx", "id": "fs"}]
+        assert admin("GET", "/mcp-clients").json() == [_STDIO_FS]
+
+
+class TestAnUnreadableRawFile:
+    def test_a_file_that_is_not_utf8_is_named_without_its_path_or_the_decoder_wording(self, admin, ws: Path) -> None:
+        path = config_layout.mcp_path(ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"clients: {}\n# \xff\n")
+
+        response = admin("GET", "/mcp-clients/raw")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == f"{path.name} 读不了：不是 UTF-8 编码（第 15 个字节）"
+        assert str(ws) not in response.text

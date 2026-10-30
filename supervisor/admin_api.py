@@ -324,9 +324,14 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         """文件内容连同指纹：编辑器保存时带回指纹，写入方据此认出中途被别处改过。"""
         if not p.is_file():
             raise HTTPException(status_code=404, detail="File not found")
-        data = p.read_bytes()
+        try:
+            data = p.read_bytes()
+            text = data.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # 和 config_files.read_raw 一样：原因只有文件名和问题，不带绝对路径和解码器原话
+            raise HTTPException(status_code=500, detail=f"{p.name} 读不了：{config_layout.config_error_text(exc)}") from exc
         # 和 read_text 一样把换行统一成 \n；指纹按落盘的原始字节算，写入方比的也是字节。
-        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
         return {"content": text, "hash": config_layout.bytes_hash(data), "path": _rel(p), **extra}
 
     def _write_overlay(
@@ -891,7 +896,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             config = mcp_runtime.editable_config(workspace_root)
         except mcp_runtime.McpConfigError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return [{**spec, "id": cid} for cid, spec in sorted(config["clients"].items())]
+        # 照 engine 的读法规整：原样回 mcp.yaml 的话，enabled: "off" 这类写法页面和运行期看到的不是同一个结论
+        return mcp_runtime.public_clients(config)
 
     @router.get("/mcp-clients/raw")
     def get_mcp_clients_raw() -> dict[str, Any]:
