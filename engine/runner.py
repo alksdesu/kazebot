@@ -591,19 +591,18 @@ async def _register_engine(
             failed = data.get("orphans_failed", 0)
             cancelled = data.get("orphans_cancelled", 0)
             if failed or cancelled:
-                print(
-                    f"[engine] registered generation {generation_id[:8]}, "
-                    f"failed {failed} and cancelled {cancelled} orphan(s)",
-                    flush=True,
+                logger.info(
+                    "registered generation %s, failed %s and cancelled %s orphan(s)",
+                    generation_id[:8], failed, cancelled,
                 )
             else:
-                print(f"[engine] registered generation {generation_id[:8]}", flush=True)
+                logger.info("registered generation %s", generation_id[:8])
             return data
         else:
-            print(f"[engine] registration failed: HTTP {r.status_code}", flush=True)
+            logger.warning("registration failed: HTTP %s", r.status_code)
             return None
     except Exception as e:
-        print(f"[engine] failed to register with supervisor: {e}", flush=True)
+        logger.warning("failed to register with supervisor: %s", e)
         return None
 
 
@@ -614,12 +613,12 @@ async def wait_supervisor(
     timeout: float = 2.0,
     interval: float = 0.5,
 ) -> None:
-    print(f"[engine] waiting for supervisor: {base_url}", flush=True)
+    logger.info("waiting for supervisor: %s", base_url)
     while True:
         try:
             r = await http.get(f"{base_url}/v1/health", timeout=timeout)
             if r.status_code == 200:
-                print("[engine] supervisor connected", flush=True)
+                logger.info("supervisor connected")
                 return
         except Exception:
             pass
@@ -654,7 +653,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         if _token_file.is_file():
             _admin_token = _token_file.read_text(encoding="utf-8").strip()
             if _admin_token:
-                print("[engine] loaded admin token from shared file", flush=True)
+                logger.info("loaded admin token from shared file")
 
     _sup_headers: dict[str, str] = {"User-Agent": "Clonoth"}
     if _admin_token:
@@ -676,7 +675,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         reload_seqs = await fetch_reload_seqs(http, supervisor_url)
         mcp_count = await registry.load_mcp_tools(seqs=reload_seqs)
         if mcp_count:
-            print(f"[engine] loaded {mcp_count} MCP tools", flush=True)
+            logger.info("loaded %s MCP tools", mcp_count)
 
         # Direction 1: graceful shutdown via signal handling
         stop_event = asyncio.Event()
@@ -684,7 +683,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         def _request_stop():
             if not stop_event.is_set():
-                print("[engine] received stop signal, initiating graceful shutdown...", flush=True)
+                logger.info("received stop signal, initiating graceful shutdown...")
                 stop_event.set()
 
         for _sig in (signal.SIGTERM, signal.SIGINT):
@@ -693,7 +692,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             except (NotImplementedError, RuntimeError):
                 pass  # Windows or non-main thread
 
-        print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers}, max_active={slots.max_active})", flush=True)
+        logger.info("worker %s ready (max_concurrent=%s, max_active=%s)", wid[:8], max_workers, slots.max_active)
         _active: set[asyncio.Task] = set()
         plugin_manager = get_manager(workspace_root, process="engine")
         from plugin_runtime.host import PluginHost
@@ -726,13 +725,13 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                         if not t.cancelled():
                             _exc = t.exception()
                             if _exc:
-                                print(f"[engine] task error: {_exc}", flush=True)
+                                logger.error("task error: %s", _exc, exc_info=(type(_exc), _exc, _exc.__traceback__))
                     _active -= _done
 
                     # ---- tools hot-reload check ----
                     reloaded = await tool_reload.poll()
                     if reloaded is not None:
-                        print(f"[engine] tools reloaded ({reloaded} tools)", flush=True)
+                        logger.info("tools reloaded (%s tools)", reloaded)
 
                     # ---- poll for new task (only if below capacity) ----
                     # 等审批的任务不占名额；空位数带给 supervisor，它据此给交互道留位置
@@ -752,7 +751,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                                 _active.add(_t)
                                 continue
                 except Exception as e:
-                    print(f"[engine] error: {e}", flush=True)
+                    logger.warning("worker loop error: %s", e)
                 # Stop-aware sleep: wake immediately on stop signal
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
@@ -766,13 +765,13 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             await tool_reload.aclose()
             # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
             if _active:
-                print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
+                logger.info("shutting down, cancelling %s active task(s)...", len(_active))
                 for t in _active:
                     t.cancel()
                 # Wait for tasks to handle CancelledError and POST terminal state
                 await asyncio.wait(_active, timeout=15.0)
             await plugin_host.stop()
-        print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
+        logger.info("worker %s stopped (generation %s)", wid[:8], generation_id[:8])
 
 
 def _lease_lost_reason(response: Any) -> str:

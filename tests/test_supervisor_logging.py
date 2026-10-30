@@ -21,13 +21,15 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from supervisor import logging_setup  # noqa: E402
+from supervisor import admin_api, logging_setup  # noqa: E402
 from supervisor.logging_setup import (  # noqa: E402
     CHATTY_LIBRARIES,
     DEFAULT_BACKUP_COUNT,
     DEFAULT_MAX_BYTES,
     KeyValueFormatter,
     LOG_FORMAT,
+    TERMINAL_LOGGER,
+    TERMINAL_ONLY,
     SupervisorLogHandler,
     backup_name,
     configure_supervisor_logging,
@@ -39,15 +41,8 @@ _SKIP_DIRS = {"__pycache__", "node_modules"}
 
 # 装 handler 之后被改动过的每一处全局状态，用例之间不还原就会互相串。
 _WATCHED_LOGGERS = (
-    *CHATTY_LIBRARIES, "py.warnings", "uvicorn.error", "uvicorn.access", "uvicorn.asgi",
+    *CHATTY_LIBRARIES, "py.warnings", "uvicorn.error", "uvicorn.access", "uvicorn.asgi", TERMINAL_LOGGER,
 )
-
-# supervisor 里允许留下的 print：都是首启时给运维看的，那会儿控制台的日志页还打不开。
-# 首登链接带着令牌，更是只能走终端 —— 进了日志文件就是谁能读日志谁就能登控制台。
-_PRINT_ALLOWED = {
-    "supervisor/admin_api.py": ("[admin]", "{console_url}?token="),
-    "supervisor/api.py": ("[web] 前端地址",),
-}
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +72,7 @@ def _restore_logging(monkeypatch: pytest.MonkeyPatch):
     if logging_setup._installed is not None:
         logging_setup._installed.close()
         logging_setup._installed = None
+    logging_setup._terminal = None
     root.handlers[:] = saved_handlers
     root.setLevel(saved_root_level)
     for name, (level, propagate, handlers) in saved.items():
@@ -625,28 +621,76 @@ class TestMainWiresItUpFirst:
         assert [call.lineno for call in calls if _keyword(call, "log_func") is not None] == []
 
 
-class TestNothingElsePrintsToTheTerminal:
-    def test_only_the_first_boot_hints_may_print(self) -> None:
-        """print 不带时间不带来源，还在前台 TUI 画面上乱插字符。"""
-        offenders: list[str] = []
-        for path in _python_files(_SUPERVISOR):
-            rel = _rel(path)
-            allowed = _PRINT_ALLOWED.get(rel, ())
-            for call in _calls_named(_parse(path), "print"):
-                text = ast.unparse(call)
-                if not any(marker in text for marker in allowed):
-                    offenders.append(f"{rel}:{call.lineno} {text}")
-
-        assert offenders == [], f"改用 logging，要新增 print 先在 _PRINT_ALLOWED 里登记理由: {offenders}"
-
-    def test_the_whitelisted_files_still_print(self) -> None:
-        # 登记项跟着代码一起腐烂：白名单留着而 print 早没了，下一次就白放行一整个文件。
-        stale = [
-            rel for rel in _PRINT_ALLOWED
-            if not _calls_named(_parse(_ROOT / rel), "print")
+class TestNothingPrintsToTheTerminal:
+    def test_supervisor_code_never_calls_print(self) -> None:
+        """print 不带时间不带来源，还在前台 TUI 画面上乱插字符。启动时给人看的几行走 TERMINAL_LOGGER。"""
+        offenders = [
+            f"{_rel(path)}:{call.lineno} {ast.unparse(call)}"
+            for path in _python_files(_SUPERVISOR)
+            for call in _calls_named(_parse(path), "print")
         ]
 
-        assert stale == [], f"这些文件已经没有 print 了，从 _PRINT_ALLOWED 里删掉: {stale}"
+        assert offenders == [], f"改用 logging，启动时给人看的提示用 TERMINAL_LOGGER: {offenders}"
+
+
+class TestTheStartupLines:
+    """前端地址、令牌从哪来照常打到终端，也进 supervisor.log；首登链接带着令牌，只上终端。"""
+
+    def test_a_startup_line_reaches_the_terminal_and_the_log_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        _configure(tmp_path)
+
+        logging.getLogger(TERMINAL_LOGGER).info("[web] 前端地址: %s", "http://127.0.0.1:8765/web/")
+
+        assert "[web] 前端地址: http://127.0.0.1:8765/web/" in capsys.readouterr().out
+        assert "INFO supervisor.terminal: [web] 前端地址: http://127.0.0.1:8765/web/" in _read(tmp_path)
+
+    def test_a_terminal_only_line_stays_out_of_the_log_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        _configure(tmp_path)
+
+        logging.getLogger(TERMINAL_LOGGER).info("只给终端", extra={TERMINAL_ONLY: True})
+
+        assert "只给终端" in capsys.readouterr().out
+        assert "只给终端" not in _read(tmp_path)
+
+    def test_they_show_even_when_the_log_level_is_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # 原来的 print 不看日志级别，调成 warning 的部署照样要看到前端地址
+        _configure(tmp_path, "warning")
+
+        logging.getLogger(TERMINAL_LOGGER).info("照样显示")
+
+        assert "照样显示" in capsys.readouterr().out
+        assert "照样显示" in _read(tmp_path)
+
+    def test_configuring_twice_keeps_one_terminal_handler(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        _configure(tmp_path)
+        _configure(tmp_path)
+
+        logging.getLogger(TERMINAL_LOGGER).info("只一次")
+
+        assert capsys.readouterr().out.count("只一次") == 1
+
+    def test_the_first_login_link_never_reaches_the_log_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
+        monkeypatch.setattr(admin_api, "_admin_token", "")
+        _configure(tmp_path)
+
+        token = admin_api.init_admin_token(tmp_path, console_url="http://127.0.0.1:8765/web/")
+
+        assert f"http://127.0.0.1:8765/web/?token={token}" in capsys.readouterr().out
+        log = _read(tmp_path)
+        assert token not in log
+        assert "首次登录" not in log
+        assert "已生成并写入" in log
 
     def test_the_process_manager_logs_instead_of_printing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture,

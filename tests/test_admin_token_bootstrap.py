@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from supervisor import admin_api  # noqa: E402
+from supervisor.logging_setup import TERMINAL_LOGGER  # noqa: E402
 
 _ENV = "CLONOTH_ADMIN_TOKEN"
 _CONSOLE = "http://127.0.0.1:8765/web/"
@@ -28,6 +29,13 @@ def _clean(monkeypatch: pytest.MonkeyPatch):
     # 令牌缓存在模块全局里，不清掉的话第一个测试的结果会漏给后面所有测试。
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.delenv(_ENV, raising=False)
+
+
+@pytest.fixture()
+def terminal(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
+    """启动时打到终端的那几行都经 TERMINAL_LOGGER，收在这里看。"""
+    caplog.set_level(logging.INFO, logger=TERMINAL_LOGGER)
+    return caplog
 
 
 def _token_path(ws: Path) -> Path:
@@ -99,38 +107,38 @@ class TestTheFileIsNotTrusted:
 
 
 class TestTheTokenStaysOutOfLogs:
-    def test_a_generated_token_is_offered_as_a_link(self, tmp_path: Path, capsys) -> None:
+    def test_a_generated_token_is_offered_as_a_link(self, tmp_path: Path, terminal) -> None:
         token = admin_api.init_admin_token(tmp_path, console_url=_CONSOLE)
 
-        assert _CONSOLE + "?token=" + token in capsys.readouterr().out
+        assert _CONSOLE + "?token=" + token in terminal.text
 
-    def test_no_link_when_the_console_is_not_built(self, tmp_path: Path, capsys) -> None:
+    def test_no_link_when_the_console_is_not_built(self, tmp_path: Path, terminal) -> None:
         # 前端没 build 时 /web/ 根本没挂载，给一条打不开的链接只会误导。
         token = admin_api.init_admin_token(tmp_path, console_url="")
 
-        assert token not in capsys.readouterr().out
+        assert token not in terminal.text
 
-    def test_a_reused_token_is_never_printed(self, tmp_path: Path, capsys) -> None:
+    def test_a_reused_token_is_never_printed(self, tmp_path: Path, terminal) -> None:
         # 只有「刚生成、你还不知道它」的令牌值得打印一次。已经落盘的再打就是白送。
         _token_path(tmp_path).parent.mkdir(parents=True)
         _token_path(tmp_path).write_text("already-here", encoding="utf-8")
 
         admin_api.init_admin_token(tmp_path, console_url=_CONSOLE)
 
-        assert "already-here" not in capsys.readouterr().out
+        assert "already-here" not in terminal.text
 
-    def test_an_environment_token_is_never_printed(self, tmp_path: Path, monkeypatch, capsys) -> None:
+    def test_an_environment_token_is_never_printed(self, tmp_path: Path, monkeypatch, terminal) -> None:
         monkeypatch.setenv(_ENV, "secret-from-env")
 
         admin_api.init_admin_token(tmp_path, console_url=_CONSOLE)
 
-        assert "secret-from-env" not in capsys.readouterr().out
+        assert "secret-from-env" not in terminal.text
 
-    def test_the_path_is_always_reported(self, tmp_path: Path, capsys) -> None:
+    def test_the_path_is_always_reported(self, tmp_path: Path, terminal) -> None:
         # 不打印内容时，至少要让人知道去哪儿取。
         admin_api.init_admin_token(tmp_path)
 
-        assert str(_token_path(tmp_path)) in capsys.readouterr().out
+        assert str(_token_path(tmp_path)) in terminal.text
 
 
 class TestOnDisk:
@@ -188,20 +196,19 @@ class TestWhenTheDiskSaysNo:
     def test_startup_still_gets_a_token(self, blocked: Path) -> None:
         assert len(admin_api.init_admin_token(blocked)) >= 24
 
-    def test_the_console_link_is_still_offered(self, blocked: Path, capsys) -> None:
+    def test_the_console_link_is_still_offered(self, blocked: Path, terminal) -> None:
         # 落盘失败只连累适配器，控制台照样能进，链接不该跟着消失。
         token = admin_api.init_admin_token(blocked, console_url=_CONSOLE)
 
-        assert _CONSOLE + "?token=" + token in capsys.readouterr().out
+        assert _CONSOLE + "?token=" + token in terminal.text
 
-    def test_it_does_not_claim_to_have_written_the_file(self, blocked: Path, capsys, caplog) -> None:
-        with caplog.at_level(logging.ERROR, logger="supervisor.admin_api"):
+    def test_it_does_not_claim_to_have_written_the_file(self, blocked: Path, terminal) -> None:
+        with terminal.at_level(logging.ERROR, logger="supervisor.admin_api"):
             admin_api.init_admin_token(blocked)
-        out = capsys.readouterr().out
 
-        assert "已生成并写入" not in out
+        assert "已生成并写入" not in terminal.text
         # 后果要说清：engine 和各适配器读不到令牌，它们的请求都会是 401。
-        assert any("401" in record.getMessage() for record in caplog.records)
+        assert any("401" in record.getMessage() for record in terminal.records)
 
     def test_no_temporary_file_is_left_behind(self, blocked: Path) -> None:
         admin_api.init_admin_token(blocked)

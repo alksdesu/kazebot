@@ -111,6 +111,7 @@ from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router
 from .platform_api import create_platform_router
 from .restart_gate import RestartGate
 from .usage_report import create_usage_router
+from .logging_setup import TERMINAL_LOGGER
 from .admin_api import (
     init_admin_token,
     presented_token,
@@ -2525,7 +2526,7 @@ def create_app(
 
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
         console_url = f"http://{host}:{port}{url_prefix()}/web/"
-        print(f"[web] 前端地址: {console_url}", flush=True)
+        logging.getLogger(TERMINAL_LOGGER).info("[web] 前端地址: %s", console_url)
 
     init_admin_token(state.workspace_root, console_url=console_url)
 

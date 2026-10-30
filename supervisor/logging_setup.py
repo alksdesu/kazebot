@@ -28,11 +28,17 @@ CHATTY_LIBRARIES = ("httpx", "httpcore")
 
 UNCAUGHT_LOGGER = "supervisor.uncaught"
 
+# 启动时给人看的几行（前端地址、令牌从哪来、首登链接）：照常打到终端，也进 supervisor.log。
+TERMINAL_LOGGER = "supervisor.terminal"
+# 带这个字段的记录只上终端、不落日志文件：首登链接里有令牌。下划线开头，KeyValueFormatter 不把它当字段印出来。
+TERMINAL_ONLY = "_terminal_only"
+
 _STANDARD_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__) | {"message", "asctime"}
 # uvicorn 给彩色终端另备的一份消息，和正文重复。
 _PRESENTATION_FIELDS = frozenset({"color_message"})
 
 _installed: logging.Handler | None = None
+_terminal: logging.Handler | None = None
 
 
 def _render(value: object) -> str:
@@ -68,6 +74,24 @@ class SupervisorLogHandler(logging.handlers.RotatingFileHandler):
     def __init__(self, path: Path, *, max_bytes: int, backup_count: int) -> None:
         super().__init__(path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
         self.namer = backup_name
+        self.addFilter(_skip_terminal_only)
+
+
+def _skip_terminal_only(record: logging.LogRecord) -> bool:
+    return not getattr(record, TERMINAL_ONLY, False)
+
+
+def _install_terminal_handler() -> None:
+    """终端 logger 挂一个 stdout handler，换掉上次装的那个，再 configure 一次也只有一份。"""
+    global _terminal
+    logger = logging.getLogger(TERMINAL_LOGGER)
+    if _terminal is not None:
+        logger.removeHandler(_terminal)
+    _terminal = logging.StreamHandler(sys.stdout)
+    _terminal.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_terminal)
+    # 钉在 INFO：日志级别调成 warning 的部署照样在终端和日志文件里看到这几行
+    logger.setLevel(logging.INFO)
 
 
 def _env_count(name: str, default: int) -> int:
@@ -133,6 +157,7 @@ def configure_supervisor_logging(log_path: Path, level: str | int = DEFAULT_LEVE
     root.addHandler(handler)
     root.setLevel(effective)
     _installed = handler
+    _install_terminal_handler()
 
     for name in CHATTY_LIBRARIES:
         logging.getLogger(name).setLevel(logging.WARNING if effective >= logging.INFO else logging.NOTSET)

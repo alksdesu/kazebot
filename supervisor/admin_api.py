@@ -46,11 +46,13 @@ from toolbox import mcp_runtime
 
 from . import config_files
 from .config_store import check_models_text
+from .logging_setup import TERMINAL_LOGGER, TERMINAL_ONLY
 from .policy import check_policy_text
 from .scheduler import check_schedules_text, schedules_path
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 _log = logging.getLogger(__name__)
+_terminal = logging.getLogger(TERMINAL_LOGGER)
 
 class RawContent(BaseModel):
     content: str
@@ -124,24 +126,26 @@ def init_admin_token(workspace_root: Path, *, console_url: str = "") -> str:
     if env_token:
         _admin_token = env_token
         _persist_token(path, env_token)
-        print("[admin] 管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）", flush=True)
+        _terminal.info("[admin] 管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）")
         return _admin_token
 
     existing = _read_token(path)
     if existing:
         _admin_token = existing
         _harden(path)
-        print(f"[admin] 管理令牌沿用 {path}（内容不输出）", flush=True)
+        _terminal.info("[admin] 管理令牌沿用 %s（内容不输出）", path)
         return _admin_token
 
     token = secrets.token_urlsafe(24)
     _admin_token = token
     if _persist_token(path, token):
-        print(f"[admin] 尚未设置管理令牌，已生成并写入 {path}", flush=True)
+        _terminal.info("[admin] 尚未设置管理令牌，已生成并写入 %s", path)
     if console_url:
-        print("[admin] 首次登录请打开：", flush=True)
-        print(f"        {console_url}?token={token}", flush=True)
-        print("[admin] 设置 CLONOTH_ADMIN_TOKEN 后本行不再输出", flush=True)
+        # 链接里带着令牌：只上终端，进了日志文件就是谁能读日志谁就能登控制台
+        terminal_only = {TERMINAL_ONLY: True}
+        _terminal.info("[admin] 首次登录请打开：", extra=terminal_only)
+        _terminal.info("        %s?token=%s", console_url, token, extra=terminal_only)
+        _terminal.info("[admin] 设置 CLONOTH_ADMIN_TOKEN 后本行不再输出", extra=terminal_only)
     return _admin_token
 
 

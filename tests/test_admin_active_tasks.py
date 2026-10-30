@@ -7,6 +7,7 @@ They pin authentication, field omission, status filtering, and newest-first orde
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.logging_setup import TERMINAL_LOGGER  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
@@ -180,34 +182,36 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
         assert "must-not-leak" not in str(item)
 
 
-def test_generated_admin_token_is_never_printed(tmp_path: Path, monkeypatch, capsys) -> None:
-    """没有控制台链接可给时，自动生成的令牌不进 stdout，只报去哪儿取。"""
+def test_generated_admin_token_is_never_printed(tmp_path: Path, monkeypatch, caplog) -> None:
+    """没有控制台链接可给时，自动生成的令牌不进终端那几行，只报去哪儿取。"""
     secret = "generated-admin-token-must-stay-secret"
     monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.setattr(admin_api.secrets, "token_urlsafe", lambda _length: secret)
 
-    assert admin_api.init_admin_token(tmp_path) == secret
+    with caplog.at_level(logging.INFO, logger=TERMINAL_LOGGER):
+        assert admin_api.init_admin_token(tmp_path) == secret
 
-    output = capsys.readouterr().out
-    assert secret not in output
-    assert str(tmp_path / "data" / ".admin_token") in output
+    assert secret not in caplog.text
+    assert str(tmp_path / "data" / ".admin_token") in caplog.text
 
 
-def test_the_fallback_getter_stays_silent(monkeypatch, capsys) -> None:
+def test_the_fallback_getter_stays_silent(monkeypatch, caplog) -> None:
     """回退取值没有「首次引导」的语境，喊一声只会把令牌洒进不相干的日志。"""
     secret = "fallback-admin-token-must-stay-secret"
     monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.setattr(admin_api.secrets, "token_urlsafe", lambda _length: secret)
 
-    assert admin_api.get_admin_token() == secret
+    with caplog.at_level(logging.DEBUG):
+        assert admin_api.get_admin_token() == secret
 
-    assert capsys.readouterr().out == ""
+    assert [record for record in caplog.records if record.name == TERMINAL_LOGGER] == []
+    assert secret not in caplog.text
 
 
 def test_create_app_writes_but_does_not_print_admin_token(
-    tmp_path: Path, monkeypatch, capsys,
+    tmp_path: Path, monkeypatch, caplog,
 ) -> None:
     """Startup may persist the token for workers, but must never log its value."""
     secret = "configured-admin-token-must-stay-secret"
@@ -215,13 +219,13 @@ def test_create_app_writes_but_does_not_print_admin_token(
     monkeypatch.setattr(admin_api, "_admin_token", "")
 
     state = _make_state(tmp_path)
-    create_app(
-        state=state,
-        process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
-    )
+    with caplog.at_level(logging.INFO, logger=TERMINAL_LOGGER):
+        create_app(
+            state=state,
+            process_manager=None,
+            config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
+        )
 
-    output = capsys.readouterr().out
-    assert secret not in output
-    assert "管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）" in output
+    assert secret not in caplog.text
+    assert "管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）" in caplog.text
     assert (tmp_path / "data" / ".admin_token").read_text(encoding="utf-8") == secret
