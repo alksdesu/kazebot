@@ -107,8 +107,9 @@ def _valid_entry_id(entry_id: str) -> str:
 
 
 def _clean_keywords(raw: Any) -> list[str]:
+    # 和注入、save_memory 一样整串算一个关键词：按逗号拆的话，存下的和召回时认的不是同一组，正则里的逗号也会被拆断
     if isinstance(raw, str):
-        items = [part.strip() for part in raw.split(",")]
+        items = [raw.strip()]
     elif isinstance(raw, (list, tuple)):
         items = [str(part or "").strip() for part in raw]
     else:

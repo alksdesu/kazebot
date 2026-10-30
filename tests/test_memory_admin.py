@@ -18,7 +18,7 @@ if str(_ROOT) not in sys.path:
 
 import supervisor.admin_api as admin_api  # noqa: E402
 from engine import memory_admin  # noqa: E402
-from engine.builtin.knowledge_inject import _DEFAULT_SCAN_DEPTH  # noqa: E402
+from engine.builtin.knowledge_inject import _DEFAULT_SCAN_DEPTH, load_memory_catalog  # noqa: E402
 
 
 def _book_path(root: Path, namespace: str, book: str = "default") -> Path:
@@ -28,13 +28,23 @@ def _book_path(root: Path, namespace: str, book: str = "default") -> Path:
 class TestUpsert:
     def test_a_new_entry_lands_with_the_same_defaults_save_memory_uses(self, tmp_path: Path) -> None:
         entry = memory_admin.upsert_entry(
-            tmp_path, "user_UserA", {"id": "likes_tea", "content": "喜欢喝奶茶", "keywords": "奶茶, 喝的"},
+            tmp_path, "user_UserA", {"id": "likes_tea", "content": "喜欢喝奶茶", "keywords": ["奶茶", "喝的"]},
         )
 
         assert entry["scan_depth"] == _DEFAULT_SCAN_DEPTH
         assert entry["enabled"] is True
         assert entry["priority"] == 0
         assert entry["keywords"] == ["奶茶", "喝的"]
+
+    def test_a_keyword_string_is_kept_whole_the_way_injection_reads_it(self, tmp_path: Path) -> None:
+        # 注入时整串算一个关键词：这里按逗号拆了，正则 /\d{1,3}/ 会被拆成两截都不成正则的词
+        entry = memory_admin.upsert_entry(
+            tmp_path, "user_UserA", {"id": "room", "content": "住 302", "keywords": r"/\d{1,3}/"},
+        )
+
+        assert entry["keywords"] == [r"/\d{1,3}/"]
+        [loaded] = load_memory_catalog(tmp_path, memory_book="user_UserA", _use_cache=False)
+        assert loaded["keywords"] == entry["keywords"]
 
     def test_a_subject_namespace_stamps_the_subject(self, tmp_path: Path) -> None:
         # 少了 subject，这条就不会随「提到这个人」被加载，等于白存。
