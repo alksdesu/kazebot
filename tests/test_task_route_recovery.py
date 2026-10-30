@@ -262,6 +262,62 @@ def test_same_delivery_id_is_persistently_deduped(tmp_path: Path) -> None:
     assert rows[0]["payload"]["text"] == "once"
 
 
+def _forbid_log_scans(monkeypatch: pytest.MonkeyPatch, log: EventLog) -> None:
+    """之后再整份扫一遍事件日志就算读了盘。"""
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("scanned the persisted event log")
+
+    monkeypatch.setattr(log, "iter_persisted_events", refuse)
+    monkeypatch.setattr(log, "_iter_persisted_events_locked", refuse)
+
+
+def _forget_tasks(state: SupervisorState, matches) -> list[str]:
+    """把任务从内存里清掉（重启后没恢复、或已过期清理），只剩日志里的 task_created。"""
+    with state._lock:
+        forgotten = [task_id for task_id, task in state.tasks.items() if matches(task)]
+        for task_id in forgotten:
+            state.tasks.pop(task_id)
+            if task_id in state._task_order:
+                state._task_order.remove(task_id)
+    return forgotten
+
+
+def test_same_delivery_id_is_deduped_after_its_event_leaves_the_memory_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:dedupe")
+    first = state.append_outbound_message(session_id=session_id, text="once", delivery_id="delivery:test:window")
+    # 内存里的近期事件早已翻过这一条
+    state.eventlog._events = []
+    _forbid_log_scans(monkeypatch, state.eventlog)
+
+    again = state.append_outbound_message(session_id=session_id, text="must not append", delivery_id="delivery:test:window")
+
+    assert again["deduped"] is True
+    assert (again["event_id"], again["event_seq"]) == (first["event_id"], first["event_seq"])
+    assert len(_outbounds(tmp_path, "delivery:test:window")) == 1
+
+
+def test_same_delivery_id_is_deduped_after_restart_without_scanning_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _make_state(tmp_path)
+    session_id = first.get_or_create_session(channel="test", conversation_key="test:dedupe")
+    original = first.append_outbound_message(session_id=session_id, text="once", delivery_id="delivery:test:restart")
+    restarted = _make_state(tmp_path)
+    _forbid_log_scans(monkeypatch, restarted.eventlog)
+
+    again = restarted.append_outbound_message(
+        session_id=session_id, text="must not append", delivery_id="delivery:test:restart",
+    )
+
+    assert again["deduped"] is True
+    assert (again["event_id"], again["event_seq"]) == (original["event_id"], original["event_seq"])
+    assert len(_outbounds(tmp_path, "delivery:test:restart")) == 1
+
+
 def test_real_route_retry_after_append_failure_emits_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = _make_state(tmp_path)
     session_id = state.get_or_create_session(channel="test", conversation_key="test:route-recovery")
@@ -745,6 +801,64 @@ def test_turn_summary_phase_identity_dedupes_created_task_across_restart(tmp_pat
         and str((((event.get("payload") or {}).get("input") or {}).get("_post_phase_id")) or "") == phase_id
     ]
     assert len(matching_created) == 1
+
+
+def test_turn_summary_receipt_is_found_without_scanning_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:summary-receipt")
+    task = _running_task(state, session_id)
+    task.status = TaskStatus.completed
+    task.result = {"action": "finish", "result": {"text": "done"}, "_tool_call_count": 3}
+    ConversationStore(tmp_path / "data" / "conversations").append(
+        session_id,
+        Message(
+            id="summary-source", role="assistant", content="summary source",
+            message_type=MessageType.ASSISTANT, source_task_id=task.task_id,
+        ),
+    )
+    phase_id = "post:summary-receipt:turn_summary"
+
+    def summarizes_this_phase(candidate: Task) -> bool:
+        return str((candidate.input or {}).get("_post_phase_id") or "") == phase_id
+
+    state._maybe_trigger_turn_summary_locked(task, phase_id=phase_id)
+    assert len(_forget_tasks(state, summarizes_this_phase)) == 1
+    _forbid_log_scans(monkeypatch, state.eventlog)
+
+    state._maybe_trigger_turn_summary_locked(task, phase_id=phase_id)
+
+    assert not any(summarizes_this_phase(candidate) for candidate in state.tasks.values())
+    created = [
+        event for event in _events(tmp_path)
+        if event.get("type") == "task_created"
+        and str((((event.get("payload") or {}).get("input") or {}).get("_post_phase_id")) or "") == phase_id
+    ]
+    assert len(created) == 1
+
+
+def test_memory_extract_receipt_is_found_without_scanning_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _make_state(tmp_path)
+    session_id = first.get_or_create_session(channel="test", conversation_key="test:memory-ledger")
+    intent = _memory_intent(session_id, due_at=datetime.now(timezone.utc) + timedelta(minutes=5), suffix="receipt")
+    first._persist_memory_extract_intent(intent)
+    _cancel_memory_timers(first)
+    first._fire_memory_extract_intent(intent["intent_id"])
+    _cancel_memory_timers(first)
+
+    restarted = _make_state(tmp_path)
+    _cancel_memory_timers(restarted)
+    _forget_tasks(
+        restarted,
+        lambda candidate: str((candidate.input or {}).get("_memory_extract_intent_id") or "") == intent["intent_id"],
+    )
+    _forbid_log_scans(monkeypatch, restarted.eventlog)
+
+    assert restarted._memory_extract_task_exists(intent["intent_id"]) is True
+    assert restarted._memory_extract_task_exists("post:memory:never:hook:memory_extract:memory_extract_schedule") is False
 
 
 def test_cleanup_file_io_does_not_hold_supervisor_lock(

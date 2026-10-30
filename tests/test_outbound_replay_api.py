@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor.admin_api as admin_api
 import supervisor.api as api
+import supervisor.eventlog as eventlog_module
+from engine.eventlog_rotation import rotate_event_log
 from supervisor.config_store import ConfigStore
 from supervisor.eventlog import EventLog
 from supervisor.policy import PolicyEngine
@@ -279,6 +281,67 @@ def test_replay_reads_rotated_logs_beyond_the_memory_cache(app_state):
     page, checkpoint = api._outbound_replay_page(state.eventlog, 0, last["seq"])
     assert [event["seq"] for event in page] == [first["seq"], last["seq"]]
     assert checkpoint == last["seq"]
+
+
+def write_retained(path, files):
+    """按从旧到新写几份留存日志（.N … .1、活动文件），每份里的 seq 由 range 给出，都是出站消息。"""
+    names = [f"{path.name}.{index}" for index in range(len(files) - 1, 0, -1)] + [path.name]
+    for name, seqs in zip(names, files):
+        rows = [
+            json.dumps({"seq": seq, "event_id": f"e-{seq}", "session_id": "session", "type": "outbound_message",
+                        "payload": {"text": str(seq), "pad": "x" * 60}})
+            for seq in seqs
+        ]
+        (path.parent / name).write_text("".join(row + "\n" for row in rows), encoding="utf-8")
+
+
+def test_replay_from_an_old_seq_does_not_read_the_files_before_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(eventlog_module, "_SEEK_WINDOW_BYTES", 2048)
+    monkeypatch.setattr(eventlog_module, "_ONLINE_ROTATE_BACKUPS", 2)
+    path = tmp_path / "data" / "events.jsonl"
+    path.parent.mkdir(parents=True)
+    write_retained(path, [range(1, 401), range(401, 801), range(801, 1201)])
+    log = EventLog(path, run_id="replay")
+    log._events = []
+    decoded = []
+    decode = eventlog_module._decode_event_line
+
+    def counting(raw):
+        event = decode(raw)
+        if event is not None and isinstance(event.get("seq"), int):
+            decoded.append(event["seq"])
+        return event
+
+    monkeypatch.setattr(eventlog_module, "_decode_event_line", counting)
+
+    page, checkpoint = api._outbound_replay_page(log, 1000, 1200)
+
+    assert [event["seq"] for event in page] == list(range(1001, 1201))
+    assert checkpoint == 1200
+    # 前两份各只读了末尾那一条；活动文件里 1000 之前只读了二分探到的几行和起点附近的一个窗口
+    assert [seq for seq in decoded if seq <= 800] == [400, 800]
+    assert len([seq for seq in decoded if 800 < seq <= 1000]) < 60
+
+
+def test_replay_pages_follow_a_rotation_between_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr(eventlog_module, "_MAX_MEMORY_EVENTS", 10)
+    monkeypatch.setattr(eventlog_module, "_ONLINE_ROTATE_BACKUPS", 3)
+    monkeypatch.setattr(api, "_OUTBOUND_REPLAY_PAGE_SIZE", 250)
+    path = tmp_path / "data" / "events.jsonl"
+    path.parent.mkdir(parents=True)
+    write_retained(path, [range(1, 301), range(301, 601)])
+    log = EventLog(path, run_id="replay")
+    first, cursor = api._outbound_replay_page(log, 0, 600)
+    # 两页之间 data_cleanup 轮转了一次，又写进来一条：各份文件都换了名字和位置
+    rotate_event_log(path, max_bytes=1, backups=3)
+    latest = append(log, "after-rotation")
+
+    second, cursor_after_second = api._outbound_replay_page(log, cursor, latest["seq"])
+    third, last_cursor = api._outbound_replay_page(log, cursor_after_second, latest["seq"])
+
+    seqs = [event["seq"] for event in first + second + third]
+    assert (cursor, cursor_after_second, last_cursor) == (250, 500, latest["seq"])
+    assert seqs == list(range(1, latest["seq"] + 1))
 
 
 def post(app, path, content):

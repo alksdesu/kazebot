@@ -266,6 +266,36 @@ def test_restart_recovers_completed_attempt_from_eventlog(state, actor):
     assert state.execution.get(actor, plan["id"])["steps"][1]["attempt"] == 1
 
 
+def test_a_missing_task_is_looked_up_in_the_log_once_while_its_step_waits_out_the_lease(state, actor, monkeypatch):
+    # 任务不在内存里、日志里也没有它的终态：租约到期前每次 tick 都会问一遍，整份日志只该扫一次
+    plan = state.execution.create(actor, PlanDraft(goal="summarize"))
+    state.execution.confirm(actor, plan["id"], 1)
+    state.execution.tick(); state.execution.tick()
+    step = state.execution.get(actor, plan["id"])["steps"][1]
+    state.tasks.pop(step["task_id"])
+    scans = []
+    scan = state.eventlog.iter_persisted_events
+
+    def counting():
+        scans.append(step["task_id"])
+        return scan()
+
+    monkeypatch.setattr(state.eventlog, "iter_persisted_events", counting)
+
+    for _ in range(3):
+        state.execution.tick()
+
+    assert len(scans) == 1
+    assert state.execution.get(actor, plan["id"])["steps"][1]["status"] in {"queued", "running"}
+
+    state.execution._set_step(plan["id"], step["id"], lease_until="2000-01-01T00:00:00+00:00")
+    state.execution.tick(); state.execution.tick()
+
+    assert len(scans) == 1
+    assert state.execution.get(actor, plan["id"])["steps"][1]["status"] == "failed"
+    assert step["task_id"] not in state.execution._missing_snapshots
+
+
 def test_reset_cancels_plan_without_touching_another_scope(state, actor):
     plan = state.execution.create(actor, PlanDraft(goal="first"))
     other_actor = FeatureActor(scope="qq_group:other", owner="alice", bot_scope="bot")

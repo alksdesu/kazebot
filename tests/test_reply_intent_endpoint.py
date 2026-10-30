@@ -73,8 +73,9 @@ def _body(**extra: Any) -> dict[str, Any]:
 
 def _pending_intent_tasks(state: SupervisorState) -> list[Any]:
     """还没被做掉的判定任务。已完成的留在 tasks 里，按标记捞会捞到上一轮那个。"""
+    # 判定任务在线程池里建：先拷一份再挑，别在另一个线程往里加的时候遍历
     return [
-        t for t in state.tasks.values()
+        t for t in list(state.tasks.values())
         if t.input.get("_reply_intent") and t.status not in {
             TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled,
         }

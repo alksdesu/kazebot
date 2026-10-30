@@ -16,13 +16,16 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from _lock_probe import ThreadRecordingLock
 from clonoth_runtime import switch_refusal
 from engine.materials import MaterialError, MaterialService
 from engine.materials.integration import begin_image_generation, persist_generated_images
 from engine.tool_step import TOOL_ERROR, ToolOutcome, result_to_raw, tool_outcome
+from supervisor.eventlog import EventLog
 from supervisor.feature_auth import FeatureActor
 from supervisor.materials_api import MaterialRuntime, create_router
 import supervisor.admin_api as admin_api
+import supervisor.materials_api as materials_api
 from toolbox.builtins import materials
 from toolbox.registry import ToolRegistry
 
@@ -267,6 +270,62 @@ def api_state(tmp_path, monkeypatch):
     app.include_router(create_router(state))
     yield app, state
     state.materials.store.close()
+
+
+def test_sending_a_version_waits_for_the_supervisor_lock_off_the_event_loop(tmp_path, monkeypatch):
+    # 全局锁可能被路由占着一阵，在事件循环上等的话所有请求都跟着卡住
+    current = FeatureActor(scope="qq_group:test", owner="user:test", is_admin=True, role="admin", bot_scope="bot", channel="qq_group")
+    monkeypatch.setattr(materials_api, "resolve_actor", lambda request, state, scope="": current)
+    exported = {"sha256": "f" * 64, "attachment": {"path": "data/exports/report.pdf", "name": "report.pdf", "mime_type": "application/pdf"}}
+    lock = ThreadRecordingLock(threading.RLock())
+    eventlog = EventLog(tmp_path / "data" / "events.jsonl", run_id="materials-send")
+    state = SimpleNamespace(
+        workspace_root=tmp_path, _lock=lock, conversation_map={"qq_group:test": "session-1"}, eventlog=eventlog,
+        materials=SimpleNamespace(export_version=lambda actor, version_id: exported),
+    )
+    app = FastAPI()
+    app.include_router(materials_api.create_router(state))
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+            sent = [await http.post("/v1/materials/versions/v1/send") for _ in range(2)]
+        return loop_thread, sent
+
+    loop_thread, (first, again) = asyncio.run(exercise())
+
+    assert first.status_code == again.status_code == 200, first.text
+    assert again.json()["event_id"] == first.json()["event_id"]
+    assert lock.threads and loop_thread not in lock.threads
+    assert [event["payload"]["delivery_id"] for event in eventlog.iter_persisted_events()] == [f"materials:v1:{'f' * 64}"]
+
+
+def test_scopes_registration_and_image_completion_take_their_locks_off_the_event_loop(api_state):
+    app, state = api_state
+    state._lock = ThreadRecordingLock(state._lock)
+    state.materials.store.lock = ThreadRecordingLock(state.materials.store.lock)
+    token = {"Authorization": "Bearer materials-test"}
+    adapter_admin = {**token, "X-Clonoth-Adapter-Actor": json.dumps(
+        {"scope": "qq_group:test", "user_id": "123", "is_admin": True, "channel": "qq_group"},
+    )}
+    model = {**token, "X-Clonoth-Task-Id": "task"}
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+            scopes = await http.get("/v1/materials/scopes", headers=adapter_admin)
+            registered = await http.post("/v1/materials/sources/register", json={"path": "data/attachments/other.png"}, headers=model)
+            state.tasks["task"].cancel_requested = True
+            completed = await http.post("/v1/materials/image-operations/op-1/complete", json={}, headers=model)
+        return loop_thread, scopes, registered, completed
+
+    loop_thread, scopes, registered, completed = asyncio.run(exercise())
+
+    assert scopes.status_code == 200, scopes.text
+    assert registered.status_code == 403 and "不属于本任务" in registered.json()["detail"]
+    assert completed.status_code == 403 and "已取消" in completed.json()["detail"]
+    assert state.materials.store.lock.threads and state._lock.threads
+    assert loop_thread not in state.materials.store.lock.threads + state._lock.threads
 
 
 def test_model_cannot_confirm_or_forge_platform_journal(api_state):

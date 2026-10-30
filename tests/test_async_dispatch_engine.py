@@ -40,7 +40,7 @@ from engine.dispatch_batch import (  # noqa: E402
     await_request,
     parse_timeout_sec,
 )
-from engine.inference import pseudo_handlers  # noqa: E402
+from engine.inference import async_delivery, pseudo_handlers  # noqa: E402
 from engine.inference.ai_step import _FINAL_STEP_REJECT_MESSAGE, _handle_tool_calls  # noqa: E402
 from engine.inference.pseudo_tools import _dispatch_control_specs, _dispatch_delegate_spec  # noqa: E402
 from engine.inference.resume_builder import DISPATCH_RESULT_TYPE, _build_resume_messages  # noqa: E402
@@ -174,6 +174,97 @@ class TestAsyncDispatchResult:
         payload = _payload(ls, "a1")
         assert payload["success"] is True and "await_dispatches" in payload["note"]
         assert "timeout_sec" not in ls.rctx.http.post.await_args.kwargs["json"]
+
+
+def _sent_bodies(ls: Any) -> list[dict[str, Any]]:
+    return [sent.kwargs["json"] for sent in ls.rctx.http.post.await_args_list]
+
+
+def _unreadable_answer() -> SimpleNamespace:
+    def broken() -> Any:
+        raise ValueError("not json")
+
+    return SimpleNamespace(status_code=200, text="<html>", json=broken)
+
+
+class TestDispatchRequestResends:
+    """派发请求没等到应答就带着同一个投递 id 重发，supervisor 认得出，派出去的只有一个；重发用完仍不确定的照实告诉模型。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(async_delivery, "REQUEST_RETRY_DELAYS_SEC", (0.0, 0.0))
+
+    def test_an_answer_lost_to_a_timeout_is_picked_up_by_the_resend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        repeat = _response({"session_id": "agent-session-1", "inbound_seq": 7, "accepted": True, "task_id": "child-1", "deduped": True})
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(side_effect=[httpx.ReadTimeout("slow"), repeat]))
+
+        _run(ls, _async(call_id="a1"))
+
+        payload = _payload(ls, "a1")
+        assert payload["success"] is True and payload["handle"] == H1
+        first, resent = _sent_bodies(ls)
+        assert first["delivery_id"] and resent == first
+        assert all(
+            sent.kwargs["timeout"] == async_delivery.REQUEST_TIMEOUT_SEC for sent in ls.rctx.http.post.await_args_list
+        )
+
+    def test_no_answer_after_every_resend_tells_the_model_to_check_before_dispatching_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(side_effect=httpx.ReadTimeout("slow")))
+
+        _run(ls, _async(call_id="a1"))
+
+        payload = _payload(ls, "a1")
+        assert payload["success"] is False and payload["status"] == "unconfirmed"
+        assert "不确定有没有派出" in payload["error"] and "list_dispatches" in payload["error"]
+        assert len(_sent_bodies(ls)) == 3 and len({body["delivery_id"] for body in _sent_bodies(ls)}) == 1
+
+    def test_a_supervisor_it_never_reached_got_no_dispatch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(side_effect=httpx.ConnectError("refused")))
+
+        _run(ls, _async(call_id="a1"))
+
+        payload = _payload(ls, "a1")
+        assert payload["success"] is False and "status" not in payload
+        assert payload["error"].startswith("没有派出：连不上 supervisor")
+        assert len(_sent_bodies(ls)) == 3
+
+    def test_a_refusal_is_not_resent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(return_value=_response({"detail": "会话忙"}, 409)))
+
+        _run(ls, _async(call_id="a1"))
+
+        assert _payload(ls, "a1") == {"success": False, "error": "会话忙"}
+        assert len(_sent_bodies(ls)) == 1
+
+    def test_an_unreadable_answer_still_counts_as_dispatched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 回了 200 就是建了任务：当成没派出的话，模型会再派一个
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(return_value=_unreadable_answer()))
+
+        _run(ls, _async(call_id="a1"))
+
+        payload = _payload(ls, "a1")
+        assert payload["success"] is True and "handle" not in payload
+        assert payload["message"].startswith("已异步委派给 helper")
+
+    def test_each_dispatch_gets_its_own_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.rctx.http = SimpleNamespace(post=AsyncMock(return_value=_inbound_answer()))
+
+        _run(ls, _async(call_id="a1"), _async("scout", call_id="a2"))
+
+        ids = [body["delivery_id"] for body in _sent_bodies(ls)]
+        assert all(ids) and len(set(ids)) == 2
 
 
 class TestAsyncFork:

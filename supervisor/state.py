@@ -25,7 +25,7 @@ from .approval_grants import (
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
 from .reply_intent import IntentRegistry
-from .eventlog import EventLog, SYSTEM_SESSION_ID
+from .eventlog import MEMORY_EXTRACT_TASK, EventLog, SYSTEM_SESSION_ID
 from clonoth_runtime import load_runtime_config
 from engine.builtin.loader import auto_discover_and_register
 from engine.child_session_retention import child_session_ttl_hours, is_retained_child_row, retention_hold
@@ -151,13 +151,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._branch_finalize_store = BranchFinalizeClaimStore(
             workspace_root / "data" / "branch_finalize_claims.sqlite3",
         )
-        self._outbound_delivery_ids: set[str] = {
-            str((event.get("payload") or {}).get("delivery_id") or "").strip()
-            for event in eventlog.events
-            if event.get("type") == "outbound_message"
-            and isinstance(event.get("payload"), dict)
-            and str((event.get("payload") or {}).get("delivery_id") or "").strip()
-        }
         self._async_tool_deliveries = DeliveredResults.from_events(eventlog.events)
 
         self._cancelled_sessions: set[str] = set()
@@ -539,6 +532,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return len(matches)
 
     def _memory_extract_task_exists(self, intent_id: str) -> bool:
+        """这个提取意图的任务建过没有：内存里的任务，加上留存日志里的 task_created（上一进程建完就崩了的也认得）。"""
         key = str(intent_id or "").strip()
         if not key:
             return False
@@ -548,14 +542,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 for task in self.tasks.values()
             ):
                 return True
-        for event in self.eventlog.iter_persisted_events():
-            if event.get("type") != "task_created":
-                continue
-            payload = event.get("payload")
-            task_input = payload.get("input") if isinstance(payload, dict) else None
-            if isinstance(task_input, dict) and str(task_input.get("_memory_extract_intent_id") or "") == key:
-                return True
-        return False
+        return self.eventlog.find_receipt(MEMORY_EXTRACT_TASK, key) is not None
 
     def _fire_memory_extract_intent(self, intent_id: str) -> None:
         key = str(intent_id or "").strip()

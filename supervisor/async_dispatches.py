@@ -1,7 +1,8 @@
 """异步委派的结果台账和 await_dispatches 汇合，结果留给某一轮、合成一轮交回，list_dispatches / cancel_dispatch，
-以及 wait 委派单项超时的到点处理。
+wait 委派单项超时的到点处理，以及认出带着同一个投递 id 重发的入站。
 
-都只在内存里：supervisor 重启后任务本身也不在了。带 _locked 的函数要求调用方持有 state._lock。
+都只在内存里：supervisor 重启后任务本身也不在了。只有认重发的入站在内存里没记着时，再查事件日志的入站回执。
+带 _locked 的函数要求调用方持有 state._lock。
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from engine.run_budget import lifetime_limit_seconds, lifetime_origin, parse_tim
 
 from . import child_retention
 from ._helpers import _now
+from .eventlog import INBOUND_DELIVERY
 from .task_ending import TaskEnding
 from .task_store import CancelEffect
 from .types import RouteStatus, Task, TaskKind, TaskStatus
@@ -65,6 +67,10 @@ _WITHDRAWN_KEY = "_result_withdrawn"
 
 LEDGER_LIMIT = 512
 LEDGER_TTL = timedelta(hours=24)
+# 调用方给的投递 id 加上这个前缀再写进入站事件，和内部那些 delivery_id 分开，外面的调用方占不了内部的 id
+_INBOUND_DELIVERY_PREFIX = "inbound:"
+# engine 带同一个 id 重发只在几十秒之内，按这段时间里收得到的入站留足
+RECEIVED_LIMIT = 4096
 LIST_ACTIVE_LIMIT = 50
 LIST_SETTLED_LIMIT = 20
 _PREVIEW_CHARS = 160
@@ -126,6 +132,15 @@ class DispatchDelivery:
     delivered: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class InboundReceipt:
+    """收下过的一条入站：带着同一个投递 id 重发时照原样回的应答。"""
+
+    session_id: str
+    inbound_seq: int
+    task_id: str
+
+
 @dataclass
 class Join:
     """一次 await_dispatches：调用方挂起，等 order 里这些句柄。"""
@@ -159,6 +174,8 @@ class AsyncDispatchRegistry:
         self.item_deadlines: dict[str, datetime] = {}
         # 任务 id -> 它的过渡段最晚到什么时候：到点还没等来路由或回报，按结束处理，在等它的批次就此收齐
         self.transit_checks: dict[str, datetime] = {}
+        # (会话键, 投递 id) -> 第一次收下时的应答，最近收下的排在后面
+        self.received: OrderedDict[tuple[str, str], InboundReceipt] = OrderedDict()
         self.timer: threading.Timer | None = None
         self.timer_due: datetime | None = None
         self.timer_token: object | None = None
@@ -179,6 +196,56 @@ def registry_locked(state: "SupervisorState") -> AsyncDispatchRegistry:
 def _existing_registry(state: "SupervisorState") -> AsyncDispatchRegistry | None:
     registry = getattr(state, "_async_dispatches", None)
     return registry if isinstance(registry, AsyncDispatchRegistry) else None
+
+
+def inbound_delivery_key(raw: Any) -> str:
+    """入站带的投递 id 写进事件时的样子；没带给空串。"""
+    text = str(raw or "").strip()
+    return f"{_INBOUND_DELIVERY_PREFIX}{text}" if text else ""
+
+
+def received_locked(state: "SupervisorState", conversation_key: str, key: str) -> InboundReceipt | None:
+    """这段对话里这个投递 id 收下过就回那次的应答；没收过、或 key 为空给 None。
+
+    内存里只记着最近收下的；没记着的（supervisor 重启过、或早被挤出去了）再按事件日志的入站回执认。
+    """
+    if not key:
+        return None
+    registry = _existing_registry(state)
+    receipt = registry.received.get((conversation_key, key)) if registry is not None else None
+    return receipt if receipt is not None else _logged_receipt_locked(state, conversation_key, key)
+
+
+def _logged_receipt_locked(state: "SupervisorState", conversation_key: str, key: str) -> InboundReceipt | None:
+    """事件日志里这个投递 id 的入站回执，得落在这段对话现在的会话里：会话重置过、或别的对话用过这个 id 的都不算。"""
+    logged = state.eventlog.find_receipt(INBOUND_DELIVERY, key)
+    session_id = state.conversation_map.get(conversation_key)
+    if logged is None or not session_id or logged["session_id"] != session_id or session_id not in state.sessions:
+        return None
+    inbound_seq = int(logged["seq"])
+    return InboundReceipt(session_id=session_id, inbound_seq=inbound_seq, task_id=_entry_task_id_locked(state, inbound_seq))
+
+
+def _entry_task_id_locked(state: "SupervisorState", inbound_seq: int) -> str:
+    """这条入站建出的入口任务；已不在内存里给空串。从它派生的子任务也带着同一个 seq，但都有 caller。"""
+    for task in state.tasks.values():
+        if task.source_inbound_seq == inbound_seq and not task.caller_task_id:
+            return task.task_id
+    return ""
+
+
+def remember_received_locked(
+    state: "SupervisorState", conversation_key: str, key: str, receipt: InboundReceipt,
+) -> None:
+    """记下一条已经收下的入站。和建任务在同一次持锁里记，重发进锁时就认得出。"""
+    if not key:
+        return
+    received = registry_locked(state).received
+    slot = (conversation_key, key)
+    received[slot] = receipt
+    received.move_to_end(slot)
+    while len(received) > RECEIVED_LIMIT:
+        received.popitem(last=False)
 
 
 def is_async_dispatch(task: Task) -> bool:

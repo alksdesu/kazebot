@@ -497,11 +497,6 @@ class SessionMixin:
     def _apply_outbound_message(self, *, seq: int, session_id: str, payload: dict[str, Any]) -> None:
         if not session_id or not isinstance(payload, dict):
             return
-        delivery_id = str(payload.get("delivery_id") or "").strip()
-        if delivery_id:
-            if not hasattr(self, "_outbound_delivery_ids"):
-                self._outbound_delivery_ids = set()
-            self._outbound_delivery_ids.add(delivery_id)
         src = payload.get("source_inbound_seq")
         try:
             inbound_seq = int(src) if src is not None else 0
@@ -692,17 +687,9 @@ class SessionMixin:
             if session_id not in self.sessions:
                 raise KeyError("session not found")
 
-            # delivery_id is the durable idempotency key. Rebuild this index from
-            # EventLog's persisted tail and update it when events are applied, so a
-            # retry after process failure cannot append a second visible message.
-            if not hasattr(self, "_outbound_delivery_ids"):
-                self._outbound_delivery_ids = set()
-            existing_delivery_event = None
-            if delivery_key and delivery_key not in self._outbound_delivery_ids:
-                existing_delivery_event = self.eventlog.find_outbound_delivery(delivery_key)
-                if existing_delivery_event is not None:
-                    self._outbound_delivery_ids.add(delivery_key)
-            if delivery_key and delivery_key in self._outbound_delivery_ids:
+            # 按留存日志认投递 id：路由重推、重启后补路由都不会再写出第二条看得见的回复
+            existing_delivery_event = self.eventlog.find_outbound_delivery(delivery_key) if delivery_key else None
+            if existing_delivery_event is not None:
                 logger.info(
                     "outbound delivery already appended; deduping",
                     extra={
@@ -716,8 +703,8 @@ class SessionMixin:
                     "ok": True,
                     "deduped": True,
                     "delivery_id": delivery_key,
-                    "event_id": str((existing_delivery_event or {}).get("event_id") or ""),
-                    "event_seq": int((existing_delivery_event or {}).get("seq", 0) or 0),
+                    "event_id": str(existing_delivery_event.get("event_id") or ""),
+                    "event_seq": int(existing_delivery_event.get("seq", 0) or 0),
                 }
 
             if src_seq is not None:
@@ -773,8 +760,6 @@ class SessionMixin:
                 payload=payload,
             )
 
-            if delivery_key:
-                self._outbound_delivery_ids.add(delivery_key)
             if src_seq is not None and src_seq not in self._inbound_routed:
                 self._inbound_routed[src_seq] = {
                     "action": "reply",

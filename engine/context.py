@@ -14,6 +14,19 @@ from engine.signals import Signal, get_bus
 logger = logging.getLogger(__name__)
 
 
+class _EventUnconfirmed:
+    """带投递 id 的事件重发用完仍没拿到应答：supervisor 可能已经写下了，也可能没有。按假值算，判断时用 is。"""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "EVENT_UNCONFIRMED"
+
+
+EVENT_UNCONFIRMED = _EventUnconfirmed()
+
+
 @dataclass
 class TaskLease:
     """worker 对一个任务的领取凭据。心跳被 supervisor 拒绝后，本地按用户取消同样的路径收手。"""
@@ -117,8 +130,12 @@ class RunContext:
         self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
         return self.current_llm_request_id
 
-    async def emit_event(self, event_type: str, payload: dict[str, Any]) -> bool:
-        """把事件交给 supervisor，返回它有没有收下。"""
+    async def emit_event(self, event_type: str, payload: dict[str, Any]) -> bool | _EventUnconfirmed:
+        """把事件交给 supervisor，返回它有没有收下。
+
+        payload 带 delivery_id 的，没拿到应答就带着同一个 id 重发（supervisor 按它只落一条），
+        重发用完仍不知道收没收下时返回 EVENT_UNCONFIRMED。
+        """
         from .conversation_routing import routing_meta
         for key, value in routing_meta(self.task_context).items():
             payload.setdefault(key, value)
@@ -134,11 +151,12 @@ class RunContext:
             payload.setdefault("branch_session_id", self.session_id)
         # Bridge emit_event → SignalBus，用 dict(payload) 复制避免后续修改影响信号订阅方
         get_bus().emit(Signal(name=event_type, payload=dict(payload)))
+        url = f"{self.supervisor_url}/v1/sessions/{route_session_id}/events"
+        body = {"type": event_type, "payload": payload}
+        if str(payload.get("delivery_id") or "").strip():
+            return await self._deliver_event(event_type, url, body)
         try:
-            response = await self.http.post(
-                f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
-                json={"type": event_type, "payload": payload},
-            )
+            response = await self.http.post(url, json=body)
         except Exception as exc:
             logger.debug("event %s not delivered: %s", event_type, exc)
             return False
@@ -146,6 +164,24 @@ class RunContext:
         if isinstance(status, int) and 200 <= status < 300:
             return True
         logger.debug("event %s rejected by supervisor: HTTP %s", event_type, status)
+        return False
+
+    async def _deliver_event(self, event_type: str, url: str, body: dict[str, Any]) -> bool | _EventUnconfirmed:
+        """带投递 id 的事件：连不上、被拒（4xx）算没收下；超时和 5xx 重发用完仍是这样，就不知道写没写下。"""
+        # engine.inference 的包初始化会反过来导入本模块，只能用到时再导入
+        from .inference.async_delivery import post_until_answered
+
+        outcome = await post_until_answered(self.http, url, body)
+        if outcome.settled:
+            status = getattr(outcome.answer, "status_code", None)
+            if not isinstance(status, int) or 200 <= status < 300:
+                return True
+            logger.warning("event %s rejected by supervisor: HTTP %s", event_type, status)
+            return False
+        if outcome.unanswered or outcome.answer is not None:
+            logger.warning("event %s unconfirmed after retries: %s", event_type, outcome.error)
+            return EVENT_UNCONFIRMED
+        logger.warning("event %s not delivered: %s", event_type, outcome.error)
         return False
 
     async def check_cancelled(self) -> bool:

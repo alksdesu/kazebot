@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,8 +10,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from engine.context import RunContext
-from engine.inference import pseudo_handlers
+from engine.context import EVENT_UNCONFIRMED, RunContext
+from engine.inference import async_delivery, pseudo_handlers
 from engine.inference.tool_format import create_tool_formatter
 from engine.protocol import ACTION_FINISH
 from providers.base import ToolCall
@@ -80,6 +81,129 @@ def test_a_delivered_reply_is_acknowledged(tmp_path: Path) -> None:
     state, _events = _loop_state(tmp_path, emit_result=True)
     _handle(state, ToolCall(id="say", name="reply", arguments={"text": "hi"}))
     assert state.messages[-1]["content"] == "ok"
+
+
+def test_an_unconfirmed_reply_tells_the_model_not_to_send_it_again_as_is(tmp_path: Path) -> None:
+    state, _events = _loop_state(tmp_path, emit_result=EVENT_UNCONFIRMED)
+
+    _handle(state, ToolCall(id="say", name="reply", arguments={"text": "hi"}))
+
+    told = state.messages[-1]["content"]
+    assert "不确定用户有没有收到" in told and "别原样重发" in told
+    assert not told.startswith("Error:")
+
+
+def test_every_reply_carries_its_own_delivery_id(tmp_path: Path) -> None:
+    payloads: list[dict] = []
+
+    async def emit_event(event_type: str, payload: dict) -> bool:
+        payloads.append(payload)
+        return True
+
+    state, _events = _loop_state(tmp_path)
+    state.rctx.emit_event = emit_event
+
+    for call_id in ("one", "two"):
+        _handle(state, ToolCall(id=call_id, name="reply", arguments={"text": "hi"}))
+
+    ids = [payload["delivery_id"] for payload in payloads]
+    assert all(ids) and len(set(ids)) == 2
+
+
+def _answer(request: httpx.Request, outcome: object) -> httpx.Response:
+    """outcome 是状态码，或者这次要抛的 httpx 异常类型。"""
+    if isinstance(outcome, type) and issubclass(outcome, Exception):
+        raise outcome("synthetic", request=request)
+    return httpx.Response(outcome, json={"ok": True})
+
+
+def _deliver(tmp_path: Path, outcomes: list, act) -> tuple[object, list[dict]]:
+    """用真的 RunContext 走一遍 act(rctx)，第 n 次请求按 outcomes[n] 应答；返回 act 的结果和每次发出的请求体。"""
+    sent: list[dict] = []
+    pending = list(outcomes)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _answer(request, pending.pop(0))
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            rctx = RunContext(
+                workspace_root=tmp_path, supervisor_url="http://sup", session_id="session", worker_id="worker",
+                http=client, llm_http=client, task_id="task",
+            )
+            return await act(rctx)
+
+    return asyncio.run(run()), sent
+
+
+@pytest.fixture()
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(async_delivery, "REQUEST_RETRY_DELAYS_SEC", (0.0, 0.0))
+
+
+@pytest.mark.usefixtures("no_backoff")
+@pytest.mark.parametrize("outcomes, expected", [
+    pytest.param([200], True, id="taken"),
+    pytest.param([httpx.ReadTimeout, 200], True, id="taken-on-the-resend"),
+    pytest.param([404], False, id="refused"),
+    pytest.param([httpx.ConnectError] * 3, False, id="never-reached"),
+    pytest.param([httpx.ReadTimeout] * 3, EVENT_UNCONFIRMED, id="no-answer"),
+    pytest.param([503] * 3, EVENT_UNCONFIRMED, id="kept-failing"),
+    pytest.param([httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectError], EVENT_UNCONFIRMED, id="maybe-taken-first"),
+])
+def test_an_event_with_a_delivery_id_is_resent_until_answered(tmp_path: Path, outcomes: list, expected: object) -> None:
+    async def emit(rctx: RunContext) -> object:
+        return await rctx.emit_event("intermediate_reply", {"text": "hi", "delivery_id": "r-1"})
+
+    delivered, sent = _deliver(tmp_path, outcomes, emit)
+
+    assert delivered is expected
+    assert len(sent) == len(outcomes)
+    assert all(body == sent[0] for body in sent)
+
+
+def _reply_through_supervisor(tmp_path: Path, outcomes: list) -> tuple[str, list[dict]]:
+    async def reply(rctx: RunContext) -> str:
+        state = SimpleNamespace(
+            rctx=rctx, node=SimpleNamespace(id="entry", tool_mode="native"), messages=[],
+            collected_attachments=[], tool_produced_attachments=[], formatter=create_tool_formatter("native"),
+        )
+        await pseudo_handlers._handle_pseudo_tool(state, ToolCall(id="say", name="reply", arguments={"text": "稍等"}), 0)
+        return state.messages[-1]["content"]
+
+    return _deliver(tmp_path, outcomes, reply)
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_the_model_hears_ok_for_a_reply_the_supervisor_took(tmp_path: Path) -> None:
+    told, sent = _reply_through_supervisor(tmp_path, [httpx.ReadTimeout, 200])
+
+    assert told == "ok"
+    assert sent[0]["payload"]["delivery_id"] and sent[0] == sent[1]
+
+
+@pytest.mark.usefixtures("no_backoff")
+@pytest.mark.parametrize("outcomes", [
+    pytest.param([httpx.ConnectError] * 3, id="never-reached"),
+    pytest.param([400], id="refused"),
+])
+def test_the_model_hears_the_user_did_not_get_a_reply_that_never_got_in(tmp_path: Path, outcomes: list) -> None:
+    told, _sent = _reply_through_supervisor(tmp_path, outcomes)
+
+    assert told == "Error: 这条 reply 没有送到 supervisor，用户没有收到。可以稍后再发一次，或把内容放进 finish。"
+
+
+@pytest.mark.usefixtures("no_backoff")
+@pytest.mark.parametrize("outcomes", [
+    pytest.param([httpx.ReadTimeout] * 3, id="no-answer"),
+    pytest.param([502] * 3, id="kept-failing"),
+])
+def test_the_model_hears_it_is_unknown_whether_the_user_got_the_reply(tmp_path: Path, outcomes: list) -> None:
+    told, sent = _reply_through_supervisor(tmp_path, outcomes)
+
+    assert "不确定用户有没有收到" in told and "别原样重发" in told
+    assert len(sent) == 3 and len({body["payload"]["delivery_id"] for body in sent}) == 1
 
 
 @pytest.mark.parametrize("post", [

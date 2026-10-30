@@ -115,8 +115,9 @@ def create_router(state) -> APIRouter:
         resolve_actor(request, state)
         return await call(service.capabilities)
 
+    # 认人、读资料库都要拿锁：写成普通 def 交给线程池，免得卡住事件循环
     @router.get("/scopes")
-    async def scopes(request: Request):
+    def scopes(request: Request):
         current = actor(request)
         if current.task_id or not current.is_admin:
             return [{"scope": current.scope, "bot_scope": current.bot_scope}]
@@ -168,16 +169,21 @@ def create_router(state) -> APIRouter:
 
     @router.post("/sources/register")
     async def register_source(request: Request, body: dict = Body(...)):
-        current = actor(request)
-        if current.task_id:
-            with state._lock:
-                task = state.tasks.get(current.task_id)
-                attachments = list(task.input.get("attachments") or []) if task else []
-                context = task.input.get("task_context") or {} if task else {}
-                attachments.extend(context.get("attachments") or [])
-            allowed = {str(item.get("path") or "").replace("\\", "/") for item in attachments if isinstance(item, dict)}
-            if str(body.get("path") or "").replace("\\", "/") not in allowed:
-                raise HTTPException(403, detail="该路径不属于本任务实际收到的附件，请由用户重新上传。")
+        def admitted():
+            current = actor(request)
+            if current.task_id:
+                with state._lock:
+                    task = state.tasks.get(current.task_id)
+                    attachments = list(task.input.get("attachments") or []) if task else []
+                    context = task.input.get("task_context") or {} if task else {}
+                    attachments.extend(context.get("attachments") or [])
+                allowed = {str(item.get("path") or "").replace("\\", "/") for item in attachments if isinstance(item, dict)}
+                if str(body.get("path") or "").replace("\\", "/") not in allowed:
+                    raise HTTPException(403, detail="该路径不属于本任务实际收到的附件，请由用户重新上传。")
+            return current
+
+        # 带任务 id 的请求认人、核对附件都要拿全局锁：两段一起挪出事件循环
+        current = await asyncio.to_thread(admitted)
         return await call(service.register_source, current, body)
 
     @router.post("/sources/{source_id}/parse")
@@ -258,10 +264,15 @@ def create_router(state) -> APIRouter:
     async def complete_image_operation(operation_id: str, request: Request, body: dict = Body(...)):
         verify_admin_token(request)
         task_id = request.headers.get("X-Clonoth-Task-Id", "")
-        with state._lock:
-            task = state.tasks.get(task_id)
-            if task is None or task.cancel_requested or task.input.get("_session_reset"):
-                raise HTTPException(403, detail="图片所属任务已取消或会话已清空。")
+
+        def check_task() -> None:
+            with state._lock:
+                task = state.tasks.get(task_id)
+                if task is None or task.cancel_requested or task.input.get("_session_reset"):
+                    raise HTTPException(403, detail="图片所属任务已取消或会话已清空。")
+
+        # 全局锁可能被路由占着一阵，在事件循环上等会把所有请求一起卡住
+        await asyncio.to_thread(check_task)
         async with slots:
             return await call(service.complete_image_operation, operation_id, task_id, body)
 
@@ -329,20 +340,27 @@ def create_router(state) -> APIRouter:
 
     @router.post("/versions/{version_id}/send")
     async def send(version_id: str, request: Request):
-        current = actor(request)
+        # 带任务 id 的请求认人时要拿全局锁
+        current = await asyncio.to_thread(actor, request)
         current.require_interaction()
         result = await call(service.export_version, current, version_id)
         delivery_id = f"materials:{version_id}:{result['sha256']}"
-        with state._lock:
-            session_id = state.conversation_map.get(current.scope)
-            if not session_id:
-                raise HTTPException(409, detail="当前会话没有可用的发送路由，可先下载成品。")
-            event = state.eventlog.find_outbound_delivery(delivery_id)
-            if event is None:
-                event = state.eventlog.append(session_id=session_id, component="supervisor", type_="outbound_message", payload={
-                    "text": "", "conversation_key": current.scope, "attachments": [result["attachment"]],
-                    "delivery_id": delivery_id, "artifact_version_id": version_id,
-                })
+
+        def request_delivery() -> dict:
+            # 全局锁可能被路由占着好一阵，在事件循环上等会把所有请求一起卡住
+            with state._lock:
+                session_id = state.conversation_map.get(current.scope)
+                if not session_id:
+                    raise HTTPException(409, detail="当前会话没有可用的发送路由，可先下载成品。")
+                event = state.eventlog.find_outbound_delivery(delivery_id)
+                if event is None:
+                    event = state.eventlog.append(session_id=session_id, component="supervisor", type_="outbound_message", payload={
+                        "text": "", "conversation_key": current.scope, "attachments": [result["attachment"]],
+                        "delivery_id": delivery_id, "artifact_version_id": version_id,
+                    })
+                return event
+
+        event = await asyncio.to_thread(request_delivery)
         return {"status": "delivery_requested", "version_id": version_id, "event_id": event["event_id"], "message": "已提交发送；实际投递由平台确认。"}
 
     return router

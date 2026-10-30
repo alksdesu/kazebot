@@ -22,12 +22,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import supervisor.admin_api as admin_api  # noqa: E402
+import supervisor.eventlog as eventlog_module  # noqa: E402
 from engine.dispatch_batch import CONTINUE_FROM_KEY  # noqa: E402
 from engine.tool_outputs import ToolOutputStore  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.async_tools import detached_cancelled_locked  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
-from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.eventlog import SYSTEM_SESSION_ID, EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
@@ -494,6 +495,59 @@ class TestRedelivery:
         assert restarted.inject_async_result(
             sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1",
         ) == {"ok": True, "strategy": "inbound", "deduped": True}
+
+    def test_a_result_older_than_the_restored_tail_is_recognised_from_the_receipts(
+        self, state: SupervisorState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        _finish(state, launcher)
+        state.inject_async_result(sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1")
+        restarted = _restarted_past_the_tail(state, tmp_path, monkeypatch)
+
+        assert restarted.inject_async_result(
+            sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1",
+        ) == {"ok": True, "strategy": "inbound", "deduped": True}
+
+    def test_a_media_result_older_than_the_restored_tail_is_not_sent_again(
+        self, state: SupervisorState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        state.inject_async_result(
+            sid, "", ["data/attachments/cat.png"], task_id=launcher.task_id, tool_name="draw", success=True,
+            delivery_id="d-1",
+        )
+        restarted = _restarted_past_the_tail(state, tmp_path, monkeypatch)
+
+        assert restarted.inject_async_result(
+            sid, "", ["data/attachments/cat.png"], task_id=launcher.task_id, tool_name="draw", success=True,
+            delivery_id="d-1",
+        ) == {"ok": True, "strategy": "outbound_attachment", "deduped": True}
+        assert len(_attachments_sent(restarted)) == 0
+
+
+def _restarted_past_the_tail(state: SupervisorState, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> SupervisorState:
+    """重启时只恢复最近几条事件，交过的那份结果不在其中；之后再整份扫日志就算读了盘。"""
+    for index in range(5):
+        state.eventlog.append(session_id=SYSTEM_SESSION_ID, component="test", type_="probe", payload={"index": index})
+    monkeypatch.setattr(eventlog_module, "_MAX_MEMORY_EVENTS", 3)
+    restarted = SupervisorState(
+        workspace_root=workspace,
+        eventlog=EventLog(workspace / "data" / "events.jsonl", run_id="async-tool-routing-restarted"),
+        policy=PolicyEngine(workspace_root=workspace),
+    )
+    restarted._defer_post_work_enqueue = True
+    assert not any(
+        str((event.get("payload") or {}).get("delivery_id") or "").startswith("async-tool:")
+        for event in restarted.eventlog.events
+    )
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("scanned the persisted event log")
+
+    monkeypatch.setattr(restarted.eventlog, "iter_persisted_events", refuse)
+    return restarted
 
 
 def _cancelled(state: SupervisorState, task_id: str, session_id: str = "") -> bool:

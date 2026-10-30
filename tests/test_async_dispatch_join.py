@@ -1801,6 +1801,35 @@ class TestForkCopy:
         assert "OSError" in detail and "稍后重试" in detail and "/secret/path" not in detail
         assert set(state.tasks) == tasks_before
 
+    def test_a_resent_fork_is_answered_without_copying_the_history_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        ConversationStore(tmp_path / "data" / "conversations").append_batch(
+            caller.session_id, [Message(id="ask", role="user", content="帮我查一下")],
+        )
+        staged_sources: list[str] = []
+        original = ConversationStore.stage_fork
+
+        def recording(self: ConversationStore, source_session_id: str) -> Any:
+            staged_sources.append(source_session_id)
+            return original(self, source_session_id)
+
+        monkeypatch.setattr(ConversationStore, "stage_fork", recording)
+        app = _app(state, tmp_path)
+        payload = self._payload(sid, caller, caller.session_id, delivery_id="d-1")
+
+        first = _call(app, "POST", "/v1/inbound", json=payload)
+        again = _call(app, "POST", "/v1/inbound", json=payload)
+
+        assert first.status_code == 200, first.text
+        assert again.status_code == 200, again.text
+        assert again.json() == {**first.json(), "deduped": True}
+        assert staged_sources == [caller.session_id]
+        assert self._staged(tmp_path) == []
+
     def test_a_refused_dispatch_copies_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         state = _state(tmp_path)
         sid = _session(state)

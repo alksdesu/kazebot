@@ -128,6 +128,8 @@ class InboundMessageIn(BaseModel):
     # 与 platform_auth 分开：后者参与鉴权，不该混入非鉴权字段。
     memory_hints: dict[str, Any] = Field(default_factory=dict)
     output_guide: OutputGuide | None = None
+    # 没收到应答时调用方带着同一个 id 重发（异步委派就是这样）：同一段对话里收下过的不再建第二份，回第一次的应答
+    delivery_id: str | None = Field(default=None, max_length=128)
 
 
 class InboundMessageOut(BaseModel):
@@ -136,22 +138,8 @@ class InboundMessageOut(BaseModel):
     accepted: bool = True
     # 这条消息建出的入口任务；内容为空没建任务时为空串。异步委派拿它和 session_id 拼出句柄
     task_id: str = ""
-
-
-class OutboundMessageIn(BaseModel):
-    text: str
-    source_inbound_seq: int | None = None
-    attachments: list[dict[str, Any]] | None = None
-    # [AutoC 2026-06-04] Why: manual outbound API calls may also be used to finalize
-    # an existing live request card. How: accept the same request-level id that engine
-    # task results carry. Purpose: the API contract remains consistent across outbound
-    # producers.
-    llm_request_id: str | None = None
-    delivery_id: str | None = None
-
-
-class OutboundMessageOut(BaseModel):
-    ok: bool = True
+    # 这是一次重发：前面三项是第一次收下时的应答
+    deduped: bool = False
 
 
 class Task(BaseModel):

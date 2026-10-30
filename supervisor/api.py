@@ -31,6 +31,7 @@ from real_paths import real_path
 from . import async_dispatches, continuation, dispatch_fork, provisioning, session_reuse, share_groups
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
+from .eventlog import REPLY_DELIVERY, DeliveryIdTaken
 from .sticker_api import create_sticker_router
 from .tool_watch import McpConfigWatch, ToolTreeWatch
 from .instances import InstanceDirectoryError, load_instance_directory, load_instances, url_prefix
@@ -71,8 +72,6 @@ from .types import (
     PolicyUpdateIn,
     OpRequestIn,
     OpRequestOut,
-    OutboundMessageIn,
-    OutboundMessageOut,
     RESTART_IN_PROGRESS,
     RESTART_NO_PROCESS_MANAGER,
     RestartIn,
@@ -196,6 +195,8 @@ _WS_CLIPPED_FIELD_CHARS = 2000
 _OUTBOUND_REPLAY_PAGE_SIZE = 200
 _OUTBOUND_REPLAY_SCAN_SIZE = 5000
 _OUTBOUND_EVENT_TYPES = frozenset({"outbound_message", "intermediate_reply"})
+# 中间回复的投递 id 加上前缀再落盘，和 reminder: 这类别处的 delivery_id 分开，适配器不会把它认成别的
+_REPLY_DELIVERY_PREFIX = "reply:"
 
 # 附件是不可信内容：不许浏览器嗅探成别的类型，直接打开时关进没有脚本的沙箱
 _FILE_SECURITY_HEADERS = {
@@ -212,7 +213,8 @@ def _renders_inline(media_type: str) -> bool:
 def _outbound_replay_page(eventlog: Any, after_seq: int, until_seq: int) -> tuple[list[dict[str, Any]], int]:
     cached = list(eventlog.events)
     use_cache = bool(cached) and after_seq >= int(cached[0]["seq"]) - 1
-    source = iter(cached) if use_cache else eventlog.iter_persisted_events()
+    # 早于内存窗口时从 after_seq 处读起：前面的整份文件不读，每一页的读盘量不随日志长度涨
+    source = iter(cached) if use_cache else eventlog.iter_persisted_events_after(after_seq)
     page: list[dict[str, Any]] = []
     scanned = 0
     try:
@@ -646,11 +648,28 @@ def create_app(
         # 目的：确保 dispatch_origin/dispatch_context_mode/dispatch_fork_from_session
         #   能通过 event payload 传递到 task 创建逻辑。
         payload = msg.model_dump()
+        delivery_key = async_dispatches.inbound_delivery_key(payload.pop("delivery_id", None))
+        if delivery_key:
+            payload["delivery_id"] = delivery_key
 
         def refuse_if_needed_locked() -> None:
             refused = session_reuse.inbound_refusal_locked(st, payload)
             if refused is not None:
                 raise HTTPException(status_code=refused.status, detail=refused.message)
+
+        def repeated_locked() -> InboundMessageOut | None:
+            # 先于各项拒收核对：第一次收下后子任务已经在跑，按会话忙拒掉的话调用方就丢了第一次的句柄
+            receipt = async_dispatches.received_locked(st, msg.conversation_key, delivery_key)
+            if receipt is None:
+                return None
+            log.info(
+                "inbound %s for %s was accepted before as task %s; answering with that",
+                delivery_key, msg.conversation_key, receipt.task_id[:12],
+            )
+            return InboundMessageOut(
+                session_id=receipt.session_id, inbound_seq=receipt.inbound_seq, accepted=True,
+                task_id=receipt.task_id, deduped=True,
+            )
 
         fork_from = dispatch_fork.fork_source(payload)
         staged = None
@@ -658,11 +677,19 @@ def create_app(
             if fork_from:
                 # 整段历史在锁外复制：先在锁里看一眼收不收、来源在不在，拒收的委派不白复制
                 with st._lock:
-                    refuse_if_needed_locked()
-                    dispatch_fork.check_source_locked(st, fork_from)
+                    repeated = repeated_locked()
+                    if repeated is None:
+                        refuse_if_needed_locked()
+                        dispatch_fork.check_source_locked(st, fork_from)
+                if repeated is not None:
+                    return repeated
                 staged = dispatch_fork.stage(st, fork_from)
             # 判能不能收和建任务在同一把锁里：两个委派同时到，只有一个能落进同一个会话
             with st._lock:
+                # 锁外复制的空当里，同一个投递 id 的另一次重发可能已经收下了
+                repeated = repeated_locked()
+                if repeated is not None:
+                    return repeated
                 refuse_if_needed_locked()
                 session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
                 if staged is not None:
@@ -674,14 +701,18 @@ def create_app(
                     payload=payload,
                 )
                 created = st.record_inbound_message_event(evt)
+                answer = async_dispatches.InboundReceipt(
+                    session_id=session_id,
+                    inbound_seq=int(evt.get("seq", 0) or 0),
+                    task_id=created.task_id if created is not None else "",
+                )
+                async_dispatches.remember_received_locked(st, msg.conversation_key, delivery_key, answer)
         except dispatch_fork.ForkCopyError as failure:
             raise HTTPException(status_code=failure.status, detail=failure.refusal) from failure
         finally:
             dispatch_fork.discard(staged)
-        inbound_seq = int(evt.get("seq", 0) or 0)
         return InboundMessageOut(
-            session_id=session_id, inbound_seq=inbound_seq, accepted=True,
-            task_id=created.task_id if created is not None else "",
+            session_id=answer.session_id, inbound_seq=answer.inbound_seq, accepted=True, task_id=answer.task_id,
         )
 
     # 下面这批端点都要拿全局锁，完成还会在锁里路由；写成普通 def 交给线程池，免得卡住事件循环
@@ -1011,26 +1042,6 @@ def create_app(
         status = str(outcome.get("status") or "unavailable")
         return DreamRunOut(ok=status == "started", status=status)
 
-    @app.post("/v1/sessions/{session_id}/outbound", response_model=OutboundMessageOut)
-    async def session_outbound(session_id: str, body: OutboundMessageIn) -> OutboundMessageOut:
-        st: SupervisorState = app.state.state
-        try:
-            st.append_outbound_message(
-                session_id=session_id,
-                text=str(body.text or ""),
-                attachments=body.attachments,
-                source_inbound_seq=body.source_inbound_seq,
-                llm_request_id=body.llm_request_id,
-                delivery_id=body.delivery_id,
-            )
-        except KeyError:
-            raise HTTPException(status_code=404, detail="session not found")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e) or "bad request")
-        except RuntimeError as e:
-            raise HTTPException(status_code=409, detail=str(e) or "conflict")
-        return OutboundMessageOut(ok=True)
-
     @app.get("/v1/sessions/{session_id}/events", response_model=list[Event])
     async def session_events(
         session_id: str,
@@ -1295,8 +1306,9 @@ def create_app(
                 continue
         return out
 
+    # engine 的每个工具事件都走这里，要写事件日志、拿全局锁：写成普通 def 交给线程池，免得卡住事件循环
     @app.post("/v1/sessions/{session_id}/events")
-    async def session_event(session_id: str, ev: HandoffEventIn) -> dict[str, Any]:
+    def session_event(session_id: str, ev: HandoffEventIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
@@ -1308,13 +1320,29 @@ def create_app(
         # 目的：WebSocket 继续实时广播，但磁盘事件日志只保留稳定状态事件。
         if ev.type == "context_usage":
             transient = True
-        evt = st.eventlog.append(
-            session_id=session_id,
-            component="shell",
-            type_=ev.type,
-            payload=dict(ev.payload or {}),
-            transient=transient,
-        )
+        payload = dict(ev.payload or {})
+        answer: dict[str, Any] = {"ok": True}
+        reply_delivery = str(payload.get("delivery_id") or "").strip() if ev.type == REPLY_DELIVERY.event_type else ""
+        if reply_delivery:
+            # engine 没收到应答会带着同一个 id 重发这条中间回复，已经写下的不再写第二条
+            payload["delivery_id"] = f"{_REPLY_DELIVERY_PREFIX}{reply_delivery}"
+            try:
+                evt, fresh = st.eventlog.append_delivery(
+                    REPLY_DELIVERY, session_id=session_id, component="shell", payload=payload,
+                )
+            except DeliveryIdTaken as taken:
+                raise HTTPException(
+                    status_code=409, detail="这个投递 id 已经被别的会话用过，这条中间回复没有写下。",
+                ) from taken
+            answer.update(event_id=evt.get("event_id"), seq=evt.get("seq"), deduped=not fresh)
+        else:
+            evt = st.eventlog.append(
+                session_id=session_id,
+                component="shell",
+                type_=ev.type,
+                payload=payload,
+                transient=transient,
+            )
         if ev.type == "outbound_message":
             st.record_outbound_message_event(evt)
         if ev.type == "context_usage":
@@ -1358,7 +1386,7 @@ def create_app(
                     elif _ev_type == "approval_decided":
                         _evt_task.current_phase = ""
                         _evt_task.current_detail = ""
-        return {"ok": True}
+        return answer
 
     @app.get("/v1/sessions")
     def list_sessions(
@@ -1674,8 +1702,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         return result
 
+    # 要拿全局锁：写成普通 def 交给线程池，免得卡住事件循环
     @app.get("/v1/sessions/{session_id}/context_window")
-    async def session_context_window(session_id: str) -> dict[str, Any]:
+    def session_context_window(session_id: str) -> dict[str, Any]:
         """获取 session 当前上下文窗口的 token 用量信息。"""
         st: SupervisorState = app.state.state
         with st._lock:
@@ -1793,8 +1822,9 @@ def create_app(
         st: SupervisorState = app.state.state
         return st.admin_state()
 
+    # 要拿全局锁：写成普通 def 交给线程池，免得卡住事件循环
     @app.get("/v1/admin/tasks/active")
-    async def admin_active_tasks(request: Request) -> list[dict[str, Any]]:
+    def admin_active_tasks(request: Request) -> list[dict[str, Any]]:
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         active_statuses = {TaskStatus.running, TaskStatus.pending, TaskStatus.suspended}
@@ -1858,8 +1888,9 @@ def create_app(
         text, truncated = result
         return {"name": name, "text": text, "truncated": truncated}
 
+    # 要拿全局锁：写成普通 def 交给线程池，免得卡住事件循环
     @app.get("/v1/admin/runtime/status")
-    async def runtime_status(request: Request) -> dict[str, Any]:
+    def runtime_status(request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         pm: ProcessManager | None = app.state.process_manager
@@ -2151,13 +2182,6 @@ def create_app(
         bot_names = [str(x) for x in (body.get("bot_names") or []) if str(x).strip()]
 
         registry = st.reply_intent
-        # 闸门在建 task 之前：排队等 worker 的判定任务毫无价值 —— 等它轮到的时候，
-        # 那条群消息早就翻页了，而它占的还是真实对话要用的那个 worker。
-        if registry.has_conversation(conversation_key):
-            return {"task_id": "", **IntentResult(error="conversation_busy").as_dict()}
-        if registry.inflight() >= max_inflight:
-            return {"task_id": "", **IntentResult(error="max_inflight").as_dict()}
-
         instruction = reply_intent_instruction(
             text=text,
             context_lines=context_lines,
@@ -2165,43 +2189,64 @@ def create_app(
             speaker=str(body.get("speaker") or ""),
             situation=body.get("situation"),
         )
-        # 判定复用这个群的会话：conversation_key 和真实消息用的是同一个，所以第一条
-        # 消息判 no 也只是提前建了个空会话，不会多出一条平行会话。
-        session_id = st.get_or_create_session(channel=channel, conversation_key=conversation_key)
-        with st._lock:
-            generation = st._current_session_generation_locked(session_id) or 1
-            child_sid, _is_new = st.get_or_create_child_session(
-                session_id, node_id, f"intent:{conversation_key}", "fresh",
-            )
-            task = st._create_task_locked(
-                session_id=session_id,
-                session_generation=generation,
-                kind=TaskKind.node,
-                node_id=node_id,
-                input_data={
-                    "instruction": instruction,
-                    "context_mode": "fresh",
-                    "child_session_id": child_sid,
-                    "use_context": False,
-                    "_system_task": True,
-                    "_reply_intent": True,
-                },
-                continuation={},
-                source_inbound_seq=None,
-                caller_task_id=None,
-            )
-            future = registry.register(task.task_id, conversation_key)
+        # 结果要交到事件循环上等着的这个 future，所以在这里建好，再带进线程登记
+        future: asyncio.Future[IntentResult] = asyncio.get_running_loop().create_future()
 
+        def create_judge_task() -> Task | str:
+            """建判定任务并登记等它的 future；闸门不放行时返回原因。"""
+            with st._lock:
+                # 闸门在建 task 之前：排队等 worker 的判定任务毫无价值 —— 等它轮到的时候，
+                # 那条群消息早就翻页了，而它占的还是真实对话要用的那个 worker。
+                # 闸门、建任务和登记在同一次持锁里：同时到的两条判定只有一条占得住这个群，任务一建出来就可能被领走做完
+                if registry.has_conversation(conversation_key):
+                    return "conversation_busy"
+                if registry.inflight() >= max_inflight:
+                    return "max_inflight"
+                # 判定复用这个群的会话：conversation_key 和真实消息用的是同一个，所以第一条
+                # 消息判 no 也只是提前建了个空会话，不会多出一条平行会话。
+                session_id = st.get_or_create_session(channel=channel, conversation_key=conversation_key)
+                generation = st._current_session_generation_locked(session_id) or 1
+                child_sid, _is_new = st.get_or_create_child_session(
+                    session_id, node_id, f"intent:{conversation_key}", "fresh",
+                )
+                task = st._create_task_locked(
+                    session_id=session_id,
+                    session_generation=generation,
+                    kind=TaskKind.node,
+                    node_id=node_id,
+                    input_data={
+                        "instruction": instruction,
+                        "context_mode": "fresh",
+                        "child_session_id": child_sid,
+                        "use_context": False,
+                        "_system_task": True,
+                        "_reply_intent": True,
+                    },
+                    continuation={},
+                    source_inbound_seq=None,
+                    caller_task_id=None,
+                )
+                registry.register(task.task_id, conversation_key, future)
+                return task
+
+        def abandon(task_id: str) -> None:
+            with st._lock:
+                registry.discard(task_id)
+            # 超时了还留着任务，模型慢的时候判定会一直堆积，把 worker 全占住。
+            st.cancel_single_task(task_id)
+
+        # 全局锁可能被路由占着一阵，在事件循环上等会把所有请求一起卡住
+        created = await asyncio.to_thread(create_judge_task)
+        if isinstance(created, str):
+            return {"task_id": "", **IntentResult(error=created).as_dict()}
+        task = created
         try:
             result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_sec)
         except asyncio.TimeoutError:
-            registry.discard(task.task_id)
-            # 超时了还留着任务，模型慢的时候判定会一直堆积，把 worker 全占住。
-            st.cancel_single_task(task.task_id)
+            await asyncio.to_thread(abandon, task.task_id)
             return {"task_id": task.task_id, **IntentResult(error="timeout").as_dict()}
         except Exception as exc:
-            registry.discard(task.task_id)
-            st.cancel_single_task(task.task_id)
+            await asyncio.to_thread(abandon, task.task_id)
             log.exception("reply intent judge failed")
             return {"task_id": task.task_id, **IntentResult(error=str(exc)[:200]).as_dict()}
         return {"task_id": task.task_id, **result.as_dict()}

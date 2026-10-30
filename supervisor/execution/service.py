@@ -56,6 +56,8 @@ class ExecutionService:
         self._paused = threading.Event()
         self._tick_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        # 任务已不在内存里的步骤：任务 id -> 日志里它最后一笔终态快照（没有为 None），只在 tick 里读写
+        self._missing_snapshots: dict[str, dict[str, Any] | None] = {}
 
     def _config(self) -> dict[str, Any]:
         """config/execution.yaml 现在生效的那份。每次取值都看一眼文件：共享组里别的实例也会改它。"""
@@ -556,11 +558,21 @@ class ExecutionService:
                 step["effect_receipt"] = {"status": "succeeded", "key": step.get("effect_key"), "task_id": task_id, "at": now()}
         self._event(self.store.mutate(plan_id, change))
 
+    def _last_terminal_snapshot(self, task_id: str) -> dict[str, Any] | None:
+        """这个任务留在日志里的最后一笔终态快照。它已经不在内存里，不会再写出新的，整份日志只扫这一次。"""
+        if task_id not in self._missing_snapshots:
+            snapshots = [
+                event.get("payload") for event in self.state.eventlog.iter_persisted_events()
+                if event.get("type") in {"task_completed", "task_cancelled"}
+                and (event.get("payload") or {}).get("task_id") == task_id
+            ]
+            self._missing_snapshots[task_id] = snapshots[-1] if snapshots else None
+        return self._missing_snapshots[task_id]
+
     def _recover_missing(self, plan: dict, step: dict) -> None:
         task_id = step["task_id"]
         if task_id:
-            snapshots = [event.get("payload") for event in self.state.eventlog.iter_persisted_events() if event.get("type") in {"task_completed", "task_cancelled"} and (event.get("payload") or {}).get("task_id") == task_id]
-            snapshot = snapshots[-1] if snapshots else None
+            snapshot = self._last_terminal_snapshot(task_id)
             # 最后一笔是交回 dispatch 的那次完成：它挂起后就没了下文，按执行进程中断收尾
             if snapshot is not None and not _continues_after(snapshot.get("result") or {}, str(snapshot.get("status") or "")):
                 self._task_result(plan["id"], step["id"], task_id, snapshot.get("result") or {}, snapshot.get("status", ""))
@@ -574,6 +586,7 @@ class ExecutionService:
         if not self._tick_lock.acquire(blocking=False):
             return
         try:
+            missing: set[str] = set()
             for plan in self.store.list(active=True):
                 if not plan["session_id"]:
                     session = self.state.get_or_create_session(channel=plan["channel"], conversation_key=plan["scope"])
@@ -584,6 +597,7 @@ class ExecutionService:
                     if step["status"] in {"queued", "running", "awaiting_approval"}:
                         task = self.state.tasks.get(step["task_id"])
                         if task is None:
+                            missing.add(step["task_id"])
                             self._recover_missing(plan, step)
                         elif self.state._task_terminal(task):
                             self.on_task_completed(task)
@@ -613,6 +627,9 @@ class ExecutionService:
                     status = "cancelled" if plan["cancel_requested"] else "completed" if all(step["status"] == "succeeded" for step in plan["steps"]) else "partial" if any(step["status"] == "succeeded" for step in plan["steps"]) else "failed"
                     plan = self.store.mutate(plan["id"], lambda document: document.update(status=status, finished_at=now(), notification_status="pending"))
                     self._event(plan)
+            # 步骤收尾了、或换了任务，记下的快照就不再用
+            for task_id in [task_id for task_id in self._missing_snapshots if task_id not in missing]:
+                del self._missing_snapshots[task_id]
             for plan in self.store.list(notifications=True):
                 self._notify(plan)
         finally:

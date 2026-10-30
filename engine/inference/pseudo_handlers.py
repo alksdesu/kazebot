@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import mimetypes as _mimetypes
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,11 @@ from clonoth_runtime import SwitchValueError, parse_bool, switch_arg, switch_ref
 from clonoth_sdk.refusals import refusal_reason
 
 from .resume_builder import _select_attachments
+from .async_delivery import RetriedPost, post_until_answered
 from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
 from ..compaction_plan import build_compaction_plan
+from ..context import EVENT_UNCONFIRMED
 from ..conversation_routing import short_reply as _is_short_reply
 from ..dispatch_batch import (
     AWAIT_ALL,
@@ -183,8 +186,19 @@ def _refusal_note(refused: list[RefusedAttachment]) -> str:
     return f"以下附件没有发出：{detail}"
 
 
+def _with_refusals(text: str, refused: list[RefusedAttachment]) -> str:
+    return f"{text}\n{_refusal_note(refused)}" if refused else text
+
+
 def _ok_with_refusals(refused: list[RefusedAttachment]) -> str:
-    return f"ok\n{_refusal_note(refused)}" if refused else "ok"
+    return _with_refusals("ok", refused)
+
+
+_REPLY_NOT_SENT = "Error: 这条 reply 没有送到 supervisor，用户没有收到。可以稍后再发一次，或把内容放进 finish。"
+_REPLY_UNCONFIRMED = (
+    "这条 reply 重发几次都没等到 supervisor 的应答，不确定用户有没有收到，别原样重发；"
+    "要紧的内容可以在 finish 里换个说法带一句。"
+)
 
 
 def _emit_pseudo_tool_result(
@@ -275,12 +289,13 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 "task_id": ls.rctx.task_id,
                 "text": reply_text,
                 "attachments": selected_atts,
+                # 没等到应答时带着它重发，supervisor 按它只落一条
+                "delivery_id": uuid.uuid4().hex,
             })
-            if delivered is False:
-                _emit_pseudo_tool_result(
-                    ls, pseudo_call,
-                    "Error: 这条 reply 没有送到 supervisor，用户没有收到。可以稍后再发一次，或把内容放进 finish。",
-                )
+            if delivered is EVENT_UNCONFIRMED:
+                _emit_pseudo_tool_result(ls, pseudo_call, _with_refusals(_REPLY_UNCONFIRMED, refused))
+            elif delivered is False:
+                _emit_pseudo_tool_result(ls, pseudo_call, _REPLY_NOT_SENT)
             else:
                 _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
         elif refused:
@@ -820,8 +835,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             }, ensure_ascii=False))
             return None
     elif ctx_mode in OWN_SESSION_MODES:
-        import uuid as _uuid
-        conv_key = f"agent:{target_node_id}:{parent_conv_key}:{_uuid.uuid4()}"
+        conv_key = f"agent:{target_node_id}:{parent_conv_key}:{uuid.uuid4()}"
     else:  # accumulate
         if ctx_key:
             conv_key = f"agent:{target_node_id}:{ctx_key}:{parent_conv_key}"
@@ -845,6 +859,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             "context_mode": ctx_mode,
         },
         "dispatch_context_mode": ctx_mode,
+        # 没等到应答时带着它重发，supervisor 认出来就交回第一次建的任务，不会派出第二个
+        "delivery_id": uuid.uuid4().hex,
     }
     parent_generation = getattr(ls.rctx, "session_generation", 0)
     if parent_generation:
@@ -862,20 +878,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         # supervisor 建任务时当场复制，排在写入队列里的消息得先落盘
         await flush_conversation_writes(ls.rctx)
 
-    try:
-        _dispatch_resp = await ls.rctx.http.post(
-            f"{ls.rctx.supervisor_url}/v1/inbound",
-            json=inbound_payload,
-            timeout=10.0,
-        )
-        if _dispatch_resp.status_code == 200:
-            dispatch_result = _async_dispatch_result(
-                target, _dispatch_resp.json(), isolation=request.isolation_fields(),
-            )
-        else:
-            dispatch_result = {"success": False, "error": refusal_reason(_dispatch_resp)}
-    except Exception as e:
-        dispatch_result = {"success": False, "error": str(e)}
+    outcome = await post_until_answered(ls.rctx.http, f"{ls.rctx.supervisor_url}/v1/inbound", inbound_payload)
+    dispatch_result = _async_dispatch_outcome(target, outcome, isolation=request.isolation_fields())
     if dispatch_result.get("success") and args.get(ITEM_TIMEOUT_KEY) not in (None, ""):
         dispatch_result["note"] = (
             f"timeout_sec 只对 wait=true 的委派有效，这次没有用上；要限时等异步委派，用 {AWAIT_DISPATCHES_TOOL_NAME} 的 timeout_sec。"
@@ -896,6 +900,35 @@ def _isolated_note(isolation: dict[str, str]) -> str:
         return ""
     repo = isolation.get(REPO_KEY)
     return f"（在隔离副本里执行，仓库 {repo}）" if repo else "（在隔离副本里执行）"
+
+
+def _async_dispatch_outcome(target: str, outcome: RetriedPost, *, isolation: dict[str, str]) -> dict[str, Any]:
+    """异步委派请求的结局交给模型：派出了、被拒了、确定没派出，或者重发用完仍不知道派没派出。"""
+    answer = outcome.answer
+    if outcome.settled:
+        if getattr(answer, "status_code", None) != 200:
+            return {"success": False, "error": refusal_reason(answer)}
+        try:
+            body = answer.json()
+        except Exception as exc:
+            # 回了 200 就是建了任务，读不出应答也按派出算，只是没有句柄
+            logger.warning("async dispatch to %s answered 200 with an unreadable body: %s", target, exc)
+            body = {}
+        if isinstance(body, dict) and body.get("deduped"):
+            logger.info("async dispatch to %s was resent; supervisor answered with the task it already created", target)
+        return _async_dispatch_result(target, body, isolation=isolation)
+    if outcome.unanswered:
+        return {
+            "success": False,
+            "status": "unconfirmed",
+            "error": (
+                f"不确定有没有派出：请求发出后一直没等到 supervisor 的应答（{outcome.error}）。"
+                f"先用 {LIST_DISPATCHES_TOOL_NAME} 看有没有这个委派，没有再重新派，别直接重发。"
+            ),
+        }
+    if answer is not None:
+        return {"success": False, "error": refusal_reason(answer)}
+    return {"success": False, "error": f"没有派出：连不上 supervisor（{outcome.error}）。"}
 
 
 def _async_dispatch_result(target: str, body: Any, *, isolation: dict[str, str] | None = None) -> dict[str, Any]:

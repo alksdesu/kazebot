@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 _TESTS = Path(__file__).resolve().parent
@@ -46,11 +47,12 @@ from engine.dispatch_batch import (  # noqa: E402
 )
 from engine.conversation_migration import ConversationRekey  # noqa: E402
 from engine.dispatch_handle import format_handle  # noqa: E402
+from engine.inference import async_delivery  # noqa: E402
 from engine.inference.ai_step import _handle_tool_calls  # noqa: E402
 from engine.inference.pseudo_handlers import prepare_wait_dispatches  # noqa: E402
 from engine.inference.pseudo_tools import _dispatch_delegate_spec  # noqa: E402
 import supervisor.session_store as session_store_module  # noqa: E402
-from supervisor import admin_api, child_retention, continuation, session_reuse  # noqa: E402
+from supervisor import admin_api, async_dispatches, child_retention, continuation, session_reuse  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -225,12 +227,16 @@ class TestEngineShowsTheSupervisorsReason:
     def test_other_failures_hand_over_what_the_supervisor_said(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        monkeypatch.setattr(async_delivery, "REQUEST_RETRY_DELAYS_SEC", (0.0, 0.0))
         ls = _loop(tmp_path, monkeypatch)
         ls.rctx.http = _supervisor(_response({"detail": "boom"}, 500))
 
         _run(ls, _async())
 
         assert _payload(ls, "a1") == {"success": False, "error": "boom"}
+        # 5xx 是 supervisor 这次没处理成，带着同一个投递 id 重发过才放弃
+        sent = [posted.kwargs["json"] for posted in ls.rctx.http.post.await_args_list]
+        assert len(sent) == 3 and sent[0]["delivery_id"] and all(body == sent[0] for body in sent)
 
     def test_a_validation_error_list_is_spelled_out_by_field(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1097,6 +1103,151 @@ class TestAsyncInbound:
         [callback] = callbacks()
         assert _agent_session(callback) == _agent_session(agent)
         assert agent.status == TaskStatus.suspended and sub.status == TaskStatus.pending
+
+
+def _in_agent_session(state: SupervisorState, agent: Task) -> list[str]:
+    return [task.task_id for task in state.tasks.values() if task.input.get("parent_session_id") == _agent_session(agent)]
+
+
+def _without_dispatch_limits(workspace: Path) -> None:
+    """两项委派上限都配成 0：入站时就不再核对发起任务还在不在。"""
+    path = workspace / "config" / "runtime.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump({"engine": {"dispatch": {"max_depth": 0, "max_live_descendants": 0}}}), encoding="utf-8",
+    )
+
+
+@pytest.mark.usefixtures("admin_token")
+class TestResentInbound:
+    """engine 没等到应答会带着同一个投递 id 重发异步委派：收下过的回第一次的应答，不再派出第二个子任务。"""
+
+    def test_a_resend_gets_the_first_answer_instead_of_a_busy_refusal(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        payload = {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-1"}
+        first = _post(app, payload)
+        scout = _accepted(state, first)
+        events = _inbound_events(state)
+
+        again = _post(app, payload)
+
+        assert again.status_code == 200, again.text
+        assert again.json() == {**first.json(), "deduped": True}
+        assert _inbound_events(state) == events
+        assert _in_agent_session(state, scout) == [scout.task_id]
+
+    def test_a_new_id_is_a_new_dispatch_and_is_checked_as_usual(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        _accepted(state, _post(app, {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-1"}))
+
+        response = _post(app, {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-2"})
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+
+    def test_a_refused_dispatch_is_not_remembered(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        scout = _accepted(state, _post(app, _dispatch_payload(state, top, "scout.node")))
+        payload = {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-1"}
+        assert _post(app, payload).status_code == INBOUND_CONFLICT_STATUS
+        _finish(state, scout)
+        assert _idle(state, _agent_session(scout))
+
+        resent = _accepted(state, _post(app, payload))
+
+        assert resent.task_id != scout.task_id
+
+    def test_the_same_id_from_another_conversation_is_not_a_repeat(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+
+        first = _accepted(state, _post(app, {**_dispatch_payload(state, top, "scout.node", mode="fresh"), "delivery_id": "d-1"}))
+        second = _accepted(state, _post(app, {**_dispatch_payload(state, top, "scout.node", mode="fresh"), "delivery_id": "d-1"}))
+
+        assert first.task_id != second.task_id
+
+    def test_the_stored_id_cannot_pass_for_an_internal_one(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        caller_resume = "task:x:completion:1:v1:caller-resume"
+
+        _accepted(state, _post(app, {**_dispatch_payload(state, top, "scout.node"), "delivery_id": caller_resume}))
+
+        assert state.eventlog.find_delivery_event(caller_resume, event_type="inbound_message") is None
+        assert state.eventlog.find_delivery_event(f"inbound:{caller_resume}", event_type="inbound_message") is not None
+
+    def test_only_the_most_recent_receipts_are_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(async_dispatches, "RECEIVED_LIMIT", 2)
+        state = _state(tmp_path)
+        receipt = async_dispatches.InboundReceipt(session_id="agent-session", inbound_seq=7, task_id="child-1")
+
+        with state._lock:
+            for key in ("inbound:a", "inbound:b", "inbound:c"):
+                async_dispatches.remember_received_locked(state, CONV, key, receipt)
+            kept = [async_dispatches.received_locked(state, CONV, key) for key in ("inbound:a", "inbound:b", "inbound:c")]
+
+        assert kept == [None, receipt, receipt]
+
+    def test_a_resend_after_a_restart_is_answered_from_the_log(self, tmp_path: Path) -> None:
+        # 两项上限都关掉时入站不再核对发起任务在不在：重启后只剩日志里的入站回执认得出这次重发
+        _without_dispatch_limits(tmp_path)
+        state = _state(tmp_path)
+        top = _inbound(state, _session(state))
+        payload = {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-1"}
+        first = _post(_app(state, tmp_path), payload)
+        assert first.status_code == 200, first.text
+        restarted = _state(tmp_path)
+        tasks_before = set(restarted.tasks)
+        events = _inbound_events(restarted)
+
+        again = _post(_app(restarted, tmp_path), payload)
+
+        assert again.status_code == 200, again.text
+        first_task = first.json()["task_id"]
+        expected_task = first_task if first_task in restarted.tasks else ""
+        assert again.json() == {**first.json(), "task_id": expected_task, "deduped": True}
+        assert set(restarted.tasks) == tasks_before
+        assert _inbound_events(restarted) == events
+
+    def test_a_resend_pushed_out_of_memory_is_answered_with_its_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(async_dispatches, "RECEIVED_LIMIT", 1)
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        payload = {**_dispatch_payload(state, top, "scout.node"), "delivery_id": "d-1"}
+        first = _post(app, payload)
+        scout = _accepted(state, first)
+        _accepted(state, _post(app, {**_dispatch_payload(state, top, "helper.node", mode="fresh"), "delivery_id": "d-2"}))
+
+        again = _post(app, payload)
+
+        assert again.status_code == 200, again.text
+        assert again.json() == {**first.json(), "deduped": True}
+        assert _in_agent_session(state, scout) == [scout.task_id]
+
+    def test_after_a_restart_the_same_id_from_another_conversation_is_a_new_dispatch(self, tmp_path: Path) -> None:
+        _without_dispatch_limits(tmp_path)
+        state = _state(tmp_path)
+        top = _inbound(state, _session(state))
+        first_payload = {**_dispatch_payload(state, top, "scout.node", mode="fresh"), "delivery_id": "d-1"}
+        second_payload = {**_dispatch_payload(state, top, "scout.node", mode="fresh"), "delivery_id": "d-1"}
+        first = _accepted(state, _post(_app(state, tmp_path), first_payload))
+        restarted = _state(tmp_path)
+
+        second = _post(_app(restarted, tmp_path), second_payload)
+
+        assert second.status_code == 200, second.text
+        assert second.json()["deduped"] is False
+        assert second.json()["task_id"] and second.json()["task_id"] != first.task_id
 
 
 @pytest.mark.usefixtures("admin_token")

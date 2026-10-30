@@ -1,4 +1,7 @@
-"""异步工具结果回传 supervisor：瞬时失败退避重试，重试完仍送不到就落盘，worker 循环里定期补投。"""
+"""异步工具结果回传 supervisor：瞬时失败退避重试，重试完仍送不到就落盘，worker 循环里定期补投。
+
+哪些应答值得重发（transient_status）、带着同一个请求体重发（post_until_answered），异步委派和中间回复也照这一套。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,8 +12,11 @@ import os
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from file_lock import try_exclusive_lock
 
@@ -20,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _RETRY_DELAYS_SEC = (1.0, 4.0, 15.0)
 _TRANSIENT_STATUS = frozenset({408, 425, 429})
+# 只该生效一次的请求（异步委派、中间回复）带着投递 id，没拿到应答就重发：一共最多三次，每次最多等这么久
+REQUEST_RETRY_DELAYS_SEC = (1.0, 4.0)
+REQUEST_TIMEOUT_SEC = 10.0
+# 抛这几种时请求还没发出去，supervisor 肯定没收到
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 # 按任务交结果的接口不会因为业务原因回这两个码：回了就是 supervisor 还没有这个接口
 _MISSING_ROUTE_STATUS = frozenset({404, 405})
 _OUTBOX_MAX_AGE_SEC = 24 * 3600
@@ -75,6 +86,63 @@ def async_result_tool_status(task_context: Any) -> str:
     return TOOL_SUCCESS if success else TOOL_ERROR
 
 
+def transient_status(status: int) -> bool:
+    """supervisor 这次没处理成、过一会儿再发可能就成了：5xx，以及 408、425、429。"""
+    return status >= 500 or status in _TRANSIENT_STATUS
+
+
+def _status_of(response: Any) -> int:
+    """应答的状态码；拿不到的按成功算。"""
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else 200
+
+
+@dataclass(frozen=True)
+class RetriedPost:
+    """带着同一个请求体重发的结局。
+
+    answer 是最后拿到的应答：不用再重发的那个，或者重试用完时最后一个瞬时失败的；一个应答都没拿到为 None。
+    unanswered 为真：有一次请求可能已经到了 supervisor，却没等到应答。
+    """
+
+    answer: Any | None
+    error: str
+    unanswered: bool
+
+    @property
+    def settled(self) -> bool:
+        """拿到了不用再重发的应答：收下了，或者明确拒绝了。"""
+        return self.answer is not None and not transient_status(_status_of(self.answer))
+
+
+async def post_until_answered(http: Any, url: str, body: dict[str, Any]) -> RetriedPost:
+    """POST body；没拿到应答、或应答是瞬时失败时，带着同一个 body 再发，最多 1 + len(REQUEST_RETRY_DELAYS_SEC) 次。
+
+    body 里得带着 supervisor 认得的投递 id，重发才不会生效两次。
+    """
+    answer: Any | None = None
+    error = ""
+    unanswered = False
+    for delay in (0.0, *REQUEST_RETRY_DELAYS_SEC):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            response = await http.post(url, json=body, timeout=REQUEST_TIMEOUT_SEC)
+        except _NOT_SENT_ERRORS as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            continue
+        except Exception as exc:
+            unanswered = True
+            error = f"{type(exc).__name__}: {exc}"
+            continue
+        answer = response
+        status = _status_of(response)
+        if not transient_status(status):
+            return RetriedPost(answer, "", unanswered)
+        error = f"HTTP {status}"
+    return RetriedPost(answer, error, unanswered)
+
+
 def outbox_dir(workspace_root: Path | str) -> Path:
     return Path(workspace_root) / "data" / "async_tool_outbox"
 
@@ -96,7 +164,7 @@ async def _post_once(http: Any, url: str, payload: dict[str, Any]) -> tuple[str,
     status = getattr(response, "status_code", None)
     if not isinstance(status, int) or 200 <= status < 300:
         return _DELIVERED, "", status if isinstance(status, int) else None
-    if status >= 500 or status in _TRANSIENT_STATUS:
+    if transient_status(status):
         return _TRANSIENT, f"HTTP {status}", status
     return _REJECTED, f"HTTP {status}", status
 

@@ -64,10 +64,13 @@ class IntentRegistry:
     def has_conversation(self, conversation_key: str) -> bool:
         return str(conversation_key or "") in self._by_conversation
 
-    def register(self, task_id: str, conversation_key: str) -> "asyncio.Future[IntentResult]":
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[IntentResult] = loop.create_future()
-        self._pending[task_id] = _Pending(str(conversation_key or ""), future, loop)
+    def register(
+        self, task_id: str, conversation_key: str, future: "asyncio.Future[IntentResult] | None" = None,
+    ) -> "asyncio.Future[IntentResult]":
+        """登记一个在等的判定。在别的线程里登记时，future 由等待方在自己的事件循环上建好传进来。"""
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+        self._pending[task_id] = _Pending(str(conversation_key or ""), future, future.get_loop())
         if conversation_key:
             self._by_conversation[str(conversation_key)] = task_id
         return future

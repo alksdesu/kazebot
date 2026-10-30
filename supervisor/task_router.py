@@ -33,6 +33,7 @@ from . import (
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
+from .eventlog import POST_PHASE_TASK
 from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from .task_ending import TaskEnding, clear_stopping, stopping_expired, transit_due
@@ -2897,7 +2898,7 @@ class TaskRouterMixin:
 
     def _repeated_async_result_locked(self, key: str, task_id: str) -> dict[str, Any] | None:
         """这份结果交过就回当时的交法；没交过回 None。"""
-        repeat = self._async_tool_deliveries.repeat(key)
+        repeat = self._async_tool_deliveries.recall(key, self.eventlog)
         if repeat is not None:
             log.info("async tool result %s from task %s was already delivered; not delivering it again", key, task_id[:12])
         return repeat
@@ -4057,21 +4058,14 @@ class TaskRouterMixin:
         # Why: previously used task.session_id directly, causing all summarizer
         # tool_call/tool_result messages to be written into the parent's JSONL,
         # creating orphan tool pairs that Anthropic/Gemini reject with 400.
-        # A task_created event is the durable side-effect receipt. If a process
-        # crashed after creation but before phase completion, recovery observes this
-        # identity and does not create a second summarizer task.
-        if phase_id:
-            for event in self.eventlog.iter_persisted_events():
-                if event.get("type") != "task_created":
-                    continue
-                payload = event.get("payload")
-                task_input = payload.get("input") if isinstance(payload, dict) else None
-                if isinstance(task_input, dict) and str(task_input.get("_post_phase_id") or "") == phase_id:
-                    return
-
         # Only the in-memory session/task mutation needs the Supervisor lock. Config
         # loading, ConversationStore reads and formatting above remain lock-free.
         with self._lock:
+            # A task_created event is the durable side-effect receipt. If a process
+            # crashed after creation but before phase completion, recovery observes this
+            # identity and does not create a second summarizer task.
+            if phase_id and self.eventlog.find_receipt(POST_PHASE_TASK, phase_id) is not None:
+                return
             if phase_id and any(
                 str((existing.input or {}).get("_post_phase_id") or "") == phase_id
                 for existing in self.tasks.values()

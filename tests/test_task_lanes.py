@@ -678,7 +678,8 @@ class TestApi:
                 ))
                 intent: Task | None = None
                 for _ in range(500):
-                    intent = next((task for task in state.tasks.values() if task.input.get("_reply_intent")), None)
+                    # 判定任务在线程池里建：先拷一份再挑，别在另一个线程往里加的时候遍历
+                    intent = next((task for task in list(state.tasks.values()) if task.input.get("_reply_intent")), None)
                     if intent is not None:
                         break
                     await asyncio.sleep(0.01)

@@ -59,6 +59,17 @@ class DeliveredResults:
             return None
         return {"ok": True, "strategy": strategy, "deduped": True}
 
+    def recall(self, key: str, eventlog: Any) -> dict[str, Any] | None:
+        """同 repeat；这里只记着最近交过的，没记着的再去事件日志的回执表里认（更早交的、重启前交的）。"""
+        repeat = self.repeat(key)
+        if repeat is not None or not key:
+            return repeat
+        for event_type, strategy in _STRATEGY_OF_EVENT.items():
+            if eventlog.find_delivery_event(key, event_type=event_type) is not None:
+                self.remember(key, strategy)
+                return self.repeat(key)
+        return None
+
     def remember(self, key: str, strategy: str) -> None:
         if not key:
             return
