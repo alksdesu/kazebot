@@ -288,6 +288,36 @@ describe('runtime 的来源与恢复默认', () => {
     expect(screen.getByText(OVERRIDE_HINT)).toBeInTheDocument();
   });
 
+  // 已经删了，只是回执读不懂：报成恢复失败，人会以为本实例那份还在。
+  it('恢复默认的回执读不懂：照恢复了交代，重读换上现状，回执的事另起一行报', async () => {
+    vi.mocked(api.getRuntimeLayers).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
+    vi.mocked(api.resetRuntime).mockRejectedValueOnce(new api.ReceiptUnreadable('runtime.yaml 本实例那份已经删掉，可回执不是 JSON'));
+    render(<AdvancedSettingsPage />); const area = openSection('runtime');
+    fireEvent.click(area.getByRole('button', { name: '加载' }));
+    await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
+
+    fireEvent.click(resetButton());
+    await screen.findByText('已恢复成仓库默认');
+
+    expect(screen.getByText('runtime.yaml 本实例那份已经删掉，可回执不是 JSON')).toHaveAttribute('role', 'alert');
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(DEFAULT_HINT)).toBeInTheDocument();
+  });
+
+  it('恢复默认之后那次重读没成：照恢复了交代，说清得先加载再改，不报成恢复失败', async () => {
+    vi.mocked(api.getRuntimeLayers).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockRejectedValue(Error('503 重读挂了'));
+    render(<AdvancedSettingsPage />); const area = openSection('runtime');
+    fireEvent.click(area.getByRole('button', { name: '加载' }));
+    await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
+
+    fireEvent.click(resetButton());
+    await screen.findByText('已恢复成仓库默认');
+
+    expect(screen.getByText('点「加载」读入最新内容再改，不然再存会被当成冲突拒掉。刚才重新读取也没成：503 重读挂了'))
+      .toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/恢复默认失败/)).toBeNull();
+  });
+
   it('恢复失败保留本实例那份，原因显示出来', async () => {
     vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile(overriding, 'override'));
     vi.mocked(api.resetRuntime).mockRejectedValueOnce(Error('409 这份文件不能删'));

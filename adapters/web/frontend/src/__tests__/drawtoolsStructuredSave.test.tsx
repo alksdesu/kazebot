@@ -753,7 +753,7 @@ describe('写出去之后换了 token', () => {
   });
 
   it('清理跑完才换 token，删了几个文件不报到新会话', async () => {
-    const cleanup = deferred<unknown>();
+    const cleanup = deferred<api.DrawtoolsCleanup>();
     vi.mocked(api.cleanupDrawtoolsAttachments).mockReturnValueOnce(cleanup.promise);
     render(<DrawtoolsSettingsPage />);
     await settled();
@@ -762,14 +762,14 @@ describe('写出去之后换了 token', () => {
     await waitFor(() => expect(api.cleanupDrawtoolsAttachments).toHaveBeenCalledOnce());
     await rotate();
     await act(async () => {
-      cleanup.resolve({ deleted_count: 3, deleted_mb: 12, remaining_count: 8, remaining_mb: 40 });
+      cleanup.resolve({ ok: true, deleted_count: 3, deleted_mb: 12, remaining_count: 8, remaining_mb: 40 });
     });
 
     expectSilent();
   });
 
   it('清理失败之前换了 token，不摆出这一趟的报错', async () => {
-    const cleanup = deferred<unknown>();
+    const cleanup = deferred<api.DrawtoolsCleanup>();
     vi.mocked(api.cleanupDrawtoolsAttachments).mockReturnValueOnce(cleanup.promise);
     render(<DrawtoolsSettingsPage />);
     await settled();
@@ -780,5 +780,35 @@ describe('写出去之后换了 token', () => {
     await act(async () => { cleanup.reject(new Error(WRITE_FAILURE)); });
 
     expectSilent();
+  });
+});
+
+describe('补建和清理的回执读不懂', () => {
+  // 补上了只是回执读不懂：说成失败的话，人会以为配置文件还缺着。
+  it('补建的回执读不懂：照补上了交代，重读一遍，回执的事另起一行报', async () => {
+    vi.mocked(api.initDrawtoolsConfigs).mockRejectedValueOnce(
+      new api.ReceiptUnreadable('缺的绘图配置已经补上，可回执格式不对：缺 created'),
+    );
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.click(screen.getByRole('button', { name: '从 Example 初始化用户配置' }));
+
+    expect(await statusText()).toBe('缺的配置文件已经补上');
+    expect(await alertText()).toBe('缺的绘图配置已经补上，可回执格式不对：缺 created。补了哪几份没读到，下面以重新读到的为准');
+    await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(2));
+  });
+
+  // 文件删了只是回执读不懂：不能编一个「删除 0 个文件」。
+  it('清理的回执读不懂：照清理完了交代，不编删了几个', async () => {
+    vi.mocked(api.cleanupDrawtoolsAttachments).mockRejectedValueOnce(new api.ReceiptUnreadable('绘图附件已经清理，可回执不是 JSON'));
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.click(screen.getByRole('button', { name: '立即清理' }));
+
+    expect(await statusText()).toBe('清理完成');
+    expect(await alertText()).toBe('绘图附件已经清理，可回执不是 JSON。删了多少、还剩多少没读到');
+    expect(screen.queryByText(/删除 0 个文件/)).toBeNull();
   });
 });

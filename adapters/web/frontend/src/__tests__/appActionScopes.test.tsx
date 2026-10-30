@@ -96,4 +96,24 @@ describe('应用动作的目标与失败反馈', () => {
     await act(async () => reject(new Error('synthetic cancel failure')));
     expect(screen.getByRole('alert')).toHaveTextContent('synthetic cancel failure'); expect(screen.queryByText('已提交取消请求。')).not.toBeInTheDocument();
   });
+  // 回执读不懂时服务端已经做完了：说成失败，人会再发一条、再取消或再重置一次。
+  it('消息发出了却读不懂回执：照实说一声，告诉人别重发', async () => {
+    send.mockResolvedValue('消息已经发出，可回执格式不对：缺 session_id'); render(<App />);
+    await act(async () => { await context.onSendMessage('hello'); });
+    expect(screen.getByRole('status')).toHaveTextContent('消息已经发出，可回执格式不对：缺 session_id。不用重发，重发会再发一条');
+  });
+  it('取消请求交上了却读不懂回执：不当成失败，也不说已取消', async () => {
+    cancel.mockResolvedValue('取消请求已经交上，可回执不是 JSON'); render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: '停止任务' }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('取消请求已经交上，可回执不是 JSON。停没停下以对话里的状态为准'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('重置了却读不懂回执：照样清掉原会话的视图，并说明回执的事', async () => {
+    vi.mocked(api.resetConversation).mockRejectedValue(new api.ReceiptUnreadable('会话已经重置，可回执格式不对：缺 ok')); render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: '打开重置' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认重置' }));
+    await waitFor(() => expect(clear).toHaveBeenCalledWith('A', 'sid-A'));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('会话已经重置，可回执格式不对：缺 ok。下一条消息将开始新的上下文');
+  });
 });

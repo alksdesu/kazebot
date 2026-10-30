@@ -143,13 +143,20 @@ export function connectionPeerName(platform: PlatformDescriptor): string {
   return platform.connectionPeer || '平台';
 }
 
+// 和后端 split_conversation_key 一个读法：整串和身份去掉首尾空白，前缀再转小写。读法不同，后端认的作用域前端就当成认不出的键
+function splitScope(scope: string): { prefix: string; identity: string } {
+  const text = scope.trim();
+  const separator = text.indexOf(':');
+  if (separator < 0) return { prefix: '', identity: '' };
+  return { prefix: text.slice(0, separator).trim().toLowerCase(), identity: text.slice(separator + 1).trim() };
+}
+
 /** 会话键前缀 → 平台与通道。认不出返回 null，调用方据此退到 owner 上报的种类。
  *
  * 光秃秃一个前缀不算会话键：策略作用域校验靠它挡住 `qq_group:` 这种空目标。 */
 export function channelForScope(scope: string): { platform: PlatformDescriptor; channel: ChannelDescriptor } | null {
-  const separator = scope.indexOf(':');
-  if (separator <= 0 || separator === scope.length - 1) return null;
-  return channelIndex.get(scope.slice(0, separator)) || null;
+  const { prefix, identity } = splitScope(scope);
+  return prefix && identity ? channelIndex.get(prefix) || null : null;
 }
 
 export function platformForScope(scope: string): PlatformDescriptor | null {
@@ -171,6 +178,6 @@ export function isConversationScope(scope: string): boolean {
 
 /** 这串文本本身就是个会话键前缀开头的技术标识，不是人看的名字。 */
 export function looksLikeScopeKey(value: string): boolean {
-  const separator = value.indexOf(':');
-  return separator > 0 && channelIndex.has(value.slice(0, separator));
+  const { prefix } = splitScope(value);
+  return Boolean(prefix) && channelIndex.has(prefix);
 }

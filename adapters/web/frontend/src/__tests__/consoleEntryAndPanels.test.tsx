@@ -14,6 +14,7 @@ import { useSettingsStore } from '../store/settingsStore';
 import { locationForLegacyDomain, tabForLegacyDomain, useViewStore } from '../store/viewStore';
 import type { AdminApproval } from '../api/supervisorClient';
 import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
+import { adminState, configReloadReply } from './fixtures/systemReplies';
 
 const conversation: ConversationMeta = {
   id: 'conv-1',
@@ -239,8 +240,8 @@ describe('设置页上下文右栏', () => {
   it('系统页的重载操作会写进右栏日志', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith('/v1/config/reload')) return jsonResponse({ ok: true });
-      if (url.endsWith('/v1/admin/state')) return jsonResponse({ sessions: 0, pending_approvals: [], engine_runtime: {} });
+      if (url.endsWith('/v1/config/reload')) return jsonResponse(configReloadReply());
+      if (url.endsWith('/v1/admin/state')) return jsonResponse(adminState());
       return jsonResponse({ status: 'ok', uptime_seconds: 1 });
     });
     vi.stubGlobal('fetch', fetchMock);

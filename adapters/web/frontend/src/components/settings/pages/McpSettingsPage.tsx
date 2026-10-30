@@ -125,8 +125,8 @@ export const McpSettingsPage = () => {
   };
 
   const preview = (client: McpClient): string => {
-    if (client.transport === 'stdio') return String(client.command || '未设置命令');
-    return String(client.url || '未设置 URL');
+    if (client.transport === 'stdio') return client.command || '未设置命令';
+    return client.url || '未设置 URL';
   };
 
   return (
@@ -139,7 +139,7 @@ export const McpSettingsPage = () => {
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {clients.length === 0 ? !listFailed && <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
             <button className={`w-full border p-3 text-left ${selectedMcpClient?.id === client.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={client.id} disabled={busy} onClick={() => { setSelectedMcpClient(client); setMessage(''); setRightPanelOpen(true); }} type="button">
-              <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{client.id}</span><span className={`border px-1.5 py-0.5 text-xs ${client.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{client.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-xs text-[var(--duties-tertiary)]">{client.transport || '未知传输'}</span></div>
+              <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{client.id}</span><span className={`border px-1.5 py-0.5 text-xs ${!client.enabled ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{!client.enabled ? '禁用' : '启用'}</span><span className="font-mono text-xs text-[var(--duties-tertiary)]">{client.transport || '未知传输'}</span></div>
               <p className="mt-1 truncate text-xs text-[var(--duties-secondary)]">{preview(client)}</p>
             </button>
           ))}

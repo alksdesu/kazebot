@@ -31,6 +31,7 @@ import {
 } from '../api/supervisorClient';
 import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { inferToolRisk } from '../utils/toolRisk';
+import { configReloadReply, restartReply, toolsReloadReply } from './fixtures/systemReplies';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -158,7 +159,14 @@ describe('expanded settings API wrappers', () => {
   });
 
   it('uses the expected create delete reload and restart endpoints', async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ ok: true, hash: 'h1', scheduled: true, target: 'engine' }));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/v1/config/reload')) return jsonResponse(configReloadReply());
+      if (url.endsWith('/v1/tools/reload')) return jsonResponse(toolsReloadReply());
+      if (url.endsWith('/v1/admin/restart')) return jsonResponse(restartReply());
+      if (init?.method === 'DELETE') return jsonResponse(url.includes('/skills/') ? { ok: true } : { ok: true, restored: false });
+      return jsonResponse({ ok: true, hash: 'h1' });
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     await createNode('token', { id: 'new_node', content: 'id: new_node\n' });

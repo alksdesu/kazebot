@@ -498,6 +498,17 @@ describe('换完配置之后的那次重启', () => {
       '没能重启 engine：调度器没应答。新配置要等它重启才生效，到「运行」里手动重启一次。',
     );
   });
+
+  // 重启请求已经到了调度器：报成没重启上，人会去「运行」里再重启一次。
+  it('重启请求交上了却读不懂回执：跟在成功那句后面交代排没排上去哪看，不报错', async () => {
+    vi.mocked(api.restartEngine).mockRejectedValue(new api.ReceiptUnreadable('重启请求已经交上，可回执不是 JSON'));
+    await joinAlpha();
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '已加入「alpha」。重启请求已经交上，可回执不是 JSON。不知道排没排上，去运行页看 worker 有没有重新拉起',
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 });
 
 // 回执是改完才发的：读不懂不等于没改成。当成失败的话 engine 不重启、全貌停在改之前，人还会再点一次。

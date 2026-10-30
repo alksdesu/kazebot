@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 import { getSystemModels, type SystemModelSlot } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
-import { Block, Empty, ErrorText, Facts, LinkButton, Panel, ReadOnlyRow } from './components';
+import { Block, Button, Empty, ErrorText, Facts, LinkButton, Panel, ReadOnlyRow } from './components';
 import { SYSTEM_SLOTS_ANCHOR } from './SystemSlots';
 import { errorMessage } from '../api/request';
 
@@ -18,17 +18,27 @@ export const VisionChannelBlock = () => {
   const [slot, setSlot] = useState<SystemModelSlot | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState('');
+  const [readAttempt, setReadAttempt] = useState(0);
 
   useEffect(() => {
     if (!adminToken) return;
     void (async () => {
+      setError('');
       try {
         const data = await getSystemModels(adminToken);
-        setSlot(data.slots.find((item) => item.key === 'image') || null);
+        // 后端一定发这一槽，缺了不能当成没配。
+        const image = data.slots.find((item) => item.key === 'image');
+        if (!image) throw new Error('系统槽位里没有读图（image）这一槽');
+        setSlot(image);
       } catch (caught) { setError(errorMessage(caught)); }
       setLoaded(true);
     })();
-  }, [adminToken]);
+  }, [adminToken, readAttempt]);
+
+  const reread = () => {
+    setLoaded(false);
+    setReadAttempt((value) => value + 1);
+  };
 
   // 自己指了地址却没说是哪家，后端就按 OpenAI 格式发。
   const channel = slot?.provider
@@ -42,7 +52,15 @@ export const VisionChannelBlock = () => {
 
   return (
     <Block hint="打标和 read_image 工具共用这一条。它在渠道页的系统槽位里改，这里只显示当前值" title="看图渠道">
-      {!loaded ? <Empty>正在读取看图渠道…</Empty> : (
+      {!loaded ? <Empty>正在读取看图渠道…</Empty> : error && !slot ? (
+        // 没读到就不摆「跟随主渠道」「未设置」：那是读到以后才说得出的结论。
+        <Panel>
+          <ErrorText role="alert">看图渠道没读到：{error}</ErrorText>
+          <div className="mt-3">
+            <Button onClick={reread} tone="quiet">重读</Button>
+          </div>
+        </Panel>
+      ) : (
         <Panel>
           {error && <ErrorText>{error}</ErrorText>}
           <ReadOnlyRow name="渠道" value={channel} />

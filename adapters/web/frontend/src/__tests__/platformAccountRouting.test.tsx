@@ -39,13 +39,18 @@ const json = (body: unknown) => new Response(JSON.stringify(body), {
   headers: { 'Content-Type': 'application/json' },
 });
 
+// 回包照后端给齐：换号回执要带换上的号，钉号回执带钉住的号。
 function stubFetch() {
-  const mock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+  const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.endsWith('/v1/instances')) return json({ instances });
+    if (url.endsWith('/v1/instances')) return json({ current_prefix: '', instances });
     if (url.includes('/account/scope')) return json(scope);
     if (url.includes('/account/qrcode')) return json({ qrcode: '', reachable: true });
-    if (/\/account\/(switch|relogin|pin)$/.test(url)) return json({ ok: true });
+    if (url.endsWith('/account/switch')) {
+      return json({ ok: true, account: JSON.parse(String(init?.body)).account, pinned: true, pin_error: '' });
+    }
+    if (url.endsWith('/account/pin')) return json({ ok: true, account: String(accountState.account ?? '') });
+    if (url.endsWith('/account/relogin')) return json({ ok: true });
     if (url.includes('/account')) return json(accountState);
     return json({});
   });

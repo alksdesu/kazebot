@@ -35,7 +35,7 @@ export function ConversationPlans({ sessionId }: { sessionId: string }) {
         }
       }
       try {
-        const data = await featureRequest<unknown>('/v1/execution/plans', { scope: currentScope, signal: request.signal });
+        const data = await featureRequest('/v1/execution/plans', { what: '本会话的计划', scope: currentScope, signal: request.signal });
         if (request.isCurrent()) {
           setScope(currentScope);
           setPlans(readExecutionPlans(data).filter(plan => !['cancelled', 'completed'].includes(plan.status)).slice(0, 5));

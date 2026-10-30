@@ -21,7 +21,7 @@ import {
   type RawText,
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
-import { savedMessage } from '../../../utils/sentence';
+import { appendSentence, savedMessage } from '../../../utils/sentence';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import { parseYamlMapping, sameData, yamlMappingProblem, type YamlKeyEdit } from '../../../console/yamlRewrite';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
@@ -288,9 +288,13 @@ export const DrawtoolsSettingsPage = () => {
   const initConfigs = async () => {
     if (!adminToken) return;
     try {
-      const result = await initDrawtoolsConfigs(adminToken);
+      const { result, receiptProblem } = await receipted(initDrawtoolsConfigs(adminToken));
       if (!requests.isCurrent()) return;
-      setMessage(result.created.length ? `已创建：${result.created.join('、')}` : '用户配置已存在，无需创建。');
+      if (!result) {
+        setMessage('缺的配置文件已经补上', appendSentence(receiptProblem, '补了哪几份没读到，下面以重新读到的为准'));
+      } else {
+        setMessage(result.created.length ? `已创建：${result.created.join('、')}` : '用户配置已存在，无需创建。');
+      }
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;
@@ -357,9 +361,13 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken) return;
     if (!window.confirm('立即清理 data/attachments/novelai？过期文件会被删除，超出容量上限时还会删掉最旧的那些。')) return;
     try {
-      const result = await cleanupDrawtoolsAttachments(adminToken);
+      const { result, receiptProblem } = await receipted(cleanupDrawtoolsAttachments(adminToken));
       if (!requests.isCurrent()) return;
-      setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
+      if (!result) {
+        setMessage('清理完成', appendSentence(receiptProblem, '删了多少、还剩多少没读到'));
+        return;
+      }
+      setMessage(`清理完成：删除 ${result.deleted_count} 个文件，释放 ${result.deleted_mb} MB；剩余 ${result.remaining_count} 个文件 / ${result.remaining_mb} MB`);
     } catch (caught) {
       if (!requests.isCurrent()) return;
       setError(errorMessage(caught, '清理失败'));
@@ -544,7 +552,7 @@ export const DrawtoolsSettingsPage = () => {
           <Feedback error={error} notice={notice} />
         </Block>
 
-        <Block frame="boxed" title="API 配置" hint="API Key 推荐使用环境变量 NOVELAI_API_KEY；如必须写入文件，可在下方保存。">
+        <Block frame="boxed" title="API 配置" hint="API Key 推荐写进本实例 .env 或 config/secrets.env，变量名默认 NOVELAI_API_KEY；只设在进程环境里的话工具拿不到，会被当成没配。如必须写入文件，可在下方保存。">
           <div className="grid gap-3 md:grid-cols-2">
             <div>
               <Field label="NovelAI / 兼容站点 Base URL" layout="stacked">
@@ -558,7 +566,7 @@ export const DrawtoolsSettingsPage = () => {
             </div>
             <div className="md:col-span-2">
               <Field label="API Key（可选，不建议写进仓库）" layout="stacked">
-                <Input width="wide" defaultValue={String(api.api_key || '')} onBlur={(event) => updateApiField('api_key', event.currentTarget.value)} placeholder="留空则使用环境变量" type="password" />
+                <Input width="wide" defaultValue={String(api.api_key || '')} onBlur={(event) => updateApiField('api_key', event.currentTarget.value)} placeholder="留空则从 .env 或 config/secrets.env 读上面那个变量" type="password" />
               </Field>
             </div>
           </div>

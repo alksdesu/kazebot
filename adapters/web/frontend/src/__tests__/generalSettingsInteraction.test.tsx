@@ -53,7 +53,7 @@ describe('通用设置', () => {
   it('连接失败提供重试而不清除已验证身份', async () => {
     mocks.health.mockRejectedValueOnce(new Error('offline'));
     render(<GeneralSettingsPage />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('无法连接调度器');
+    expect(await screen.findByRole('alert')).toHaveTextContent('健康检查没通过：offline。请检查服务是否运行，再刷新连接状态');
     expect(useSettingsStore.getState().adminToken).toBe('fixture-token');
     expect(useSettingsStore.getState().isAuthenticated).toBe(true);
   });

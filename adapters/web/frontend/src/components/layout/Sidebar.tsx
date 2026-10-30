@@ -18,7 +18,8 @@ interface SidebarProps {
   activeConversationId: string | null;
   onCreateConversation: () => void;
   onSelectConversation: (conversationId: string) => void;
-  onDeleteConversation: (conversationId: string) => Promise<void> | void;
+  /** 删掉了却读不懂回执时给回执的问题。 */
+  onDeleteConversation: (conversationId: string) => Promise<string | void> | void;
   childNodesByConversation?: Record<string, ChildNodeState[]>;
 }
 
@@ -87,6 +88,7 @@ export const Sidebar = ({
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const deleting = useRef(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [search, setSearch] = useState('');
   // One timer for the next finished child to drop out of the tree, instead of re-rendering every second.
   useEffect(() => {
@@ -98,8 +100,8 @@ export const Sidebar = ({
   }, [childNodeMap, now]);
   const remove = async (conversation: ConversationMeta) => {
     if (deleting.current || !window.confirm(`删除“${conversation.title}”及其上下文？此操作无法撤销。`)) return;
-    deleting.current = true; setPendingDelete(conversation.id); setError('');
-    try { await onDeleteConversation(conversation.id); }
+    deleting.current = true; setPendingDelete(conversation.id); setError(''); setNotice('');
+    try { setNotice((await onDeleteConversation(conversation.id)) || ''); }
     catch (reason) { setError(errorMessage(reason, '删除失败，请重试。')); }
     finally { deleting.current = false; setPendingDelete(null); }
   };
@@ -128,6 +130,7 @@ export const Sidebar = ({
       <WorkspaceNav />
       <div className="px-3 pb-2 pt-3"><label className="sr-only" htmlFor="conversation-search">搜索对话</label><input id="conversation-search" type="search" className="app-input w-full" placeholder="搜索对话" value={search} onChange={event => setSearch(event.target.value)} /></div>
       {error && <p className="mx-3 mb-2 text-sm text-[var(--duties-danger)]" role="alert">{error}</p>}
+      {notice && <p className="mx-3 mb-2 text-sm text-[var(--duties-secondary)]" role="status">{notice}</p>}
       {/* Conversation list */}
       <nav aria-label="对话" className="min-h-0 flex-1 overflow-y-auto">
         {startupError && <div className="mx-3 mb-3 space-y-2">

@@ -13,6 +13,7 @@ import type { SessionRunningTask } from '../api/supervisorClient';
 import { selectMessages } from '../store/eventSelectors';
 import { useChatStore } from '../store/chatStore';
 import { useClientPrefsStore } from '../store/clientPrefsStore';
+import { useSettingsStore } from '../store/settingsStore';
 import type { SupervisorEvent } from '../types/chat';
 import type { WsMessage } from '../types/message';
 
@@ -24,7 +25,7 @@ class FakeWebSocket {
 
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   readyState = FakeWebSocket.CONNECTING;
   sent: string[] = [];
@@ -37,9 +38,9 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close() {
+  close(code = 1000, reason = '') {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code, reason } as CloseEvent);
   }
 
   open() {
@@ -101,6 +102,7 @@ describe('chatStore', () => {
 
   afterEach(() => {
     useChatStore.getState().resetState();
+    useSettingsStore.setState({ adminToken: null });
     // [2026-06-02] Why: title persistence intentionally survives resetState at runtime.
     // How: clear jsdom storage during test cleanup instead of relying on the store reset.
     // Purpose: tests stay isolated while production browser refreshes keep cached titles.
@@ -117,6 +119,7 @@ describe('chatStore', () => {
       }
       return jsonResponse([]);
     }));
+    useSettingsStore.setState({ adminToken: 'stream-token' });
 
     const conversationId = useChatStore.getState().createConversation();
     await useChatStore.getState().sendMessage('run uname', undefined, 'ereuna_main');
@@ -131,12 +134,10 @@ describe('chatStore', () => {
     expect(ws.url).toContain('/v1/ws');
 
     ws.open();
-    expect(ws.sent).toEqual([JSON.stringify({ last_seq: 0 })]);
-    // [2026-06-01] Opening the browser WebSocket is enough to mark realtime as healthy.
-    // Why: waiting for a non-ping event leaves the right rail stuck in a false
-    // connecting or disconnected state when the socket is already usable. How: the
-    // onOpen callback updates connectionStatus immediately. Purpose: the UI reflects
-    // the actual connection before the first Supervisor event arrives.
+    expect(ws.sent).toEqual([JSON.stringify({ last_seq: 0, token: 'stream-token' })]);
+    // An opened socket can still be refused; the stream counts as up once the server accepted the token.
+    expect(useChatStore.getState().connectionStatus).toBe('connecting');
+    ws.receive({ type: 'stream_ready' });
     expect(useChatStore.getState().connectionStatus).toBe('open');
 
     ws.receive(supervisorEvent(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'run uname' }));
@@ -936,6 +937,55 @@ describe('chatStore', () => {
     expect(useChatStore.getState().isGenerating).toBe(true);
   });
 
+  // A refused token never starts working on its own: reconnecting would only be refused again.
+  it('sends the user back to login with the reason when the stream refuses the token, and stops reconnecting', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).endsWith('/v1/inbound') ? jsonResponse({ session_id: 'sess-chat', inbound_seq: 1, accepted: true }) : jsonResponse([])
+    )));
+    useSettingsStore.setState({ adminToken: 'stale-token', isAuthenticated: true, loginNotice: '' });
+    useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('hello', undefined, 'ereuna_main');
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      FakeWebSocket.instances[0].open();
+      FakeWebSocket.instances[0].close(4401, 'unauthorized');
+      vi.advanceTimersByTime(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(useChatStore.getState().connectionStatus).toBe('closed');
+    expect(useSettingsStore.getState()).toMatchObject({
+      isAuthenticated: false,
+      adminToken: 'stale-token',
+      loginNotice: '实时消息通道不认当前令牌（令牌无效或已过期），请重新登录。',
+    });
+    useSettingsStore.setState({ loginNotice: '' });
+  });
+
+  it('opens a new stream when the token changed since the open one authenticated', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).endsWith('/v1/inbound') ? jsonResponse({ session_id: 'sess-chat', inbound_seq: 1, accepted: true }) : jsonResponse([])
+    )));
+    useSettingsStore.setState({ adminToken: 'old-token' });
+    useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('first', undefined, 'ereuna_main');
+    const first = FakeWebSocket.instances[0];
+    first.open();
+    first.receive({ type: 'stream_ready' });
+
+    useSettingsStore.setState({ adminToken: 'new-token' });
+    await useChatStore.getState().sendMessage('second', undefined, 'ereuna_main');
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(useChatStore.getState().connectionStatus).toBe('connecting');
+    FakeWebSocket.instances[1].open();
+    expect(FakeWebSocket.instances[1].sent).toEqual([JSON.stringify({ last_seq: 0, token: 'new-token' })]);
+  });
+
   // Events sent while the stream was down are never replayed: a reconnect re-reads what is on screen.
   it('re-reads the open conversation after the stream reconnects and drops a task that ended meanwhile', async () => {
     let finished = false;
@@ -964,6 +1014,7 @@ describe('chatStore', () => {
     useChatStore.getState().loadStartup();
     await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].receive({ type: 'stream_ready' });
     await waitFor(() => expect(useChatStore.getState().historyByConversation['conv-resync']).toMatchObject({ loading: false }));
     expect(historyReads()).toBe(1);
     expect(useChatStore.getState().isGenerating).toBe(true);
@@ -981,6 +1032,7 @@ describe('chatStore', () => {
       vi.useRealTimers();
     }
     FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].receive({ type: 'stream_ready' });
 
     await waitFor(() => expect(useChatStore.getState().generatingBySession['sess-resync']).toBe(false));
     const state = useChatStore.getState();

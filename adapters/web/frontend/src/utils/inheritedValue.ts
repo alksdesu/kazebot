@@ -1,6 +1,7 @@
 // 会话的请求最终用哪个模型、哪个地址、走哪个渠道，和 engine/model.py 的 resolve_provider 同一个顺序：
 // 会话覆盖 → 节点 → 两者点名的渠道块 → 全局在用渠道。哪一层还没读到就停在那一层，不拿下一层顶上。
 import type { ProviderConfigPublic } from '../api/supervisorClient';
+import { parseEnvRef } from './envRef';
 
 export type ReadStatus = 'loaded' | 'loading' | 'failed';
 
@@ -61,6 +62,12 @@ const text = (fields: object | null | undefined, key: string): string => {
   return typeof value === 'string' ? value.trim() : '';
 };
 
+// 节点的模型和地址由 engine 展开：$ENV{} 一个变量名都没写，展开是空串，和没写一样往下一层找。会话覆盖原样送上游，不走这一步。
+const nodeText = (fields: object | null, key: string): string => {
+  const value = text(fields, key);
+  return parseEnvRef(value)?.length === 0 ? '' : value;
+};
+
 // engine 读会话覆盖时 provider 和旧写法 provider_type 都认，节点只认 provider
 const sessionProvider = (fields: object | null): string => text(fields, 'provider') || text(fields, 'provider_type');
 
@@ -86,7 +93,7 @@ export function inheritedField(sources: InheritanceSources, field: 'model' | 'ba
   const { session, node, global } = sources;
   const layers: InheritedLayer[] = [];
   if (withSession) layers.push({ source: 'session', status: session.status, value: text(session.fields, field) });
-  layers.push({ source: 'node', status: node.status, value: text(node.fields, field), origin: node.id });
+  layers.push({ source: 'node', status: node.status, value: nodeText(node.fields, field), origin: node.id });
   layers.push(channelLayer(sources, field));
   layers.push({ source: 'global', status: global.status, value: field === 'model' ? global.model.trim() : global.baseUrl.trim() });
   return resolveInherited(layers);

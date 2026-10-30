@@ -225,3 +225,16 @@ describe('缓存命中页的换算', () => {
     expect(windowStart('all', '2026-10-01T00:00:00.000Z', now)).toBe('2026-10-01T00:00:00.000Z');
   });
 });
+
+describe('缓存命中页读不懂报告时', () => {
+  // 缺一格补成 0 的话，「无数据」就成了 0% 命中。
+  it('说没读成，不画表', async () => {
+    fetchMock.mockImplementation(async () => {
+      const report = reportFor('session', new URLSearchParams());
+      return json({ ...report, totals: { ...report.totals, baseline: { ...report.totals.baseline, hit_rate: undefined } } });
+    });
+    render(<CacheUsagePage />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('缓存命中汇总格式不对：缺 totals.baseline.hit_rate');
+    expect(screen.queryByRole('table')).toBeNull();
+  });
+});

@@ -68,7 +68,7 @@ const ApprovalsSettingsPageBody = () => {
     try {
       const state = await getAdminState(adminToken);
       if (!request.isCurrent()) return;
-      const pending = state.pending_approvals || [];
+      const pending = state.pending_approvals;
       setApprovals(pending);
       setListFailed(false);
       // Read the selection at call time: depending on it would tear down and restart the poll on every click.

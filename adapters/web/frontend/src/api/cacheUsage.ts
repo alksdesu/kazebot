@@ -1,7 +1,8 @@
 // 提示缓存命中率汇总：/v1/admin/usage/cache 的返回形状与请求。
 import { MOUNT } from '../instances/paths';
 import { requestJson } from './request';
-import type { MemoryOwner } from './supervisorClient';
+import { BOOLEAN, NUMBER, TEXT, at, nullable, oneOf, shaped, shapedRows } from './shape';
+import { MEMORY_OWNER, type MemoryOwner } from './supervisorClient';
 
 export type CacheUsageDimension = 'session' | 'node' | 'model' | 'channel';
 export type CacheBaselineMode = 'legacy' | 'before';
@@ -72,9 +73,59 @@ export function cacheUsageUrl(query: CacheUsageQuery): string {
   return `${MOUNT}/v1/admin/usage/cache?${params.toString()}`;
 }
 
+const STATS = {
+  tasks: NUMBER,
+  prompt_tokens: NUMBER,
+  cache_read_tokens: NUMBER,
+  miss_tokens: NUMBER,
+  hit_rate: nullable(NUMBER),
+  no_data_tasks: NUMBER,
+  no_data_prompt_tokens: NUMBER,
+};
+const SESSION = { conversation_key: TEXT, current_account: BOOLEAN, internal: BOOLEAN };
+const SCAN = {
+  files: NUMBER, reparsed: NUMBER, bad_lines: NUMBER, records: NUMBER, segments: NUMBER, duplicates: NUMBER, without_usage: NUMBER,
+};
+
+function statsOf(what: string, value: unknown, path: string): CacheUsageStats {
+  const { tasks, prompt_tokens, cache_read_tokens, miss_tokens, hit_rate, no_data_tasks, no_data_prompt_tokens } = shaped(what, value, STATS, path);
+  return { tasks, prompt_tokens, cache_read_tokens, miss_tokens, hit_rate, no_data_tasks, no_data_prompt_tokens };
+}
+
+function sessionOf(what: string, value: unknown, path: string): CacheUsageSession {
+  const session = shaped(what, value, SESSION, path);
+  const owner = session.owner === null ? null : shaped(what, session.owner, MEMORY_OWNER, at(path, 'owner')) as unknown as MemoryOwner;
+  return { conversation_key: session.conversation_key, owner, current_account: session.current_account, internal: session.internal };
+}
+
+// 命中率表读不懂就抛：缺一格补成 0，「无数据」就成了 0% 命中。
+function cacheUsageOf(what: string, value: unknown): CacheUsageReport {
+  const report = shaped(what, value, { group_by: oneOf('session', 'node', 'model', 'channel') });
+  const period = shaped(what, report.window, { since: nullable(TEXT), until: nullable(TEXT) }, 'window');
+  const baseline = shaped(what, report.baseline, { mode: oneOf('legacy', 'before'), before: nullable(TEXT) }, 'baseline');
+  const totals = shaped(what, report.totals, {}, 'totals');
+  return {
+    group_by: report.group_by,
+    window: { since: period.since, until: period.until },
+    baseline: { mode: baseline.mode, before: baseline.before },
+    totals: { current: statsOf(what, totals.current, 'totals.current'), baseline: statsOf(what, totals.baseline, 'totals.baseline') },
+    rows: shapedRows(what, report.rows, { key: TEXT }, 'rows').map((row, index) => {
+      const path = at('rows', index);
+      return {
+        key: row.key,
+        current: statsOf(what, row.current, at(path, 'current')),
+        baseline: statsOf(what, row.baseline, at(path, 'baseline')),
+        ...(row.session === undefined ? {} : { session: sessionOf(what, row.session, at(path, 'session')) }),
+      };
+    }),
+    scan: shaped(what, report.scan, SCAN, 'scan'),
+  };
+}
+
 export function getCacheUsage(
   query: CacheUsageQuery,
   options: { token?: string; signal?: AbortSignal } = {},
 ): Promise<CacheUsageReport> {
-  return requestJson<CacheUsageReport>(cacheUsageUrl(query), { token: options.token, signal: options.signal });
+  const what = '缓存命中汇总';
+  return requestJson(cacheUsageUrl(query), what, (body) => cacheUsageOf(what, body), { token: options.token, signal: options.signal });
 }

@@ -53,6 +53,8 @@ interface SettingsState {
   adminToken: string | null;
   storageWarning: string;
   isAuthenticated: boolean;
+  /** 登录被收回的原因，登录页照这句报；下一次验证开始时清掉。 */
+  loginNotice: string;
   isConnected: boolean;
   entryNodeId: string;
   /** 能当入口的节点，给节点下拉用。 */
@@ -111,12 +113,35 @@ interface SettingsState {
   setSessionProviderOverride: (override: SessionProviderOverride | null, sessionId?: string) => void;
   /** 退出登录：这次登录读到的节点、渠道、全局配置、会话状态连同读取状态一起回到没读过。 */
   clearLoginData: () => void;
+  /** 后端不认这个令牌了：回到登录页说明原因。令牌留着，登录页不自动再验，由人决定重试还是换一个。 */
+  expireLogin: (reason: string) => void;
+  setLoginNotice: (text: string) => void;
   setRightPanelOpen: (open: boolean) => void;
 }
+
+const loginDataCleared = (state: SettingsState): Partial<SettingsState> => ({
+  availableNodes: [],
+  allNodes: [],
+  nodeListRead: UNREAD,
+  modelConfig: null,
+  activeNodeId: '',
+  activeNodeSessionId: '',
+  activeNodeIsOverride: false,
+  activeNodeWrites: state.activeNodeWrites + 1,
+  defaultNodeId: '',
+  globalModel: '',
+  globalBaseUrl: '',
+  globalConfigRead: UNREAD,
+  providerTable: null,
+  providerTableRead: UNREAD,
+  sessionProviderOverride: null,
+  sessionProviderOverrideSessionId: '',
+});
 
 export const useSettingsStore = create<SettingsState>((set) => ({
   adminToken: readStored(LS_KEY_TOKEN),
   isAuthenticated: false,
+  loginNotice: '',
   isConnected: false,
   entryNodeId: readStored(LS_KEY_NODE) || '',
   storageWarning,
@@ -178,24 +203,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     return next === state.providerTableRead ? state : { providerTableRead: next };
   }),
   setSessionProviderOverride: (override, sessionId = '') => set({ sessionProviderOverride: override, sessionProviderOverrideSessionId: sessionId }),
-  clearLoginData: () => set((state) => ({
-    availableNodes: [],
-    allNodes: [],
-    nodeListRead: UNREAD,
-    modelConfig: null,
-    activeNodeId: '',
-    activeNodeSessionId: '',
-    activeNodeIsOverride: false,
-    activeNodeWrites: state.activeNodeWrites + 1,
-    defaultNodeId: '',
-    globalModel: '',
-    globalBaseUrl: '',
-    globalConfigRead: UNREAD,
-    providerTable: null,
-    providerTableRead: UNREAD,
-    sessionProviderOverride: null,
-    sessionProviderOverrideSessionId: '',
-  })),
+  clearLoginData: () => set(loginDataCleared),
+  expireLogin: (reason) => set((state) => ({ ...loginDataCleared(state), isAuthenticated: false, loginNotice: reason })),
+  setLoginNotice: (text) => set({ loginNotice: text }),
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
 }));
 

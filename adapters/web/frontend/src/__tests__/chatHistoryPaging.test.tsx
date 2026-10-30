@@ -12,7 +12,7 @@ class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   readyState = 0;
 
@@ -22,9 +22,9 @@ class FakeWebSocket {
 
   send() {}
 
-  close() {
+  close(code = 1000, reason = '') {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({ code, reason } as CloseEvent);
   }
 }
 
@@ -33,7 +33,7 @@ const json = (value: unknown, status = 200): Response => new Response(JSON.strin
   headers: { 'Content-Type': 'application/json' },
 });
 
-const IDLE: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '' };
+const IDLE: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '', approvalsError: '' };
 
 const message = (id: string, role: WsMessage['role'], text: string, createdAt = '2026-05-31T03:00:00.000Z'): WsMessage => ({
   id,
@@ -123,6 +123,17 @@ describe('消息列表的历史提示', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('子节点列表没读到：503 子会话挂了');
     expect(screen.getByText(/发送消息，开始对话/)).toBeInTheDocument();
   });
+
+  // 断线期间要的审批只靠这一读补成卡片：不说一声，读失败看着就像没有待审批。
+  it('待审批没读到时消息照常摆着，另起一行说原因，重读就重读整个会话', () => {
+    const retry = vi.fn();
+    render(<MessageListV2 messages={[message('m1', 'user', '还在这里')]} toolsById={{}} history={{ ...IDLE, approvalsError: '503 审批挂了' }} onRetryHistory={retry} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('待审批没读到，断线期间要的审批可能没显示在这里：503 审批挂了');
+    expect(screen.getByText('还在这里')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重读' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
 });
 
 describe('会话历史的读取、往前翻与重试', () => {
@@ -190,6 +201,52 @@ describe('会话历史的读取、往前翻与重试', () => {
     fail = false;
     useChatStore.getState().retryHistory();
     await waitFor(() => expect(view()).toMatchObject({ loading: false, error: '', childrenError: '' }));
+  });
+
+  const pendingApproval = {
+    approval_id: 'approval-missed', session_id: 'sess-p', operation: 'execute_command', details: { command: 'ls' },
+    status: 'pending', fingerprint: 'fp-1', requested_at: '2026-05-31T03:00:00Z', decided_at: null, decision: null,
+    comment: null, tool_call_id: null, node_id: null, task_id: null,
+  };
+  const adminState = { sessions: 1, approvals: { pending: 1 }, tasks: {}, pending_approvals: [pendingApproval], engine_runtime: {} };
+
+  it('待审批读失败记在这个会话的历史状态上，历史照常换上；重读读成了就清掉，并补上漏掉的审批卡', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    let fail = true;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-p/history')) return json([historyRow(0, 'user', 'question')]);
+      if (url.includes('/v1/admin/state')) return fail ? json({ detail: '审批挂了' }, 503) : json(adminState);
+      if (url.includes('/running_tasks')) return json({ tasks: [] });
+      return json([]);
+    }));
+    seed();
+
+    useChatStore.getState().selectConversation('conv-p');
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, error: '', approvalsError: '503 审批挂了' }));
+    expect(texts()).toEqual(['question']);
+    expect(useChatStore.getState().approvalBlockById['approval-missed']).toBeUndefined();
+
+    fail = false;
+    useChatStore.getState().retryHistory();
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, approvalsError: '' }));
+    expect(useChatStore.getState().approvalBlockById['approval-missed']).toBeDefined();
+  });
+
+  it('管理状态对不上形状也算待审批没读成，不当成没有待审批', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-p/history')) return json([]);
+      if (url.includes('/v1/admin/state')) return json({ ...adminState, pending_approvals: undefined });
+      if (url.includes('/running_tasks')) return json({ tasks: [] });
+      return json([]);
+    }));
+    seed();
+
+    useChatStore.getState().selectConversation('conv-p');
+
+    await waitFor(() => expect(view()).toMatchObject({ loading: false, approvalsError: '管理状态格式不对：缺 pending_approvals' }));
   });
 
   it('子会话列表对不上形状也算没读成，不当成一个子会话都没有', async () => {

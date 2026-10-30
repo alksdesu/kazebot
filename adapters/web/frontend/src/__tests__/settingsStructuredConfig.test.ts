@@ -19,6 +19,7 @@ import {
   serializeNodeConfig,
   serializeRuntimeConfig,
   serializeSkillQuickFields,
+  skillKeywordsLock,
 } from '../components/settings/settingsStructuredConfig';
 import { StaleKeysError } from '../console/yamlCommit';
 import { editYamlKeys } from '../console/yamlRewrite';
@@ -690,5 +691,60 @@ describe('hand-written switches read like the engine reads them', () => {
   it('reads enabled on a skill', () => {
     expect(parseSkillQuickFields('---\nname: s\nenabled: "false"\n---\n正文\n').enabled).toBe(false);
     expect(parseSkillQuickFields('---\nname: s\n---\n正文\n').enabled).toBe(true);
+  });
+});
+
+// 引擎读技能关键词时整段形如 /pattern/flags 才当正则：按逗号拆开的两截都不成正则。
+describe('skill keywords keep a /regex/ whole', () => {
+  const SKILL = '---\nname: demo\nkeywords: ["a"]\n---\n正文\n';
+
+  it('writes a regex with commas in it back as one keyword', () => {
+    const fields = { ...parseSkillQuickFields(SKILL), keywords: String.raw`/\d{1,3}/, 早安` };
+
+    const { content } = serializeSkillQuickFields(SKILL, fields);
+
+    expect(parseSkillQuickFields(content).keywords).toBe(String.raw`/\d{1,3}/, 早安`);
+  });
+
+  it('a list holding such a regex survives an edit in the quick field', () => {
+    const skill = '---\nname: demo\nkeywords: ["/a{1,3}/i", "b"]\n---\n正文\n';
+    const fields = parseSkillQuickFields(skill);
+
+    const { content } = serializeSkillQuickFields(skill, { ...fields, keywords: `${fields.keywords}, c` });
+
+    expect(parseSkillQuickFields(content).keywords).toBe('/a{1,3}/i, b, c');
+  });
+});
+
+// engine 只认字符串项、整串算一个词；快速编辑框改一次就会把这些写法转成字符串或按逗号拆开。
+describe('skill keywords the quick field cannot write back stay read-only', () => {
+  const skill = (keywords: string) => `---\nname: demo\nkeywords: ${keywords}\n---\n正文\n`;
+
+  it.each([
+    ['a list item that is not a string', '[a, 1]'],
+    ['a single string with a comma in it', '"早安, 晚安"'],
+    ['a list item with a comma that is not a regex', '["早安, 晚安", b]'],
+    ['a value that is neither a string nor a list', '5'],
+  ])('locks %s', (_case, keywords) => {
+    expect(skillKeywordsLock(skill(keywords))).toContain('这里只读');
+  });
+
+  it.each([
+    ['a plain list', '[a, b]'],
+    ['a single string without a comma', '早安'],
+    ['a list holding a regex with commas', '["/a{1,3}/i", b]'],
+    ['an empty list', '[]'],
+  ])('leaves %s editable', (_case, keywords) => {
+    expect(skillKeywordsLock(skill(keywords))).toBe('');
+  });
+
+  it('refuses to write the keywords back but still saves the other fields', () => {
+    const raw = skill('[a, 1]');
+    const fields = parseSkillQuickFields(raw);
+
+    expect(() => serializeSkillQuickFields(raw, { ...fields, keywords: 'a, 2' })).toThrow('这里只读');
+    expect(serializeSkillQuickFields(raw, { ...fields, enabled: false }).content).toBe(
+      '---\nname: demo\nkeywords: [a, 1]\nenabled: false\n---\n正文\n',
+    );
   });
 });

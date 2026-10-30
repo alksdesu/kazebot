@@ -1,5 +1,6 @@
 import { useLayoutEffect } from 'react';
 import { ApiError, send } from '../api/request';
+import { BOOLEAN, NON_EMPTY_TEXT, OBJECT, TEXT, at, jsonOf, shaped, shapedRows } from '../api/shape';
 import { MOUNT } from '../instances/paths';
 import { useSettingsStore } from '../store/settingsStore';
 import { extensions } from './registry';
@@ -17,6 +18,27 @@ export interface FrontendCatalog {
   errors?: Array<{ id: string; error: string; enabled: boolean }>;
 }
 interface ActivePlugin { hash: string; generation: string; stop: () => void; dispose: () => Promise<void> }
+
+const CATALOG = '前端插件清单';
+const ASSET = { path: TEXT, hash: TEXT };
+const PLUGIN = { id: NON_EMPTY_TEXT, desired_hash: TEXT, package_hash: TEXT, config: OBJECT, metadata: OBJECT };
+const CATALOG_ERROR = { id: NON_EMPTY_TEXT, error: TEXT, enabled: BOOLEAN };
+
+function frontendCatalogOf(value: unknown): FrontendCatalog {
+  const catalog = shaped(CATALOG, value, { generation: TEXT });
+  const plugins = shapedRows(CATALOG, catalog.plugins, PLUGIN, 'plugins').map((row, index): FrontendPlugin => {
+    const path = at('plugins', index);
+    const { id, desired_hash, package_hash, config, metadata } = row;
+    return {
+      id, desired_hash, package_hash, config, metadata,
+      entry: shaped(CATALOG, row.entry, ASSET, at(path, 'entry')),
+      styles: shapedRows(CATALOG, row.styles, ASSET, at(path, 'styles')),
+      ...(row.assets === undefined ? {} : { assets: shapedRows(CATALOG, row.assets, ASSET, at(path, 'assets')) }),
+    };
+  });
+  const errors = catalog.errors === undefined ? undefined : shapedRows(CATALOG, catalog.errors, CATALOG_ERROR, 'errors');
+  return { generation: catalog.generation, plugins, ...(errors ? { errors } : {}) };
+}
 type ModuleLoader = (source: string) => Promise<FrontendPluginModule>;
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const publishedStyles = new Set<HTMLStyleElement>();
@@ -86,9 +108,8 @@ export class FrontendPluginRuntime {
   }
   private async synchronize(epoch: number) {
     try {
-      const catalog = await (await this.request('/frontend', this.controller.signal)).json() as FrontendCatalog;
+      const catalog = frontendCatalogOf(await jsonOf(CATALOG, await this.request('/frontend', this.controller.signal)));
       if (epoch !== this.epoch) return;
-      if (!Array.isArray(catalog.plugins)) throw new Error('Invalid frontend plugin catalog');
       const failures = (catalog.errors || []).filter((entry) => entry.enabled);
       const ids = new Set([...catalog.plugins.map((plugin) => plugin.id), ...failures.map((entry) => entry.id)]);
       for (const failure of failures) {

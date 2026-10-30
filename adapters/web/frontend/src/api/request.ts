@@ -1,6 +1,7 @@
 // 控制台发往本实例 API 的请求都从这里出：带不带令牌、等多久、失败怎么报，只在这一处定。
 import { useSettingsStore } from '../store/settingsStore';
 import { fetchWithDeadline } from './requestDeadline';
+import { jsonOf } from './shape';
 
 const ERROR_BODY_LIMIT = 4000;
 const TRANSIENT_STATUSES: ReadonlySet<number> = new Set([502, 503, 504, 530]);
@@ -87,8 +88,16 @@ export interface RequestOptions extends Omit<RequestInit, 'headers' | 'body'> {
 
 export const currentAdminToken = (): string => useSettingsStore.getState().adminToken || '';
 
-/** 拼好请求发出去，不看状态码。插件 SDK 要原样拿到 Response。 */
-export function send(url: string, options: RequestOptions = {}): Promise<Response> {
+const TOKEN_REFUSED = '服务端不认当前令牌（令牌无效或已过期），请重新登录。';
+
+// 登录页验令牌时还没登录，不算：不然验一次错的令牌就被拉回登录页，没完没了
+function expireRefusedLogin(credential: string): void {
+  const settings = useSettingsStore.getState();
+  if (settings.isAuthenticated && credential && credential === settings.adminToken) settings.expireLogin(TOKEN_REFUSED);
+}
+
+/** 拼好请求发出去，不看状态码，插件 SDK 要原样拿到 Response。带着当前登录的令牌被回 401 时，和事件流 4401 一样回登录页。 */
+export async function send(url: string, options: RequestOptions = {}): Promise<Response> {
   const { headers: extra, json, body, token, anonymous, timeoutMs, bypassPlugins, ...rest } = options;
   const headers: Record<string, string> = { ...extra };
   if (json !== undefined) headers['Content-Type'] = 'application/json';
@@ -97,7 +106,9 @@ export function send(url: string, options: RequestOptions = {}): Promise<Respons
   if (json !== undefined) init.body = JSON.stringify(json);
   else if (body !== undefined) init.body = body;
   const credential = anonymous ? '' : (token || currentAdminToken());
-  return fetchWithDeadline(url, init, timeoutMs, { bypassPlugins, credential });
+  const response = await fetchWithDeadline(url, init, timeoutMs, { bypassPlugins, credential });
+  if (response.status === 401) expireRefusedLogin(credential);
+  return response;
 }
 
 /** 发请求，非 2xx 抛 ApiError。 */
@@ -107,6 +118,9 @@ export async function request(url: string, options: RequestOptions = {}): Promis
   return response;
 }
 
-export async function requestJson<T>(url: string, options: RequestOptions = {}): Promise<T> {
-  return (await request(url, options)).json() as Promise<T>;
+/** 发请求读 2xx 的 JSON 正文，按 read 认形状。正文不是 JSON 时报「what格式不对：返回的不是 JSON」。 */
+export async function requestJson<T>(
+  url: string, what: string, read: (body: unknown) => T, options: RequestOptions = {},
+): Promise<T> {
+  return read(await jsonOf(what, await request(url, options)));
 }

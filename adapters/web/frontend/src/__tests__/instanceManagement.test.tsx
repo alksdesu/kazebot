@@ -328,6 +328,24 @@ describe('实例创建与归档', () => {
     expect(screen.getByRole('textbox', { name: '新实例名' })).toHaveValue('');
   });
 
+  // 回执读不懂时工作区已经建好、交给 root 侧了：当成没建成的话，人会拿同一个名字再建一次。
+  it('建实例的回执读不懂：照填的名字盯进度，说清不用再建', async () => {
+    vi.mocked(api.createInstance).mockRejectedValue(new api.ReceiptUnreadable('实例 xiaoyu2 已经开始建，可回执格式不对：缺 ports'));
+    vi.mocked(api.getInstanceProgress).mockResolvedValue({ id: 'xiaoyu2', lines: ['建好了'], finished: true, ok: true, detail: '' });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '建实例' })));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('实例 xiaoyu2 已经开始建，可回执格式不对：缺 ports。不用再建一次，进度看下面的日志');
+    expect(screen.getByRole('textbox', { name: '新实例名' })).toHaveValue('');
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+    expect(api.getInstanceProgress).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2');
+    expect(screen.getByText('实例已建立，请去它自己的控制台扫码登录。')).toBeInTheDocument();
+  });
+
   it('页面重新打开时从实例清单恢复未完成的创建任务', async () => {
     vi.mocked(api.getInstances).mockResolvedValue([
       { ...rows[0], provisioning: { id: 'xiaoyu2', lines: ['等 supervisor 应答'], finished: false, ok: false, detail: '', state: 'running', retryable: true, action: 'create' } },

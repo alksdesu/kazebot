@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => {
   const unread = () => ({ loaded: false, error: '' });
   const state = {
     adminToken: null as string | null, isAuthenticated: false, entryNodeId: '', availableNodes: [] as unknown[], defaultNodeId: '',
-    nodeListRead: unread(), globalConfigRead: unread(),
+    nodeListRead: unread(), globalConfigRead: unread(), loginNotice: '',
   };
   return {
     state,
@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => {
     setEntryNodeId: vi.fn(),
     setToken: vi.fn((token: string | null) => { state.adminToken = token; }),
     setAuthenticated: vi.fn((value: boolean) => { state.isAuthenticated = value; }),
+    setLoginNotice: vi.fn((text: string) => { state.loginNotice = text; }),
   };
 });
 
@@ -38,6 +39,7 @@ vi.mock('../store/settingsStore', () => {
     setGlobalConfig: mocks.setGlobalConfig,
     failGlobalConfig: mocks.failGlobalConfig,
     setEntryNodeId: mocks.setEntryNodeId,
+    setLoginNotice: mocks.setLoginNotice,
   });
   return { LS_KEY_NODE: 'fixture-node', useSettingsStore: Object.assign(() => getState(), { getState, subscribe: () => () => {} }) };
 });
@@ -62,6 +64,7 @@ beforeEach(() => {
   mocks.state.defaultNodeId = '';
   mocks.state.nodeListRead = { loaded: false, error: '' };
   mocks.state.globalConfigRead = { loaded: false, error: '' };
+  mocks.state.loginNotice = '';
   mocks.verify.mockReset();
   mocks.getNodes.mockReset();
   mocks.getAppConfig.mockReset().mockResolvedValue(appConfig(''));
@@ -132,6 +135,23 @@ describe('登录交互', () => {
     expect(mocks.setToken).toHaveBeenCalledWith('fixture-manual-token');
     expect(mocks.setAuthenticated).toHaveBeenCalledWith(true);
     expect(mocks.loadNodes.mock.calls[0][0]).toBe('fixture-manual-token');
+  });
+
+  // 后端认 HTTP 却不认事件流时，自动再验会登进去又被踢出来，来回不停。
+  it('登录被收回时先说原因，不拿保存的令牌自动再验；点了重试才验', async () => {
+    mocks.state.adminToken = 'fixture-saved-token';
+    mocks.state.loginNotice = '实时消息通道不认当前令牌（令牌无效或已过期），请重新登录。';
+    mocks.verify.mockResolvedValue(true);
+    render(<LoginPage />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('实时消息通道不认当前令牌（令牌无效或已过期），请重新登录。');
+    expect(mocks.verify).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试已保存登录' }));
+    await act(async () => {});
+    expect(mocks.verify.mock.calls[0][0]).toBe('fixture-saved-token');
+    expect(mocks.setLoginNotice).toHaveBeenCalledWith('');
+    expect(mocks.setAuthenticated).toHaveBeenCalledWith(true);
   });
 
   it('切换到手动登录后，旧的自动验证结果不能覆盖新身份', async () => {

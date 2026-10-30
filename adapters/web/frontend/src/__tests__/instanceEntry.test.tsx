@@ -151,7 +151,7 @@ describe('独立实例入口', () => {
   it('加载失败可手动进入当前实例，也可重试目录', async () => {
     mocks.directory.mockRejectedValueOnce(new Error('offline'));
     render(<InstanceDirectory />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('暂时无法读取实例目录');
+    expect(await screen.findByRole('alert')).toHaveTextContent('暂时无法读取实例目录：offline。可以重试，或直接进入当前实例。');
     fireEvent.click(screen.getByRole('button', { name: '进入当前实例' }));
     expect(mocks.navigate).toHaveBeenCalledWith('', false);
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
@@ -211,6 +211,7 @@ describe('登录与侧栏的实例导航', () => {
     mocks.directory.mockRejectedValueOnce(new Error('offline'));
     render(<InstanceNavigation />);
     expect(await screen.findByRole('link', { name: '选择实例' })).toHaveAttribute('href', '/web/?entry=instances');
+    expect(screen.getByText('实例目录没读到：offline')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '重试实例目录' }));
     expect(await screen.findByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
   });

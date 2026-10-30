@@ -106,7 +106,6 @@ const FeaturesPageBody = () => {
   const parseError = String(live?.state?.parse_error || '');
   // 一版都没采纳过（起来时就坏、或此前一直不存在）时生效值按空文件算，说「上一份」会让人以为文件里的值还在生效。
   const keepsLastGood = live?.state?.loaded?.exists !== false;
-  const platforms = (live as FeaturesLiveState | null)?.platforms || [];
 
   return (
     <>
@@ -118,7 +117,7 @@ const FeaturesPageBody = () => {
           请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
-      {loading && !live ? <Empty>正在读取全局设置…</Empty> : live && <Adoption platforms={platforms} />}
+      {loading && !live ? <Empty>正在读取全局设置…</Empty> : live && <Adoption platforms={(live as FeaturesLiveState).platforms} />}
       {schemaError ? <ErrorText>{schemaError}</ErrorText>
         : !schema ? adminToken && <Empty>正在读取控制台布局…</Empty>
           : (

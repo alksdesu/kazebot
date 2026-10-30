@@ -134,11 +134,12 @@ const NodeFilesSettingsPageEditor = () => {
     if (!window.confirm(`${removal.confirm}${unsaved}`)) return;
     setSaving(true);
     try {
-      await deleteNodeFile(adminToken, current.name);
+      // 回执读不懂时也已经删了：照删完收尾，再交代回执的事。
+      const { receiptProblem } = await receipted(deleteNodeFile(adminToken, current.name));
       // 恢复默认后文件还在，只是换回仓库那份；重读列表时照旧选中它。
       if (!removal.restores) setSelected('');
       setSaved(content);
-      setMessage(removal.done);
+      setMessage(removal.done, receiptProblem);
       await loadFiles();
     } catch (caught) {
       setError(errorMessage(caught, `${removal.label}失败`));

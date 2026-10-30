@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   getSystemModels,
+  receipted,
   updateImageDefaultChannel,
   updateSystemModel,
   type ChannelChoice,
@@ -16,8 +17,9 @@ import {
 } from '../api/supervisorClient';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
+import { appendSentence, rereadFailed } from '../utils/sentence';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
-import { Block, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
+import { Block, Button, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
 import { errorMessage } from '../api/request';
 
 /** 深链锚点。看图渠道等槽位在别的页面只回显，改要回到这里。 */
@@ -200,6 +202,9 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
   const [imageDefault, setImageDefault] = useState('');
   const [savedImageDefault, setSavedImageDefault] = useState('');
   const [loaded, setLoaded] = useState(false);
+  // 一次都没读成时的原因：这时没有可改的东西，不能摆成「没有可配的槽位」。
+  const [readFailure, setReadFailure] = useState('');
+  const [readAttempt, setReadAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
@@ -209,16 +214,16 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
     setImageTools(data.image_tools ?? []);
     setImageDefault(data.image_default_channel ?? '');
     setSavedImageDefault(data.image_default_channel ?? '');
+    setReadFailure('');
     setLoaded(true);
   };
 
   useEffect(() => {
     if (!token) return;
     void getSystemModels(token).then(absorb).catch((caught) => {
-      setError(errorMessage(caught));
-      setLoaded(true);
+      setReadFailure(errorMessage(caught));
     });
-  }, [token]);
+  }, [token, readAttempt]);
 
   const dirty = useMemo(
     () => drafts.some(changed) || imageDefault !== savedImageDefault,
@@ -227,24 +232,43 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
 
   const confirmDiscard = useUnsavedChanges(dirty, '系统槽位还有未保存修改，确定离开或丢弃吗？');
 
+  // 写回执读不懂时已经存上了：重读一遍顶替回执；重读也没成就留着手上这份，说清得先刷新再改。
+  const settle = async (auth: string, next: SystemModelsResponse | null, receiptProblem: string) => {
+    const done = '已保存。下一个任务就用新配置。';
+    try {
+      absorb(next ?? await getSystemModels(auth));
+      setNote(done);
+      setError(receiptProblem);
+    } catch (caught) {
+      setNote(done);
+      setError(rereadFailed(receiptProblem, errorMessage(caught), '刷新页面读入最新内容'));
+    }
+  };
+
   const save = async () => {
     if (!token || busy || !loaded) return;
     setBusy(true);
     setError('');
     try {
+      // 每一次写回的都是写完以后的全貌，所以只认最后一次的回执。
       let latest: SystemModelsResponse | null = null;
+      let receiptProblem = '';
+      let wrote = false;
       for (const draft of drafts) {
         if (!changed(draft)) continue;
-        latest = await updateSystemModel(token, draft.slot.key, slotPatch(draft));
+        const written = await receipted(updateSystemModel(token, draft.slot.key, slotPatch(draft)));
+        latest = written.result;
+        receiptProblem = appendSentence(receiptProblem, written.receiptProblem);
+        wrote = true;
       }
       // 放在槽位之后：改完 key 才知道现在到底有几个渠道可选。
       if (imageDefault !== savedImageDefault) {
-        latest = await updateImageDefaultChannel(token, imageDefault);
+        const written = await receipted(updateImageDefaultChannel(token, imageDefault));
+        latest = written.result;
+        receiptProblem = appendSentence(receiptProblem, written.receiptProblem);
+        wrote = true;
       }
-      if (latest) {
-        absorb(latest);
-        setNote('已保存。下一个任务就用新配置。');
-      }
+      if (wrote) await settle(token, latest, receiptProblem);
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -252,12 +276,24 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
   };
 
   // 表情包页的看图渠道只回显不可改，链过来时要能直接滚到这一块。
+  const settled = loaded || Boolean(readFailure);
   useEffect(() => {
-    if (!loaded || window.location.hash !== `#${SYSTEM_SLOTS_ANCHOR}`) return;
+    if (!settled || window.location.hash !== `#${SYSTEM_SLOTS_ANCHOR}`) return;
     document.getElementById(SYSTEM_SLOTS_ANCHOR)?.scrollIntoView({ block: 'start' });
-  }, [loaded]);
+  }, [settled]);
 
-  if (!loaded) return <Empty>正在读取系统槽位…</Empty>;
+  if (!loaded && !readFailure) return <Empty>正在读取系统槽位…</Empty>;
+
+  if (!loaded) {
+    return (
+      <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" id={SYSTEM_SLOTS_ANCHOR} title="系统槽位">
+        <ErrorText role="alert">系统槽位没读到，这里没法改：{readFailure}</ErrorText>
+        <div className="mt-3">
+          <Button onClick={() => { setReadFailure(''); setReadAttempt((value) => value + 1); }} tone="quiet">重读</Button>
+        </div>
+      </Block>
+    );
+  }
 
   return (
     <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" id={SYSTEM_SLOTS_ANCHOR} title="系统槽位">

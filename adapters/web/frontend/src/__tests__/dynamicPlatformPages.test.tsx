@@ -34,6 +34,7 @@ import { usePlatformRegistry } from '../platforms/usePlatformRegistry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
+import { unpublishedStateReply } from './fixtures/consoleReplies';
 
 const OTHERCHAT: PlatformDescriptor = {
   id: 'otherchat',
@@ -103,7 +104,7 @@ function stubBackend(): string[] {
     const url = String(input);
     seen.push(url);
     if (url.endsWith('/config/schema')) return json(OTHER_SCHEMA);
-    if (url.endsWith('/config/state')) return json({ published: false, applied: false, file: {}, state: null });
+    if (url.endsWith('/config/state')) return json(unpublishedStateReply());
     if (url.endsWith('/config/raw')) return json({ content: '', hash: '', exists: false });
     return json({});
   }));

@@ -3,123 +3,22 @@ import type { NodeDef, SupervisorEvent } from '../types';
 import { nameWith } from '../console/format';
 import { commandAction } from '../plugins/commands';
 import { isInstancePath, MOUNT } from '../instances/paths';
-import { ApiError, errorMessage, request, send, type RequestOptions } from './request';
+import { ApiError, currentAdminToken, request, send, type RequestOptions } from './request';
+import {
+  BOOLEAN, NON_EMPTY_TEXT, NUMBER, OBJECT, PRESENT, TEXT, TEXT_LIST,
+  ReceiptUnreadable, at, formatError, isJsonObject, jsonOf, listOf, nullable, oneOf, optional, receiptOf, recordOf,
+  shaped, shapedRecord, shapedRows, shapedValue,
+  type Kind, type Shape, type Shaped,
+} from './shape';
 
 export { MOUNT, instanceConsoleHref } from '../instances/paths';
 export { ApiError, isEditConflict, isNotFound, isTransientApiError } from './request';
+export { ReceiptUnreadable, receipted, type Receipted } from './shape';
 
 const API = `${MOUNT}/v1`;
 
 function apiFetch(path: string, options?: RequestOptions): Promise<Response> {
   return request(`${API}${path}`, options);
-}
-
-// ── 响应形状 ──
-// 后端一定会发的东西对不上形状就抛「…格式不对」：补成空值的话，界面会把「没读懂」说成「一个都没有」。
-
-const isJsonObject = (value: unknown): value is Record<string, unknown> => (
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-);
-
-/** 一种值该是什么样。mismatch 是对不上时接在位置后面的那半句，比如「不是字符串」。 */
-interface Kind<T> {
-  readonly ok: (value: unknown) => value is T;
-  readonly mismatch: string;
-}
-
-const TEXT: Kind<string> = {
-  ok: (value): value is string => typeof value === 'string',
-  mismatch: '不是字符串',
-};
-const NON_EMPTY_TEXT: Kind<string> = {
-  ok: (value): value is string => typeof value === 'string' && value !== '',
-  mismatch: '不是非空字符串',
-};
-const BOOLEAN: Kind<boolean> = {
-  ok: (value): value is boolean => typeof value === 'boolean',
-  mismatch: '不是 true 或 false',
-};
-const NUMBER: Kind<number> = {
-  ok: (value): value is number => typeof value === 'number' && Number.isFinite(value),
-  mismatch: '不是数字',
-};
-const OBJECT: Kind<Record<string, unknown>> = {
-  ok: isJsonObject,
-  mismatch: '不是 JSON 对象',
-};
-const TEXT_LIST: Kind<string[]> = {
-  ok: (value): value is string[] => Array.isArray(value) && value.every(TEXT.ok),
-  mismatch: '不是字符串数组',
-};
-
-/** 接口类型里带问号的字段：缺了照旧，在就得对得上。 */
-const optional = <T>(kind: Kind<T>): Kind<T | undefined> => ({
-  ok: (value): value is T | undefined => value === undefined || kind.ok(value),
-  mismatch: kind.mismatch,
-});
-
-const nullable = <T>(kind: Kind<T>): Kind<T | null> => ({
-  ok: (value): value is T | null => value === null || kind.ok(value),
-  mismatch: `${kind.mismatch}，也不是 null`,
-});
-
-/** 后端只发这几个值里的一个：认不出的不按哪一个猜。 */
-const oneOf = <T extends string>(...values: readonly T[]): Kind<T> => ({
-  ok: (value): value is T => typeof value === 'string' && (values as readonly string[]).includes(value),
-  mismatch: `不是 ${values.join('、')} 之一`,
-});
-
-type Shape = Readonly<Record<string, Kind<unknown>>>;
-type Shaped<S extends Shape> = {
-  -readonly [K in keyof S]: S[K] extends Kind<infer T> ? T : never;
-} & Record<string, unknown>;
-
-// path 是值在响应里的位置，比如 instances[2].current；空串指整个响应。
-const at = (path: string, key: string | number): string => (
-  typeof key === 'number' ? `${path}[${key}]` : path ? `${path}.${key}` : key
-);
-
-function formatError(what: string, value: unknown, path: string, mismatch: string): Error {
-  if (value === undefined && path) return new Error(`${what}格式不对：缺 ${path}`);
-  return new Error(`${what}格式不对：${path ? `${path} ` : '返回的'}${mismatch}`);
-}
-
-/** value 得是对象，shape 里的字段都对得上；对不上抛 what 的格式错误。shape 以外的字段原样留着。 */
-function shaped<S extends Shape>(what: string, value: unknown, shape: S, path = ''): Shaped<S> {
-  if (!isJsonObject(value)) throw formatError(what, value, path, OBJECT.mismatch);
-  for (const [key, kind] of Object.entries(shape)) {
-    if (!kind.ok(value[key])) throw formatError(what, value[key], at(path, key), kind.mismatch);
-  }
-  return value as Shaped<S>;
-}
-
-/** value 得是数组，每一项都按 shape 对得上。 */
-function shapedRows<S extends Shape>(what: string, value: unknown, shape: S, path = ''): Shaped<S>[] {
-  if (!Array.isArray(value)) throw formatError(what, value, path, '不是数组');
-  return value.map((row: unknown, index) => shaped(what, row, shape, at(path, index)));
-}
-
-/** 改动在后端已经做完，只是回执读不懂。调用方照做完收尾、另读一遍现状，再单独交代回执的事：当成失败，人会再点一次。 */
-export class ReceiptUnreadable extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ReceiptUnreadable';
-  }
-}
-
-/** 按 read 读 2xx 的回执。正文不是 JSON、形状对不上都抛 ReceiptUnreadable；what 打头的那半句得先说清已经做完。 */
-async function receiptOf<T>(what: string, resp: Response, read: (body: unknown) => T): Promise<T> {
-  let body: unknown;
-  try {
-    body = await resp.json();
-  } catch {
-    throw new ReceiptUnreadable(`${what}不是 JSON`);
-  }
-  try {
-    return read(body);
-  } catch (error) {
-    throw new ReceiptUnreadable(errorMessage(error));
-  }
 }
 
 /** 附件在本实例上的地址。path 是工作区相对路径，例如 data/attachments/xxx/yyy.png；令牌走请求头，不进地址。 */
@@ -137,6 +36,11 @@ export interface UploadedAttachment {
   type: 'image' | 'file';
 }
 
+const UPLOADED_ATTACHMENT = {
+  path: NON_EMPTY_TEXT, name: TEXT, size: NUMBER, mime_type: TEXT, type: oneOf('image', 'file'),
+};
+
+/** 传上了却读不懂回执时抛 ReceiptUnreadable：文件已经在服务器上，只是不知道它的路径，引用不了。 */
 export async function uploadAttachment(
   file: File,
   conversationKey: string,
@@ -148,18 +52,28 @@ export async function uploadAttachment(
   const resp = await apiFetch(`/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`, {
     method: 'POST', body: form, token,
   });
-  return resp.json();
+  const receipt = nameWith(`附件 ${file.name}`, '已经传上，可回执');
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, UPLOADED_ATTACHMENT));
 }
 
 // ── Inbound (send message) ──
 
+export interface InboundReceipt {
+  session_id: string;
+  inbound_seq: number;
+  accepted: boolean;
+}
+
+const INBOUND_RECEIPT = { session_id: NON_EMPTY_TEXT, inbound_seq: NUMBER, accepted: BOOLEAN };
+
+/** 发出了却读不懂回执时抛 ReceiptUnreadable：消息已经进了服务器，会话号要等事件流里的回显补上。 */
 export async function postInbound(params: {
   conversation_key: string;
   text: string;
   attachments?: any[];
   use_context?: boolean;
   entry_node_id?: string;
-}): Promise<{ session_id: string; inbound_seq: number; accepted: boolean }> {
+}): Promise<InboundReceipt> {
   const resp = await apiFetch('/inbound', {
     method: 'POST',
     json: {
@@ -171,17 +85,20 @@ export async function postInbound(params: {
       entry_node_id: params.entry_node_id,
     },
   });
-  return resp.json();
+  const receipt = '消息已经发出，可回执';
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, INBOUND_RECEIPT));
 }
 
 // ── 全局事件流 ──
 
 export interface GlobalStreamHandlers {
   onEvent: (event: SupervisorEvent) => void;
-  /** reconnected：断开过又连上了。后端只推连上之后的新事件，断开期间的要调用方自己重拉。 */
+  /** 后端认过令牌、开始推送了。reconnected：断开过又连上了。后端只推连上之后的新事件，断开期间的要调用方自己重拉。 */
   onOpen?: (info: { reconnected: boolean }) => void;
-  /** retryInMs：多久之后自动重连，按断开次数指数退避。 */
+  /** retryInMs：多久之后自动重连。平常按断开次数指数退避，后端说了要等多久就按它说的。 */
   onClose?: (info: { retryInMs: number }) => void;
+  /** 后端不认这个令牌（没带或不对）：不再自动重连，得让人重新登录。 */
+  onUnauthorized?: () => void;
 }
 
 // 数值而不是 WebSocket.CONNECTING：测试和老浏览器替换的 WebSocket 上不一定挂着这些静态常量。
@@ -189,6 +106,9 @@ const SOCKET_CONNECTING = 0;
 const SOCKET_OPEN = 1;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+// 后端的关闭码：4401 令牌被拒；4429 认证失败太多、正在退避，reason 里写着要等几秒。
+const CLOSE_UNAUTHORIZED = 4401;
+const CLOSE_THROTTLED = 4429;
 
 let globalSocket: WebSocket | null = null;
 let globalHandlers: GlobalStreamHandlers | null = null;
@@ -201,20 +121,39 @@ function clearReconnectTimer(): void {
   reconnectTimer = null;
 }
 
+function nextBackoffMs(): number {
+  const delay = reconnectDelay;
+  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+  return delay;
+}
+
+/** 4429 时后端要求等的毫秒数；reason 里读不出秒数给 null，按平常的退避算。 */
+function throttledRetryMs(reason: string): number | null {
+  const seconds = Number(/\d+(?:\.\d+)?/.exec(reason)?.[0]);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : null;
+}
+
 function openGlobalSocket(): void {
   clearReconnectTimer();
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${wsProtocol}//${window.location.host}${API}/ws`);
   globalSocket = socket;
+  let ready = false;
 
-  socket.onopen = () => {
-    if (globalSocket !== socket) return;
+  // 被拒的连接也是先 open 再关：退避要等后端认过令牌才清零，不然每次都从一秒重来。
+  const markReady = () => {
+    if (ready) return;
+    ready = true;
     reconnectDelay = RECONNECT_BASE_MS;
-    // 后端要先收到一帧才开始推送；last_seq 不补发历史，补齐靠调用方重拉。
-    socket.send(JSON.stringify({ last_seq: 0 }));
     const reconnected = openedBefore;
     openedBefore = true;
     globalHandlers?.onOpen?.({ reconnected });
+  };
+
+  socket.onopen = () => {
+    if (globalSocket !== socket) return;
+    // 后端拿首帧里的令牌认证，认过才开始推送；last_seq 不补发历史，补齐靠调用方重拉。
+    socket.send(JSON.stringify({ last_seq: 0, token: currentAdminToken() }));
   };
 
   socket.onmessage = (message) => {
@@ -224,15 +163,22 @@ function openGlobalSocket(): void {
     } catch {
       return;
     }
-    if (!data || typeof data !== 'object' || (data as { type?: unknown }).type === 'ping') return;
-    globalHandlers?.onEvent(data as SupervisorEvent);
+    // 认不出的帧不报：事件流没有回执，报了也没人能处理，下一次同步会把漏掉的补上。
+    if (!isJsonObject(data) || typeof data.type !== 'string') return;
+    // stream_ready 是认证通过的信号；先到的心跳或事件同样说明认证过了。
+    markReady();
+    if (data.type === 'stream_ready' || data.type === 'ping') return;
+    globalHandlers?.onEvent(data as unknown as SupervisorEvent);
   };
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
     if (globalSocket !== socket) return;
     globalSocket = null;
-    const retryInMs = reconnectDelay;
-    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+    if (event.code === CLOSE_UNAUTHORIZED) {
+      globalHandlers?.onUnauthorized?.();
+      return;
+    }
+    const retryInMs = (event.code === CLOSE_THROTTLED ? throttledRetryMs(event.reason) : null) ?? nextBackoffMs();
     reconnectTimer = setTimeout(openGlobalSocket, retryInMs);
     globalHandlers?.onClose?.({ retryInMs });
   };
@@ -242,7 +188,7 @@ function openGlobalSocket(): void {
   };
 }
 
-/** 订阅全部会话的事件。已连着就只换回调；正在等重连时立刻重试一次。断开后按指数退避自动重连。 */
+/** 订阅全部会话的事件。已连着就只换回调；正在等重连时立刻重试一次。断开后自动重连，令牌被拒除外。 */
 export function connectGlobalWS(handlers: GlobalStreamHandlers): void {
   globalHandlers = handlers;
   const readyState = globalSocket?.readyState;
@@ -279,9 +225,19 @@ export interface HealthState {
 /** 连接状态灯的健康检查：十秒没应答就算断开，不等读请求默认的那一分钟。 */
 export const HEALTH_TIMEOUT_MS = 10_000;
 
+// 匿名请求只回 status 和运行时长，run_id、workspace_root、started_at 只给带令牌的。
+const HEALTH = {
+  status: TEXT,
+  run_id: optional(TEXT),
+  workspace_root: optional(TEXT),
+  started_at: optional(TEXT),
+  uptime_seconds: optional(NUMBER),
+};
+
 export async function checkHealth(signal?: AbortSignal, timeoutMs?: number): Promise<HealthState> {
+  const what = '健康检查';
   const resp = await apiFetch('/health', { signal, anonymous: true, timeoutMs });
-  return resp.json();
+  return shaped(what, await jsonOf(what, resp), HEALTH);
 }
 
 export interface AdminApproval {
@@ -302,6 +258,23 @@ export interface AdminApproval {
   expired_reason?: string | null;
 }
 
+const ADMIN_APPROVAL = {
+  approval_id: NON_EMPTY_TEXT,
+  session_id: optional(TEXT),
+  operation: TEXT,
+  details: optional(OBJECT),
+  status: optional(TEXT),
+  fingerprint: optional(TEXT),
+  requested_at: optional(TEXT),
+  decided_at: optional(nullable(TEXT)),
+  decision: optional(nullable(oneOf('allow', 'deny'))),
+  comment: optional(nullable(TEXT)),
+  tool_call_id: optional(nullable(TEXT)),
+  node_id: optional(nullable(TEXT)),
+  task_id: optional(nullable(TEXT)),
+  expired_reason: optional(nullable(TEXT)),
+};
+
 export interface AdminState {
   sessions: number;
   approvals: Record<string, number>;
@@ -309,6 +282,14 @@ export interface AdminState {
   pending_approvals: AdminApproval[];
   engine_runtime: Record<string, unknown>;
 }
+
+// 计数补成 0、待审批补成空表，页面就会说「没有任务」「没有待审批」。
+const ADMIN_STATE = {
+  sessions: NUMBER,
+  approvals: recordOf(NUMBER),
+  tasks: recordOf(NUMBER),
+  engine_runtime: OBJECT,
+};
 
 export interface ActiveTask {
   task_id: string;
@@ -328,10 +309,29 @@ export interface ActiveTask {
   cancel_requested: boolean;
   current_phase: string;
   current_detail: string;
-  lane: TaskLane;
+  /** 排在哪一道，见 TaskLane。只拿来分组：分道之前的后端不给，认不出的道名归进「未分道」。 */
+  lane?: string;
   /** 在等人工审批：这段时间不占 engine 的并发名额。 */
   awaiting_approval: boolean;
 }
+
+const ACTIVE_TASK = {
+  task_id: NON_EMPTY_TEXT,
+  session_id: TEXT,
+  node_id: nullable(TEXT),
+  status: oneOf('running', 'pending', 'suspended'),
+  kind: oneOf('node', 'tool'),
+  created_at: TEXT,
+  updated_at: TEXT,
+  worker_id: nullable(TEXT),
+  caller_task_id: nullable(TEXT),
+  input_summary: TEXT,
+  cancel_requested: BOOLEAN,
+  current_phase: TEXT,
+  current_detail: TEXT,
+  lane: optional(TEXT),
+  awaiting_approval: BOOLEAN,
+};
 
 /** 领任务时排哪一道：快道是接话判断，交互道是用户在等的，后台道是压缩、记忆提取这类系统流程。 */
 export type TaskLane = 'fast' | 'interactive' | 'background';
@@ -404,16 +404,14 @@ export function skillDir(skill: AdminSkill): string {
   return skill.dir || skill.name;
 }
 
+/** mcp.yaml 里的一项，后端已照运行时的读法规整：开关是布尔，传输方式认不出的按 stdio，命令、参数、地址都是字符串。 */
 export interface McpClient {
   id: string;
   description?: string;
-  enabled?: boolean;
+  enabled: boolean;
   transport?: string;
   command?: string;
-  args?: string[];
-  env?: Record<string, unknown>;
   url?: string;
-  headers?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -455,21 +453,15 @@ function saveResultOf(receipt: string, resp: Response): Promise<RawSaveResult> {
 
 const savedReceipt = (what: string): string => nameWith(what, '已经存上，可回执');
 const createdReceipt = (what: string): string => nameWith(what, '已经建好，可回执');
+const removedReceipt = (what: string): string => nameWith(what, '本实例那份已经删掉，可回执');
 
-/** 写操作的结果。存上了、只是回执读不懂时 result 是 null，receiptProblem 写着哪里没读懂。 */
-export interface Receipted<R> {
-  result: R | null;
-  receiptProblem: string;
-}
+const CONFIG_REMOVE = { ok: BOOLEAN, restored: BOOLEAN };
 
-/** 等写操作做完。回执读不懂不算失败，交回 null 和原因，由调用方照存上了收尾；别的错误照抛。 */
-export async function receipted<R>(write: Promise<R>): Promise<Receipted<R>> {
-  try {
-    return { result: await write, receiptProblem: '' };
-  } catch (error) {
-    if (error instanceof ReceiptUnreadable) return { result: null, receiptProblem: error.message };
-    throw error;
-  }
+// 删了却读不懂回执时抛 ReceiptUnreadable：当成没删，人会再点一次，第二次只会撞上「没改过、删不掉」。
+async function removeResultOf(receipt: string, resp: Response): Promise<ConfigRemoveResult> {
+  const { ok, restored } = await receiptOf(receipt, resp, (body) => shaped(receipt, body, CONFIG_REMOVE));
+  if (!ok) throw new Error('服务端没有删掉这份配置，请重试');
+  return { ok, restored };
 }
 
 function rawWriteFields(content: string, baseHash: string | null): { content: string; base_hash?: string } {
@@ -481,7 +473,7 @@ const RAW_TEXT = { content: TEXT, hash: TEXT };
 // 正文或指纹对不上形状就报格式不对：拿空串顶上，编辑器摆出来的是一份空文件；拿 null 顶上，保存时不带指纹，把真文件整份盖掉。
 async function readRawConfig(what: string, path: string, token: string): Promise<RawText> {
   const resp = await apiFetch(path, { token });
-  const { content, hash } = shaped(what, await resp.json(), RAW_TEXT);
+  const { content, hash } = shaped(what, await jsonOf(what, resp), RAW_TEXT);
   return { content, hash };
 }
 
@@ -499,13 +491,17 @@ async function writeRawConfig(
 const pathPart = (value: string): string => encodeURIComponent(value);
 
 export async function getAdminState(token: string): Promise<AdminState> {
+  const what = '管理状态';
   const resp = await apiFetch('/admin/state', { token });
-  return resp.json();
+  const body = shaped(what, await jsonOf(what, resp), ADMIN_STATE);
+  return { ...body, pending_approvals: shapedRows(what, body.pending_approvals, ADMIN_APPROVAL, 'pending_approvals') as AdminApproval[] };
 }
 
+// 补成空表就是「没有在跑的任务」：任务监视里的取消按钮跟着消失。
 export async function fetchActiveTasks(token?: string): Promise<ActiveTask[]> {
+  const what = '活跃任务列表';
   const resp = await apiFetch('/admin/tasks/active', { token });
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), ACTIVE_TASK);
 }
 
 /** 取消单个任务。cancelActiveTasks 管的是整个会话。 */
@@ -552,8 +548,9 @@ const NODE_ROW = {
 };
 
 export async function getNodes(token: string): Promise<AdminNode[]> {
+  const what = '节点表';
   const resp = await apiFetch('/admin/config/nodes', { token });
-  return shapedRows('节点表', await resp.json(), NODE_ROW) as unknown as AdminNode[];
+  return shapedRows(what, await jsonOf(what, resp), NODE_ROW) as unknown as AdminNode[];
 }
 
 export function getConfigRaw(token: string): Promise<RawText> {
@@ -697,8 +694,9 @@ function providersReceipt(receipt: string, resp: Response): Promise<ProvidersRes
 }
 
 export async function getProviders(token: string): Promise<ProvidersResponse> {
+  const what = '渠道表';
   const resp = await apiFetch('/config/providers', { token });
-  return providersTable('渠道表', await resp.json());
+  return providersTable(what, await jsonOf(what, resp));
 }
 
 export interface ProviderOptionChoice {
@@ -741,8 +739,9 @@ const PROVIDER_PROFILES = {
 };
 
 export async function getProviderProfiles(token: string): Promise<ProviderProfiles> {
+  const what = '渠道参数清单';
   const resp = await apiFetch('/config/provider-options', { token });
-  const body = shaped('渠道参数清单', await resp.json(), PROVIDER_PROFILES);
+  const body = shaped(what, await jsonOf(what, resp), PROVIDER_PROFILES);
   return {
     options: (body.options ?? {}) as ProviderOptionsCatalog,
     wireFormats: (body.wire_formats ?? {}) as Record<string, string>,
@@ -759,12 +758,13 @@ export async function listUpstreamModels(
   name: string,
   data: { base_url?: string; api_key?: string; slot?: string },
 ): Promise<string[]> {
+  const what = '模型列表';
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}/models`, {
     method: 'POST',
     token,
     json: data,
   });
-  return shaped('模型列表', await resp.json(), { models: TEXT_LIST }).models;
+  return shaped(what, await jsonOf(what, resp), { models: TEXT_LIST }).models;
 }
 
 export async function upsertProvider(
@@ -823,9 +823,34 @@ export interface SystemModelsResponse {
   image_default_channel?: string;
 }
 
+const SYSTEM_MODEL_SLOT = {
+  key: NON_EMPTY_TEXT,
+  label: TEXT,
+  desc: TEXT,
+  supports_provider: BOOLEAN,
+  env_prefix: TEXT,
+  model: TEXT,
+  base_url: TEXT,
+  model_raw: TEXT,
+  base_url_raw: TEXT,
+  provider: TEXT,
+  api_key_present: BOOLEAN,
+  api_key_redacted: TEXT,
+};
+const IMAGE_TOOL_STATUS = { name: NON_EMPTY_TEXT, slot: TEXT, available: BOOLEAN };
+
+// 槽位补成空表，页面会说「没有可配的槽位」；model_raw 补成空串，保存一次就把变量引用抹掉了。
+function systemModelsOf(what: string, value: unknown): SystemModelsResponse {
+  const body = shaped(what, value, { image_default_channel: optional(TEXT) });
+  const slots = shapedRows(what, body.slots, SYSTEM_MODEL_SLOT, 'slots');
+  if (body.image_tools === undefined) return { ...body, slots };
+  return { ...body, slots, image_tools: shapedRows(what, body.image_tools, IMAGE_TOOL_STATUS, 'image_tools') };
+}
+
 export async function getSystemModels(token: string): Promise<SystemModelsResponse> {
+  const what = '系统槽位';
   const resp = await apiFetch('/config/system-models', { token });
-  return resp.json();
+  return systemModelsOf(what, await jsonOf(what, resp));
 }
 
 // ── Policy（服务端策略，对所有渠道生效） ──
@@ -881,8 +906,9 @@ const policyFileOf = (what: string, data: unknown): PolicyFile => {
 };
 
 export async function getPolicy(token: string): Promise<PolicyFile> {
+  const what = '服务端策略';
   const resp = await apiFetch('/config/policy', { token });
-  return policyFileOf('服务端策略', await resp.json());
+  return policyFileOf(what, await jsonOf(what, resp));
 }
 
 /** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。baseHash 是读到时的指纹，中途被别处改过就 409。
@@ -950,20 +976,19 @@ export interface InstanceDirectory {
   instances: InstanceDirectoryEntry[];
 }
 
+const INSTANCE_DIRECTORY_ENTRY = { label: TEXT, path: TEXT };
+
 export async function getInstanceDirectory(signal?: AbortSignal): Promise<InstanceDirectory> {
+  const what = '实例列表';
   const response = await apiFetch('/instance-directory', {
     signal, credentials: 'omit', cache: 'no-store', anonymous: true, timeoutMs: 10_000, bypassPlugins: true,
   });
-  const data = await response.json();
-  if (!data || data.current_path !== MOUNT || !Array.isArray(data.instances)) {
-    throw new Error('实例列表与当前入口不一致，请检查服务配置');
-  }
+  const data = shaped(what, await jsonOf(what, response), { current_path: TEXT });
+  if (data.current_path !== MOUNT) throw new Error('实例列表与当前入口不一致，请检查服务配置');
   const paths = new Set<string>();
   const instances: InstanceDirectoryEntry[] = [];
-  for (const item of data.instances) {
-    if (!item || !isInstancePath(item.path) || typeof item.label !== 'string' || !item.label.trim()) {
-      throw new Error('实例列表包含无效地址或名称');
-    }
+  for (const item of shapedRows(what, data.instances, INSTANCE_DIRECTORY_ENTRY, 'instances')) {
+    if (!isInstancePath(item.path) || !item.label.trim()) throw new Error('实例列表包含无效地址或名称');
     if (paths.has(item.path)) continue;
     paths.add(item.path);
     instances.push({ label: item.label, path: item.path });
@@ -996,6 +1021,17 @@ export function ownedByAnotherInstance(
   return instanceOwning(platformId, account, instances.filter((row) => !row.current));
 }
 
+const INSTANCE_PROGRESS = {
+  id: NON_EMPTY_TEXT,
+  lines: TEXT_LIST,
+  finished: BOOLEAN,
+  ok: BOOLEAN,
+  detail: TEXT,
+  state: optional(oneOf('queued', 'running')),
+  retryable: optional(BOOLEAN),
+  action: optional(oneOf('create', 'remove')),
+};
+
 const CONSOLE_INSTANCE = {
   id: NON_EMPTY_TEXT,
   label: TEXT,
@@ -1009,9 +1045,14 @@ const CONSOLE_INSTANCE = {
 
 // 读不懂就抛，不能当成单实例：清单为空时 ownedByAnotherInstance 一律放行，双登拦不住。
 export async function getInstances(token: string): Promise<ConsoleInstance[]> {
+  const what = '实例列表';
   const resp = await apiFetch('/instances', { token });
-  const body = shaped('实例列表', await resp.json(), {});
-  return shapedRows('实例列表', body.instances, CONSOLE_INSTANCE, 'instances') as ConsoleInstance[];
+  const body = shaped(what, await jsonOf(what, resp), {});
+  return shapedRows(what, body.instances, CONSOLE_INSTANCE, 'instances').map((row, index): ConsoleInstance => ({
+    ...row,
+    provisioning: row.provisioning
+      && shaped(what, row.provisioning, INSTANCE_PROGRESS, at(at('instances', index), 'provisioning')),
+  }));
 }
 
 /** 新实例落点。序号决定端口，前缀决定它挂在域名的哪一层。 */
@@ -1047,6 +1088,18 @@ export function isValidInstanceId(id: string): boolean {
   return INSTANCE_ID.test(id) && !RESERVED_INSTANCE_IDS.has(id);
 }
 
+const INSTANCE_PLAN = {
+  id: NON_EMPTY_TEXT,
+  label: TEXT,
+  idx: NUMBER,
+  prefix: TEXT,
+  ports: recordOf(NUMBER),
+  workspace: TEXT,
+  platform: TEXT,
+  account: TEXT,
+};
+
+/** 工作区建好、已经交给 root 侧接着建，只是回执读不懂时抛 ReceiptUnreadable：照填的实例名盯进度就行。 */
 export async function createInstance(
   token: string,
   id: string,
@@ -1059,17 +1112,19 @@ export async function createInstance(
     token,
     json: { id, label, platform, account },
   });
-  return resp.json();
+  const receipt = nameWith(`实例 ${id}`, '已经开始建，可回执');
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, INSTANCE_PLAN));
 }
 
 export async function getInstanceProgress(
   token: string,
   id: string,
 ): Promise<InstanceProgress> {
+  const what = nameWith(`实例 ${id}`, '的进度');
   const resp = await apiFetch(`/instances/${encodeURIComponent(id)}/progress`, {
     token,
   });
-  return resp.json();
+  return shaped(what, await jsonOf(what, resp), INSTANCE_PROGRESS);
 }
 
 export async function deleteInstance(token: string, id: string): Promise<void> {
@@ -1168,8 +1223,9 @@ async function changeShareGroup(path: string, token: string, init: RequestOption
 }
 
 export async function getShareGroups(token: string): Promise<ShareGroupOverview> {
+  const what = '共享配置组';
   const resp = await apiFetch('/share-groups', { token });
-  return readShareGroups('共享配置组', await resp.json());
+  return readShareGroups(what, await jsonOf(what, resp));
 }
 
 export function createShareGroup(token: string, name: string): Promise<ShareGroupChange> {
@@ -1191,10 +1247,33 @@ export function deleteShareGroup(token: string, name: string): Promise<ShareGrou
 const platformAccountPath = (platformId: string, leaf = ''): string =>
   `/platforms/${encodeURIComponent(platformId)}/account${leaf}`;
 
+const QUICK_LOGIN_TARGET = {
+  account: NON_EMPTY_TEXT,
+  nick: optional(TEXT),
+  avatar: optional(TEXT),
+  available: optional(BOOLEAN),
+  dead_reason: optional(TEXT),
+};
+const ACCOUNT_STATUS = {
+  configured: BOOLEAN,
+  reachable: optional(BOOLEAN),
+  reason: optional(TEXT),
+  account: optional(TEXT),
+  nick: optional(TEXT),
+  online: optional(BOOLEAN),
+  is_login: optional(BOOLEAN),
+  login_error: optional(TEXT),
+  qrcode: optional(TEXT),
+};
+
+// 读不懂不能当成没配：页面会改口叫人去配 WebUI token，可那份配置本来没问题。
 export async function getPlatformAccount(token: string, platformId: string): Promise<AccountStatus> {
+  const what = '账号状态';
   const resp = await apiFetch(platformAccountPath(platformId), { token });
-  const data = await resp.json();
-  return data || { configured: false };
+  const status = shaped(what, await jsonOf(what, resp), ACCOUNT_STATUS);
+  return status.quick_login === undefined
+    ? status
+    : { ...status, quick_login: shapedRows(what, status.quick_login, QUICK_LOGIN_TARGET, 'quick_login') };
 }
 
 /** 换号、钉号的回执。 */
@@ -1203,10 +1282,14 @@ export interface AccountChange {
   rosterError: string;
 }
 
-const accountChangeOf = (json: unknown): AccountChange => {
-  const reason = (json as { roster_error?: unknown } | null)?.roster_error;
-  return { rosterError: typeof reason === 'string' ? reason.trim() : '' };
-};
+const ACCOUNT_CHANGE = { ok: BOOLEAN, account: TEXT, roster_error: optional(TEXT) };
+
+// 号已经换上、只是回执读不懂时抛 ReceiptUnreadable：说成没换上，人会再换一次。
+async function accountChangeOf(receipt: string, resp: Response, refused: string): Promise<AccountChange> {
+  const change = await receiptOf(receipt, resp, (body) => shaped(receipt, body, ACCOUNT_CHANGE));
+  if (!change.ok) throw new Error(refused);
+  return { rosterError: change.roster_error?.trim() ?? '' };
+}
 
 export async function switchPlatformAccount(token: string, platformId: string, account: string): Promise<AccountChange> {
   const resp = await apiFetch(platformAccountPath(platformId, '/switch'), {
@@ -1214,7 +1297,7 @@ export async function switchPlatformAccount(token: string, platformId: string, a
     token,
     json: { account },
   });
-  return accountChangeOf(await resp.json());
+  return accountChangeOf(`已经切到 ${account}，可回执`, resp, `服务端没有切到 ${account}，请重试`);
 }
 
 /** 让平台停在等扫码的状态。QQ 在已登录状态下拒发二维码、也没有登出接口，只能清掉自动登录再重启容器。 */
@@ -1233,7 +1316,7 @@ export async function pinPlatformAccount(token: string, platformId: string): Pro
     token,
     json: {},
   });
-  return accountChangeOf(await resp.json());
+  return accountChangeOf('已经设成重启后自动登录，可回执', resp, '服务端没有设成重启后自动登录，请重试');
 }
 
 export interface LoginQrcode {
@@ -1243,18 +1326,16 @@ export interface LoginQrcode {
   reason?: string;
 }
 
+const LOGIN_QRCODE = { qrcode: TEXT, reachable: BOOLEAN, reason: optional(TEXT) };
+
 export async function getPlatformLoginQrcode(token: string, platformId: string): Promise<LoginQrcode> {
+  const what = '登录二维码';
   const resp = await apiFetch(platformAccountPath(platformId, '/qrcode'), {
     method: 'POST',
     token,
     json: {},
   });
-  const data = await resp.json();
-  return {
-    qrcode: String((data && data.qrcode) || ''),
-    reachable: (data && data.reachable) !== false,
-    reason: String((data && data.reason) || ''),
-  };
+  return shaped(what, await jsonOf(what, resp), LOGIN_QRCODE);
 }
 
 /** 字段留空串表示删掉这一项（回到跟随主渠道）；不传表示不动。 */
@@ -1268,10 +1349,11 @@ export async function updateSystemModel(
     token,
     json: data,
   });
-  return resp.json();
+  const receipt = savedReceipt(`系统槽位 ${slot}`);
+  return receiptOf(receipt, resp, (body) => systemModelsOf(receipt, body));
 }
 
-/** 配了多个生图渠道时默认用哪个。空串 = 交给模型按用途判断。 */
+/** 配了多个生图渠道时默认用哪个。空串 = 交给模型按用途判断。存上了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function updateImageDefaultChannel(
   token: string,
   defaultChannel: string,
@@ -1281,7 +1363,8 @@ export async function updateImageDefaultChannel(
     token,
     json: { default_channel: defaultChannel },
   });
-  return resp.json();
+  const receipt = savedReceipt('默认生图渠道');
+  return receiptOf(receipt, resp, (body) => systemModelsOf(receipt, body));
 }
 
 export async function setActiveProvider(token: string, provider: string): Promise<ProvidersResponse> {
@@ -1349,24 +1432,26 @@ const RUNTIME_FILE = { ...RAW_TEXT, source: oneOf('default', 'override'), path: 
 const RUNTIME_LAYERS = { ...RUNTIME_FILE, defaults: OBJECT, effective: OBJECT };
 
 export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
+  const what = 'runtime.yaml 原文';
   const resp = await apiFetch('/admin/config/runtime/raw', { token });
-  const { content, hash, source, path } = shaped('runtime.yaml 原文', await resp.json(), RUNTIME_FILE);
+  const { content, hash, source, path } = shaped(what, await jsonOf(what, resp), RUNTIME_FILE);
   return { content, hash, source, path };
 }
 
 export async function getRuntimeLayers(token: string): Promise<RuntimeLayers> {
+  const what = 'runtime.yaml 原文';
   const resp = await apiFetch('/admin/config/runtime/raw', { token });
-  const { content, hash, source, path, defaults, effective } = shaped('runtime.yaml 原文', await resp.json(), RUNTIME_LAYERS);
+  const { content, hash, source, path, defaults, effective } = shaped(what, await jsonOf(what, resp), RUNTIME_LAYERS);
   return { content, hash, source, path, defaults, effective };
 }
 
-/** 删掉本实例的 runtime.yaml，全部参数回到仓库默认。 */
+/** 删掉本实例的 runtime.yaml，全部参数回到仓库默认。删了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function resetRuntime(token: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch('/admin/config/runtime/raw', {
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return removeResultOf(removedReceipt('runtime.yaml'), resp);
 }
 
 export function updateRuntimeRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
@@ -1423,7 +1508,7 @@ export interface MemoryEntry {
   updated_at?: string;
 }
 
-const MEMORY_OWNER = { kind: TEXT, label: TEXT };
+export const MEMORY_OWNER = { kind: TEXT, label: TEXT };
 
 /** 读不出来的一本记忆。problem 只有位置和问题，不带文件内容。 */
 export interface UnreadableMemoryBook {
@@ -1457,7 +1542,7 @@ const UNREADABLE_MEMORY_BOOK = { book: NON_EMPTY_TEXT, problem: TEXT };
 export async function getMemoryOverview(token: string): Promise<MemoryNamespace[]> {
   const what = '记忆来源列表';
   const resp = await apiFetch('/admin/config/memory/overview', { token });
-  const body = shaped(what, await resp.json(), {});
+  const body = shaped(what, await jsonOf(what, resp), {});
   return shapedRows(what, body.namespaces, MEMORY_NAMESPACE, 'namespaces').map((row, index) => ({
     ...row,
     unreadable_books: row.unreadable_books ?? [],
@@ -1470,7 +1555,7 @@ export async function getMemoryEntries(token: string, namespace: string): Promis
   const resp = await apiFetch(
     `/admin/config/memory/${encodeURIComponent(namespace)}/entries`, { token },
   );
-  const body = shaped(what, await resp.json(), {});
+  const body = shaped(what, await jsonOf(what, resp), {});
   const unreadable = body.unreadable_books === undefined
     ? []
     : shapedRows(what, body.unreadable_books, UNREADABLE_MEMORY_BOOK, 'unreadable_books');
@@ -1480,6 +1565,9 @@ export async function getMemoryEntries(token: string, namespace: string): Promis
   };
 }
 
+const MEMORY_SAVE = { ok: BOOLEAN, entry: OBJECT };
+
+/** 存上了却读不懂回执时抛 ReceiptUnreadable：再存一次会把同一条整条覆盖一遍。 */
 export async function saveMemoryEntry(
   token: string, namespace: string, entry: Partial<MemoryEntry>,
 ): Promise<MemoryEntry> {
@@ -1488,7 +1576,13 @@ export async function saveMemoryEntry(
     token,
     json: entry,
   });
-  return (await resp.json()).entry;
+  const receipt = savedReceipt('这条记忆');
+  const saved = await receiptOf(receipt, resp, (body) => {
+    const result = shaped(receipt, body, MEMORY_SAVE);
+    return { ok: result.ok, entry: shaped(receipt, result.entry, MEMORY_ENTRY, 'entry') as unknown as MemoryEntry };
+  });
+  if (!saved.ok) throw new Error('服务端没有存上这条记忆，请重试');
+  return saved.entry;
 }
 
 export async function deleteMemoryEntry(
@@ -1500,11 +1594,17 @@ export async function deleteMemoryEntry(
   );
 }
 
+const MEMORY_CLEAR = { ok: BOOLEAN, removed: NUMBER };
+
+/** 清空了却读不懂回执时抛 ReceiptUnreadable：记忆已经删了，只是不知道删了几条。 */
 export async function clearMemoryNamespace(token: string, namespace: string): Promise<number> {
   const resp = await apiFetch(`/admin/config/memory/${encodeURIComponent(namespace)}`, {
     method: 'DELETE', token,
   });
-  return (await resp.json()).removed || 0;
+  const receipt = '这一份记忆已经清空，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, MEMORY_CLEAR));
+  if (!result.ok) throw new Error('服务端没有清空这一份记忆，请重试');
+  return result.removed;
 }
 
 export interface ConversationRow {
@@ -1538,28 +1638,46 @@ const CONVERSATION_ROW = {
 export async function getConversations(token: string): Promise<ConversationRow[]> {
   const what = '会话列表';
   const resp = await apiFetch('/admin/conversations', { token });
-  const body = shaped(what, await resp.json(), {});
+  const body = shaped(what, await jsonOf(what, resp), {});
   return shapedRows(what, body.conversations, CONVERSATION_ROW, 'conversations').map((row, index) => ({
     ...row,
     owner: row.owner === null ? null : shaped(what, row.owner, MEMORY_OWNER, at(at('conversations', index), 'owner')),
   })) as unknown as ConversationRow[];
 }
 
+/** 存档里的一条消息。tool_calls、meta 这些照存档原样带着，预览只念这两项。 */
+export interface ConversationMessage {
+  role: string;
+  content: MessageContent;
+}
+
+export interface ConversationMessages {
+  /** 存档里一共几条；messages 只是最近的 limit 条。 */
+  total: number;
+  messages: ConversationMessage[];
+}
+
 export async function getConversationMessages(
   token: string, sessionId: string, limit = 200,
-): Promise<{ total: number; messages: Array<Record<string, any>> }> {
+): Promise<ConversationMessages> {
+  const what = '会话记录';
   const resp = await apiFetch(
     `/admin/conversations/${encodeURIComponent(sessionId)}/messages?limit=${limit}`,
     { token },
   );
-  return resp.json();
+  const body = shaped(what, await jsonOf(what, resp), { total: NUMBER });
+  return {
+    total: body.total,
+    messages: shapedRows(what, body.messages, { role: TEXT, content: MESSAGE_CONTENT }, 'messages'),
+  };
 }
 
-export async function resetConversationBySession(token: string, sessionId: string): Promise<any> {
+/** 删掉了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function resetConversationBySession(token: string, sessionId: string): Promise<ConversationReset> {
   const resp = await apiFetch(`/admin/conversations/${encodeURIComponent(sessionId)}/reset`, {
     method: 'POST', token,
   });
-  return resp.json();
+  return conversationResetOf('会话上下文已经删掉，可回执', resp);
 }
 
 export interface ScopePlanRow {
@@ -1602,6 +1720,35 @@ export interface ScopeStatus {
   ambiguous_sources: ScopeCount[];
 }
 
+const SCOPE_COUNT = { scope: TEXT, conversations: NUMBER };
+const SCOPE_PLAN_ROW = { old_namespace: NON_EMPTY_TEXT, new_namespace: TEXT, has_memory: BOOLEAN, blocked: BOOLEAN };
+const SCOPE_STORE_COUNT = { label: TEXT, moved: NUMBER, replaced: NUMBER };
+const SCOPE_STATUS = { current_scope: TEXT, live_scope: TEXT, bot_alive: BOOLEAN, preview: nullable(OBJECT) };
+const SCOPE_PREVIEW = {
+  source_scope: TEXT,
+  target_scope: TEXT,
+  unknown_namespaces: TEXT_LIST,
+  unresolved_namespaces: TEXT_LIST,
+};
+
+// 「还没绑定账号」「无需搬迁」都是读到以后才说得出的结论，读不懂就抛。
+function scopeStatusOf(what: string, value: unknown): ScopeStatus {
+  const status = shaped(what, value, SCOPE_STATUS);
+  const ambiguousSources = shapedRows(what, status.ambiguous_sources, SCOPE_COUNT, 'ambiguous_sources');
+  if (status.preview === null) return { ...status, preview: null, ambiguous_sources: ambiguousSources };
+  const preview = shaped(what, status.preview, SCOPE_PREVIEW, 'preview');
+  return {
+    ...status,
+    ambiguous_sources: ambiguousSources,
+    preview: {
+      ...preview,
+      conversations: shapedRows(what, preview.conversations, SCOPE_PLAN_ROW, 'preview.conversations'),
+      other_scopes: shapedRows(what, preview.other_scopes, SCOPE_COUNT, 'preview.other_scopes'),
+      stores: shapedRecord(what, preview.stores, SCOPE_STORE_COUNT, 'preview.stores'),
+    },
+  };
+}
+
 export async function getAccountScope(
   token: string,
   platformId: string,
@@ -1613,24 +1760,47 @@ export async function getAccountScope(
   // 空串是「没有归属的存量」，和不传是两回事。
   if (source !== undefined) params.set('source', source);
   const query = params.toString();
+  const what = '记忆归属';
   const resp = await apiFetch(`${platformAccountPath(platformId, '/scope')}${query ? `?${query}` : ''}`, {
     token,
   });
-  return resp.json();
+  return scopeStatusOf(what, await jsonOf(what, resp));
 }
 
+/** 搬迁的回执。后端还报各库改写的行数和跳过的会话，页面只念这几项。 */
+export interface ScopeMigration {
+  ok: boolean;
+  moved_memory_dirs: number;
+  sessions_changed: number;
+  backup_dir: string;
+  /** 搬了记忆、命中记录却读不了没跟着改名时的原因；没出事是空串。 */
+  hit_cache_problem: string;
+}
+
+const SCOPE_MIGRATION = {
+  ok: BOOLEAN,
+  moved_memory_dirs: NUMBER,
+  sessions_changed: NUMBER,
+  backup_dir: TEXT,
+  hit_cache_problem: TEXT,
+};
+
+/** 搬完了却读不懂回执时抛 ReceiptUnreadable：数据已经划过去了，再搬一次只会扑空。 */
 export async function migrateAccountScope(
   token: string,
   platformId: string,
   target: string,
   source?: string,
-): Promise<any> {
+): Promise<ScopeMigration> {
   const resp = await apiFetch(platformAccountPath(platformId, '/scope/migrate'), {
     method: 'POST',
     token,
     json: source === undefined ? { target } : { target, source },
   });
-  return resp.json();
+  const receipt = '记忆归属已经搬完，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, SCOPE_MIGRATION));
+  if (!result.ok) throw new Error('服务端没有搬迁，请重试');
+  return result;
 }
 
 // ── Sticker library ──
@@ -1681,6 +1851,37 @@ export interface StickerImportResult {
   skipped: number;
 }
 
+const STICKER = {
+  sha256: NON_EMPTY_TEXT,
+  name: TEXT,
+  state: oneOf('pending', 'library', 'discarded'),
+  source: TEXT,
+  tags: TEXT_LIST,
+  auto_tags: TEXT_LIST,
+  manual_tags: TEXT_LIST,
+  manual_override: BOOLEAN,
+  caption_state: oneOf('pending', 'running', 'done', 'failed'),
+  caption_error: TEXT,
+  width: NUMBER,
+  height: NUMBER,
+  animated: BOOLEAN,
+  size: NUMBER,
+  from_group: TEXT,
+  from_user: TEXT,
+  sent_count: NUMBER,
+  last_sent_at: NUMBER,
+  created_at: NUMBER,
+  usable: BOOLEAN,
+};
+const STICKER_COUNTS = { pending: NUMBER, library: NUMBER, discarded: NUMBER, usable: NUMBER, awaiting_caption: NUMBER };
+const STICKER_IMPORT = { scanned: NUMBER, added: NUMBER, known: NUMBER, skipped: NUMBER };
+
+// 改完紧接着这张图被删了，后端回的是空对象：交回 null，不当成读不懂。
+function stickerReceipt(receipt: string, body: unknown): Sticker | null {
+  if (isJsonObject(body) && Object.keys(body).length === 0) return null;
+  return shaped(receipt, body, STICKER);
+}
+
 /** 预览图地址。带令牌取回再显示，令牌不进地址。 */
 export function stickerImageUrl(sha256: string): string {
   return `${API}/stickers/${encodeURIComponent(sha256)}/image`;
@@ -1696,28 +1897,38 @@ export async function listStickers(
     limit: String(params.limit ?? 60),
     offset: String(params.offset ?? 0),
   });
+  const what = '图库';
   const resp = await apiFetch(`/stickers?${query}`, { token });
-  return resp.json();
+  // 补成空表、0 张的话，页面会说「这一档还没有图」「在库 0 张」。
+  const body = shaped(what, await jsonOf(what, resp), {});
+  return {
+    items: shapedRows(what, body.items, STICKER, 'items'),
+    counts: shaped(what, body.counts, STICKER_COUNTS, 'counts'),
+  };
 }
 
+/** null：改完紧接着这张图被删了。改了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function updateSticker(
   token: string,
   sha256: string,
   patch: { name?: string; manual_tags?: string[]; manual_override?: boolean },
-): Promise<Sticker> {
+): Promise<Sticker | null> {
   const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}`, {
     method: 'PATCH',
     token,
     json: patch,
   });
-  return resp.json();
+  const receipt = savedReceipt('这张图的名字和标签');
+  return receiptOf(receipt, resp, (body) => stickerReceipt(receipt, body));
 }
 
-export async function acceptSticker(token: string, sha256: string): Promise<Sticker> {
+/** null：转正后紧接着这张图被删了。转了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function acceptSticker(token: string, sha256: string): Promise<Sticker | null> {
   const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}/accept`, {
     method: 'POST', token,
   });
-  return resp.json();
+  const receipt = '这张图已经转正，可回执';
+  return receiptOf(receipt, resp, (body) => stickerReceipt(receipt, body));
 }
 
 export async function discardSticker(token: string, sha256: string): Promise<void> {
@@ -1732,13 +1943,16 @@ export async function deleteSticker(token: string, sha256: string): Promise<void
   });
 }
 
+/** 排进队列了却读不懂回执时抛 ReceiptUnreadable：不知道排了几张，不能说成 0 张。 */
 export async function recaptionStickers(token: string, onlyFailed: boolean): Promise<number> {
   const resp = await apiFetch('/stickers/recaption', {
     method: 'POST',
     token,
     json: { only_failed: onlyFailed },
   });
-  return (await resp.json()).queued || 0;
+  const receipt = '已经重新排进打标队列，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, { queued: NUMBER }));
+  return result.queued;
 }
 
 export async function uploadSticker(
@@ -1756,9 +1970,12 @@ export async function uploadSticker(
   const resp = await apiFetch(`/stickers/upload?${query}`, {
     method: 'POST', body: form, token,
   });
-  return resp.json();
+  // 传上了却读不懂回执时抛 ReceiptUnreadable：再传一次会被当成库里已有的图拒掉。
+  const receipt = '这张图已经传上，可回执';
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, STICKER));
 }
 
+/** 导入了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function importStickers(
   token: string, path: string, accept: boolean,
 ): Promise<StickerImportResult> {
@@ -1767,7 +1984,8 @@ export async function importStickers(
     token,
     json: { path, accept },
   });
-  return resp.json();
+  const receipt = '目录已经导入，可回执';
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, STICKER_IMPORT));
 }
 
 export function getSchedulesRaw(token: string): Promise<RawText> {
@@ -1791,9 +2009,23 @@ export interface NodeFileInfo {
   same_as_default: boolean;
 }
 
+const NODE_FILE = {
+  name: NON_EMPTY_TEXT,
+  path: TEXT,
+  kind: oneOf('node', 'fragment'),
+  suffix: TEXT,
+  is_example: BOOLEAN,
+  base_name: TEXT,
+  size: NUMBER,
+  updated_at: NUMBER,
+  source: oneOf('default', 'override', 'custom'),
+  same_as_default: BOOLEAN,
+};
+
 export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
+  const what = '节点文件列表';
   const resp = await apiFetch('/admin/config/node-files', { token });
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), NODE_FILE);
 }
 
 export function getNodeFileRaw(token: string, filename: string): Promise<RawText> {
@@ -1810,7 +2042,7 @@ export async function deleteNodeFile(token: string, filename: string): Promise<C
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return removeResultOf(removedReceipt(`节点文件 ${filename}`), resp);
 }
 
 export function getNodeRaw(token: string, nodeId: string): Promise<RawText> {
@@ -1835,12 +2067,26 @@ export async function deleteNode(token: string, nodeId: string): Promise<ConfigR
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return removeResultOf(removedReceipt(`节点 ${nodeId}`), resp);
 }
 
+const ADMIN_TOOL = {
+  name: NON_EMPTY_TEXT,
+  source: oneOf('builtin', 'plugin', 'external'),
+  editable: BOOLEAN,
+  file: optional(TEXT),
+  description: optional(TEXT),
+  input_schema: optional(OBJECT),
+  timeout_sec: optional(NUMBER),
+  has_spec: optional(BOOLEAN),
+  origin: optional(oneOf('custom', 'override', 'bundled')),
+};
+
+// 读不懂就抛：补成空表的话，页面会说「共 0 个」「没有符合条件的工具」。
 export async function getTools(token: string): Promise<AdminTool[]> {
+  const what = '工具清单';
   const resp = await apiFetch('/admin/config/tools', { token });
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), ADMIN_TOOL);
 }
 
 export function getToolRaw(token: string, name: string): Promise<RawText> {
@@ -1865,7 +2111,7 @@ export async function deleteTool(token: string, name: string): Promise<ConfigRem
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return removeResultOf(removedReceipt(`工具 ${name}`), resp);
 }
 
 // ── Drawtools ──
@@ -1898,7 +2144,7 @@ const DRAWTOOLS_FILE = {
 export async function getDrawtoolsBundle(token: string): Promise<DrawtoolsBundle> {
   const what = '绘图配置';
   const resp = await apiFetch('/admin/config/drawtools', { token });
-  const body = shaped(what, await resp.json(), { prompts: OBJECT });
+  const body = shaped(what, await jsonOf(what, resp), { prompts: OBJECT });
   const fileAt = (path: string, value: unknown): DrawtoolsRawFile => shaped(what, value, DRAWTOOLS_FILE, path);
   return {
     settings: fileAt('settings', body.settings),
@@ -1909,9 +2155,21 @@ export async function getDrawtoolsBundle(token: string): Promise<DrawtoolsBundle
   };
 }
 
-export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean; created: string[] }> {
+/** 补建绘图配置的结果：created 是这次从模板抄进来的那几份，已有的不动。 */
+export interface DrawtoolsInit {
+  ok: boolean;
+  created: string[];
+}
+
+const DRAWTOOLS_INIT = { ok: BOOLEAN, created: TEXT_LIST };
+
+/** 补建了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function initDrawtoolsConfigs(token: string): Promise<DrawtoolsInit> {
   const resp = await apiFetch('/admin/config/drawtools/init', { method: 'POST', token });
-  return resp.json();
+  const receipt = '缺的绘图配置已经补上，可回执';
+  const { ok, created } = await receiptOf(receipt, resp, (body) => shaped(receipt, body, DRAWTOOLS_INIT));
+  if (!ok) throw new Error('服务端没有补建绘图配置，请重试');
+  return { ok, created };
 }
 
 export function getDrawtoolsSettingsRaw(token: string): Promise<RawText> {
@@ -1930,9 +2188,31 @@ export function updateDrawtoolsCharactersRaw(token: string, content: string, bas
   return writeRawConfig('绘图 character_tags.yaml', '/admin/config/drawtools/characters/raw', token, content, baseHash);
 }
 
-export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
+/** 立即清理绘图附件的结果。后端另带删掉的前 200 个文件，页面只念合计。 */
+export interface DrawtoolsCleanup {
+  ok: boolean;
+  deleted_count: number;
+  deleted_mb: number;
+  remaining_count: number;
+  remaining_mb: number;
+}
+
+const DRAWTOOLS_CLEANUP = {
+  ok: BOOLEAN,
+  deleted_count: NUMBER,
+  deleted_mb: NUMBER,
+  remaining_count: NUMBER,
+  remaining_mb: NUMBER,
+};
+
+/** 清理了却读不懂回执时抛 ReceiptUnreadable：不知道删了几个，不能说成删了 0 个。 */
+export async function cleanupDrawtoolsAttachments(token: string): Promise<DrawtoolsCleanup> {
   const resp = await apiFetch('/admin/config/drawtools/cleanup', { method: 'POST', token });
-  return resp.json();
+  const receipt = '绘图附件已经清理，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, DRAWTOOLS_CLEANUP));
+  if (!result.ok) throw new Error('服务端没有清理绘图附件，请重试');
+  const { ok, deleted_count, deleted_mb, remaining_count, remaining_mb } = result;
+  return { ok, deleted_count, deleted_mb, remaining_count, remaining_mb };
 }
 
 export function getDrawtoolsPromptRaw(token: string, name: string): Promise<RawText> {
@@ -1943,9 +2223,23 @@ export function updateDrawtoolsPromptRaw(token: string, name: string, content: s
   return writeRawConfig(`绘图提示词 ${name}`, `/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content, baseHash);
 }
 
+const ADMIN_SKILL = {
+  name: NON_EMPTY_TEXT,
+  dir: optional(NON_EMPTY_TEXT),
+  path: optional(TEXT),
+  description: optional(TEXT),
+  enabled: optional(BOOLEAN),
+  strategy: optional(TEXT),
+  keywords: optional(TEXT_LIST),
+  body_preview: optional(TEXT),
+  problem: optional(TEXT),
+  rule_error: optional(TEXT),
+};
+
 export async function getSkills(token: string): Promise<AdminSkill[]> {
+  const what = '技能列表';
   const resp = await apiFetch('/admin/config/skills', { token });
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), ADMIN_SKILL);
 }
 
 export function getSkillRaw(token: string, dir: string): Promise<RawText> {
@@ -1965,17 +2259,36 @@ export async function createSkill(token: string, data: AdminCreatePayload): Prom
   return saveResultOf(createdReceipt(`技能 ${data.id}`), resp);
 }
 
-export async function deleteSkill(token: string, dir: string): Promise<any> {
+/** 删了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function deleteSkill(token: string, dir: string): Promise<void> {
   const resp = await apiFetch(`/admin/config/skills/${pathPart(dir)}`, {
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  const receipt = nameWith(`技能 ${dir}`, '已经删掉，可回执');
+  const { ok } = await receiptOf(receipt, resp, (body) => shaped(receipt, body, { ok: BOOLEAN }));
+  if (!ok) throw new Error('服务端没有删掉这个技能，请重试');
 }
 
+// 后端已经规整过：开关不是布尔、地址不是字符串就是读错了，报格式不对，不在这里替它纠正。
+const MCP_CLIENT = {
+  id: NON_EMPTY_TEXT,
+  enabled: BOOLEAN,
+  share_sessions: BOOLEAN,
+  transport: NON_EMPTY_TEXT,
+  description: optional(TEXT),
+  command: optional(TEXT),
+  args: optional(TEXT_LIST),
+  env: optional(recordOf(TEXT)),
+  url: optional(TEXT),
+  headers: optional(recordOf(TEXT)),
+};
+
+// 读不懂就抛：补成空表的话，页面会说「暂无 MCP Client」。
 export async function getMcpClients(token: string): Promise<McpClient[]> {
+  const what = 'MCP Client 列表';
   const resp = await apiFetch('/admin/config/mcp-clients', { token });
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), MCP_CLIENT);
 }
 
 export function getMcpClientsRaw(token: string): Promise<RawText> {
@@ -1998,6 +2311,21 @@ export interface RestartResult {
   in_progress?: RestartInProgress | null;
 }
 
+const RESTART_RESULT = {
+  scheduled: BOOLEAN,
+  target: TEXT,
+  reason: optional(nullable(TEXT)),
+  in_progress: optional(nullable(OBJECT)),
+};
+const RESTART_IN_PROGRESS = { target: TEXT, since: TEXT };
+
+function restartResultOf(what: string, value: unknown): RestartResult {
+  const body = shaped(what, value, RESTART_RESULT);
+  const inProgress = body.in_progress ? shaped(what, body.in_progress, RESTART_IN_PROGRESS, 'in_progress') : body.in_progress;
+  return { ...body, in_progress: inProgress };
+}
+
+/** 后端回绝照常抛；请求交上了却读不懂回执时抛 ReceiptUnreadable：排没排上要看运行页。 */
 export async function restartEngine(
   token: string,
   // reason 进 eventlog，调用方不同就得说不同的话，否则事后查不出是从哪按的。
@@ -2008,7 +2336,8 @@ export async function restartEngine(
     token,
     json: { target: 'engine', reason },
   });
-  return resp.json();
+  const receipt = '重启请求已经交上，可回执';
+  return receiptOf(receipt, resp, (body) => restartResultOf(receipt, body));
 }
 
 export async function enableCodeWrite(token: string): Promise<void> {
@@ -2050,7 +2379,8 @@ export interface ConfigLayerFile {
 export interface ConfigLiveState {
   published: boolean;
   reason?: string;
-  age_sec?: number;
+  /** bot 没写心跳时间、或写的读不懂时是 null。 */
+  age_sec?: number | null;
   /** 心跳超过 90s 没更新，bot 大概失联了。 */
   stale?: boolean;
   /** 跑着的那份值确实来自磁盘上的当前文件版本。 */
@@ -2132,7 +2462,7 @@ export interface FeatureAdoption {
   display_name: string;
   published: boolean;
   stale?: boolean;
-  age_sec?: number;
+  age_sec?: number | null;
   applied: boolean;
   reason?: string;
 }
@@ -2338,11 +2668,12 @@ const PLATFORM_SUMMARY = {
 const PLATFORM_CHANNEL = { name: NON_EMPTY_TEXT, kind: TEXT, hashed: BOOLEAN };
 
 export async function getPlatforms(token: string): Promise<PlatformCatalog> {
+  const what = '平台清单';
   const resp = await apiFetch('/platforms', { token });
-  const body = shaped('平台清单', await resp.json(), { current: optional(nullable(NON_EMPTY_TEXT)) });
-  const platforms = shapedRows('平台清单', body.platforms, PLATFORM_SUMMARY, 'platforms').map((row, index) => ({
+  const body = shaped(what, await jsonOf(what, resp), { current: optional(nullable(NON_EMPTY_TEXT)) });
+  const platforms = shapedRows(what, body.platforms, PLATFORM_SUMMARY, 'platforms').map((row, index) => ({
     ...row,
-    channels: shapedRows('平台清单', row.channels, PLATFORM_CHANNEL, at(at('platforms', index), 'channels')),
+    channels: shapedRows(what, row.channels, PLATFORM_CHANNEL, at(at('platforms', index), 'channels')),
   }));
   return { platforms: platforms as unknown as PlatformSummary[], current: body.current ?? null };
 }
@@ -2356,7 +2687,7 @@ const CONFIG_RAW_FILE = { ...RAW_TEXT, exists: BOOLEAN };
 
 async function readConfigFile(what: string, path: string, token: string): Promise<ConfigRawFile> {
   const resp = await apiFetch(path, { token });
-  const { content, hash, exists } = shaped(what, await resp.json(), CONFIG_RAW_FILE);
+  const { content, hash, exists } = shaped(what, await jsonOf(what, resp), CONFIG_RAW_FILE);
   return { content, hash, exists };
 }
 
@@ -2379,9 +2710,188 @@ async function writeConfigFile(
   });
 }
 
-async function readJson<T>(path: string, token: string): Promise<T> {
-  const resp = await apiFetch(path, { token });
-  return resp.json();
+const FILE_FINGERPRINT = { exists: BOOLEAN, mtime_ns: NUMBER, size: NUMBER };
+const CONFIG_SOURCE = oneOf('platform', 'global', 'legacy', 'env', 'default');
+const CONFIG_INPUT_RULE = {
+  kind: oneOf('id', 'word'),
+  pattern: optional(TEXT),
+  min: optional(NUMBER),
+  max: optional(NUMBER),
+  trim: optional(BOOLEAN),
+};
+const PLATFORM_CAPABILITY = {
+  key: NON_EMPTY_TEXT,
+  name: TEXT,
+  desc: TEXT,
+  default: TEXT,
+  group_scoped: BOOLEAN,
+  grants: TEXT_LIST,
+};
+const RUNTIME_FACTS = {
+  pid: optional(NUMBER),
+  queue_workers_running: optional(NUMBER),
+  forward_bridge_running: optional(BOOLEAN),
+  forward_bridge_endpoint: optional(TEXT),
+  forward_bridge_token_set: optional(BOOLEAN),
+  group_history_capacities: optional(listOf(NUMBER)),
+};
+const RUNTIME_ENVIRONMENT = { supervisor_url: optional(TEXT), workspace: optional(TEXT), hash_secret_set: optional(BOOLEAN) };
+const RUNTIME_VOLATILE = { cached_groups: optional(NUMBER), history_gap_groups: optional(NUMBER) };
+const LIVE_SNAPSHOT = {
+  connected: optional(BOOLEAN),
+  account: optional(TEXT),
+  backlog: optional(NUMBER),
+  config_path: optional(TEXT),
+  parse_error: optional(TEXT),
+  layer: optional(TEXT),
+  values: optional(OBJECT),
+  sources: optional(recordOf(CONFIG_SOURCE)),
+  layers: optional(recordOf(TEXT_LIST)),
+  paths: optional(recordOf(TEXT)),
+  reload: optional(recordOf(TEXT)),
+  notes: optional(recordOf(TEXT)),
+};
+const CONFIG_LIVE = {
+  published: BOOLEAN,
+  reason: optional(TEXT),
+  age_sec: optional(nullable(NUMBER)),
+  stale: optional(BOOLEAN),
+  applied: optional(BOOLEAN),
+};
+
+function fingerprintOf(what: string, value: unknown, path: string): ConfigFileFingerprint {
+  const { exists, mtime_ns, size } = shaped(what, value, FILE_FINGERPRINT, path);
+  return { exists, mtime_ns, size };
+}
+
+function layerFileOf(what: string, value: unknown, path: string): ConfigLayerFile {
+  const { config_path, parse_error, file, loaded } = shaped(what, value, { config_path: TEXT, parse_error: TEXT }, path);
+  return {
+    config_path,
+    parse_error,
+    file: fingerprintOf(what, file, at(path, 'file')),
+    loaded: fingerprintOf(what, loaded, at(path, 'loaded')),
+  };
+}
+
+function runtimeFactsOf(what: string, value: unknown, path: string): PlatformRuntimeFacts {
+  const facts = shaped(what, value, RUNTIME_FACTS, path);
+  if (facts.environment !== undefined) shaped(what, facts.environment, RUNTIME_ENVIRONMENT, at(path, 'environment'));
+  if (facts.volatile !== undefined) shaped(what, facts.volatile, RUNTIME_VOLATILE, at(path, 'volatile'));
+  return facts as PlatformRuntimeFacts;
+}
+
+// 来源、能写的层、生效值出自哪一版文件都拿来下结论：补成空的，「没读懂」会被说成「都跟着默认」。
+function liveStateOf(what: string, value: unknown): ConfigLiveState {
+  const live = shaped(what, value, CONFIG_LIVE);
+  const file = fingerprintOf(what, live.file, 'file');
+  if (live.state === undefined) return { ...live, file };
+  const snapshot = shaped(what, live.state, LIVE_SNAPSHOT, 'state');
+  const read = <T>(key: string, parse: (raw: unknown, path: string) => T): Record<string, T> => (
+    snapshot[key] === undefined ? {} : { [key]: parse(snapshot[key], at('state', key)) }
+  );
+  const state = {
+    ...snapshot,
+    ...read('file', (raw, path) => fingerprintOf(what, raw, path)),
+    ...read('loaded', (raw, path) => fingerprintOf(what, raw, path)),
+    ...read('defaults', (raw, path) => layerFileOf(what, raw, path)),
+    ...read('runtime', (raw, path) => runtimeFactsOf(what, raw, path)),
+    ...read('capabilities', (raw, path) => shapedRows(what, raw, PLATFORM_CAPABILITY, path)),
+    ...read('input_rules', (raw, path) => shapedRecord(what, raw, CONFIG_INPUT_RULE, path)),
+  };
+  return { ...live, file, state: state as NonNullable<ConfigLiveState['state']> };
+}
+
+const FEATURE_ADOPTION = {
+  id: NON_EMPTY_TEXT,
+  display_name: TEXT,
+  published: BOOLEAN,
+  stale: optional(BOOLEAN),
+  age_sec: optional(nullable(NUMBER)),
+  applied: BOOLEAN,
+  reason: optional(TEXT),
+};
+// value 是平台那边写着的原样，什么类型都可能。
+const FEATURE_FALLBACK = { platform: NON_EMPTY_TEXT, display_name: TEXT, source: oneOf('legacy', 'env'), file: TEXT, value: PRESENT };
+const CENTRAL_SWITCH = { enabled: BOOLEAN, set_globally: BOOLEAN };
+
+function featuresStateOf(what: string, value: unknown): FeaturesLiveState {
+  const body = shaped(what, value, {});
+  const fallbacks = body.fallbacks === undefined ? {} : {
+    fallbacks: Object.fromEntries(
+      Object.entries(shaped(what, body.fallbacks, {}, 'fallbacks'))
+        .map(([name, rows]) => [name, shapedRows(what, rows, FEATURE_FALLBACK, at('fallbacks', name))]),
+    ),
+  };
+  const central = body.central === undefined ? {} : { central: shapedRecord(what, body.central, CENTRAL_SWITCH, 'central') };
+  return {
+    ...liveStateOf(what, body),
+    platforms: shapedRows(what, body.platforms, FEATURE_ADOPTION, 'platforms'),
+    ...fallbacks,
+    ...central,
+  };
+}
+
+const CONSOLE_NODE_KINDS = ['block', 'grid', 'panel', 'loose', 'fixed', 'field', 'desc', 'note', 'custom'] as const;
+type ConsoleNodeKind = (typeof CONSOLE_NODE_KINDS)[number];
+const CONSOLE_NODE_FIELDS: Readonly<Record<ConsoleNodeKind, Shape>> = {
+  block: { title: TEXT, hint: optional(TEXT), frame: optional(oneOf('ruled', 'boxed')) },
+  grid: {},
+  panel: {},
+  loose: {},
+  fixed: { label: TEXT, desc: optional(TEXT) },
+  field: { key: NON_EMPTY_TEXT, sub: optional(BOOLEAN), spacing: optional(oneOf('panel', 'loose')) },
+  desc: { text: TEXT, indent: optional(BOOLEAN) },
+  note: { text: TEXT },
+  custom: { name: NON_EMPTY_TEXT },
+};
+// 排布容器总发 children（可以是空表），别的节点没有子节点时不发这一项。
+const CONSOLE_CONTAINERS: ReadonlySet<ConsoleNodeKind> = new Set(['grid', 'panel', 'loose']);
+
+function consoleNodesOf(what: string, value: unknown, path: string): ConsoleNode[] {
+  return shapedRows(what, value, { kind: oneOf(...CONSOLE_NODE_KINDS) }, path).map((row, index) => {
+    const nodePath = at(path, index);
+    const node = shaped(what, row, CONSOLE_NODE_FIELDS[row.kind], nodePath);
+    if (row.children === undefined && !CONSOLE_CONTAINERS.has(row.kind)) return node as unknown as ConsoleNode;
+    return { ...node, children: consoleNodesOf(what, row.children, at(nodePath, 'children')) } as unknown as ConsoleNode;
+  });
+}
+
+const CHOICE_PAIR: Kind<[string, string]> = {
+  ok: (value): value is [string, string] => Array.isArray(value) && value.length === 2 && value.every(TEXT.ok),
+  mismatch: '不是「值、名字」两个字符串',
+};
+const CONSOLE_FIELD = {
+  kind: oneOf('bool', 'tristate', 'number', 'percent', 'text', 'choice', 'words', 'ids'),
+  label: TEXT,
+  desc: optional(TEXT),
+  unit: optional(TEXT),
+  step: optional(NUMBER),
+  max: optional(NUMBER),
+  scale: optional(NUMBER),
+  choices: optional(listOf(CHOICE_PAIR)),
+  empty: optional(TEXT),
+  placeholder: optional(TEXT),
+  follows: optional(TEXT),
+  follows_when: optional(TEXT_LIST),
+  unset: optional(BOOLEAN),
+  path: TEXT,
+  layers: TEXT_LIST,
+  default: PRESENT,
+};
+const CONSOLE_SECTION = { id: NON_EMPTY_TEXT, label: TEXT, icon: TEXT, note: TEXT, paths: TEXT_LIST };
+
+// 认不出的节点照猜着画，页面会少一块或摆错控件，看不出是读错了。
+function consoleSchemaOf(what: string, value: unknown): ConsoleSchema {
+  const body = shaped(what, value, { version: NUMBER });
+  return {
+    version: body.version,
+    sections: shapedRows(what, body.sections, CONSOLE_SECTION, 'sections').map((section, index) => ({
+      ...section,
+      nodes: consoleNodesOf(what, section.nodes, at(at('sections', index), 'nodes')),
+    })),
+    fields: shapedRecord(what, body.fields, CONSOLE_FIELD, 'fields'),
+  };
 }
 
 export function getPlatformRaw(token: string, platformId: string): Promise<ConfigRawFile> {
@@ -2394,13 +2904,17 @@ export function updatePlatformRaw(
   return writeConfigFile(`平台 ${platformId} 的配置`, platformConfigPath(platformId, 'raw'), token, content, baseHash);
 }
 
-export function getPlatformState(token: string, platformId: string): Promise<ConfigLiveState> {
-  return readJson(platformConfigPath(platformId, 'state'), token);
+export async function getPlatformState(token: string, platformId: string): Promise<ConfigLiveState> {
+  const what = nameWith(`平台 ${platformId}`, '的生效状态');
+  const resp = await apiFetch(platformConfigPath(platformId, 'state'), { token });
+  return liveStateOf(what, await jsonOf(what, resp));
 }
 
 /** 平台页的分区布局与控件说明。取自平台代码里的声明，bot 没起来也拿得到。 */
-export function getPlatformSchema(token: string, platformId: string): Promise<ConsoleSchema> {
-  return readJson(platformConfigPath(platformId, 'schema'), token);
+export async function getPlatformSchema(token: string, platformId: string): Promise<ConsoleSchema> {
+  const what = nameWith(`平台 ${platformId}`, '的控制台布局');
+  const resp = await apiFetch(platformConfigPath(platformId, 'schema'), { token });
+  return consoleSchemaOf(what, await jsonOf(what, resp));
 }
 
 export function getFeaturesRaw(token: string): Promise<ConfigRawFile> {
@@ -2411,13 +2925,47 @@ export function updateFeaturesRaw(token: string, content: string, baseHash: stri
   return writeConfigFile('features.yaml', featuresConfigPath('raw'), token, content, baseHash);
 }
 
-export function getFeaturesState(token: string): Promise<FeaturesLiveState> {
-  return readJson(featuresConfigPath('state'), token);
+export async function getFeaturesState(token: string): Promise<FeaturesLiveState> {
+  const what = '全局设置的生效状态';
+  const resp = await apiFetch(featuresConfigPath('state'), { token });
+  return featuresStateOf(what, await jsonOf(what, resp));
 }
 
-export function getFeaturesSchema(token: string): Promise<ConsoleSchema> {
-  return readJson(featuresConfigPath('schema'), token);
+export async function getFeaturesSchema(token: string): Promise<ConsoleSchema> {
+  const what = '全局设置的控制台布局';
+  const resp = await apiFetch(featuresConfigPath('schema'), { token });
+  return consoleSchemaOf(what, await jsonOf(what, resp));
 }
+
+const DRY_RUN_PRESENCE = {
+  active: BOOLEAN,
+  window_sec: NUMBER,
+  absent_judge_probability: NUMBER,
+  quiet_wait_sec: NUMBER,
+  quiet_max_wait_sec: NUMBER,
+  density_limit: NUMBER,
+  density_window_sec: NUMBER,
+};
+const DRY_RUN_VERDICT = {
+  index: NUMBER,
+  text: TEXT,
+  triggered: BOOLEAN,
+  signal: TEXT,
+  blocked_by: TEXT,
+  reason: TEXT,
+  undetermined: BOOLEAN,
+  cooldown_remaining: NUMBER,
+  at_sec: optional(NUMBER),
+  source: optional(TEXT),
+  presence: optional(oneOf('', 'present', 'absent')),
+  quiet: optional(oneOf('', 'waiting', 'merged', 'due', 'cancelled')),
+  quiet_due_at: optional(NUMBER),
+  quiet_merged: optional(NUMBER),
+  gate: optional(oneOf('', 'pending', 'passed', 'missed')),
+  gate_probability: optional(NUMBER),
+  density_left: optional(nullable(NUMBER)),
+  present_until: optional(nullable(NUMBER)),
+};
 
 /** 试听。config 省略时用 bot 公布的生效值，省得调用方自己拼一份不一样的。 */
 export async function dryRunPlatformTrigger(
@@ -2434,28 +2982,57 @@ export async function dryRunPlatformTrigger(
     token,
     json: body,
   });
-  return resp.json();
+  // 缺一项就会把「会不会接话」「被谁拦下」念错。
+  const what = '试听结果';
+  const result = shaped(what, await jsonOf(what, resp), { enabled_signals: TEXT_LIST, cooldown_applied: BOOLEAN });
+  return {
+    enabled_signals: result.enabled_signals,
+    cooldown_applied: result.cooldown_applied,
+    ...(result.presence === undefined ? {} : { presence: shaped(what, result.presence, DRY_RUN_PRESENCE, 'presence') }),
+    results: shapedRows(what, result.results, DRY_RUN_VERDICT, 'results'),
+  };
 }
 
-export async function reloadConfig(token: string): Promise<any> {
+/** 重读了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function reloadConfig(token: string): Promise<{ ok: boolean }> {
   const resp = await apiFetch('/config/reload', {
     method: 'POST',
     token,
   });
-  return resp.json();
+  const receipt = '配置已经重新读取，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, { ok: BOOLEAN, config: OBJECT }));
+  if (!result.ok) throw new Error('服务端没有重新读取配置，请重试');
+  return result;
 }
 
-export async function reloadTools(token: string): Promise<any> {
+/** 重载工具的回执：几个重载序号，engine 比对它们决定要不要重新扫一遍工具。 */
+export interface ToolsReload {
+  ok: boolean;
+  run_id: string;
+  seq: number;
+  mcp_config_seq: number;
+  mcp_reload_seq: number;
+}
+
+const TOOLS_RELOAD = { ok: BOOLEAN, run_id: TEXT, seq: NUMBER, mcp_config_seq: NUMBER, mcp_reload_seq: NUMBER };
+
+/** 交上了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function reloadTools(token: string): Promise<ToolsReload> {
   const resp = await apiFetch('/tools/reload', {
     method: 'POST',
     token,
   });
-  return resp.json();
+  const receipt = '工具重载已经交上，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, TOOLS_RELOAD));
+  if (!result.ok) throw new Error('服务端没有重载工具，请重试');
+  const { ok, run_id, seq, mcp_config_seq, mcp_reload_seq } = result;
+  return { ok, run_id, seq, mcp_config_seq, mcp_reload_seq };
 }
 
 export async function getAllToolNames(token: string): Promise<string[]> {
+  const what = '工具名清单';
   const resp = await apiFetch('/admin/config/all-tool-names', { token });
-  return resp.json();
+  return shapedValue(what, await jsonOf(what, resp), TEXT_LIST);
 }
 
 export interface EffectiveTool {
@@ -2479,11 +3056,28 @@ export interface EffectiveTools {
   tools: EffectiveTool[];
 }
 
+const EFFECTIVE_TOOL = {
+  name: NON_EMPTY_TEXT,
+  registered: BOOLEAN,
+  external: BOOLEAN,
+  guarded: nullable(BOOLEAN),
+  gated: TEXT,
+  automatic: TEXT,
+};
+
+// 读不懂就抛：补成空表的话，授权页一个「不可用」都不标，看着就像勾了的都能用。
 export async function getEffectiveTools(token: string, nodeId: string): Promise<EffectiveTools> {
+  const what = nameWith(`节点 ${nodeId}`, '实际能用的工具');
   const resp = await apiFetch(`/admin/config/nodes/${encodeURIComponent(nodeId)}/effective-tools`, {
     token,
   });
-  return resp.json();
+  const body = shaped(what, await jsonOf(what, resp), { node_id: TEXT, mode: TEXT, dead_names: TEXT_LIST });
+  return {
+    node_id: body.node_id,
+    mode: body.mode,
+    dead_names: body.dead_names,
+    tools: shapedRows(what, body.tools, EFFECTIVE_TOOL, 'tools'),
+  };
 }
 
 // ── Model config ──
@@ -2491,52 +3085,68 @@ export async function getEffectiveTools(token: string, nodeId: string): Promise<
 // 没有读接口：/config/openai/secret 返回明文 api_key，那是 engine 取密钥的通道。
 // 界面要 model / base_url / api_key_present 就走 activeProviderConfig。
 
+/** 存上了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function updateModelConfig(
   token: string,
   params: { model?: string; base_url?: string; api_key?: string },
-): Promise<any> {
+): Promise<AppConfigPublic> {
   const resp = await apiFetch('/config/openai', {
     method: 'POST',
     token,
     json: params,
   });
-  return resp.json();
+  const receipt = savedReceipt('模型配置');
+  return receiptOf(receipt, resp, (body) => appConfigOf(receipt, body));
 }
 
+/** 会话自己的渠道覆盖：后端原样存、原样给的一份 JSON 对象，字段跟着渠道走。 */
 export type SessionProviderOverride = Record<string, unknown>;
 
+const providerOverridePath = (sessionId: string): string => `/sessions/${encodeURIComponent(sessionId)}/provider_override`;
+
 export async function getSessionProviderOverride(sessionId: string, token: string): Promise<SessionProviderOverride> {
-  const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, { token });
-  return resp.json();
+  const what = '会话的渠道覆盖';
+  const resp = await apiFetch(providerOverridePath(sessionId), { token });
+  return shaped(what, await jsonOf(what, resp), {});
 }
 
+/** 存上了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function updateSessionProviderOverride(
   sessionId: string,
   token: string,
   params: SessionProviderOverride,
 ): Promise<SessionProviderOverride> {
   // 整份替换：编辑器没摆出来的字段也得原样带回来。
-  const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, {
+  const resp = await apiFetch(providerOverridePath(sessionId), {
     method: 'PUT',
     token,
     json: params,
   });
-  return resp.json();
+  const receipt = savedReceipt('会话的渠道覆盖');
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, {}));
 }
 
+/** 清掉了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function clearSessionProviderOverride(sessionId: string, token: string): Promise<SessionProviderOverride> {
-  const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, {
+  const resp = await apiFetch(providerOverridePath(sessionId), {
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  const receipt = '会话的渠道覆盖已经清掉，可回执';
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, {}));
 }
 
 // ── Approvals ──
 
 export type ApprovalDecision = 'allow' | 'deny';
 
-/** 提交审批决定。返回的是服务端当前那条审批：status 和本次决定对不上，说明它早已被别处处理过。 */
+// 定案后的审批一定带着状态：拿它和这次的决定比，才知道生效的是不是这一次。
+const DECIDED_APPROVAL = { ...ADMIN_APPROVAL, status: NON_EMPTY_TEXT };
+
+/**
+ * 提交审批决定。返回的是服务端当前那条审批：status 和本次决定对不上，说明它早已被别处处理过。
+ * 交上了却读不懂回执时抛 ReceiptUnreadable：决定已经到了服务端，生没生效要看它现在的状态。
+ */
 export async function decideApproval(
   token: string | undefined,
   approvalId: string,
@@ -2548,43 +3158,92 @@ export async function decideApproval(
     token,
     json: { decision, comment: comment || `${decision} via web` },
   });
-  return resp.json();
+  const receipt = '审批决定已经交上，可回执';
+  return receiptOf(receipt, resp, (body) => shaped(receipt, body, DECIDED_APPROVAL) as AdminApproval);
 }
 
 // ── Cancel ──
 
-export async function cancelActiveTasks(sessionId: string): Promise<any> {
+export interface CancelResult {
+  ok: boolean;
+  /** 这次取消掉的任务数。 */
+  cancelled_count?: number;
+}
+
+const CANCEL_RESULT = { ok: BOOLEAN, cancelled_count: optional(NUMBER) };
+
+/** 取消会话里正在跑和排队的任务。后端回绝照常抛；取消了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function cancelActiveTasks(sessionId: string): Promise<CancelResult> {
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/cancel_active_tasks`, { method: 'POST' });
-  return resp.json();
+  const receipt = '取消请求已经交上，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, CANCEL_RESULT));
+  if (!result.ok) throw new Error('服务端没有取消任务，请重试');
+  return result;
 }
 
 // ── Reset conversation ──
 
-export async function resetConversation(conversationKey: string): Promise<any> {
+export interface ConversationReset {
+  ok: boolean;
+  old_session_id: string;
+  conversation_key: string;
+  /** 跟着清掉的子会话和分支数。 */
+  cleared_children: number;
+}
+
+const CONVERSATION_RESET = { ok: BOOLEAN, old_session_id: TEXT, conversation_key: TEXT, cleared_children: NUMBER };
+
+async function conversationResetOf(receipt: string, resp: Response): Promise<ConversationReset> {
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, CONVERSATION_RESET));
+  if (!result.ok) throw new Error('服务端没有重置会话，请重试');
+  return result;
+}
+
+/** 重置了却读不懂回执时抛 ReceiptUnreadable。 */
+export async function resetConversation(conversationKey: string): Promise<ConversationReset> {
   const resp = await apiFetch('/conversations/reset', {
     method: 'POST',
     json: { conversation_key: conversationKey },
   });
-  return resp.json();
+  return conversationResetOf('会话已经重置，可回执', resp);
 }
 
 // ── Active node ──
 
-export async function getActiveNode(sessionId: string): Promise<{
+export interface ActiveNode {
   node_id: string;
   is_override: boolean;
   default_node_id: string;
-}> {
-  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/active_node`);
-  return resp.json();
 }
 
-export const switchNode = commandAction('node.switch', async (sessionId: string, targetNodeId: string): Promise<any> => {
+const ACTIVE_NODE = { node_id: TEXT, is_override: BOOLEAN, default_node_id: TEXT };
+
+export async function getActiveNode(sessionId: string): Promise<ActiveNode> {
+  const what = '会话的当前节点';
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/active_node`);
+  return shaped(what, await jsonOf(what, resp), ACTIVE_NODE);
+}
+
+export interface NodeSwitch {
+  ok: boolean;
+  /** 切换后接手这个会话的节点：清掉覆盖时是默认入口。 */
+  target_node_id: string;
+  is_override: boolean;
+  default_node_id: string;
+}
+
+const NODE_SWITCH = { ok: BOOLEAN, target_node_id: TEXT, is_override: BOOLEAN, default_node_id: TEXT };
+
+/** targetNodeId 给空串是清掉覆盖、回到默认入口。后端回绝照常抛；切好了却读不懂回执时抛 ReceiptUnreadable。 */
+export const switchNode = commandAction('node.switch', async (sessionId: string, targetNodeId: string): Promise<NodeSwitch> => {
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/switch_node`, {
     method: 'POST',
     json: { target_node_id: targetNodeId },
   });
-  return resp.json();
+  const receipt = '节点已经切换，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, NODE_SWITCH));
+  if (!result.ok) throw new Error('服务端没有切换节点，请重试');
+  return result;
 });
 
 // ── App config ──
@@ -2597,9 +3256,19 @@ export interface AppConfigPublic {
   default_entry_node_id: string;
 }
 
+// 默认入口要拿去替人挑入口：不是字符串就算没读成，当成没配会挑错。
+const APP_CONFIG = { version: optional(NUMBER), provider: TEXT, openai: OBJECT, default_entry_node_id: TEXT };
+const OPENAI_PUBLIC = { model: TEXT, base_url: TEXT, api_key_present: optional(BOOLEAN) };
+
+function appConfigOf(what: string, value: unknown): AppConfigPublic {
+  const body = shaped(what, value, APP_CONFIG);
+  return { ...body, openai: shaped(what, body.openai, OPENAI_PUBLIC, 'openai') };
+}
+
 export async function getConfig(): Promise<AppConfigPublic> {
+  const what = '全局配置';
   const resp = await apiFetch('/config');
-  return resp.json();
+  return appConfigOf(what, await jsonOf(what, resp));
 }
 
 /** getConfig 的旧名：插件拿到的是整个 api 模块，删了会断插件。 */
@@ -2617,30 +3286,44 @@ export interface SessionListItem {
   updated_at: string;
 }
 
+const SESSION_ITEM = {
+  session_id: NON_EMPTY_TEXT, conversation_key: TEXT, channel: TEXT, created_at: TEXT, updated_at: TEXT,
+};
+
 /** 一页会话，按最近更新排在前。返回条数少于 limit 就是到底了。 */
 export async function listSessions(channel = 'web', limit = 50, offset = 0): Promise<SessionListItem[]> {
+  const what = '会话列表';
   const query = new URLSearchParams({ channel, limit: String(limit) });
   if (offset > 0) query.set('offset', String(offset));
   const resp = await apiFetch(`/sessions?${query}`);
-  const data = await resp.json();
-  if (!Array.isArray(data)) throw new Error('会话列表响应格式无效');
-  return data;
+  return shapedRows(what, await jsonOf(what, resp), SESSION_ITEM);
 }
 
 // ── Delete session ──
 
+/** 后端回绝照常抛；删掉了却读不懂回执时抛 ReceiptUnreadable。 */
 export async function deleteSession(sessionId: string): Promise<{ ok: boolean }> {
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
-  const result = await resp.json();
-  if (result?.ok !== true) throw new Error('服务端未确认删除会话，请重试');
+  const receipt = '会话已经删掉，可回执';
+  const result = await receiptOf(receipt, resp, (body) => shaped(receipt, body, { ok: BOOLEAN }));
+  if (!result.ok) throw new Error('服务端未确认删除会话，请重试');
   return result;
 }
 
 // ── Session messages (legacy, flat text) ──
 
-export async function getSessionMessages(sessionId: string, limit = 200): Promise<{ role: string; content: string }[]> {
+/** 消息正文：纯文本，或者带图片、文件的多模态块。 */
+export type MessageContent = string | Array<Record<string, unknown>>;
+
+const MESSAGE_CONTENT: Kind<MessageContent> = {
+  ok: (value): value is MessageContent => typeof value === 'string' || (Array.isArray(value) && value.every(isJsonObject)),
+  mismatch: '不是字符串，也不是对象数组',
+};
+
+export async function getSessionMessages(sessionId: string, limit = 200): Promise<{ role: string; content: MessageContent }[]> {
+  const what = '会话消息';
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/messages?limit=${limit}`);
-  return resp.json();
+  return shapedRows(what, await jsonOf(what, resp), { role: TEXT, content: MESSAGE_CONTENT });
 }
 
 // ── Structured history (ConversationStore) ──
@@ -2659,7 +3342,7 @@ export interface StructuredMessage {
   /** 在完整历史里的位置，从 0 起。往前翻页时拿最早一条的 cursor 当 before。老后端不给。 */
   cursor?: number;
   role: string;
-  content: string;
+  content: MessageContent;
   message_type?: string;
   created_at?: string;
   source_node_id?: string;
@@ -2707,14 +3390,23 @@ export interface SessionHistoryQuery {
   signal?: AbortSignal;
 }
 
+// 其余字段拼卡片时逐个看类型；这几项不对，翻页接不上或者整页渲染不出来。
+const HISTORY_ROW = {
+  id: TEXT,
+  cursor: optional(NUMBER),
+  role: TEXT,
+  content: MESSAGE_CONTENT,
+  tool_calls: optional(listOf(OBJECT)),
+  thinking_blocks: optional(listOf(OBJECT)),
+};
+
 export async function getSessionHistory(sessionId: string, query: SessionHistoryQuery = {}): Promise<StructuredMessage[]> {
+  const what = '历史消息';
   const params = new URLSearchParams({ limit: String(query.limit ?? 200) });
   if (query.before !== undefined) params.set('before', String(query.before));
   if (query.taskId) params.set('task_id', query.taskId);
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/history?${params}`, { signal: query.signal });
-  const data = await resp.json();
-  if (!Array.isArray(data)) throw new Error('历史消息响应格式无效');
-  return data;
+  return shapedRows(what, await jsonOf(what, resp), HISTORY_ROW) as unknown as StructuredMessage[];
 }
 
 const CHILD_SESSION = {
@@ -2732,8 +3424,9 @@ const CHILD_SESSION = {
 };
 
 export async function getSessionChildren(sessionId: string): Promise<ChildSessionInfo[]> {
+  const what = '子会话列表';
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/children`);
-  return shapedRows('子会话列表', await resp.json(), CHILD_SESSION);
+  return shapedRows(what, await jsonOf(what, resp), CHILD_SESSION);
 }
 
 /** 会话里（含入口分支）还在排队或在跑的任务。挂起等子任务的不算。 */
@@ -2764,9 +3457,10 @@ const RUNNING_TASK = {
 // 补成空表就是「什么都没在跑」：会话的生成中标记会被错清掉。
 // 挂起等子 agent 的也要：不带的话，正等子 agent 的会话重连后被标成空闲。
 export async function getSessionRunningTasks(sessionId: string): Promise<SessionRunningTask[]> {
+  const what = '运行中的任务列表';
   const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/running_tasks?include_suspended=true`);
-  const body = shaped('运行中的任务列表', await resp.json(), {});
-  return shapedRows('运行中的任务列表', body.tasks, RUNNING_TASK, 'tasks') as SessionRunningTask[];
+  const body = shaped(what, await jsonOf(what, resp), {});
+  return shapedRows(what, body.tasks, RUNNING_TASK, 'tasks') as SessionRunningTask[];
 }
 
 // ── 运行诊断 ──
@@ -2799,28 +3493,52 @@ export interface LogFileInfo {
   modified: number;
 }
 
+const WORKER_HEALTH = {
+  alive: BOOLEAN,
+  pid: nullable(NUMBER),
+  uptime_sec: NUMBER,
+  failures: NUMBER,
+  respawns: NUMBER,
+  given_up: BOOLEAN,
+  last_exit_code: nullable(NUMBER),
+  last_log: TEXT,
+  retry_in_sec: NUMBER,
+  generation: TEXT,
+};
+const RUNTIME_STATUS = { supervised: BOOLEAN, workers: OBJECT, tasks: OBJECT, started_at: TEXT, uptime_sec: NUMBER };
+const TASK_COUNTS = { queued: NUMBER, running: NUMBER };
+
+// worker 补成空表就是「一个都没起来」，任务数补成 0 就是「什么都没在跑」。
 export async function getRuntimeStatus(token: string): Promise<RuntimeStatus> {
+  const what = '运行状态';
   const resp = await apiFetch('/admin/runtime/status', { token });
-  return resp.json();
+  const body = shaped(what, await jsonOf(what, resp), RUNTIME_STATUS);
+  return {
+    ...body,
+    workers: shapedRecord(what, body.workers, WORKER_HEALTH, 'workers'),
+    tasks: shaped(what, body.tasks, TASK_COUNTS, 'tasks'),
+  };
 }
 
 const LOG_FILE = { name: NON_EMPTY_TEXT, size: NUMBER, modified: NUMBER };
 
 // 补成空表就是「还没有日志文件」。
 export async function listLogFiles(token: string): Promise<LogFileInfo[]> {
+  const what = '日志列表';
   const resp = await apiFetch('/admin/runtime/logs', { token });
-  const body = shaped('日志列表', await resp.json(), {});
-  return shapedRows('日志列表', body.files, LOG_FILE, 'files');
+  const body = shaped(what, await jsonOf(what, resp), {});
+  return shapedRows(what, body.files, LOG_FILE, 'files');
 }
 
 export async function readLogTail(
   token: string, name: string, lines = 500,
 ): Promise<{ text: string; truncated: boolean }> {
+  const what = nameWith(`日志 ${name}`, '的内容');
   const resp = await apiFetch(
     `/admin/runtime/logs/${encodeURIComponent(name)}?lines=${lines}`,
     { token },
   );
-  return resp.json();
+  return shaped(what, await jsonOf(what, resp), { text: TEXT, truncated: BOOLEAN });
 }
 
 export async function retryEngine(token: string): Promise<void> {
@@ -2944,7 +3662,7 @@ const importedReceipt = (what: string): string => nameWith(what, '已经导入�
 export async function getPlugins(token: string, signal?: AbortSignal): Promise<PluginsResponse> {
   const what = '插件列表';
   const resp = await apiFetch('/admin/plugins', { token, signal });
-  const body = shaped(what, await resp.json(), { generation: TEXT, shared_group: nullable(TEXT) });
+  const body = shaped(what, await jsonOf(what, resp), { generation: TEXT, shared_group: nullable(TEXT) });
   return {
     ...body,
     plugins: shapedRows(what, body.plugins, {}, 'plugins').map((row, index) => pluginRow(what, row, at('plugins', index))),
@@ -2953,8 +3671,9 @@ export async function getPlugins(token: string, signal?: AbortSignal): Promise<P
 }
 
 export async function getPluginSource(token: string, id: string): Promise<{ content: string; hash: string }> {
+  const what = `插件 ${id} 的源码`;
   const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, { token });
-  const { content, hash } = shaped(`插件 ${id} 的源码`, await resp.json(), RAW_TEXT);
+  const { content, hash } = shaped(what, await jsonOf(what, resp), RAW_TEXT);
   return { content, hash };
 }
 

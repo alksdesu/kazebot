@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { RequestTicket } from '../../../api/requestGuard';
+import { errorMessage } from '../../../api/request';
 import { checkHealth, HEALTH_TIMEOUT_MS } from '../../../api/supervisorClient';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
@@ -9,6 +10,7 @@ import { readProviderTable } from '../../../store/settingsReads';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { LoginPage } from '../../auth/LoginPage';
 import { Block, Button, PageShell } from './settingsControls';
+import { appendSentence } from '../../../utils/sentence';
 
 export const GeneralSettingsPage = () => {
   const { adminToken, isAuthenticated, isConnected, storageWarning, setConnected } = useSettingsStore();
@@ -27,10 +29,10 @@ export const GeneralSettingsPage = () => {
     try {
       await checkHealth(request.signal, HEALTH_TIMEOUT_MS);
       if (request.isCurrent()) setConnected(true);
-    } catch {
+    } catch (caught) {
       if (request.isCurrent()) {
         setConnected(false);
-        setError('无法连接调度器。请检查服务是否运行，再刷新连接状态。');
+        setError(appendSentence(`健康检查没通过：${errorMessage(caught)}`, '请检查服务是否运行，再刷新连接状态'));
       }
     } finally {
       if (healthCheck.current === request) {

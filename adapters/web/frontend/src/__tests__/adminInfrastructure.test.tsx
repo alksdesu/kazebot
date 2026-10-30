@@ -39,6 +39,8 @@ import { YamlEditor } from '../components/common';
 import { TONE_BOX } from '../styles/tones';
 import { inferToolRisk, riskClassName, riskLabel } from '../utils/toolRisk';
 
+import { adminState, configReloadReply, restartReply, toolsReloadReply } from './fixtures/systemReplies';
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -57,7 +59,10 @@ describe('admin API infrastructure wrappers', () => {
       if (url.endsWith('/tools') || url.endsWith('/skills') || url.endsWith('/mcp-clients') || url.endsWith('/all-tool-names')) {
         return jsonResponse([]);
       }
-      return jsonResponse({ ok: true, sessions: 0, approvals: {}, tasks: {}, pending_approvals: [], engine_runtime: {} });
+      if (url.endsWith('/v1/admin/restart')) return jsonResponse(restartReply());
+      if (url.endsWith('/v1/config/reload')) return jsonResponse(configReloadReply());
+      if (url.endsWith('/v1/tools/reload')) return jsonResponse(toolsReloadReply());
+      return jsonResponse(adminState());
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -114,7 +119,10 @@ describe('admin API infrastructure wrappers', () => {
   });
 
   it('creates and deletes nodes, tools, and skills through admin config endpoints', async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ ok: true, hash: 'h1' }));
+    // Receipts as the backend sends them: node and tool deletes carry restored, a skill delete only ok.
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => jsonResponse(
+      init?.method !== 'DELETE' ? { ok: true, hash: 'h1' } : url.includes('/skills/') ? { ok: true } : { ok: true, restored: false },
+    ));
     vi.stubGlobal('fetch', fetchMock);
 
     await createNode('admin-token', { id: 'node-a', content: 'id: node-a\n' });

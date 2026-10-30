@@ -1,10 +1,10 @@
 // 链路分区里前端自己画的几块：队列与缓存的实况、改一次要重启的那几个值，以及唯一的危险操作。
 import { useState } from 'react';
 
-import { restartEngine } from '../api/supervisorClient';
+import { receipted, restartEngine } from '../api/supervisorClient';
 import { usePageNotice } from '../hooks/usePageNotice';
 import { useSettingsStore } from '../store/settingsStore';
-import { restartRefusal } from '../utils/systemStatus';
+import { restartRefusal, unreadRestartMessage } from '../utils/systemStatus';
 import {
   Button,
   DangerPanel,
@@ -91,8 +91,10 @@ export const RestartEngine = () => {
     if (!token) return;
     setMessage('正在请求…');
     try {
-      const result = await restartEngine(token, '用户从控制台请求重启引擎');
-      if (result?.scheduled) setMessage('已排上重启，几秒后 worker 会重新起来。');
+      const { result, receiptProblem } = await receipted(restartEngine(token, '用户从控制台请求重启引擎'));
+      // 回执读不懂时请求已经到了：当成失败，人会再点一次，可能重启两回。
+      if (!result) setMessage(unreadRestartMessage(receiptProblem));
+      else if (result.scheduled) setMessage('已排上重启，几秒后 worker 会重新起来。');
       else setError(`没能重启：${restartRefusal(result)}。`);
     } catch (caught) {
       setError(errorMessage(caught, '请求失败'));

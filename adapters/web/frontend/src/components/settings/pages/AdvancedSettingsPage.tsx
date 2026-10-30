@@ -8,7 +8,7 @@ import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/u
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { appendSentence, reloadBeforeEditing, savedMessage } from '../../../utils/sentence';
+import { appendSentence, reloadBeforeEditing, rereadMissed, savedMessage } from '../../../utils/sentence';
 import { YamlEditor } from '../../common';
 import { RawFormStatus, RawSourceDetails } from '../RawSourceDetails';
 import {
@@ -77,7 +77,7 @@ async function reloadAfterUnreadReceipt(receiptProblem: string, reload: () => Pr
     await reload();
     return receiptProblem;
   } catch (error) {
-    return appendSentence(reloadBeforeEditing(receiptProblem, '点「加载」读入最新内容'), `刚才重新读取也没成：${errorMessage(error)}`);
+    return appendSentence(reloadBeforeEditing(receiptProblem, '点「加载」读入最新内容'), rereadMissed(errorMessage(error)));
   }
 }
 
@@ -200,13 +200,15 @@ const RuntimeFileBody = () => {
     const unsaved = dirty ? '未保存的修改也会一起丢掉。' : '';
     if (!window.confirm(`删掉本实例的 config/runtime.yaml，全部参数恢复成仓库默认？${unsaved}`)) return;
     await run(async () => {
+      let receiptProblem: string;
       try {
-        await resetRuntime(adminToken);
-        adopt(await getRuntimeLayers(adminToken));
-        return { text: '已恢复成仓库默认', failed: false };
+        ({ receiptProblem } = await receipted(resetRuntime(adminToken)));
       } catch (error) {
         return failed(errorMessage(error, '恢复默认失败'));
       }
+      // 已经删了：紧接着那次重读没成不能报成恢复失败，手上的指纹作废了，得先加载再改。
+      const problem = await reloadAfterUnreadReceipt(receiptProblem, async () => { adopt(await getRuntimeLayers(adminToken)); });
+      return { text: '已恢复成仓库默认', failed: false, problem };
     });
   };
 

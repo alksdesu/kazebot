@@ -10,8 +10,10 @@ import {
   getConversationMessages,
   getMemoryEntries,
   getMemoryOverview,
+  receipted,
   resetConversationBySession,
   saveMemoryEntry,
+  type ConversationMessages,
   type ConversationRow,
   type MemoryEntry,
   type MemoryNamespace,
@@ -25,6 +27,8 @@ import { useConversationNames } from '../features/useConversationNames';
 import { scopeIdentity } from '../features/conversationNames';
 import { ContextArchiveSettings } from './ContextArchiveSettings';
 import { errorMessage } from '../api/request';
+import { KEYWORD_INPUT_HINT, splitKeywords } from '../utils/keywords';
+import { appendSentence } from '../utils/sentence';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
 
@@ -186,16 +190,17 @@ const MemoryBlock = () => {
     setBusy(true);
     setMessage('');
     try {
-      await saveMemoryEntry(adminToken, selected, {
+      const { receiptProblem } = await receipted(saveMemoryEntry(adminToken, selected, {
         id: draft.id.trim(),
         content: draft.content.trim(),
-        keywords: draft.keywords.split(',').map((word) => word.trim()).filter(Boolean),
+        keywords: splitKeywords(draft.keywords),
         constant: draft.constant,
-      });
+      }));
+      // 回执读不懂时也已经存上了：草稿照清，条目以紧接着重读到的为准。
       setDraft(EMPTY_DRAFT);
       await loadEntries(selected);
       await loadOverview();
-      setMessage('已添加');
+      setMessage('已添加', receiptProblem && appendSentence(receiptProblem, '条目以重新读到的为准'));
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -218,11 +223,14 @@ const MemoryBlock = () => {
     if (!window.confirm(`清空「${current?.owner.label || '所选来源'}」的全部记忆？不可恢复。`)) return;
     setBusy(true);
     try {
-      const removed = await clearMemoryNamespace(adminToken, selected);
+      const { result: removed, receiptProblem } = await receipted(clearMemoryNamespace(adminToken, selected));
       setSelected('');
       setDraft(EMPTY_DRAFT);
       await loadOverview();
-      setMessage(`已清空 ${removed} 条`);
+      setMessage(
+        removed === null ? '已清空' : `已清空 ${removed} 条`,
+        receiptProblem && appendSentence(receiptProblem, '删了几条没读到'),
+      );
     } catch (caught) { setError(errorMessage(caught)); } finally { setBusy(false); }
   };
 
@@ -340,7 +348,7 @@ const MemoryBlock = () => {
                   <span className={LABEL}>关键词</span>
                   <Input
                     onChange={(event) => setDraft({ ...draft, keywords: event.target.value })}
-                    placeholder="逗号分隔，说到这些词时才会想起来"
+                    placeholder={`说到这些词时才会想起来。${KEYWORD_INPUT_HINT}`}
                     value={draft.keywords}
                     width="flex"
                   />
@@ -377,7 +385,7 @@ const ContextBlock = () => {
   const requests = useRequestGuard();
   const names = useConversationNames(rows.map(row => ({ scope: row.conversation_key || `session:${row.session_id}`, owner: row.owner, current_account: row.current_account })));
   const labelFor = (row: ConversationRow) => names.get(scopeIdentity(row.conversation_key || `session:${row.session_id}`)) || '会话（名称暂不可用）';
-  const [preview, setPreview] = useState<{ id: string; total: number; messages: Array<Record<string, any>> } | null>(null);
+  const [preview, setPreview] = useState<({ id: string } & ConversationMessages) | null>(null);
   const { notice, error, setMessage, setError } = usePageNotice();
   const [offset, setOffset] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -405,12 +413,13 @@ const ContextBlock = () => {
     requests.drop('preview');
     setLoading(false);
     try {
-      await resetConversationBySession(adminToken, row.session_id);
+      // 回执读不懂时上下文也已经删了：照删完收尾，再交代回执的事。
+      const { receiptProblem } = await receipted(resetConversationBySession(adminToken, row.session_id));
       if (!requests.isCurrent()) return;
       setPreview(null);
       await load();
       if (!requests.isCurrent()) return;
-      setMessage('已删除，下一条消息开始重新积累');
+      setMessage('已删除，下一条消息开始重新积累', receiptProblem);
     } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
 
@@ -436,9 +445,9 @@ const ContextBlock = () => {
           <p className={KW}>共 {preview.total} 条，显示最近 {preview.messages.length} 条</p>
           {preview.messages.map((msg, index) => (
             <p className={TEXT} key={index}>
-              <span className={ID}>{String(msg.role || '')}</span>
+              <span className={ID}>{msg.role}</span>
               {' '}
-              {String(msg.content || '').slice(0, 400)}
+              {entryText(msg.content).slice(0, 400)}
             </p>
           ))}
         </div>

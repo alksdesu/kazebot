@@ -28,6 +28,8 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   setActiveProvider: vi.fn(),
   upsertProvider: vi.fn(),
 }));
+// 系统槽位另有测试。留在页上的话它没有桩、会报没读到，和本页自己的提示抢 alert。
+vi.mock('../console/SystemSlots', () => ({ SystemSlots: () => null }));
 
 const PROVIDERS = {
   active_provider: 'openai',

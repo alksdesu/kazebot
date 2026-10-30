@@ -55,6 +55,15 @@ describe('平台注册表', () => {
     expect(looksLikeScopeKey('qq_group:')).toBe(true);
   });
 
+  it('和后端一样去掉空白、前缀不分大小写：后端认的作用域，前端不能当成认不出的键', () => {
+    expect(conversationKindForScope(' QQ_Group : abc ')).toBe('group');
+    expect(platformForScope('Qq_Private:7')?.id).toBe('qq');
+    expect(isConversationScope('qq_group:   ')).toBe(false);
+    expect(isConversationScope(':abc')).toBe(false);
+    expect(looksLikeScopeKey(' QQ_GROUP:x')).toBe(true);
+    expect(looksLikeScopeKey('QQ 群')).toBe(false);
+  });
+
   it('换上后端清单之后认得新平台，空清单不覆盖内置的', () => {
     adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
     expect(conversationKindForScope('tg_group:abc')).toBe('group');

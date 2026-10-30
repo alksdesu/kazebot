@@ -277,7 +277,7 @@ describe('收尾不留定时器', () => {
 
 describe('featureRequest 沿用同一套时限', () => {
   it('默认 GET 到点报超时', async () => {
-    const result = capture(featureRequest('/v1/community/state', { scope: 'qq_group:probe' }));
+    const result = capture(featureRequest('/v1/community/state', { what: '社区状态', scope: 'qq_group:probe' }));
     await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS - 1);
     expect(result.settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
@@ -292,7 +292,7 @@ describe('featureRequest 沿用同一套时限', () => {
   });
 
   it('POST 推过十分钟也不超时', async () => {
-    const result = capture(featureRequest('/v1/community/rules', { method: 'POST', body: { name: '规则' } }));
+    const result = capture(featureRequest('/v1/community/rules', { method: 'POST', receipt: '规则已经建好，可回执', body: { name: '规则' } }));
     await vi.advanceTimersByTimeAsync(TEN_MINUTES);
     expect(result.settled).toBe(false);
     expect(vi.getTimerCount()).toBe(0);

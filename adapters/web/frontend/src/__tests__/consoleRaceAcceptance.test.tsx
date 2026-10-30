@@ -6,6 +6,7 @@ import { ProvidersPage } from '../console/ProvidersPage';
 import { AccountScope } from '../console/AccountScope';
 import { MemoryPage } from '../console/MemoryPage';
 import { useSettingsStore } from '../store/settingsStore';
+import { scopeMigrationReply } from './fixtures/accountReplies';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
@@ -87,7 +88,7 @@ beforeEach(() => {
   vi.mocked(api.getConversations).mockResolvedValue([]);
   vi.mocked(api.getConversationMessages).mockResolvedValue({ total: 0, messages: [] });
   vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target) => scopeStatus(target));
-  vi.mocked(api.migrateAccountScope).mockResolvedValue({ moved_memory_dirs: 1, sessions_changed: 1, backup_dir: 'synthetic-backup' });
+  vi.mocked(api.migrateAccountScope).mockResolvedValue(scopeMigrationReply({ moved_memory_dirs: 1, sessions_changed: 1, backup_dir: 'synthetic-backup' }));
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -176,7 +177,7 @@ describe('记忆来源与上下文读取', () => {
     const a = { ...conversation('a'), owner: { kind: 'group' as const, label: '同名群' } };
     const b = { ...conversation('b'), owner: { kind: 'group' as const, label: '同名群' }, current_account: false };
     vi.mocked(api.getConversations).mockResolvedValue([a, b]);
-    vi.mocked(api.resetConversationBySession).mockResolvedValue({});
+    vi.mocked(api.resetConversationBySession).mockResolvedValue({ ok: true, old_session_id: 'b', conversation_key: 'qq_group:b', cleared_children: 0 });
     render(<MemoryPage />); const titles = await screen.findAllByText(/^同名群/);
     const label = titles.find(item => item.textContent?.includes('历史账号'))!;
     fireEvent.click(within(label.parentElement!).getByRole('button', { name: '删除' }));
@@ -223,7 +224,7 @@ describe('记忆来源与上下文读取', () => {
     expect(screen.getByLabelText('内容')).toHaveValue('未保存记忆'); expect(screen.getByLabelText('标识')).toHaveValue('fixture_entry');
   });
   it('上下文预览保持最后选择的会话，不被旧会话回包覆盖', async () => {
-    const old = deferred<{ total: number; messages: Array<Record<string, unknown>> }>();
+    const old = deferred<api.ConversationMessages>();
     vi.mocked(api.getConversations).mockResolvedValue([conversation('甲'), conversation('乙')]);
     vi.mocked(api.getConversationMessages).mockImplementation(async (_auth, id) => id === '甲' ? old.promise : { total: 1, messages: [{ role: 'user', content: '乙会话原文' }] });
     render(<MemoryPage />); await screen.findByText('会话甲');

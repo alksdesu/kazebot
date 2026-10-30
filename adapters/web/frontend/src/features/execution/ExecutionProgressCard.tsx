@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { readReceipt, receipted } from '../../api/shape';
+import { appendSentence } from '../../utils/sentence';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { startPolling } from '../../utils/polling';
 import { downloadFeature, featureRequest } from '../client';
 import { actionClass, FeatureFeedback, primaryClass } from '../ui';
-import { readExecutionPlan, statusLabel, type ExecutionPlan } from './types';
+import { PLAN_ACTION_RECEIPTS, readExecutionPlan, statusLabel, type ExecutionPlan, type PlanAction } from './types';
+
+const PLAN = '计划进度';
 
 export function ExecutionProgressCard({ planId, scope }: { planId: string; scope?: string }) {
   const [plan, setPlan] = useState<ExecutionPlan | null>(null);
@@ -19,17 +23,25 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
     const refresh = async () => {
       if (mutating.current) return;
       const request = requests.begin('plan');
-      try { const value = await featureRequest<unknown>(`/v1/execution/plans/${planId}`, { scope, signal: request.signal }); if (request.isCurrent()) { setPlan(readExecutionPlan(value)); setReadError(''); } }
+      try { const value = await featureRequest(`/v1/execution/plans/${planId}`, { what: PLAN, scope, signal: request.signal }); if (request.isCurrent()) { setPlan(readExecutionPlan(value)); setReadError(''); } }
       catch (reason) { if (request.isCurrent()) setReadError(errorMessage(reason)); }
     };
     const stop = startPolling(refresh, 3000, { first: refresh });
     return () => { requests.drop('plan'); stop(); };
   }, [requests, planId, scope, retry]);
   if (!plan || plan.id !== planId || (scope && plan.scope !== scope)) return readError ? <FeatureFeedback error={readError} retry={() => setRetry(current => current + 1)} /> : <p role="status">正在读取计划进度…</p>;
-  const action = async (name: string) => {
+  const action = async (name: PlanAction) => {
     if (mutating.current) return;
     mutating.current = true; requests.drop('plan'); setBusy(true);
-    try { setError(''); const next = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', body: { expected_revision: plan.revision, step_ids: [] } })); if (requests.isCurrent()) setPlan(next); } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); } }
+    try {
+      setError('');
+      const receipt = PLAN_ACTION_RECEIPTS[name];
+      const { result: next, receiptProblem } = await receipted(featureRequest(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', receipt, body: { expected_revision: plan.revision, step_ids: [] } })
+        .then(value => readReceipt(receipt, value, readExecutionPlan)));
+      if (!requests.isCurrent()) return;
+      if (next) setPlan(next);
+      else setError(appendSentence(receiptProblem, '进度以下一次读到的为准'));
+    } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); } }
   };
   return <section className="min-w-0 space-y-3 border border-[var(--duties-border)] p-3 text-sm [overflow-wrap:anywhere]" aria-label="计划步骤进度">
     <h3 className="font-semibold">{plan.goal} · {statusLabel[plan.status]}</h3><p className="text-sm">{plan.id} · 版本 {plan.revision} · {plan.work_scope}</p>

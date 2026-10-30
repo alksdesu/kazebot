@@ -22,6 +22,14 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+const pendingApproval = (approvalId: string) => ({
+  approval_id: approvalId, session_id: 'session-alpha', operation: 'execute_command', details: {},
+  status: 'pending', fingerprint: `fp-${approvalId}`, requested_at: '2026-06-01T13:59:00.000Z',
+  decided_at: null, decision: null, comment: null, tool_call_id: null, node_id: 'node-alpha', task_id: 'task-alpha-123456',
+});
+
+const quietState = (sessions: number) => ({ sessions, approvals: { pending: 0 }, tasks: {}, pending_approvals: [], engine_runtime: {} });
+
 describe('SystemDashboard', () => {
   beforeEach(() => {
     useSettingsStore.setState({ adminToken: 'admin-token', isConnected: true });
@@ -36,6 +44,7 @@ describe('SystemDashboard', () => {
           sessions: 3,
           approvals: { pending: 2, allowed: 1, denied: 0 },
           tasks: { pending: 1, running: 4, suspended: 1, completed: 10, failed: 0, cancelled: 0 },
+          pending_approvals: [pendingApproval('ap-1'), pendingApproval('ap-2')],
           engine_runtime: { worker_id: 'worker-a', last_seen_at: '2026-06-01T14:00:00.000Z', workers: ['worker-a'] },
         });
       }
@@ -60,6 +69,10 @@ describe('SystemDashboard', () => {
           caller_task_id: null,
           input_summary: 'Inspect current production state',
           cancel_requested: false,
+          current_phase: '',
+          current_detail: '',
+          lane: 'interactive',
+          awaiting_approval: false,
         }]);
       }
       return jsonResponse({});
@@ -135,7 +148,7 @@ describe('SystemDashboard', () => {
       const url = String(input);
       if (url.endsWith('/v1/admin/state')) {
         stateCalls += 1;
-        return stateCalls === 1 ? slow.promise : jsonResponse({ sessions: 7, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} });
+        return stateCalls === 1 ? slow.promise : jsonResponse(quietState(7));
       }
       if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
       return jsonResponse({});
@@ -148,9 +161,10 @@ describe('SystemDashboard', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
     expect(stateCalls).toBe(1);
-    expect(screen.getByText('…')).toBeInTheDocument();
+    // 会话数、待审批、运行中任务和引擎都还没读到。
+    expect(screen.getAllByText('…')).toHaveLength(4);
 
-    await act(async () => { slow.resolve(jsonResponse({ sessions: 3, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} })); });
+    await act(async () => { slow.resolve(jsonResponse(quietState(3))); });
     expect(stateCalls).toBe(1);
     expect(screen.getByText('3')).toBeInTheDocument();
 
@@ -166,7 +180,7 @@ describe('SystemDashboard', () => {
       const url = String(input);
       if (url.endsWith('/v1/admin/state')) {
         stateCalls += 1;
-        return stateCalls === 1 ? slow.promise : jsonResponse({ sessions: 9, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} });
+        return stateCalls === 1 ? slow.promise : jsonResponse(quietState(9));
       }
       if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
       return jsonResponse({});
@@ -182,9 +196,9 @@ describe('SystemDashboard', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(stateCalls).toBe(1);
-    expect(screen.getByText('…')).toBeInTheDocument();
+    expect(screen.getAllByText('…')).toHaveLength(4);
 
-    await act(async () => { slow.resolve(jsonResponse({ sessions: 4, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} })); });
+    await act(async () => { slow.resolve(jsonResponse(quietState(4))); });
     expect(stateCalls).toBe(1);
     expect(screen.getByText('4')).toBeInTheDocument();
 
@@ -194,5 +208,40 @@ describe('SystemDashboard', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(stateCalls).toBe(2);
     expect(screen.getByText('9')).toBeInTheDocument();
+  });
+
+  // 没读成的计数摆成 0，看着就像真的没有待审批、没有在跑的任务。
+  it('says a state it never read is unknown and why, instead of showing zeros', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/admin/state')) return jsonResponse({ sessions: 3, approvals: { pending: 1 }, engine_runtime: {} });
+      if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
+      return jsonResponse({});
+    }));
+    render(<SystemDashboard />);
+
+    expect(await screen.findByText('管理状态格式不对：缺 tasks')).toBeInTheDocument();
+    expect(screen.getAllByText('无数据')).toHaveLength(4);
+    expect(screen.getByText('引擎状态没读到。')).toBeInTheDocument();
+    expect(screen.queryByText('0')).not.toBeInTheDocument();
+    expect(screen.queryByText('无工作进程')).not.toBeInTheDocument();
+  });
+
+  it('keeps the active task modal from calling an unread list empty', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/admin/state')) return jsonResponse(quietState(1));
+      if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
+      if (url.endsWith('/v1/admin/tasks/active')) return jsonResponse([{ task_id: 'task-1', status: 'running' }]);
+      return jsonResponse({});
+    }));
+    render(<SystemDashboard />);
+    await waitFor(() => expect(screen.getByText('1')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '查看运行中任务详情' }));
+
+    expect(await screen.findByText('活跃任务列表格式不对：缺 [0].session_id')).toBeInTheDocument();
+    expect(screen.getByText('活跃任务没读到，不知道现在有没有在跑的任务')).toBeInTheDocument();
+    expect(screen.queryByText('当前没有活跃任务')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '重读' })).toBeInTheDocument();
   });
 });

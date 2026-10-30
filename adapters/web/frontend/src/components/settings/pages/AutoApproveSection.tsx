@@ -1,6 +1,7 @@
 // 自动审批：勾中的工具在本浏览器免审批。存 localStorage，跟服务端策略是两回事。
 import { useEffect, useMemo, useState } from 'react';
 
+import { errorMessage } from '../../../api/request';
 import { getAllToolNames } from '../../../api/supervisorClient';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import {
@@ -10,6 +11,7 @@ import {
 } from '../../../store/clientPrefsStore';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { appendSentence } from '../../../utils/sentence';
 import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
 import { Block, Button, Chip, Chips, Empty, Facts, Input, Tag } from './settingsControls';
 
@@ -35,7 +37,9 @@ const RECOMMENDED_TOOL_NAMES = new Set(KNOWN_TOOL_RULES.map((rule) => rule.toolN
 
 const OTHER_TOOL_DESCRIPTION = '默认需要手动审批。它送审时报什么策略操作由后端决定，所以还要把那个操作也勾上才会自动放行。';
 
-const CATALOG_LOAD_ERROR = '拉不到后端工具清单，下面只剩这几个已知项。别的工具不是被关掉了，是这次没列出来，重新加载页面再试。';
+const catalogLoadError = (reason: string): string => appendSentence(
+  `拉不到后端工具清单：${reason}`, '下面只剩这几个已知项。别的工具不是被关掉了，是这次没列出来。',
+);
 
 const CoveredOperations = ({ toolName }: { toolName: string }) => {
   const operations = TOOL_APPROVAL_OPERATIONS[toolName];
@@ -83,7 +87,8 @@ export const AutoApproveSection = () => {
   // 同页的工具清单先到就先用，免得这一节自己那次请求回来之前只剩七行在闪。
   const seededToolNames = useSettingsSelectionStore((state) => state.allToolNames);
   const [fetchedToolNames, setFetchedToolNames] = useState<string[] | null>(null);
-  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadFailure, setLoadFailure] = useState('');
+  const [readAttempt, setReadAttempt] = useState(0);
   const [query, setQuery] = useState('');
   const [showAll, setShowAll] = useState(false);
   const requests = useRequestGuard();
@@ -93,13 +98,13 @@ export const AutoApproveSection = () => {
     getAllToolNames(adminToken || '')
       .then((names) => {
         if (!request.isCurrent()) return;
-        setFetchedToolNames(Array.isArray(names) ? names : []);
-        setLoadFailed(false);
+        setFetchedToolNames(names);
+        setLoadFailure('');
       })
-      .catch(() => {
-        if (request.isCurrent()) setLoadFailed(true);
+      .catch((caught: unknown) => {
+        if (request.isCurrent()) setLoadFailure(errorMessage(caught, '工具清单读取失败'));
       });
-  }, [requests, adminToken]);
+  }, [requests, adminToken, readAttempt]);
 
   const recommended = useMemo(
     () => KNOWN_TOOL_RULES.map((rule): ToolRule => ({ ...rule, risk: inferToolRisk(rule.toolName) })),
@@ -136,7 +141,7 @@ export const AutoApproveSection = () => {
 
   // 搜索的时候一直折着等于搜了个寂寞。
   const listOpen = showAll || Boolean(needle);
-  const showLoadError = loadFailed && catalog.length === 0;
+  const showLoadError = Boolean(loadFailure) && catalog.length === 0;
 
   // 收起时得连搜索词一起清掉，否则 needle 还在，列表按上面那条规则又会自己弹开。
   const toggleList = () => {
@@ -188,7 +193,12 @@ export const AutoApproveSection = () => {
           </div>
         </div>
 
-        {showLoadError && <Facts>{CATALOG_LOAD_ERROR}</Facts>}
+        {showLoadError && (
+          <div className="space-y-2">
+            <Facts>{catalogLoadError(loadFailure)}</Facts>
+            <Button onClick={() => setReadAttempt((value) => value + 1)} tone="quiet">重新读取工具清单</Button>
+          </div>
+        )}
 
         {others.length > 0 && (
           <div>

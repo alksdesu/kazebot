@@ -37,6 +37,12 @@ const entry = (index: number) => ({
   source: 'auto',
 });
 
+// 后端存完回的是整理过的整条：没写本名的落进 default，补上启用、扫描深度和时间戳。
+const savedEntry = (payload: Record<string, unknown>) => ({
+  enabled: true, priority: 0, scan_depth: 2, ...payload, book: payload.book || 'default', source: 'manual',
+  created_at: '2026-10-28T01:00:00+00:00', updated_at: '2026-10-28T01:00:00+00:00',
+});
+
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
@@ -53,25 +59,35 @@ function stub({
   unreadable = [] as any[],
   conversations = [] as any[],
   removed = 0,
-  replies = {} as { overview?: Reply[]; entries?: Reply[]; save?: Reply[] },
+  messages = { total: 0, messages: [] } as { total: number; messages: unknown[] },
+  replies = {} as { overview?: Reply[]; entries?: Reply[]; save?: Reply[]; clear?: Reply[]; reset?: Reply[] },
 } = {}) {
   // 总览、条目、写入各走各的，得能单排某一路第几次的成败：按调用顺序取，null 是这一次照常回。
   const queued = {
     overview: [...(replies.overview || [])],
     entries: [...(replies.entries || [])],
     save: [...(replies.save || [])],
+    clear: [...(replies.clear || [])],
+    reset: [...(replies.reset || [])],
   };
   const take = (key: keyof typeof queued, body: unknown) =>
     (queued[key].length ? queued[key].shift() : null)?.() ?? jsonResponse(body);
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    const method = init?.method || 'GET';
     if (url.includes('/memory/overview')) return take('overview', { namespaces });
     if (url.includes('/entries')) {
-      return (init?.method || 'GET') === 'GET' ? take('entries', { entries, unreadable_books: unreadable }) : take('save', { entry: {} });
+      if (method === 'GET') return take('entries', { entries, unreadable_books: unreadable });
+      if (method === 'DELETE') return jsonResponse({ ok: true });
+      return take('save', { ok: true, entry: savedEntry(JSON.parse(String(init?.body))) });
     }
-    if (url.includes('/admin/config/memory/')) return jsonResponse({ removed });
+    if (url.includes('/admin/config/memory/')) return take('clear', { ok: true, removed });
     if (url.includes('/admin/config/runtime/raw')) {
       return jsonResponse({ content: '', hash: '', source: 'default', path: 'defaults/runtime.yaml', defaults: {}, effective: {} });
+    }
+    if (url.includes('/messages?')) return jsonResponse(messages);
+    if (url.endsWith('/reset')) {
+      return take('reset', { ok: true, old_session_id: 'sess-1', conversation_key: 'key-1', cleared_children: 0 });
     }
     if (url.includes('/admin/conversations')) return jsonResponse({ conversations });
     if (url.includes('/platforms/qq/account/scope')) return jsonResponse({ current_scope: '', bot_alive: false });
@@ -302,6 +318,34 @@ describe('会话上下文', () => {
     expect(screen.getByText(/其它账号/)).toBeInTheDocument();
   });
 
+  it('预览照存档原样念多模态的正文，不念成 [object Object]', async () => {
+    stub({
+      conversations: [conversation(1)],
+      messages: { total: 1, messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: '看图' }] }] },
+    });
+    render(<MemoryPage />);
+    await screen.findByText('会话1');
+
+    fireEvent.click(screen.getByRole('button', { name: '查看' }));
+
+    expect(await screen.findByText('共 1 条，显示最近 1 条')).toBeInTheDocument();
+    expect(screen.getByText(/\[\{"type":"text","text":"看图"\}\]/)).toBeInTheDocument();
+    expect(screen.queryByText(/object Object/)).toBeNull();
+  });
+
+  // 删掉了只是回执读不懂：报成没删，人会再删一次。
+  it('删除上下文的回执读不懂：照删掉了交代，回执的事另起一行报', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    stub({ conversations: [conversation(1)], replies: { reset: [() => jsonResponse({ ok: true })] } });
+    render(<MemoryPage />);
+    await screen.findByText('会话1');
+
+    fireEvent.click(screen.getByRole('button', { name: '删除' }));
+
+    expect(await screen.findByText('已删除，下一条消息开始重新积累')).toBeInTheDocument();
+    expect(screen.getByText('会话上下文已经删掉，可回执格式不对：缺 old_session_id')).toHaveAttribute('role', 'alert');
+  });
+
   it('当前号一条会话都没有时照样说出来，不是被分页吞掉', async () => {
     stub({ conversations: Array.from({ length: 3 }, (_, index) => conversation(100 + index, false)) });
     render(<MemoryPage />);
@@ -348,6 +392,19 @@ describe('记忆页的那一句提示', () => {
     expect(screen.getByText('503 条目读不回来。503 总览读不回来')).toHaveAttribute('role', 'alert');
   });
 
+  // 存上了只是回执读不懂：当成失败，人会再存一次；草稿留着，看着也像没存上。
+  it('添加的回执读不懂：照添加了交代，草稿清掉，回执的事另起一行报', async () => {
+    stub({ namespaces: sources, replies: { save: [() => jsonResponse({ ok: true })] } });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    await addEntry();
+
+    expect(await screen.findByText('已添加')).toBeInTheDocument();
+    expect(screen.getByText('这条记忆已经存上，可回执格式不对：缺 entry。条目以重新读到的为准')).toHaveAttribute('role', 'alert');
+    expect(screen.getByLabelText('内容')).toHaveValue('');
+  });
+
   it('添加失败的原因报成错误，不当成提示', async () => {
     stub({ namespaces: sources, replies: { save: [fails('记忆目录只读')] } });
     render(<MemoryPage />);
@@ -370,6 +427,20 @@ describe('记忆页的那一句提示', () => {
 
     expect(await screen.findByText('已清空 7 条')).toBeInTheDocument();
     expect(screen.getByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
+  });
+
+  it('清空的回执读不懂：照清空了交代，不编一个条数', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    stub({ namespaces: sources, replies: { clear: [() => jsonResponse({ ok: true })] } });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await waitFor(() => expect(screen.getByRole('button', { name: '清空' })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole('button', { name: '清空' }));
+
+    expect(await screen.findByText('已清空')).toBeInTheDocument();
+    expect(screen.getByText('这一份记忆已经清空，可回执格式不对：缺 removed。删了几条没读到')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/已清空 \d+ 条/)).toBeNull();
   });
 
   it('清空了最后一份，空栏说没有记忆，结果只在底下交代一次', async () => {
@@ -547,5 +618,24 @@ describe('手写的关键词', () => {
 
     expect(await screen.findByText('第 1 条')).toBeInTheDocument();
     expect(screen.queryByText(/关键词：/)).toBeNull();
+  });
+});
+
+// 正则里的逗号被当成分隔符拆开，存下的两截都不成正则，召回时再也命中不了。
+describe('添加时的关键词', () => {
+  it('写成 /正则/ 的那段整段存成一个词，别的照逗号拆', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')] });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await waitFor(() => expect(screen.getByLabelText('内容')).toBeEnabled());
+
+    fireEvent.change(screen.getByLabelText('标识'), { target: { value: 'room' } });
+    fireEvent.change(screen.getByLabelText('内容'), { target: { value: '住 302' } });
+    fireEvent.change(screen.getByLabelText('关键词'), { target: { value: String.raw`/\d{1,3}/, 房间` } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+
+    await screen.findByText('已添加');
+    const save = vi.mocked(globalThis.fetch).mock.calls.find(([, init]) => init?.method === 'POST');
+    expect(JSON.parse(String(save?.[1]?.body)).keywords).toEqual([String.raw`/\d{1,3}/`, '房间']);
   });
 });

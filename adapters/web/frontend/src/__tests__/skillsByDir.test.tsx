@@ -54,7 +54,7 @@ describe('技能列表', () => {
 
   it('删除按目录找文件', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    vi.mocked(deleteSkill).mockResolvedValue({ ok: true });
+    vi.mocked(deleteSkill).mockResolvedValue(undefined);
     render(<SkillsSettingsPage />);
 
     fireEvent.click((await sharedRows())[1]);

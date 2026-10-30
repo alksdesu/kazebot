@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage, isEditConflict } from '../../api/request';
+import { readReceipt, receipted } from '../../api/shape';
+import { appendSentence, rereadMissed } from '../../utils/sentence';
 import { asPercent } from '../../console/format';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
@@ -7,7 +9,7 @@ import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { INSTANCE_DEFAULTS_TARGET, useScopePicker } from '../useScopePicker';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
-import { type ConversationPolicy, type ConversationPolicyKey } from './types';
+import { readCommunityState, readDecisions, type ConversationPolicy, type ConversationPolicyKey, type Decision } from './types';
 import { booleanPolicyKeys, draftIdentity, draftValue, effectivePolicy, nullablePolicyKeys, percentPolicyKeys, policyDraft, policyPatch, readPolicySnapshot, samePolicy, type PolicyDraft, type PolicySnapshot, type PolicyValue } from './policyForm';
 
 const labels: Record<ConversationPolicyKey, string> = {
@@ -18,7 +20,18 @@ const labels: Record<ConversationPolicyKey, string> = {
   interject_presence: '在场 / 离场',
   interject_absent_probability: '离场时去问模型的概率（%）',
 };
-interface Decision { message_id: string; action: string; reason: string }
+const DEFAULTS = '实例默认接话设置';
+const STATE = '会话接话设置';
+const DECISIONS = '接话判定记录';
+const QUIET_DONE = { listen: '已改为旁听。', silent: '已改为完全安静。', off: '已恢复正常回应。' } as const;
+
+/** 读回来的接话设置。会话那份连同临时安静一起认：quiet 读不懂当成没有，页面会说「正常回应」。 */
+function policySnapshotOf(what: string, value: unknown, global: boolean, scope: string): PolicySnapshot {
+  if (!global) readCommunityState(what, value);
+  const next = readPolicySnapshot(value, global);
+  if (!global && next.community?.scope !== scope) throw new Error(`${what}说的是另一个会话（${next.community?.scope}）`);
+  return next;
+}
 const displayValue = (key: ConversationPolicyKey, value: PolicyValue | undefined) => {
   if (value === null || value === undefined) return '跟随平台配置';
   if (typeof value === 'boolean') return value ? '开启' : '关闭';
@@ -61,6 +74,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
   const [latest, setLatest] = useState<PolicySnapshot | null>(null);
   const [draft, setDraft] = useState<PolicyDraft>({});
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [decisionsError, setDecisionsError] = useState('');
   const [minutes, setMinutes] = useState('30');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -100,25 +114,27 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     const request = requests.begin('policy');
     setReadBlocked(true);
     try {
-      const [current, logs] = global
-        ? [await featureRequest<unknown>('/v1/community/settings/defaults', { signal: request.signal }), null]
-        : await Promise.all([
-          featureRequest<unknown>('/v1/community/state', { scope, signal: request.signal }),
-          featureRequest<{ items: Decision[] }>('/v1/community/decisions', { scope, signal: request.signal }),
-        ]);
+      // 判定记录只是参考：它没读成不该挡着改策略，各报各的。
+      // 用 catch 不用 then 的第二个参数：形状对不上是在第一个回调里抛的，第二个参数接不住
+      const logs = global ? null : featureRequest('/v1/community/decisions', { what: DECISIONS, scope, signal: request.signal })
+        .then(value => ({ items: readDecisions(DECISIONS, value), problem: '' }))
+        .catch((reason: unknown) => ({ items: [] as Decision[], problem: errorMessage(reason) }));
+      const current = global
+        ? await featureRequest('/v1/community/settings/defaults', { what: DEFAULTS, signal: request.signal })
+        : await featureRequest('/v1/community/state', { what: STATE, scope, signal: request.signal });
       if (!request.isCurrent()) return;
-      const next = readPolicySnapshot(current, global);
-      if (!global && next.community?.scope !== scope) throw new Error('服务端返回的会话不匹配，未启用保存。');
-      accept(next, resetDraft);
-      setDecisions(logs?.items || []);
+      accept(policySnapshotOf(global ? DEFAULTS : STATE, current, global, scope), resetDraft);
       setLoading(false);
+      const decided = logs ? await logs : { items: [], problem: '' };
+      if (!request.isCurrent()) return;
+      setDecisions(decided.items); setDecisionsError(decided.problem);
     } catch (reason) {
       if (request.isCurrent()) throw reason;
     }
   }, [requests, scope, global, picker.valid]);
   useEffect(() => {
     mutating.current = false; baselineRef.current = null; dirtyRef.current = false;
-    setSnapshot(null); setLatest(null); setDraft({}); setDecisions([]); setBusy(false); setError(''); setNotice(''); setConflict(false); setReadBlocked(true);
+    setSnapshot(null); setLatest(null); setDraft({}); setDecisions([]); setDecisionsError(''); setBusy(false); setError(''); setNotice(''); setConflict(false); setReadBlocked(true);
   }, [viewKey]);
   useEffect(() => {
     setLoading(picker.valid);
@@ -126,14 +142,20 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     return () => { requests.drop('policy'); };
   }, [requests, refresh, picker.valid]);
 
-  const run = async (action: () => Promise<unknown>, message = '') => {
+  // action 交回回执读不懂的原因：写已经做完了，照常交代，原因另起一行报。
+  const run = async (action: () => Promise<string | void>, message = '') => {
     if (!picker.valid || !requests.isCurrent() || mutating.current) return;
     mutating.current = true; requests.drop('policy');
     setBusy(true); setError(''); setNotice('');
-    try { await action(); if (requests.isCurrent() && message) setNotice(message); }
+    try {
+      const receiptProblem = await action();
+      if (requests.isCurrent()) { if (message) setNotice(message); if (receiptProblem) setError(receiptProblem); }
+    }
     catch (reason) { if (requests.isCurrent()) { setError(errorMessage(reason)); if (isEditConflict(reason)) setConflict(true); } }
     finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); setLoading(false); } }
   };
+  // 写已经做完之后的重读：没成只补一句，不往外抛，免得「已保存」被换成一条失败。
+  const reread = (resetDraft = false): Promise<string> => refresh(resetDraft).then(() => '', (reason: unknown) => rereadMissed(errorMessage(reason)));
   const reload = () => {
     if (confirmDiscard()) void run(() => refresh(true));
   };
@@ -141,14 +163,17 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     if (!baseline || !effective || !dirty || conflict || readBlocked) return;
     const clearingOrphan = !global && picker.policyOnlyScopes.includes(scope) && !Object.keys(draft).length;
     const body = { ...policyPatch(baseline, draft, effective, global), expected_revision: baseline.revision, ...(global ? {} : { expected_defaults_revision: baseline.defaultsRevision }) };
+    const receipt = global ? '实例默认已经存上，可回执' : '会话覆盖已经存上，可回执';
     void run(async () => {
-      const response = await featureRequest<unknown>(global ? '/v1/community/settings/defaults' : '/v1/community/settings/overrides', { ...(global ? {} : { scope }), method: 'PATCH', body });
+      const { result: next, receiptProblem } = await receipted(featureRequest(global ? '/v1/community/settings/defaults' : '/v1/community/settings/overrides', { ...(global ? {} : { scope }), method: 'PATCH', body, receipt })
+        .then(response => readReceipt(receipt, response, value => policySnapshotOf(receipt, value, global, scope))));
       if (!requests.isCurrent()) return;
       setReadBlocked(true);
-      const next = readPolicySnapshot(response, global);
-      if (!global && next.community?.scope !== scope) throw new Error('服务端返回的会话不匹配，请重新载入确认保存结果。');
-      accept(next, true);
-      if (clearingOrphan) await picker.reload();
+      // 存上了只是回执读不懂：手上的版本号已经过时，重新载入一份再让人接着改。
+      if (next) accept(next, true);
+      const rereadProblem = next ? '' : await reread(true);
+      if (clearingOrphan && requests.isCurrent()) await picker.reload();
+      return appendSentence(receiptProblem, rereadProblem);
     }, global ? '实例默认配置已保存；已有会话覆盖保持不变。' : clearingOrphan ? '会话覆盖已清除；此会话已无聊天记录及单独覆盖，请选择当前实例默认配置继续。' : '会话覆盖已保存。');
   };
 
@@ -189,10 +214,10 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
           <p>{latest.community.quiet.mode ? `${latest.community.quiet.mode === 'listen' ? '旁听' : '完全安静'}，到 ${new Date((latest.community.quiet.expires_at || 0) * 1000).toLocaleString()} 自动恢复` : '正常回应'}</p>
           <p>仅作用于当前会话。旁听仍接明确 @、引用和命令；完全安静暂停普通对话与通知，恢复、状态和取消等控制命令仍可使用。</p>
           <label className="block max-w-sm">分钟数<input aria-label="安静分钟数" type="number" min={1} max={10080} className={controlClass} value={minutes} onChange={event => setMinutes(event.target.value)} /></label>
-          <div className="flex flex-wrap gap-3">{(['listen', 'silent', 'off'] as const).map(mode => <button className={actionClass} disabled={busy || (mode !== 'off' && !validMinutes)} key={mode} onClick={() => void run(async () => { await featureRequest('/v1/community/quiet', { scope, method: 'POST', body: { mode, duration_sec: mode === 'off' ? 0 : Number(minutes) * 60 } }); if (requests.isCurrent()) await refresh(); })}>{mode === 'listen' ? '旁听' : mode === 'silent' ? '完全安静' : '恢复'}</button>)}</div>
+          <div className="flex flex-wrap gap-3">{(['listen', 'silent', 'off'] as const).map(mode => <button className={actionClass} disabled={busy || (mode !== 'off' && !validMinutes)} key={mode} onClick={() => void run(async () => { const { receiptProblem } = await receipted(featureRequest('/v1/community/quiet', { scope, method: 'POST', receipt: '安静模式已经换好，可回执', body: { mode, duration_sec: mode === 'off' ? 0 : Number(minutes) * 60 } })); if (!requests.isCurrent()) return; return appendSentence(receiptProblem, await reread()); }, QUIET_DONE[mode])}>{mode === 'listen' ? '旁听' : mode === 'silent' ? '完全安静' : '恢复'}</button>)}</div>
         </section>
         <section className={sectionClass}><h2 className="font-semibold">最近接话判定</h2><button className={actionClass} disabled={busy} onClick={() => void run(() => refresh())}>刷新判定</button>
-          {!decisions.length && <EmptyState>启用策略并收到消息后，这里会显示当前会话的实际判定。</EmptyState>}
+          {decisionsError ? <p role="alert">{decisionsError}</p> : !decisions.length && <EmptyState>启用策略并收到消息后，这里会显示当前会话的实际判定。</EmptyState>}
           {decisions.map(decision => <article key={decision.message_id} className="border border-[var(--duties-border)] p-3"><p>{{ ignore: '忽略', reaction: '表态', react: '表态', reply: '回复', short_reply: '短答', task: '执行任务', execute: '执行任务' }[decision.action] || decision.action} · {decision.reason}</p><p className="text-xs">消息 {decision.message_id}</p></article>)}
         </section>
       </>}

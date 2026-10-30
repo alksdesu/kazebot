@@ -173,6 +173,8 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const requests = useRequestGuard();
   const taskActivities = useChatStore(state => state.taskActivities);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
+  // An empty list that was never read does not mean nothing is running.
+  const [listFailed, setListFailed] = useState(false);
   const [loading, setLoading] = useState(false);
   const { error, setError, setLoadError, clearNotice } = usePageNotice();
   const [refreshTick, setRefreshTick] = useState(0);
@@ -190,6 +192,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       if (!adminToken) {
         if (request.isCurrent()) {
           setTasks([]);
+          setListFailed(true);
           setLoadError('需要管理员令牌才能读取活跃任务。');
           setLoading(false);
         }
@@ -201,10 +204,12 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
         const nextTasks = await fetchActiveTasks(adminToken);
         if (request.isCurrent()) {
           setTasks(nextTasks);
+          setListFailed(false);
           setLoadError('');
         }
       } catch (loadError) {
         if (request.isCurrent()) {
+          setListFailed(true);
           setLoadError(errorMessage(loadError, '活跃任务刷新失败。'));
         }
       } finally {
@@ -329,6 +334,15 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
         {loading && tasks.length === 0 ? (
           <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">
             正在加载活跃任务…
+          </div>
+        ) : tasks.length === 0 && listFailed ? (
+          <div className="flex items-center justify-center gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-[0.75rem] text-[var(--duties-secondary)]">
+            <span>活跃任务没读到，不知道现在有没有在跑的任务</span>
+            {adminToken && (
+              <button className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] ${TONE_BOX.info}`} onClick={() => setRefreshTick(value => value + 1)} type="button">
+                重读
+              </button>
+            )}
           </div>
         ) : tasks.length === 0 ? (
           <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-4 text-center text-[0.75rem] text-[var(--duties-secondary)]">

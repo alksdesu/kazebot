@@ -19,6 +19,7 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
   listStickers: vi.fn(),
   acceptSticker: vi.fn(),
+  recaptionStickers: vi.fn(),
 }));
 
 // 停手 300ms 才真的去搜。
@@ -72,7 +73,7 @@ describe('图库只认最后发出的那次读', () => {
     render(<StickersPage />);
     await waitFor(() => expect(api.listStickers).toHaveBeenCalledOnce());
 
-    click('在库 0');
+    click('在库');
     expect(await screen.findByText('在库图')).toBeInTheDocument();
     expect(asked(1)).toEqual({ state: 'library', search: '', limit: 60, offset: 0 });
 
@@ -140,7 +141,7 @@ describe('图库只认最后发出的那次读', () => {
     render(<StickersPage />);
     await waitFor(() => expect(api.listStickers).toHaveBeenCalledOnce());
 
-    click('在库 0');
+    click('在库');
     expect(await screen.findByText('在库图')).toBeInTheDocument();
 
     await act(async () => { stale.reject(new Error(LIST_FAILURE)); });
@@ -151,6 +152,24 @@ describe('图库只认最后发出的那次读', () => {
 });
 
 describe('这一页没读成', () => {
+  // 一次都没读成时说成「在库 0 张」，就是说图库是空的。
+  it('首读失败不报各档 0 张，给重新读取，读成了照常摆出张数', async () => {
+    vi.mocked(api.listStickers).mockRejectedValueOnce(new Error(LIST_FAILURE)).mockResolvedValue(page(['待审图']));
+
+    render(<StickersPage />);
+    expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
+    expect(screen.getByText('各档的张数没读到，原因见下。')).toBeInTheDocument();
+    expect(screen.queryByText(/在库 0 张/)).toBeNull();
+    expect(screen.getByRole('button', { name: '在库' })).toBeInTheDocument();
+
+    click('重新读取这一页');
+
+    expect(await screen.findByText('待审图')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '在库 3' })).toBeInTheDocument();
+    expect(screen.queryByText(LIST_FAILURE)).toBeNull();
+    expect(screen.queryByRole('button', { name: '重新读取这一页' })).toBeNull();
+  });
+
   it('首读失败不说这一档还没有图，读成了空页才说', async () => {
     vi.mocked(api.listStickers)
       .mockRejectedValueOnce(new Error(LIST_FAILURE))
@@ -160,7 +179,7 @@ describe('这一页没读成', () => {
     expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
     expect(screen.queryByText('这一档还没有图。')).toBeNull();
 
-    click('在库 0');
+    click('在库');
 
     expect(await screen.findByText('这一档还没有图。')).toBeInTheDocument();
     expect(screen.queryByText(LIST_FAILURE)).toBeNull();
@@ -191,7 +210,7 @@ describe('图库的那一句提示', () => {
     render(<StickersPage />);
     expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
 
-    click('在库 0');
+    click('在库');
 
     expect(await screen.findByText('在库图')).toBeInTheDocument();
     expect(screen.queryByText(LIST_FAILURE)).toBeNull();
@@ -216,6 +235,35 @@ describe('图库的那一句提示', () => {
 
     expect(await screen.findByText('转正没成')).toHaveAttribute('role', 'alert');
     expect(screen.queryByText('已转正，进候选了')).toBeNull();
+  });
+
+  // 转正了只是回执读不懂：报成失败，人会再点一次，第二次会被拒成「只有待审的图能转正」。
+  it('转正的回执读不懂：照转正了交代，回执的事另起一行报', async () => {
+    vi.mocked(api.listStickers).mockResolvedValue(page(['待审图']));
+    vi.mocked(api.acceptSticker).mockRejectedValue(new api.ReceiptUnreadable('这张图已经转正，可回执格式不对：缺 usable'));
+
+    render(<StickersPage />);
+    await screen.findByText('待审图');
+    click('转正');
+
+    expect(await screen.findByText('已转正，进候选了')).toBeInTheDocument();
+    expect(screen.getByText('这张图已经转正，可回执格式不对：缺 usable')).toHaveAttribute('role', 'alert');
+    expect(api.listStickers).toHaveBeenCalledTimes(2);
+  });
+
+  it('重新打标的回执读不懂：说排进队列了，不编一个张数', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.listStickers).mockResolvedValue(page(['待审图']));
+    vi.mocked(api.recaptionStickers).mockRejectedValue(new api.ReceiptUnreadable('已经重新排进打标队列，可回执不是 JSON'));
+
+    render(<StickersPage />);
+    await screen.findByText('待审图');
+    click('重新打标');
+
+    expect(await screen.findByText('已重新排进打标队列，打标在后台跑')).toBeInTheDocument();
+    expect(screen.getByText('已经重新排进打标队列，可回执不是 JSON。排了几张没读到')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/已排队 \d+ 张/)).toBeNull();
+    confirm.mockRestore();
   });
 
   it('操作完那次重读失败，结果照常交代，原因另起一行报错', async () => {
@@ -296,7 +344,8 @@ describe('图库的那一句提示', () => {
     await act(async () => { stale.resolve(page(['幽灵图'])); });
 
     expect(screen.queryByText('幽灵图')).toBeNull();
-    expect(screen.getByRole('button', { name: '在库 0' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '在库' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^在库 \d+$/ })).toBeNull();
   });
 
   it('退出登录之后，上一个号那次读失败也不报出来', async () => {

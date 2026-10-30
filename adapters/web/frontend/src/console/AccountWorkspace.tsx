@@ -16,6 +16,7 @@ import {
   isValidInstanceId,
   ownedByAnotherInstance,
   pinPlatformAccount,
+  receipted,
   switchPlatformAccount,
   type AccountStatus,
   type ConsoleInstance,
@@ -35,6 +36,7 @@ import { usePageNotice } from '../hooks/usePageNotice';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { startPolling } from '../utils/polling';
+import { appendSentence } from '../utils/sentence';
 import { errorMessage } from '../api/request';
 import type { RequestTicket } from '../api/requestGuard';
 
@@ -55,6 +57,11 @@ const accountLine = (row: ConsoleInstance): string => {
   const name = getPlatform(row.platform)?.shortName ?? row.platform;
   return row.account ? `${name} ${row.account}` : `${name} · 还没登录`;
 };
+
+// 换号、钉号的回执读不懂时号已经换上了，只是不知道记没记进实例清单。
+const unknownRoster = (receiptProblem: string): string => appendSentence(
+  receiptProblem, '记没记进实例清单不知道，刷新实例列表看本实例那一行登记的号',
+);
 
 // 出错的原因单占一行念出来，进展照常摆着；没出错也没进展时才拿占位话垫着。
 const AccountFeedback = ({ error, notice, placeholder = '' }: { error: string; notice: string; placeholder?: string }) => (
@@ -164,10 +171,12 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (!requests.isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError(''); setProgressTransient(false);
     try {
-      const plan = await createInstance(token, id, newLabel.trim(), platform.id, account);
+      const { result: plan, receiptProblem } = await receipted(createInstance(token, id, newLabel.trim(), platform.id, account));
       if (!requests.isCurrent()) return;
       setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
-      setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+      // 回执读不懂时工作区也已经建好、交给 root 侧了：照填的实例名盯进度。
+      setJob({ id: plan?.id ?? id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+      if (receiptProblem) setNote(appendSentence(receiptProblem, '不用再建一次，进度看下面的日志'));
       void refresh();
     } catch (failure) { if (requests.isCurrent()) setNote(errorMessage(failure)); }
     finally { mutation.current = false; if (requests.isCurrent()) setBusy(false); }
@@ -336,9 +345,9 @@ const AccountConnectionPage = ({ token, instances, ownershipReady, ownershipErro
             setQrImage('');
             setStage('idle');
             try {
-              const { rosterError: reason } = await pinPlatformAccount(token, platformId);
+              const { result, receiptProblem } = await receipted(pinPlatformAccount(token, platformId));
               if (!requests.isCurrent()) return;
-              setRosterError(reason);
+              setRosterError(result ? result.rosterError : unknownRoster(receiptProblem));
               setMessage(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
             } catch (caught) {
               if (requests.isCurrent()) setMessage(`已登录 ${next.nick || next.account}。`, `没能设为重启后自动登录：${errorMessage(caught)}`);
@@ -402,9 +411,9 @@ const AccountConnectionPage = ({ token, instances, ownershipReady, ownershipErro
     mutation.current = true; requests.drop('account'); setLoading(false); setBusy(true);
     setPaused(false);
     try {
-      const { rosterError: reason } = await switchPlatformAccount(token, platformId, target.account);
+      const { result, receiptProblem } = await receipted(switchPlatformAccount(token, platformId, target.account));
       if (!requests.isCurrent()) return;
-      setRosterError(reason);
+      setRosterError(result ? result.rosterError : unknownRoster(receiptProblem));
       stageStartedAt.current = Date.now();
       setStage('restarting');
       setMessage('已请求切换，等它上线…');
@@ -593,9 +602,16 @@ const AccountConnectionPage = ({ token, instances, ownershipReady, ownershipErro
                 </div>
               );
             })
-          ) : (
+          ) : status ? (
             <Facts>
               没有可免扫码切换的号。一个号在这台机器上登录过之后才会出现在这里。
+            </Facts>
+          ) : (
+            // 状态没读回来就不知道有哪些号，不能说成一个都没有。
+            <Facts>
+              {loading
+                ? '正在读取可免扫码切换的号…'
+                : '账号状态没读到，不知道有哪些号能免扫码切换。点上面的「刷新账号状态」重读。'}
             </Facts>
           )}
         </Panel>

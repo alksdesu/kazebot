@@ -319,7 +319,8 @@ describe('上一轮没回来', () => {
     await tick();
     await tick();
     expect(checkHealth).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('连不上')).toBeInTheDocument();
+    // 还没有结果就不是「连不上」。
+    expect(screen.getByText('正在检查…')).toBeInTheDocument();
 
     await act(async () => { slow.resolve({ status: 'ok', uptime_seconds: 3600 } as any); });
     expect(checkHealth).toHaveBeenCalledTimes(1);
@@ -329,6 +330,15 @@ describe('上一轮没回来', () => {
     await tick();
     expect(checkHealth).toHaveBeenCalledTimes(2);
     expect(screen.getByText('已运行 2 小时')).toBeInTheDocument();
+  });
+
+  // 回包读不懂也算没通过，可那时它连得上：光说「连不上」，人会去查网络。
+  it('健康检查没通过时连同原因一起摆出来', async () => {
+    vi.mocked(checkHealth).mockRejectedValue(new Error('健康检查格式不对：缺 status'));
+    await mount();
+
+    expect(screen.getByText('连不上')).toBeInTheDocument();
+    expect(screen.getByText('健康检查格式不对：缺 status')).toBeInTheDocument();
   });
 });
 

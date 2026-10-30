@@ -1,10 +1,11 @@
 // 账号页的提示。这一页三秒一次地重读状态，换号和扫码的进展不能被它冲掉。
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as api from '../api/supervisorClient';
 import { AccountWorkspaceSlot } from '../console/AccountWorkspace';
 import { useSettingsStore } from '../store/settingsStore';
+import { scopeMigrationReply } from './fixtures/accountReplies';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
@@ -64,9 +65,7 @@ beforeEach(() => {
   vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
   vi.mocked(api.getPlatformLoginQrcode).mockResolvedValue({ qrcode: 'QRSTR', reachable: true });
   vi.mocked(api.getAccountScope).mockResolvedValue(scopeIdle);
-  vi.mocked(api.migrateAccountScope).mockResolvedValue({
-    moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1',
-  });
+  vi.mocked(api.migrateAccountScope).mockResolvedValue(scopeMigrationReply());
   vi.mocked(api.switchPlatformAccount).mockResolvedValue({ rosterError: '' });
   vi.mocked(api.pinPlatformAccount).mockResolvedValue({ rosterError: '' });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
@@ -106,6 +105,23 @@ describe('账号页的提示', () => {
     await mount();
 
     expect(screen.getByText('正在读取…')).toBeInTheDocument();
+    expect(screen.getByText('正在读取可免扫码切换的号…')).toBeInTheDocument();
+  });
+
+  // 读不回状态就不知道有哪些号能切，说成「没有可免扫码切换的号」像是这台机器上真没登过别的号。
+  it('首次读状态失败：快速切换那块说没读到，不说没有可切的号', async () => {
+    vi.mocked(api.getPlatformAccount).mockRejectedValue(new Error(READ_FAILED));
+    await mount();
+
+    expect(screen.getByText(READ_FAILED)).toHaveAttribute('role', 'alert');
+    expect(screen.getByText('账号状态没读到，不知道有哪些号能免扫码切换。点上面的「刷新账号状态」重读。')).toBeInTheDocument();
+    expect(screen.queryByText(/没有可免扫码切换的号/)).toBeNull();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
+    await click('刷新账号状态');
+
+    expect(screen.getByRole('button', { name: '切到这个号' })).toBeEnabled();
+    expect(screen.queryByText(/账号状态没读到/)).toBeNull();
   });
 
   it('快速切换失败的原因熬得过紧接着那次重读，死号照样置灰', async () => {
@@ -547,6 +563,38 @@ describe('实例清单没记上新号', () => {
     expect(screen.getByText(ROSTER)).toHaveAttribute('role', 'alert');
   });
 
+  // 回执读不懂时号已经换上了：报成换号失败，人会再切一次。
+  it('快速切换的回执读不懂：照换上了往下走，交代不知道记没记进清单', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.switchPlatformAccount).mockRejectedValue(new api.ReceiptUnreadable('已经切到 2000002，可回执不是 JSON'));
+    await mount();
+
+    await click('切到这个号');
+
+    expect(screen.getByText('已请求切换，等它上线…')).toBeInTheDocument();
+    expect(screen.getByText(
+      '已经切到 2000002，可回执不是 JSON。记没记进实例清单不知道，刷新实例列表看本实例那一行登记的号',
+    )).toHaveAttribute('role', 'alert');
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it('扫码登上后钉号的回执读不懂：照设上了交代，再说不知道记没记进清单', async () => {
+    vi.mocked(api.pinPlatformAccount).mockRejectedValue(
+      new api.ReceiptUnreadable('已经设成重启后自动登录，可回执格式不对：缺 account'),
+    );
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
+    await intoScanning();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
+    await tick();
+
+    expect(screen.getByText('已登录 当前机器人，并设为重启后自动登录。')).toBeInTheDocument();
+    expect(screen.getByText(
+      '已经设成重启后自动登录，可回执格式不对：缺 account。记没记进实例清单不知道，刷新实例列表看本实例那一行登记的号',
+    )).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/没能设为重启后自动登录/)).toBeNull();
+  });
+
   it('扫码登上后钉号时带着原因也摆出来', async () => {
     vi.mocked(api.pinPlatformAccount).mockResolvedValue({ rosterError: ROSTER });
     vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
@@ -607,10 +655,9 @@ describe('记忆归属的提示', () => {
   // 目录搬完了、命中记录却没跟着改名：不说的话，修好文件之后数据清理会把这些命中当成没主的摘掉。
   it('命中记录没跟着改名时，搬迁照常交代，读不了的原因另起一行报错', async () => {
     vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValue(scopePlan);
-    vi.mocked(api.migrateAccountScope).mockResolvedValue({
-      moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1',
+    vi.mocked(api.migrateAccountScope).mockResolvedValue(scopeMigrationReply({
       hit_keys_rewritten: 0, hit_cache_problem: "第 1 行第 14 列：Expecting ':' delimiter",
-    });
+    }));
 
     await migrateThenFailRead();
 
@@ -623,9 +670,7 @@ describe('记忆归属的提示', () => {
 
   it('命中记录跟着改了名就只交代搬迁', async () => {
     vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValue(scopePlan);
-    vi.mocked(api.migrateAccountScope).mockResolvedValue({
-      moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1', hit_keys_rewritten: 2, hit_cache_problem: '',
-    });
+    vi.mocked(api.migrateAccountScope).mockResolvedValue(scopeMigrationReply());
 
     await migrateThenFailRead();
 
@@ -650,19 +695,50 @@ describe('记忆归属的提示', () => {
     expect(screen.getByRole('button', { name: '执行搬迁' })).toBeEnabled();
   });
 
-  it('首次读归属失败，下一次读回来那句就没了', async () => {
+  // 一次都没读到时说「还没绑定账号」，是替后端下了个没读到的结论。
+  it('首次读归属失败说没读到，下一次读回来那句就没了', async () => {
     vi.mocked(api.getAccountScope)
       .mockRejectedValueOnce(new Error(SCOPE_FAILED))
       .mockResolvedValue(scopePlan);
     await mount();
     expect(screen.getByText(SCOPE_FAILED)).toBeInTheDocument();
-    expect(screen.getByText('还没绑定账号')).toBeInTheDocument();
+    expect(screen.getByText('没读到')).toBeInTheDocument();
+    expect(screen.queryByText('还没绑定账号')).not.toBeInTheDocument();
 
     await fillTarget('2000002');
     await click('预览');
 
     expect(screen.queryByText(SCOPE_FAILED)).not.toBeInTheDocument();
-    expect(screen.queryByText('还没绑定账号')).not.toBeInTheDocument();
+    expect(screen.queryByText('没读到')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '执行搬迁' })).toBeEnabled();
+  });
+
+  it('首次读归属失败后点重读，读回来就换上', async () => {
+    vi.mocked(api.getAccountScope).mockRejectedValueOnce(new Error(SCOPE_FAILED)).mockResolvedValue(scopeIdle);
+    await mount();
+    const scopeBlock = () => screen.getByRole('heading', { name: '记忆归属' }).closest('section')!;
+
+    await click('重读');
+
+    expect(api.getAccountScope).toHaveBeenCalledTimes(2);
+    expect(within(scopeBlock()).getByText('1000001')).toBeInTheDocument();
+    expect(within(scopeBlock()).queryByRole('button', { name: '重读' })).toBeNull();
+    expect(screen.queryByText(SCOPE_FAILED)).not.toBeInTheDocument();
+  });
+
+  // 回执读不懂时数据已经划过去了：报成搬迁失败，人会再搬一次。
+  it('搬迁的回执读不懂：照搬完了交代，没读到的另起一行说，再重读归属', async () => {
+    vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValueOnce(scopePlan).mockResolvedValue(scopeIdle);
+    vi.mocked(api.migrateAccountScope).mockRejectedValue(
+      new api.ReceiptUnreadable('记忆归属已经搬完，可回执格式不对：缺 backup_dir'),
+    );
+
+    await migrateThenFailRead();
+
+    expect(screen.getByText('已搬迁。')).toBeInTheDocument();
+    expect(screen.getByText(
+      '记忆归属已经搬完，可回执格式不对：缺 backup_dir。搬了几份、备份放在哪没读到，归属以下面重新读到的为准',
+    )).toHaveAttribute('role', 'alert');
+    expect(api.getAccountScope).toHaveBeenCalledTimes(3);
   });
 });

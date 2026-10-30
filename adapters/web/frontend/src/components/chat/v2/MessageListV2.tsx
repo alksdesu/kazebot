@@ -69,6 +69,17 @@ const ChildrenNotice = ({ history, onRetryHistory }: Pick<MessageListV2Props, 'h
   );
 };
 
+// Approvals requested while the stream was down only reach the chat through this read; without the line a failed read looks like "nothing to approve".
+const ApprovalsNotice = ({ history, onRetryHistory }: Pick<MessageListV2Props, 'history' | 'onRetryHistory'>) => {
+  if (!history?.approvalsError) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 px-4 py-2 text-xs" role="alert">
+      <span className="text-[var(--duties-danger)]">待审批没读到，断线期间要的审批可能没显示在这里：{history.approvalsError}</span>
+      {onRetryHistory && <Button size="sm" tone="quiet" onClick={onRetryHistory}>重读</Button>}
+    </div>
+  );
+};
+
 const EmptyState = ({ history, onRetryHistory }: Pick<MessageListV2Props, 'history' | 'onRetryHistory'>) => {
   if (history?.loading) {
     return <p className="text-sm text-[var(--duties-tertiary)]" role="status">正在加载历史消息…</p>;
@@ -135,6 +146,7 @@ export const MessageListV2 = ({ messages, toolsById, history, onLoadOlder, onRet
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
         <ChildrenNotice history={history} onRetryHistory={onRetryHistory} />
+        <ApprovalsNotice history={history} onRetryHistory={onRetryHistory} />
         <EmptyState history={history} onRetryHistory={onRetryHistory} />
       </div>
     );
@@ -145,6 +157,7 @@ export const MessageListV2 = ({ messages, toolsById, history, onLoadOlder, onRet
       <div className="mx-auto max-w-3xl">
         <HistoryBar history={history} onLoadOlder={onLoadOlder} onRetryHistory={onRetryHistory} />
         <ChildrenNotice history={history} onRetryHistory={onRetryHistory} />
+        <ApprovalsNotice history={history} onRetryHistory={onRetryHistory} />
         {messages.map((message) => (
           <MessageCard key={message.id} message={message} toolsById={toolsById} />
         ))}

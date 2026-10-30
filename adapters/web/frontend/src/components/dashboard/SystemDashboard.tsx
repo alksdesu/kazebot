@@ -10,7 +10,7 @@ import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
-import { connectionDotClass, countActiveTasks, formatUptime } from '../../utils/systemStatus';
+import { connectionDotClass, countActiveTasks, countPendingApprovals, formatUptime } from '../../utils/systemStatus';
 import { TONE_BOX } from '../../styles/tones';
 import { ActiveTasksModal } from './ActiveTasksModal';
 import { errorMessage } from '../../api/request';
@@ -33,8 +33,10 @@ function connectionLabel(status: string): string {
   return 'WebSocket 空闲';
 }
 
-function engineStatus(adminState: AdminState | null): { label: string; detail: string } {
-  const runtime = adminState?.engine_runtime || {};
+function engineStatus(adminState: AdminState | null, unread: string): { label: string; detail: string } {
+  // Never read is not "no worker": that would read as the engine being down.
+  if (!adminState) return { label: unread, detail: '引擎状态没读到。' };
+  const runtime = adminState.engine_runtime;
   const workerId = typeof runtime.worker_id === 'string' ? runtime.worker_id : '';
   const workers = Array.isArray(runtime.workers) ? runtime.workers.filter((item): item is string => typeof item === 'string') : [];
   const lastSeenAt = typeof runtime.last_seen_at === 'string' ? runtime.last_seen_at : '';
@@ -97,9 +99,9 @@ export const SystemDashboard = () => {
     return startPolling(load, 15000, { first: load });
   }, [requests, adminToken]);
 
-  const pendingApprovals = data.adminState?.approvals?.pending ?? data.adminState?.pending_approvals?.length ?? 0;
-  const activeTasks = countActiveTasks(data.adminState?.tasks);
-  const engine = useMemo(() => engineStatus(data.adminState), [data.adminState]);
+  // Counts that were never read show as unknown, not as 0.
+  const unread = data.loading ? '…' : '无数据';
+  const engine = useMemo(() => engineStatus(data.adminState, unread), [data.adminState, unread]);
 
   return (
     <section aria-label="系统仪表盘" className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
@@ -126,9 +128,9 @@ export const SystemDashboard = () => {
       )}
 
       <div className="grid grid-cols-2 gap-2">
-        <Stat label="会话数" value={data.adminState?.sessions ?? (data.loading ? '…' : '无数据')} />
-        <Stat label="待审批" value={pendingApprovals} />
-        <Stat label="运行中任务" value={activeTasks} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
+        <Stat label="会话数" value={data.adminState?.sessions ?? unread} />
+        <Stat label="待审批" value={data.adminState ? countPendingApprovals(data.adminState) : unread} />
+        <Stat label="运行中任务" value={data.adminState ? countActiveTasks(data.adminState.tasks) : unread} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
         <Stat label="运行时间" value={formatUptime(data.health?.uptime_seconds)} />
       </div>
 

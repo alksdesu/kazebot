@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useSettingsStore } from '../../store/settingsStore';
 import { downloadFile } from '../../api/blobs';
-import { errorMessage, requestJson } from '../../api/request';
+import { errorMessage, request as sendRequest } from '../../api/request';
+import { readReceipt, receiptOf, receipted, type Receipted } from '../../api/shape';
 import { AuthorizedImage } from '../../components/common/AuthorizedImage';
 import { featureRequest, featureUrl } from '../client';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
@@ -10,15 +11,19 @@ import { startPolling } from '../../utils/polling';
 import { EmptyState, FeatureFeedback, FeaturePage, actionClass } from '../ui';
 import { Block, Button, Check, Desc, ErrorText, Input, Panel, Select, Textarea } from '../../console/components';
 import type { MaterialScope } from '../../api/supervisorClient';
+import { appendSentence, rereadMissed } from '../../utils/sentence';
 import { scopeIdentity, type ConversationDescriptor } from '../conversationNames';
 import { useConversationNames } from '../useConversationNames';
+import {
+  readArtifact, readArtifactRows, readCapabilities, readCitation, readDelivery, readExtractions, readJob, readJobs,
+  readJournalMessage, readJournalSearch, readMaterialScopes, readMaterialSettings, readSource, readSources, readSpans, readVersion,
+  type Artifact, type ArtifactRow, type Capabilities, type Extraction, type Job, type JournalHit, type Source, type Span, type Version,
+} from './materialShapes';
 
-type Source = { id: string; name: string; status: string; mime_type: string; warnings?: { message: string }[] };
-type Span = { id: string; text: string; citation: string; locator: { label: string } };
-type Version = { id: string; artifact_id: string; number: number; status: string; sha256: string; page_count: number; format: string };
-type Artifact = { id: string; name: string; current_version: string; versions: Version[] };
-type Extraction = { id: string; source_id: string; revision: number; status: string; fields: { id: string; label: string; value: string; uncertain: boolean }[] };
-type Job = { id: string; status: string; version_id?: string; artifact_id: string; error?: string };
+type ReadOptions = { params?: Record<string, string | number | boolean>; signal?: AbortSignal; method?: string; body?: unknown };
+const ignoreReceipt = (): void => undefined;
+const SCOPES = '资料会话名单';
+const CAPABILITIES = '资料处理能力';
 
 const STATUS_LABELS: Record<string, string> = {
   registered: '待解析', parsed: '已解析', queued: '排队中', running: '生成与渲染中',
@@ -27,6 +32,7 @@ const STATUS_LABELS: Record<string, string> = {
   needs_review: '待校对', reviewed: '已校对',
 };
 const statusLabel = (status: string) => STATUS_LABELS[status] || status;
+const RETRY_RECEIPT = '生成任务已经重新排上，可回执';
 
 export function buildMaterialSpec(format: string, title: string, text: string): Record<string, unknown> {
   if (format === 'xlsx') return { title, sheets: [{ name: '数据', rows: text.split('\n').filter(Boolean).map(row => row.split('\t')) }] };
@@ -69,10 +75,10 @@ export function MaterialsPage() {
   const [spans, setSpans] = useState<Span[]>([]);
   const [journal, setJournal] = useState(false);
   const [chatQuery, setChatQuery] = useState('');
-  const [chatResults, setChatResults] = useState<{ id: string; message_id: string; sender_name: string; timestamp: number; text: string; truncated: boolean }[]>([]);
+  const [chatResults, setChatResults] = useState<JournalHit[]>([]);
   const [extractions, setExtractions] = useState<Extraction[]>([]);
   const [corrections, setCorrections] = useState<Record<string, { revision: number; values: Record<string, string> }>>({});
-  const [artifacts, setArtifacts] = useState<{ id: string; name: string }[]>([]);
+  const [artifacts, setArtifacts] = useState<ArtifactRow[]>([]);
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [selectedVersion, setSelectedVersion] = useState('');
   const [compareVersion, setCompareVersion] = useState('');
@@ -83,7 +89,10 @@ export function MaterialsPage() {
   const [recentJobs, setRecentJobs] = useState<Job[]>([]);
   const [inspected, setInspected] = useState(false);
   const [loadedPages, setLoadedPages] = useState<number[]>([]);
-  const [capabilities, setCapabilities] = useState<{ office_renderer: boolean; modules: Record<string, boolean> } | null>(null);
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState('');
+  // 这一范围的几张列表读成过没有：没读成时说「尚无资料」，等于告诉人这里是空的。
+  const [listsRead, setListsRead] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
@@ -105,11 +114,20 @@ export function MaterialsPage() {
   const confirmDiscard = useUnsavedChanges(Object.keys(corrections).length > 0 || Boolean((title || content) && generationDraft !== savedGeneration));
   const version = artifact?.versions.find(item => item.id === selectedVersion);
   const generationActive = Boolean(job && ['queued', 'running'].includes(job.status));
-  const api = async <T,>(path: string, method = 'GET', body?: unknown, params: Record<string, string | number | boolean> = {}, signal?: AbortSignal) => {
+  const read = async <T,>(path: string, what: string, parse: (what: string, body: unknown) => T, options: ReadOptions = {}): Promise<T> => {
     requests.check();
-    const result = await featureRequest<T>('/v1/materials' + path, { method, body, params: { ...params, bot_scope: botScope }, scope, signal });
-    requests.check(); return result;
+    const body = await featureRequest('/v1/materials' + path, { what, method: options.method, body: options.body, params: { ...options.params, bot_scope: botScope }, scope, signal: options.signal });
+    requests.check(); return parse(what, body);
   };
+  // 写已经做完、回执读不懂时 result 是 null：调用处照做完收尾，重读一遍现状，再交代回执的事。
+  const write = async <T,>(path: string, method: string, receipt: string, parse: (what: string, body: unknown) => T, body?: unknown): Promise<Receipted<T>> => {
+    requests.check();
+    const outcome = await receipted(featureRequest('/v1/materials' + path, { receipt, method, body, params: { bot_scope: botScope }, scope })
+      .then(value => readReceipt(receipt, value, raw => parse(receipt, raw))));
+    requests.check(); return outcome;
+  };
+  // 写已经做完之后的重读：没成只补一句，不往外抛，免得「已完成」被换成一条失败。
+  const reread = (load: () => Promise<void>): Promise<string> => load().then(() => '', (reason: unknown) => rereadMissed(errorMessage(reason)));
 
   async function perform(action: () => Promise<void>) {
     if (runningOperation.current) return;
@@ -129,12 +147,12 @@ export function MaterialsPage() {
     const request = requests.begin('refresh');
     try {
       const [newSources, newArtifacts, newExtractions, settings, jobs] = await Promise.all([
-        api<Source[]>('/sources', 'GET', undefined, {}, request.signal), api<{ id: string; name: string }[]>('/artifacts', 'GET', undefined, {}, request.signal),
-        api<Extraction[]>('/extractions', 'GET', undefined, {}, request.signal), api<{ journal_enabled: boolean }>('/settings', 'GET', undefined, {}, request.signal),
-        api<Job[]>('/jobs', 'GET', undefined, {}, request.signal),
+        read('/sources', '资料列表', readSources, { signal: request.signal }), read('/artifacts', '作品列表', readArtifactRows, { signal: request.signal }),
+        read('/extractions', '截图校对列表', readExtractions, { signal: request.signal }), read('/settings', '原消息记录设置', readMaterialSettings, { signal: request.signal }),
+        read('/jobs', '生成任务列表', readJobs, { signal: request.signal }),
       ]);
       if (!request.isCurrent()) return;
-      setLoading(false); setSources(newSources); setArtifacts(newArtifacts); setExtractions(newExtractions); setJournal(settings.journal_enabled); setRecentJobs(jobs);
+      setLoading(false); setListsRead(true); setSources(newSources); setArtifacts(newArtifacts); setExtractions(newExtractions); setJournal(settings.journal_enabled); setRecentJobs(jobs);
       setJob(current => current && ['queued', 'running'].includes(current.status) ? current : jobs.find(item => ['queued', 'running'].includes(item.status)) || current);
     } catch (reason) {
       if (request.isCurrent()) throw reason;
@@ -144,7 +162,7 @@ export function MaterialsPage() {
   async function openArtifact(id: string, preferred = '') {
     const request = requests.begin('artifact');
     try {
-      const item = await api<Artifact>(`/artifacts/${encodeURIComponent(id)}`, 'GET', undefined, {}, request.signal);
+      const item = await read(`/artifacts/${encodeURIComponent(id)}`, '作品', readArtifact, { signal: request.signal });
       if (!request.isCurrent()) return;
       setArtifact(item); setSelectedVersion(preferred || item.current_version); setCompareVersion('');
     } catch (reason) {
@@ -153,19 +171,19 @@ export function MaterialsPage() {
   }
 
   useEffect(() => {
-    setScopeSnapshot({ token, rows: [] }); setScopeError(''); setCapabilities(null);
+    setScopeSnapshot({ token, rows: [] }); setScopeError(''); setCapabilities(null); setCapabilityError('');
     if (!token) return;
     const scopeList = catalog.begin('scopes');
-    featureRequest<MaterialScope[]>('/v1/materials/scopes', { signal: scopeList.signal }).then(items => {
-      if (scopeList.isCurrent()) setScopeSnapshot({ token, rows: Array.isArray(items) ? items.filter(item => item && typeof item.scope === 'string' && typeof item.bot_scope === 'string') : [] });
-    }).catch(() => { if (scopeList.isCurrent()) setScopeError('资料会话名称读取失败，仍可操作当前范围。'); });
+    featureRequest('/v1/materials/scopes', { what: SCOPES, signal: scopeList.signal }).then(items => {
+      if (scopeList.isCurrent()) setScopeSnapshot({ token, rows: readMaterialScopes(SCOPES, items) });
+    }).catch(reason => { if (scopeList.isCurrent()) setScopeError(appendSentence(`资料会话名称读取失败：${errorMessage(reason)}`, '仍可操作当前范围。')); });
     const renderers = catalog.begin('capabilities');
-    featureRequest<{ office_renderer: boolean; modules: Record<string, boolean> }>('/v1/materials/capabilities', { signal: renderers.signal }).then(item => { if (renderers.isCurrent()) setCapabilities(item); }).catch(reason => { if (renderers.isCurrent()) setError(errorMessage(reason)); });
+    featureRequest('/v1/materials/capabilities', { what: CAPABILITIES, signal: renderers.signal }).then(item => { if (renderers.isCurrent()) setCapabilities(readCapabilities(CAPABILITIES, item)); }).catch(reason => { if (renderers.isCurrent()) setCapabilityError(errorMessage(reason)); });
   }, [catalog, token, scopeRetry]);
 
   useEffect(() => {
     runningOperation.current = false; setBusy(false);
-    setSources([]); setArtifacts([]); setExtractions([]); setJournal(false); setLoading(true); setScopeDraft(scope); setSearched(false); setChatSearched(false);
+    setSources([]); setArtifacts([]); setExtractions([]); setJournal(false); setLoading(true); setListsRead(false); setScopeDraft(scope); setSearched(false); setChatSearched(false);
     setArtifact(null); setSelectedVersion(''); setSourceId(''); setSpans([]); setChatResults([]); setCorrections({}); setJob(null); setRecentJobs([]);
     if (scope.trim()) void perform(async () => { try { await refresh(); } finally { if (requests.isCurrent()) setLoading(false); } });
   }, [requests, scope]);
@@ -176,7 +194,7 @@ export function MaterialsPage() {
     if (!job || !['queued', 'running'].includes(job.status)) return;
     const check = () => {
       const request = requests.begin('job');
-      return api<Job>(`/jobs/${job.id}`, 'GET', undefined, {}, request.signal).then(next => {
+      return read(`/jobs/${job.id}`, '生成任务', readJob, { signal: request.signal }).then(next => {
         if (!request.isCurrent()) return;
         setJob(next);
         if (next.status === 'preview_ready') {
@@ -191,19 +209,37 @@ export function MaterialsPage() {
   async function upload(file: File) {
     const form = new FormData(); form.append('file', file);
     requests.check();
-    const source = await requestJson<Source>(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
+    const receipt = '资料已经传上，可回执';
+    const response = await sendRequest(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
       method: 'POST', body: form,
     });
+    const { result: source, receiptProblem } = await receipted<Source>(receiptOf(receipt, response, raw => readSource(receipt, raw)));
     requests.check();
-    await refresh(); requests.check(); setSourceId(source.id); setNotice(`已登记 ${source.name}。`);
+    const rereadProblem = await reread(refresh); requests.check();
+    if (source) setSourceId(source.id);
+    setNotice(`已登记 ${source ? source.name : file.name}。`);
+    setError(appendSentence(receiptProblem && appendSentence(receiptProblem, '在下面的列表里选中它再检索'), rereadProblem));
   }
 
   async function generate(event: FormEvent) {
     event.preventDefault();
     await perform(async () => {
-      setJob(await api<Job>('/artifacts/generate', 'POST', { format, spec: buildMaterialSpec(format, title, content) })); setSavedGeneration(generationDraft);
+      const { result: queued, receiptProblem } = await write('/artifacts/generate', 'POST', '生成任务已经交上，可回执', readJob, { format, spec: buildMaterialSpec(format, title, content) });
+      setSavedGeneration(generationDraft);
+      if (queued) setJob(queued);
+      // 交上了却读不懂回执：重读一遍，排着的那个任务会从任务列表里接上。
+      const rereadProblem = queued ? '' : await reread(refresh); requests.check();
       setNotice('正在生成并渲染，完成后会显示全部预览页。');
+      setError(appendSentence(receiptProblem, rereadProblem));
     });
+  }
+
+  // 交上了却读不懂回执时手上的任务状态是旧的：重读一遍，还在跑的那个由轮询接着跟。
+  async function settleJob(path: string, receipt: string, refreshAfter: boolean) {
+    const { result: next, receiptProblem } = await write(path, 'POST', receipt, readJob);
+    if (next) setJob(next);
+    const rereadProblem = refreshAfter || !next ? await reread(refresh) : ''; requests.check();
+    setError(appendSentence(receiptProblem, rereadProblem));
   }
 
   async function downloadVersion(item: Version, name: string) {
@@ -219,7 +255,8 @@ export function MaterialsPage() {
       }}>{[...options].map(([key]) => <option key={key} value={key}>{scopeNames.get(key)}</option>)}</Select></label>
       <details><summary className="cursor-pointer text-sm">高级：会话标识</summary><form className="mt-3 min-w-0 space-y-2" onSubmit={event => { event.preventDefault(); changeScope(scopeDraft, null); }}><label>会话内部标识<Input width="wide" aria-label="资料会话范围" value={scopeDraft} onChange={event => setScopeDraft(event.target.value)} /></label><Button type="submit" disabled={!scopeDraft.trim() || (scopeDraft === scope && botScope === null)}>切换会话范围</Button></form></details>
       </div>
-      <p className="break-words text-xs text-[var(--duties-secondary)]">当前操作范围：{scopeNames.get(selectedScope)}</p><p>Office 渲染：{!capabilities ? '读取中…' : capabilities.office_renderer ? '可用' : '未就绪，DOCX/XLSX/PPTX 暂不能完成预览'}；PDF 预览：{capabilities?.modules.pdf_preview ? '可用' : '未就绪'}</p>
+      <p className="break-words text-xs text-[var(--duties-secondary)]">当前操作范围：{scopeNames.get(selectedScope)}</p><p>Office 渲染：{!capabilities ? capabilityError ? '没读到' : '读取中…' : capabilities.office_renderer ? '可用' : '未就绪，DOCX/XLSX/PPTX 暂不能完成预览'}；PDF 预览：{!capabilities ? capabilityError ? '没读到' : '读取中…' : capabilities.modules.pdf_preview ? '可用' : '未就绪'}</p>
+      {capabilityError && <p role="alert">{`Office 渲染、PDF 预览没读到：${capabilityError}`} <Button tone="quiet" onClick={() => setScopeRetry(value => value + 1)}>重读处理能力</Button></p>}
       {scopeError && <p role="status">{scopeError} <Button tone="quiet" onClick={() => setScopeRetry(value => value + 1)}>重试会话名称</Button></p>}
       <Button disabled={busy} onClick={() => void perform(refresh)}>刷新</Button>
     </Panel>
@@ -235,39 +272,41 @@ export function MaterialsPage() {
       </Select>
       <Input width="wide" aria-label="文件检索词" placeholder="输入问题中的关键词；留空查看开头依据" value={query} onChange={event => setQuery(event.target.value)} />
       <Button disabled={!sourceId || busy} onClick={() => void perform(async () => {
-        const found = await api<{ results: Span[]; warnings: { message: string }[] }>(`/sources/${sourceId}/spans`, 'GET', undefined, { q: query });
+        const found = await read(`/sources/${sourceId}/spans`, '检索结果', readSpans, { params: { q: query } });
         setSearched(true); setSpans(found.results); setNotice(found.warnings.map(warning => warning.message).join(' '));
       })}>解析并检索</Button>
-      {!loading && !sources.length && <EmptyState>尚无资料。上传文件后，可按关键词查找原文依据。</EmptyState>}
+      {listsRead && !sources.length && <EmptyState>尚无资料。上传文件后，可按关键词查找原文依据。</EmptyState>}
       {searched && !spans.length && <EmptyState>没有找到匹配依据，请换一个关键词或检查解析提示。</EmptyState>}
       {spans.map(span => <Panel key={span.id}><strong>{span.citation}</strong><p className="whitespace-pre-wrap">{span.text}</p><Button disabled={busy} onClick={() => void perform(async () => {
-        const cite = await api<{ label: string; quote: string }>(`/sources/${sourceId}/cite`, 'POST', { span_id: span.id, quote: span.text.slice(0, 4000) });
+        const cite = await read(`/sources/${sourceId}/cite`, '引用核验结果', readCitation, { method: 'POST', body: { span_id: span.id, quote: span.text.slice(0, 4000) } });
         setNotice(`已核验原文引用：${cite.label}\n${cite.quote}`);
       })}>核验这段引用</Button></Panel>)}
     </Block></div>
     <div id="journal-section" className="scroll-mt-4"><Block title="授权原消息检索">
       <Check disabled={busy} checked={journal} onChange={checked => void perform(async () => {
-        const config = await api<{ journal_enabled: boolean }>('/settings', 'PUT', { journal_enabled: checked }); setJournal(config.journal_enabled); if (!config.journal_enabled) { setChatResults([]); setChatSearched(false); }
+        const { result: config, receiptProblem } = await write('/settings', 'PUT', '原消息记录开关已经存上，可回执', readMaterialSettings, { journal_enabled: checked });
+        if (!config) { const rereadProblem = await reread(refresh); requests.check(); setError(appendSentence(appendSentence(receiptProblem, '开关以重新读到的为准'), rereadProblem)); return; }
+        setJournal(config.journal_enabled); if (!config.journal_enabled) { setChatResults([]); setChatSearched(false); }
       })}>记录当前会话的新原消息</Check>
       <Desc>开启后才记录实际收到的消息。关闭后停止检索；压缩摘要不能当作过去的原话。</Desc>
       <Input width="wide" aria-label="聊天原文检索" value={chatQuery} onChange={event => setChatQuery(event.target.value)} placeholder="原话关键词" />
       <Button disabled={!journal || busy} onClick={() => void perform(async () => {
-        const found = await api<{ results: typeof chatResults; message?: string }>('/journal/search', 'GET', undefined, { q: chatQuery }); setChatSearched(true); setChatResults(found.results); if (found.message) setNotice(found.message);
+        const found = await read('/journal/search', '原消息检索结果', readJournalSearch, { params: { q: chatQuery } }); setChatSearched(true); setChatResults(found.results); if (found.message) setNotice(found.message);
       })}>查找原消息</Button>
       {chatSearched && !chatResults.length && <EmptyState>没有匹配的原消息。只会检索授权开启后收到的消息。</EmptyState>}
       {chatResults.map(item => <Panel key={item.id}><strong>{item.sender_name} · {new Date(item.timestamp * 1000).toLocaleString()} · 消息 {item.message_id}</strong><p className="whitespace-pre-wrap">{item.text}</p>{item.truncated && <Button disabled={busy} onClick={() => void perform(async () => {
-        const original = await api<{ text: string }>(`/journal/messages/${encodeURIComponent(item.message_id)}`); setNotice(original.text);
+        const original = await read(`/journal/messages/${encodeURIComponent(item.message_id)}`, '原消息', readJournalMessage); setNotice(original.text);
       })}>查看完整原文</Button>}</Panel>)}
     </Block></div>
     <div id="extraction-section" className="scroll-mt-4"><Block title="截图结构化校对">
       <Desc>在 QQ 发截图并说明“整理成表格、待办或错误信息”，识别草稿会显示在这里。模糊字段需核对原图；校对完成不自动执行待办或命令。</Desc>
-      {!loading && !extractions.length && <EmptyState>尚无识别草稿。在 QQ 发送截图并说明要整理的内容后，这里会显示可校对字段。</EmptyState>}
+      {listsRead && !extractions.length && <EmptyState>尚无识别草稿。在 QQ 发送截图并说明要整理的内容后，这里会显示可校对字段。</EmptyState>}
       {extractions.map(item => <Panel key={item.id}>
         <h3>{item.id} · 修订 {item.revision} · {statusLabel(item.status)}</h3>
         <MaterialImage path={`/v1/materials/sources/${item.source_id}/file`} scope={scope} botScope={botScope} alt="待校对截图" />
         {item.fields.map(field => <label className="block" key={field.id}>{field.label}{field.uncertain ? '（待核对）' : ''}<Input width="wide" aria-label={`${item.id} ${field.label}`} disabled={busy} value={corrections[item.id]?.values[field.id] ?? field.value} onChange={event => setCorrections(current => ({ ...current, [item.id]: { revision: current[item.id]?.revision ?? item.revision, values: { ...current[item.id]?.values, [field.id]: event.target.value } } }))} /></label>)}
         {corrections[item.id] && corrections[item.id].revision !== item.revision && <div role="alert"><p>校对已有新的修订。本地草稿已保留，请核对后重新载入。</p><Button disabled={busy} onClick={() => { if (window.confirm('丢弃这份本地校对草稿，载入最新修订？')) setCorrections(current => { const next = { ...current }; delete next[item.id]; return next; }); }}>重新载入校对</Button></div>}
-        <Button disabled={busy || Boolean(corrections[item.id] && corrections[item.id].revision !== item.revision)} onClick={() => void perform(async () => { await api(`/extractions/${item.id}`, 'PATCH', { expected_revision: corrections[item.id]?.revision ?? item.revision, values: corrections[item.id]?.values || {}, confirm: true }); setCorrections(current => { const next = { ...current }; delete next[item.id]; return next; }); await refresh(); })}>保存并确认校对</Button>
+        <Button disabled={busy || Boolean(corrections[item.id] && corrections[item.id].revision !== item.revision)} onClick={() => void perform(async () => { const { receiptProblem } = await write(`/extractions/${item.id}`, 'PATCH', '校对已经存上，可回执', ignoreReceipt, { expected_revision: corrections[item.id]?.revision ?? item.revision, values: corrections[item.id]?.values || {}, confirm: true }); setCorrections(current => { const next = { ...current }; delete next[item.id]; return next; }); const rereadProblem = await reread(refresh); requests.check(); setNotice('校对已保存并确认。'); setError(appendSentence(receiptProblem, rereadProblem)); })}>保存并确认校对</Button>
       </Panel>)}
     </Block></div>
     <div id="generation-section" className="scroll-mt-4"><Block title="生成可编辑成品">
@@ -280,18 +319,18 @@ export function MaterialsPage() {
         <Textarea rows={8} aria-label="成品内容" value={content} onChange={event => setContent(event.target.value)} required />
         <Button type="submit" disabled={busy || generationActive || !title || !content}>生成并渲染预览</Button>
       </fieldset></form>
-      {job && <p role="status">任务 {job.id}：{statusLabel(job.status)} {job.error || ''}{['queued', 'running'].includes(job.status) && <Button disabled={busy} onClick={() => void perform(async () => setJob(await api<Job>(`/jobs/${job.id}/cancel`, 'POST')))}>取消</Button>}</p>}
+      {job && <p role="status">任务 {job.id}：{statusLabel(job.status)} {job.error || ''}{['queued', 'running'].includes(job.status) && <Button disabled={busy} onClick={() => void perform(() => settleJob(`/jobs/${job.id}/cancel`, '生成任务已经取消，可回执', false))}>取消</Button>}</p>}
       {job?.status === 'preview_ready' && job.version_id && <Button disabled={busy} onClick={() => void perform(() => openArtifact(job.artifact_id, job.version_id))}>查看本次生成预览</Button>}
       {recentJobs.filter(item => item.id !== job?.id).slice(0, 10).map(item => <Panel key={item.id}>
         <p>任务 {item.id}：{statusLabel(item.status)} {item.error || ''}</p>
-        {['failed', 'interrupted', 'cancelled'].includes(item.status) && <Button disabled={busy} onClick={() => void perform(async () => { setJob(await api<Job>(`/jobs/${item.id}/retry`, 'POST')); await refresh(); })}>重试本地生成</Button>}
+        {['failed', 'interrupted', 'cancelled'].includes(item.status) && <Button disabled={busy} onClick={() => void perform(() => settleJob(`/jobs/${item.id}/retry`, RETRY_RECEIPT, true))}>重试本地生成</Button>}
         {item.status === 'preview_ready' && item.version_id && <Button disabled={busy} onClick={() => void perform(() => openArtifact(item.artifact_id, item.version_id))}>查看已完成预览</Button>}
       </Panel>)}
-      {job && ['failed', 'interrupted', 'cancelled'].includes(job.status) && <Button disabled={busy} onClick={() => void perform(async () => { setJob(await api<Job>(`/jobs/${job.id}/retry`, 'POST')); await refresh(); })}>重试本地生成</Button>}
+      {job && ['failed', 'interrupted', 'cancelled'].includes(job.status) && <Button disabled={busy} onClick={() => void perform(() => settleJob(`/jobs/${job.id}/retry`, RETRY_RECEIPT, true))}>重试本地生成</Button>}
     </Block></div>
     <div id="version-section" className="scroll-mt-4"><Block title="作品版本与预览确认">
       <Select width="wide" disabled={busy} aria-label="选择作品" value={artifact?.id || ''} onChange={event => { if (event.target.value) void perform(() => openArtifact(event.target.value)); else { requests.drop('artifact'); setArtifact(null); setSelectedVersion(''); setCompareVersion(''); } }}><option value="">选择作品</option>{artifacts.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</Select>
-      {!loading && !artifacts.length && <EmptyState>尚无作品。生成成品，或在 QQ 完成图片创作后，可在这里预览和管理版本。</EmptyState>}
+      {listsRead && !artifacts.length && <EmptyState>尚无作品。生成成品，或在 QQ 完成图片创作后，可在这里预览和管理版本。</EmptyState>}
       {artifact && <>
         <h3 className="font-semibold">{artifact.name}</h3>
         <div className="grid gap-4 md:grid-cols-2">
@@ -302,11 +341,11 @@ export function MaterialsPage() {
         {version && <>
           <p>v{version.number}，共 {version.page_count} 页。以下预览对应将下载或发送的确定文件。</p>
           {Array.from({ length: version.page_count }, (_, index) => <Panel key={`${version.id}:${index}`}><p>第 {index + 1} 页</p><MaterialImage path={`/v1/materials/versions/${version.id}/preview/${index + 1}`} scope={scope} botScope={botScope} alt={`预览第${index + 1}页`} onReady={() => setLoadedPages(current => current.includes(index) ? current : [...current, index])} /></Panel>)}
-          {version.id !== artifact.current_version ? <Button disabled={busy} onClick={() => void perform(async () => { const restored = await api<Version>(`/artifacts/${artifact.id}/restore`, 'POST', { version_id: version.id, expected_version: artifact.current_version }); await openArtifact(artifact.id, restored.id); setNotice('已恢复为新版本，旧版本仍保留。'); })}>恢复此版为新版本</Button> : <>
+          {version.id !== artifact.current_version ? <Button disabled={busy} onClick={() => void perform(async () => { const { result: restored, receiptProblem } = await write(`/artifacts/${artifact.id}/restore`, 'POST', '旧版本已经恢复成新版本，可回执', readVersion, { version_id: version.id, expected_version: artifact.current_version }); const rereadProblem = await reread(() => openArtifact(artifact.id, restored?.id)); requests.check(); setNotice('已恢复为新版本，旧版本仍保留。'); setError(appendSentence(receiptProblem, rereadProblem)); })}>恢复此版为新版本</Button> : <>
             <Check checked={inspected} onChange={setInspected}>我已核对全部预览页，内容与排版无误</Check>
-            <Button disabled={busy || !inspected || loadedPages.length !== version.page_count} onClick={() => void perform(async () => { await api(`/versions/${version.id}/approve`, 'POST', { sha256: version.sha256, preview_inspected: true }); await openArtifact(artifact.id, version.id); setNotice('已确认这个确定版本。'); })}>确认当前版本</Button>
+            <Button disabled={busy || !inspected || loadedPages.length !== version.page_count} onClick={() => void perform(async () => { const { receiptProblem } = await write(`/versions/${version.id}/approve`, 'POST', '这个版本已经确认，可回执', ignoreReceipt, { sha256: version.sha256, preview_inspected: true }); const rereadProblem = await reread(() => openArtifact(artifact.id, version.id)); requests.check(); setNotice('已确认这个确定版本。'); setError(appendSentence(receiptProblem, rereadProblem)); })}>确认当前版本</Button>
             <Button disabled={busy || version.status !== 'approved'} onClick={() => void perform(() => downloadVersion(version, artifact.name))}>下载成品</Button>
-            <Button disabled={busy || version.status !== 'approved'} onClick={() => void perform(async () => { const sent = await api<{ message: string }>(`/versions/${version.id}/send`, 'POST'); setNotice(sent.message); })}>发送到当前会话</Button>
+            <Button disabled={busy || version.status !== 'approved'} onClick={() => void perform(async () => { const { result: sent, receiptProblem } = await write(`/versions/${version.id}/send`, 'POST', '发送已经交上，可回执', readDelivery); setNotice(sent ? sent.message : '已提交发送；实际投递由平台确认。'); if (receiptProblem) setError(receiptProblem); })}>发送到当前会话</Button>
           </>}
         </>}
       </>}

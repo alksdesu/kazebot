@@ -84,6 +84,15 @@ describe('submitApprovalDecision', () => {
     await expect(submitApprovalDecision('ap-1', 'allow', '')).resolves.toEqual({ applied: true, status: 'allowed' });
     expect(api.decideApproval).toHaveBeenCalledTimes(2);
   });
+
+  // 决定已经到了服务端：当成失败，人会照着再点，自动审批会撤掉记录。
+  it('决定交上了却读不懂回执：不算失败，交回回执的问题，不猜生效没有', async () => {
+    vi.mocked(api.decideApproval).mockRejectedValueOnce(new api.ReceiptUnreadable('审批决定已经交上，可回执格式不对：缺 status'));
+
+    await expect(submitApprovalDecision('ap-1', 'allow', '', 'token-a')).resolves.toEqual({
+      applied: false, status: '', receiptProblem: '审批决定已经交上，可回执格式不对：缺 status',
+    });
+  });
 });
 
 describe('useApprovalDecision', () => {
@@ -135,6 +144,18 @@ describe('useApprovalDecision', () => {
       message: '该审批已失效：任务已结束，没有人再等这条审批',
     });
     expect(result.current.messageOf('ap-1')).toBe('该审批已失效：任务已结束，没有人再等这条审批');
+  });
+
+  it('回执读不懂时说清决定已经交上，生效没有看审批现在的状态', async () => {
+    vi.mocked(api.decideApproval).mockRejectedValue(new api.ReceiptUnreadable('审批决定已经交上，可回执不是 JSON'));
+    const { result } = renderHook(() => useApprovalDecision());
+
+    let outcome: unknown;
+    await act(async () => { outcome = await result.current.decide('ap-1', 'allow'); });
+
+    const message = '审批决定已经交上，可回执不是 JSON。生效没有，以审批现在的状态为准';
+    expect(outcome).toEqual({ applied: false, status: '', receiptProblem: '审批决定已经交上，可回执不是 JSON', failed: false, message });
+    expect(result.current.messageOf('ap-1')).toBe(message);
   });
 
   it('提交失败把原因留下，下次提交前清掉', async () => {

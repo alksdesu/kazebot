@@ -54,6 +54,9 @@ const ToolInventorySection = () => {
   const { adminToken, isAuthenticated, setRightPanelOpen } = useSettingsStore();
   const { selectedTool, setAllToolNames, setSelectedTool } = useSettingsSelectionStore();
   const [tools, setTools] = useState<AdminTool[]>([]);
+  // 一次都没读成时手上是空表：说成「共 0 个」「没有符合条件的工具」，就是说一个工具都没有。
+  const [listRead, setListRead] = useState(false);
+  const [listFailed, setListFailed] = useState(false);
   const [newName, setNewName] = useState('');
   const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
@@ -71,12 +74,15 @@ const ToolInventorySection = () => {
       const items = await getTools(adminToken);
       if (!request.isCurrent()) return undefined;
       setTools(items);
+      setListRead(true);
+      setListFailed(false);
       setAllToolNames(items.map((item) => item.name));
       if (selectedTool && !items.some((item) => item.name === selectedTool.name)) setSelectedTool(null);
       setLoadError('');
       return items;
     } catch (caught) {
       if (!request.isCurrent()) return undefined;
+      setListFailed(true);
       setLoadError(errorMessage(caught, '加载工具失败'));
       return undefined;
     } finally {
@@ -128,11 +134,12 @@ const ToolInventorySection = () => {
     if (!confirmNavigation()) return;
     const toolName = selectedTool.name;
     try {
-      await deleteTool(adminToken, toolName);
+      // 回执读不懂时也已经删了：照删完收尾，再交代回执的事。
+      const { receiptProblem } = await receipted(deleteTool(adminToken, toolName));
       if (!requests.isCurrent()) return;
       // 先清掉选中：恢复默认后名字没变，右栏要看到选中换过一次才会重读成仓库那份脚本。
       setSelectedTool(null);
-      setMessage(`${removal.done}，重载工具后生效`);
+      setMessage(`${removal.done}，重载工具后生效`, receiptProblem);
       const items = await load();
       if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.name === toolName);
@@ -146,9 +153,9 @@ const ToolInventorySection = () => {
     if (!adminToken) return;
     if (!confirmNavigation()) return;
     try {
-      const result = await reloadTools(adminToken);
+      const { result, receiptProblem } = await receipted(reloadTools(adminToken));
       if (!requests.isCurrent()) return;
-      setMessage(`工具已重载，序号 ${result.seq ?? '未知'}`);
+      setMessage(result ? `工具已重载，序号 ${result.seq}` : '工具已重载', receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;
@@ -167,7 +174,7 @@ const ToolInventorySection = () => {
     <Block frame="boxed"
       hint="模型能调的全部工具都在这里。外部脚本工具可以增删改：改仓库自带的会在 config/tools 下存一份本实例的版本，恢复默认即删掉这份；内置和插件工具只能看。风险等级根据工具名前缀推断，脚本编辑器在右栏。"
       scope="all-channels"
-      title={`工具清单 · 共 ${tools.length}`}
+      title={listRead ? `工具清单 · 共 ${tools.length}` : '工具清单'}
     >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
@@ -226,7 +233,7 @@ const ToolInventorySection = () => {
             })}
             {visible.length === 0 && (
               <li className="border border-dashed border-[var(--duties-border)] p-3 text-xs text-[var(--duties-tertiary)]">
-                没有符合条件的工具。
+                {listRead ? '没有符合条件的工具。' : listFailed ? '工具清单没读到，原因见下。点「刷新工具」重读。' : '正在读取工具清单…'}
               </li>
             )}
           </ul>

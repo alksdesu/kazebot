@@ -107,11 +107,12 @@ export const AgentsSettingsPage = () => {
     if (!confirmNavigation()) return;
     const nodeId = selectedNode.id;
     try {
-      await deleteNode(adminToken, nodeId);
+      // 回执读不懂时也已经删了：照删完收尾，再交代回执的事。
+      const { receiptProblem } = await receipted(deleteNode(adminToken, nodeId));
       if (!requests.isCurrent()) return;
       // 先清掉选中：恢复默认后 id 没变，右栏要看到选中换过一次才会重读成仓库那份。
       setSelectedNode(null);
-      setMessage(removal.done);
+      setMessage(removal.done, receiptProblem);
       const items = await loadNodes();
       if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.id === nodeId);

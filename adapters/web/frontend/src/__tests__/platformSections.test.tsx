@@ -13,6 +13,7 @@ import { Section } from '../console/Section';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { clearConsoleSchemas, QQ_SCHEMA, seedConsoleSchemas } from './consoleSchemaFixture';
+import { featuresStateReply, unpublishedStateReply } from './fixtures/consoleReplies';
 
 const SECTION_STORE_KEY = 'console_sections_qq';
 
@@ -405,7 +406,8 @@ describe('跟着实况刷新', () => {
       const url = String(input);
       seen.push(url);
       if (url.endsWith('/config/raw')) return json({ content: '', hash: '', exists: false });
-      if (url.endsWith('/config/state')) return json({ published: false, applied: false, file: {}, state: null, platforms: [] });
+      if (url.endsWith('/features/config/state')) return json(featuresStateReply());
+      if (url.endsWith('/config/state')) return json(unpublishedStateReply());
       return json({});
     }));
     return seen;

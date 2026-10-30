@@ -61,7 +61,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'fixture-auth', isAuthenticated: true });
   instanceDefaults({}); overrides = {}; revision = 3;
   vi.mocked(api.getConversations).mockResolvedValue([row(group, '读书群')]);
-  vi.mocked(featureRequest).mockImplementation(async (path, options = {}) => {
+  vi.mocked(featureRequest).mockImplementation(async (path, options) => {
     if (path.endsWith('/settings/scopes')) return { items: [] } as never;
     if (path.endsWith('/settings/defaults')) {
       if (options.method === 'PATCH') {
@@ -108,6 +108,7 @@ describe('实例默认里的插话覆盖', () => {
     expect(mutations()).toEqual([['/v1/community/settings/defaults', {
       method: 'PATCH',
       body: { values: { interject_presence: true, interject_absent_probability: 0.25 }, reset_fields: [], expected_revision: 2 },
+      receipt: '实例默认已经存上，可回执',
     }]]);
     expect(screen.getByLabelText(probabilityLabel)).toHaveValue('25');
     expect(screen.getByText(/当前生效：25%/)).toBeInTheDocument();

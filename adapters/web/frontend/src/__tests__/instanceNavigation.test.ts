@@ -98,6 +98,23 @@ describe('公开实例目录请求', () => {
     await expect(getInstanceDirectory()).rejects.toThrow(/实例列表/);
   });
 
+  // 说成「与当前入口不一致」的话，人会去改一份本来没问题的入口配置。
+  it.each([
+    [{ instances: [] }, '实例列表格式不对：缺 current_path'],
+    [{ current_path: '' }, '实例列表格式不对：缺 instances'],
+    [{ current_path: '', instances: [{ label: '主实例' }] }, '实例列表格式不对：缺 instances[0].path'],
+  ])('目录读不懂时照实说格式不对 (%j)', async (body, problem) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body))));
+    const { getInstanceDirectory } = await import('../api/supervisorClient');
+    await expect(getInstanceDirectory()).rejects.toThrow(problem);
+  });
+
+  it('目录不是 JSON 时说不是 JSON，不报解析器的英文原话', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>gateway</html>')));
+    const { getInstanceDirectory } = await import('../api/supervisorClient');
+    await expect(getInstanceDirectory()).rejects.toThrow('实例列表格式不对：返回的不是 JSON');
+  });
+
   it('服务失败保留状态码供界面显示和重试', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: '实例目录暂不可用' }), { status: 503 })));
     const { getInstanceDirectory } = await import('../api/supervisorClient');

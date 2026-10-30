@@ -9,6 +9,7 @@ import {
   isValidShareGroupName,
   joinShareGroup,
   leaveShareGroup,
+  receipted,
   ReceiptUnreadable,
   restartEngine,
   type ShareGroup,
@@ -18,7 +19,7 @@ import {
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { appendSentence } from '../utils/sentence';
-import { restartRefusal } from '../utils/systemStatus';
+import { restartRefusal, unreadRestartMessage } from '../utils/systemStatus';
 import { Block, Button, Facts, Footnote, Input, ItemTitle, List, Panel, Row, Tag } from './components';
 import { errorMessage } from '../api/request';
 
@@ -118,9 +119,13 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
       if (action === 'delete') { setNote(message); setProblem(receiptProblem); return; }
       // 配置已经换掉是成功的那半句，照常交代；没重启上是另一回事，单独报错。
       try {
-        const restart = await restartEngine(token, ACTION_REASON[action]);
+        const { result: restart, receiptProblem: restartProblem } = await receipted(restartEngine(token, ACTION_REASON[action]));
         if (!requests.isCurrent()) return;
-        if (restart.scheduled) {
+        if (!restart) {
+          // 重启请求已经到了，只是不知道排没排上：不是失败，跟在成功的那半句后面交代。
+          setNote(appendSentence(message, unreadRestartMessage(restartProblem)));
+          setProblem(receiptProblem);
+        } else if (restart.scheduled) {
           setNote(appendSentence(message, 'engine 正在重启，工具和节点会换成新配置。'));
           setProblem(receiptProblem);
         } else {

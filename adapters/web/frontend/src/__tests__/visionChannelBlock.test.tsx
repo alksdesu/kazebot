@@ -1,6 +1,6 @@
 // 看图渠道在表情包页只回显。改它的入口只有渠道页的系统槽位一处，
 // 两处都能写就会出现两份各自为政的草稿，先保存的那份被后保存的覆盖。
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getSystemModels, updateSystemModel } from '../api/supervisorClient';
@@ -67,6 +67,48 @@ describe('看图渠道回显', () => {
     await show();
     expect(screen.queryByRole('button', { name: /保存/ })).toBeNull();
     expect(updateSystemModel).not.toHaveBeenCalled();
+  });
+});
+
+describe('没读到', () => {
+  // 「跟随主渠道」「未设置」是读到以后的结论；没读到就这么说，看着像真的没配。
+  it('只说没读到和原因，给重读，不摆出没配的样子', async () => {
+    vi.mocked(getSystemModels)
+      .mockRejectedValueOnce(new Error('系统槽位格式不对：slots 不是数组'))
+      .mockResolvedValue(structuredClone(slots({ model_raw: 'vision-model', model: 'vision-model' })) as any);
+    render(<VisionChannelBlock />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('看图渠道没读到：系统槽位格式不对：slots 不是数组');
+    expect(screen.queryByText('跟随主渠道')).toBeNull();
+    expect(screen.queryByText('未设置')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '重读' }));
+    expect(await screen.findByText('vision-model')).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('重读还在路上时说正在读取，不先摆出没配的样子', async () => {
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(getSystemModels)
+      .mockRejectedValueOnce(new Error('503 槽位读挂了'))
+      .mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }) as any);
+    render(<VisionChannelBlock />);
+    await screen.findByRole('alert');
+
+    fireEvent.click(screen.getByRole('button', { name: '重读' }));
+
+    expect(await screen.findByText('正在读取看图渠道…')).toBeTruthy();
+    expect(screen.queryByText('跟随主渠道')).toBeNull();
+    await act(async () => { answer(structuredClone(slots())); });
+    expect(await screen.findByRole('link', { name: '去渠道页改读图槽位' })).toBeTruthy();
+  });
+
+  it('槽位清单里没有读图这一槽：算没读到，不当成没配', async () => {
+    vi.mocked(getSystemModels).mockResolvedValue({ slots: [], image_tools: [], image_default_channel: '' } as any);
+    render(<VisionChannelBlock />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('看图渠道没读到：系统槽位里没有读图（image）这一槽');
+    expect(screen.queryByText('跟随主渠道')).toBeNull();
   });
 });
 

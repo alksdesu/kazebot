@@ -379,13 +379,51 @@ describe('会话面板', () => {
 
     expect(useSettingsStore.getState()).toMatchObject({ activeNodeId: 'entry', activeNodeIsOverride: true });
   });
+
+  // 切换已经在服务端生效：当成失败的话，人会再切一次，下拉框还停在切之前。
+  it('切好了却读不懂回执：照实说一声，并重读当前节点', async () => {
+    vi.mocked(api.switchNode).mockRejectedValue(new api.ReceiptUnreadable('节点已经切换，可回执格式不对：缺 target_node_id'));
+    const { container } = render(<SessionConfigPanel sessionId="session-1" />);
+    await waitFor(() => expect(api.getActiveNode).toHaveBeenCalledTimes(1));
+    vi.mocked(api.getActiveNode).mockResolvedValue(activeNode('entry', true));
+
+    const select = container.querySelector('select')!;
+    await waitFor(() => expect(within(select).getByRole('option', { name: 'Entry' })).toBeInTheDocument());
+    fireEvent.change(select, { target: { value: 'entry' } });
+
+    expect(await screen.findByText('节点已经切换，可回执格式不对：缺 target_node_id。下拉框里是重新读到的当前节点')).toBeInTheDocument();
+    await waitFor(() => expect(api.getActiveNode).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(useSettingsStore.getState()).toMatchObject({ activeNodeId: 'entry', activeNodeIsOverride: true }));
+  });
+
+  it('会话覆盖存上了却读不懂回执：锁住编辑重读一遍，不当成保存失败', async () => {
+    vi.mocked(api.getSessionProviderOverride).mockResolvedValueOnce({}).mockResolvedValue({ model: 'saved-model' });
+    const update = vi.spyOn(api, 'updateSessionProviderOverride')
+      .mockRejectedValue(new api.ReceiptUnreadable('会话的渠道覆盖已经存上，可回执格式不对：返回的不是 JSON 对象'));
+    try {
+      render(<SessionConfigPanel sessionId="session-1" focus="model" />);
+
+      const model = await screen.findByLabelText('模型');
+      await waitFor(() => expect(model).toBeEnabled());
+      fireEvent.change(model, { target: { value: 'saved-model' } });
+      fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+      expect(await screen.findByText('会话的渠道覆盖已经存上，可回执格式不对：返回的不是 JSON 对象。会话覆盖以重新读到的为准')).toBeInTheDocument();
+      expect(update).toHaveBeenCalledOnce();
+      await waitFor(() => expect(api.getSessionProviderOverride).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByLabelText('模型')).toHaveValue('saved-model'));
+    } finally {
+      update.mockRestore();
+    }
+  });
 });
 
 describe('共用读取', () => {
+  // 形状由接口函数核，这里只管核不过的那句原样记下、不往 store 里写猜的值。
   it('回来的格式不对也算没读成，不当成空的写进 store', async () => {
-    vi.mocked(api.getAppConfig).mockResolvedValue({} as never);
-    vi.mocked(api.getActiveNode).mockResolvedValue({} as never);
-    vi.mocked(api.getSessionProviderOverride).mockResolvedValue([] as never);
+    vi.mocked(api.getAppConfig).mockRejectedValue(new Error('全局配置格式不对：缺 default_entry_node_id'));
+    vi.mocked(api.getActiveNode).mockRejectedValue(new Error('会话的当前节点格式不对：缺 node_id'));
+    vi.mocked(api.getSessionProviderOverride).mockRejectedValue(new Error('会话的渠道覆盖格式不对：返回的不是 JSON 对象'));
     const scope = new RequestScope();
 
     await readGlobalConfig(scope.begin('config'));
@@ -393,9 +431,9 @@ describe('共用读取', () => {
     const override = await readSessionOverride('session-1', 'test-token', scope.begin('override'));
 
     const state = useSettingsStore.getState();
-    expect(state.globalConfigRead).toEqual({ loaded: false, error: '全局配置回来的格式不对' });
-    expect(node).toEqual({ ok: false, error: '节点状态回来的格式不对' });
-    expect(override).toEqual({ ok: false, error: '会话覆盖回来的格式不对' });
+    expect(state.globalConfigRead).toEqual({ loaded: false, error: '全局配置格式不对：缺 default_entry_node_id' });
+    expect(node).toEqual({ ok: false, error: '会话的当前节点格式不对：缺 node_id' });
+    expect(override).toEqual({ ok: false, error: '会话的渠道覆盖格式不对：返回的不是 JSON 对象' });
     expect(state.activeNodeSessionId).toBe('');
     expect(state.sessionProviderOverrideSessionId).toBe('');
   });
@@ -412,12 +450,12 @@ describe('共用读取', () => {
     expect(useSettingsStore.getState()).toMatchObject({ activeNodeId: 'entry', activeNodeIsOverride: true });
   });
 
-  it('全局配置读成了把后端配的默认入口记下；默认入口不是字符串算格式不对', async () => {
+  it('全局配置读成了把后端配的默认入口记下；读不成时不记', async () => {
     const scope = new RequestScope();
-    vi.mocked(api.getAppConfig).mockResolvedValueOnce({ ...GLOBAL_CONFIG, default_entry_node_id: undefined } as never);
+    vi.mocked(api.getAppConfig).mockRejectedValueOnce(new Error('全局配置格式不对：缺 default_entry_node_id'));
 
     expect(await readGlobalConfig(scope.begin('config'))).toBe(false);
-    expect(useSettingsStore.getState()).toMatchObject({ globalConfigRead: { loaded: false, error: '全局配置回来的格式不对' }, defaultNodeId: '' });
+    expect(useSettingsStore.getState()).toMatchObject({ globalConfigRead: { loaded: false, error: '全局配置格式不对：缺 default_entry_node_id' }, defaultNodeId: '' });
 
     expect(await readGlobalConfig(scope.begin('config'))).toBe(true);
     expect(useSettingsStore.getState()).toMatchObject({ globalConfigRead: LOADED, defaultNodeId: 'main', globalModel: 'global-model' });

@@ -19,6 +19,7 @@ import {
 import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { configReloadReply, restartReply } from './fixtures/systemReplies';
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -110,8 +111,8 @@ describe('P0 settings pages', () => {
         });
       }
       if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 3723 });
-      if (url.endsWith('/v1/config/reload')) return jsonResponse({ ok: true, reloaded: true });
-      if (url.endsWith('/v1/admin/restart')) return jsonResponse({ scheduled: true, target: 'engine', method: init?.method });
+      if (url.endsWith('/v1/config/reload') && init?.method === 'POST') return jsonResponse(configReloadReply());
+      if (url.endsWith('/v1/admin/restart') && init?.method === 'POST') return jsonResponse(restartReply());
       return jsonResponse({});
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -137,6 +138,21 @@ describe('P0 settings pages', () => {
 
   it('renders Approvals with inferred risk labels and sends decisions', async () => {
     authenticateSettings();
+    const pendingApproval = {
+      approval_id: 'approval-1',
+      session_id: 'sess-approval',
+      operation: '执行命令',
+      details: { tool_name: 'execute_command', path: '/tmp/demo', reason: '需要执行命令' },
+      status: 'pending',
+      fingerprint: 'fp-approval-1',
+      requested_at: '2026-06-02T10:00:00Z',
+      decided_at: null,
+      decision: null,
+      comment: null,
+      tool_call_id: 'tool-call-1',
+      node_id: 'ereuna_main',
+      task_id: 'task-123',
+    };
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/v1/admin/state')) {
@@ -144,18 +160,13 @@ describe('P0 settings pages', () => {
           sessions: 1,
           approvals: { pending: 1 },
           tasks: { running: 0 },
-          pending_approvals: [{
-            approval_id: 'approval-1',
-            operation: '执行命令',
-            node_id: 'ereuna_main',
-            task_id: 'task-123',
-            tool_call_id: 'tool-call-1',
-            details: { tool_name: 'execute_command', path: '/tmp/demo', reason: '需要执行命令' },
-          }],
+          pending_approvals: [pendingApproval],
           engine_runtime: {},
         });
       }
-      if (url.endsWith('/v1/approvals/approval-1')) return jsonResponse({ ok: true, method: init?.method });
+      if (url.endsWith('/v1/approvals/approval-1') && init?.method === 'POST') {
+        return jsonResponse({ ...pendingApproval, status: 'allowed', decided_at: '2026-06-02T10:00:05Z', decision: 'allow', comment: 'settings allow' });
+      }
       return jsonResponse({});
     });
     vi.stubGlobal('fetch', fetchMock);

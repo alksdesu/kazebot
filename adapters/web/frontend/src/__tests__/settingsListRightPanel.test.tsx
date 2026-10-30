@@ -95,7 +95,7 @@ describe('settings list pages open the right panel on selection', () => {
 
   it('opens the right panel when an MCP client is selected', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse([
-      { id: 'mcp_alpha', enabled: true, transport: 'streamable_http', url: 'https://mcp.example.test' },
+      { id: 'mcp_alpha', enabled: true, share_sessions: false, transport: 'streamable_http', url: 'https://mcp.example.test', headers: {} },
     ])));
 
     render(<McpSettingsPage />);

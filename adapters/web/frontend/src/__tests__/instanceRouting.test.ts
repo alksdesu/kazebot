@@ -25,7 +25,7 @@ describe('独立实例入口', () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ instances: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
     await client.getInstances('selected-token');
-    await featureRequest('/v1/community/state', { scope: 'qq_group:synthetic' });
+    await featureRequest('/v1/community/state', { what: '社区状态', scope: 'qq_group:synthetic' });
     expect(fetchMock).toHaveBeenNthCalledWith(1, `${mount}/v1/instances`, expect.objectContaining({ headers: { Authorization: 'Bearer selected-token' } }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, `${mount}/v1/community/state?scope=qq_group%3Asynthetic`, expect.objectContaining({ headers: { Authorization: 'Bearer selected-token' } }));
     const socket = vi.fn();

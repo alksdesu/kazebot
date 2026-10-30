@@ -1,10 +1,11 @@
 // 账号作用域搬迁。换号之后同一个群会各记各的，这里把旧号名下的会话与记忆整批划给新号。
 import { useEffect, useState } from 'react';
 
-import { getAccountScope, migrateAccountScope, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
+import { getAccountScope, migrateAccountScope, receipted, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
 import { usePageNotice } from '../hooks/usePageNotice';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useSettingsStore } from '../store/settingsStore';
+import { appendSentence } from '../utils/sentence';
 import { Block, Button, ErrorText, Footnote, Input } from './components';
 import { usePlatform } from './platformContext';
 import { errorMessage } from '../api/request';
@@ -32,6 +33,8 @@ export const AccountScope = () => {
   const [target, setTarget] = useState('');
   const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
+  // 最近一次读取没成。归属一次都没读到时据此说「没读到」，不能说成还没绑定账号。
+  const [readFailed, setReadFailed] = useState(false);
   const [previewTarget, setPreviewTarget] = useState('');
   const requests = useRequestGuard(platformId);
 
@@ -39,6 +42,7 @@ export const AccountScope = () => {
     if (!adminToken) return;
     const request = requests.begin('scope');
     setPreviewTarget('');
+    setReadFailed(false);
     setBusy(true);
     try {
       const result = await getAccountScope(adminToken, platformId, withTarget, withSource);
@@ -46,8 +50,16 @@ export const AccountScope = () => {
       setStatus(result);
       setPreviewTarget(withTarget);
       setLoadError('');
-    } catch (caught) { if (request.isCurrent()) setLoadError(errorMessage(caught)); }
-    finally { if (request.isCurrent()) setBusy(false); }
+    } catch (caught) {
+      if (!request.isCurrent()) return;
+      setLoadError(errorMessage(caught));
+      setReadFailed(true);
+    } finally { if (request.isCurrent()) setBusy(false); }
+  };
+
+  const reread = () => {
+    clearNotice();
+    void load();
   };
 
   useEffect(() => { void load(); }, [requests]);
@@ -67,15 +79,19 @@ export const AccountScope = () => {
     setBusy(true);
     try {
       // 按预览认定的源账号搬：预览之后盘上多出别的账号的会话，也不会换成搬另一批。
-      const result = await migrateAccountScope(adminToken, platformId, to, from);
+      const { result, receiptProblem } = await receipted(migrateAccountScope(adminToken, platformId, to, from));
       if (!requests.isCurrent()) return;
-      const hitCacheProblem = typeof result.hit_cache_problem === 'string' ? result.hit_cache_problem : '';
-      // 目录搬完了、命中记录却没跟着改名：不改的话，下一轮数据清理会把这些命中当成没主的摘掉，搬过去的记忆就像从没被想起过。
-      setMessage(
-        `已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`,
-        hitCacheProblem && `记忆命中记录读不了（${hitCacheProblem}），里面的命中时间没跟着换到新账号名下。`
-          + '修好文件时照 supervisor 日志里那份旧 → 新对照改掉前缀',
-      );
+      if (!result) {
+        // 回执读不懂时也已经搬完了：再搬一次只会扑空，归属以紧接着重读到的为准。
+        setMessage('已搬迁。', appendSentence(receiptProblem, '搬了几份、备份放在哪没读到，归属以下面重新读到的为准'));
+      } else {
+        // 目录搬完了、命中记录却没跟着改名：不改的话，下一轮数据清理会把这些命中当成没主的摘掉，搬过去的记忆就像从没被想起过。
+        setMessage(
+          `已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`,
+          result.hit_cache_problem && `记忆命中记录读不了（${result.hit_cache_problem}），里面的命中时间没跟着换到新账号名下。`
+            + '修好文件时照 supervisor 日志里那份旧 → 新对照改掉前缀',
+        );
+      }
       await load();
     } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
@@ -89,7 +105,10 @@ export const AccountScope = () => {
   return (
     <Block hint="换号后同一个群会各记各的；搬迁把旧号名下的全部数据划给新号" title="记忆归属">
       <p className={TEXT}>
-        当前归属：<strong>{status?.current_scope || '还没绑定账号'}</strong>
+        当前归属：<strong>{status ? status.current_scope || '还没绑定账号' : readFailed ? '没读到' : '正在读取…'}</strong>
+        {!status && readFailed && (
+          <Button className="ml-2" disabled={busy} onClick={reread} size="sm" tone="quiet">重读</Button>
+        )}
         {status?.bot_alive && status?.live_scope && status.live_scope !== status.current_scope
           && `（bot 正跑在 ${status.live_scope}）`}
       </p>

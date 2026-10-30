@@ -21,7 +21,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'fixture-auth', isAuthenticated: true });
   defaults = { settings: { ...policy }, values: {}, revision: 2 }; overrides = {}; revision = 3;
   vi.mocked(api.getConversations).mockResolvedValue([row(group, '读书群'), row(privateScope, '小林'), row('web:console', '旧控制台'), row('qq_group:old', '历史群', false)]);
-  vi.mocked(featureRequest).mockImplementation(async (path, options = {}) => {
+  vi.mocked(featureRequest).mockImplementation(async (path, options) => {
     if (path.endsWith('/settings/scopes')) return { items: [] } as never;
     if (path.endsWith('/settings/defaults')) {
       if (options.method === 'PATCH') { const body = options.body as { values: Partial<typeof policy> }; defaults = { ...defaults, settings: { ...defaults.settings, ...body.values }, values: { ...defaults.values, ...body.values }, revision: defaults.revision + 1 }; }
@@ -98,7 +98,7 @@ describe('实例默认与逐项继承的读写合同', () => {
     fireEvent.change(screen.getByLabelText(windowLabel), { target: { value: '0' } });
     fireEvent.click(screen.getByRole('button', { name: '保存实例默认配置' }));
     await screen.findByText('实例默认配置已保存；已有会话覆盖保持不变。');
-    expect(mutations()).toEqual([['/v1/community/settings/defaults', { method: 'PATCH', body: { values: { response_policy_enabled: false, merge_window_sec: 0 }, reset_fields: [], expected_revision: 2 } }]]);
+    expect(mutations()).toEqual([['/v1/community/settings/defaults', { method: 'PATCH', body: { values: { response_policy_enabled: false, merge_window_sec: 0 }, reset_fields: [], expected_revision: 2 }, receipt: '实例默认已经存上，可回执' }]]);
   });
   it('局部默认禁用继承字段，显式false/0是自定义而不是inherit', async () => {
     render(<ConversationSettings scope={group} />);

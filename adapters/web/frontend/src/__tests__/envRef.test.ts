@@ -1,7 +1,7 @@
 // 与后端 clonoth_runtime.resolve_env_ref 对齐的识别规则。
 import { describe, expect, it } from 'vitest';
 
-import { describeEnvRef, envRefNames } from '../utils/envRef';
+import { describeEnvRef, envRefNames, parseEnvRef } from '../utils/envRef';
 
 describe('envRefNames', () => {
   it('两种写法都认', () => {
@@ -20,15 +20,30 @@ describe('envRefNames', () => {
     expect(envRefNames('')).toEqual([]);
   });
 
-  it('空模板和没闭合的都当字面量，跟后端一个口径', () => {
-    expect(envRefNames('${}')).toEqual([]);
-    expect(envRefNames('$ENV{}')).toEqual([]);
-    expect(envRefNames('$ENV{BROKEN')).toEqual([]);
-  });
-
   it('前后有空白也认', () => {
     expect(envRefNames('  ${OPENAI_MODEL}  ')).toEqual(['OPENAI_MODEL']);
     expect(envRefNames('$ENV{ A | B }')).toEqual(['A', 'B']);
+  });
+});
+
+describe('parseEnvRef', () => {
+  // runtime 一直把 $ENV{} 当引用展开，结果是空串；${} 要求括号里有东西，空的才原样当字面量。
+  it('$ENV{} 是一个变量名都没写的引用，${} 不是引用', () => {
+    expect(parseEnvRef('$ENV{}')).toEqual([]);
+    expect(parseEnvRef('$ENV{ | }')).toEqual([]);
+    expect(parseEnvRef('${}')).toBeNull();
+  });
+
+  it('没闭合的、字面量都不是引用', () => {
+    expect(parseEnvRef('$ENV{BROKEN')).toBeNull();
+    expect(parseEnvRef('${BROKEN')).toBeNull();
+    expect(parseEnvRef('gpt-4o-mini')).toBeNull();
+    expect(parseEnvRef('')).toBeNull();
+  });
+
+  it('写了变量名的引用给出变量名', () => {
+    expect(parseEnvRef('$ENV{NEW|OLD}')).toEqual(['NEW', 'OLD']);
+    expect(parseEnvRef('${OPENAI_MODEL}')).toEqual(['OPENAI_MODEL']);
   });
 });
 
@@ -40,6 +55,11 @@ describe('describeEnvRef', () => {
 
   it('不是引用就原样过', () => {
     expect(describeEnvRef('gpt-4o-mini')).toBe('gpt-4o-mini');
+    expect(describeEnvRef('${}')).toBe('${}');
     expect(describeEnvRef('')).toBe('');
+  });
+
+  it('$ENV{} 展开是空串，交给调用方说没设置', () => {
+    expect(describeEnvRef('$ENV{}')).toBe('');
   });
 });

@@ -3,7 +3,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getSystemModels, updateSystemModel } from '../api/supervisorClient';
+import { getSystemModels, ReceiptUnreadable, updateSystemModel } from '../api/supervisorClient';
 import { SystemSlots } from '../console/SystemSlots';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -267,5 +267,55 @@ describe('代码审查槽位', () => {
     const [, key, body] = vi.mocked(updateSystemModel).mock.calls[0];
     expect(key).toBe('review');
     expect(body).toEqual({ model: 'review-model' });
+  });
+});
+
+describe('读不成和回执读不懂', () => {
+  // 一个槽位都没读到时摆成「没有可配的槽位」，看着像后端真的不给配。
+  it('没读成就说没读到、给重读，不摆空清单也不给保存', async () => {
+    vi.mocked(getSystemModels)
+      .mockRejectedValueOnce(new Error('系统槽位格式不对：缺 slots[0].model_raw'))
+      .mockResolvedValue(structuredClone(SLOTS) as any);
+    render1();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('系统槽位没读到，这里没法改：系统槽位格式不对：缺 slots[0].model_raw');
+    expect(screen.queryByText('没有可配的槽位。')).toBeNull();
+    expect(screen.queryByRole('button', { name: '保存槽位' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '重读' }));
+    await waitFor(() => expect(rows()).toHaveLength(6));
+    expect(getSystemModels).toHaveBeenCalledTimes(2);
+  });
+
+  // 存上了只是回执读不懂：当成失败，人会再存一次，草稿还停在存之前。
+  it('存上了却读不懂回执：重读一遍换上，再交代回执的事', async () => {
+    const saved = structuredClone(SLOTS);
+    saved.slots[1] = slot({ key: 'summary', label: '轮摘要', supports_provider: true, model: 'summary-model', model_raw: 'summary-model' });
+    vi.mocked(getSystemModels).mockResolvedValueOnce(structuredClone(SLOTS) as any).mockResolvedValue(saved as any);
+    vi.mocked(updateSystemModel).mockRejectedValue(new ReceiptUnreadable('系统槽位 summary 已经存上，可回执不是 JSON'));
+    render1();
+    await screen.findByText('系统槽位');
+
+    fireEvent.change(within(rowFor('轮摘要')).getByLabelText('轮摘要 模型'), { target: { value: 'summary-model' } });
+    save();
+
+    expect(await screen.findByText('系统槽位 summary 已经存上，可回执不是 JSON')).toBeInTheDocument();
+    expect(screen.getByText('已保存。下一个任务就用新配置。')).toBeInTheDocument();
+    expect(getSystemModels).toHaveBeenCalledTimes(2);
+    expect(within(rowFor('轮摘要')).getByLabelText('轮摘要 模型')).toHaveValue('summary-model');
+  });
+
+  it('重读也没成时说清得先刷新再改', async () => {
+    vi.mocked(getSystemModels).mockResolvedValueOnce(structuredClone(SLOTS) as any).mockRejectedValue(new Error('503 重读挂了'));
+    vi.mocked(updateSystemModel).mockRejectedValue(new ReceiptUnreadable('系统槽位 summary 已经存上，可回执不是 JSON'));
+    render1();
+    await screen.findByText('系统槽位');
+
+    fireEvent.change(within(rowFor('轮摘要')).getByLabelText('轮摘要 模型'), { target: { value: 'summary-model' } });
+    save();
+
+    expect(await screen.findByText(
+      '系统槽位 summary 已经存上，可回执不是 JSON。刷新页面读入最新内容再改。刚才重新读取也没成：503 重读挂了',
+    )).toBeInTheDocument();
   });
 });

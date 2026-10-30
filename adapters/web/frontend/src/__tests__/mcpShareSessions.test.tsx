@@ -81,7 +81,7 @@ it('removes the key when unticked instead of writing false', async () => {
 
 it('creates a client from the list page without share_sessions', async () => {
   serve({ transport: 'stdio', command: 'run-me' });
-  vi.mocked(api.getMcpClients).mockResolvedValue([{ id: 'alpha', transport: 'stdio', command: 'run-me' }]);
+  vi.mocked(api.getMcpClients).mockResolvedValue([{ id: 'alpha', enabled: true, transport: 'stdio', command: 'run-me' }]);
   render(<McpSettingsPage />);
   await screen.findByRole('button', { name: /alpha/ });
 

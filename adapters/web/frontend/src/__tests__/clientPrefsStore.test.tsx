@@ -320,4 +320,16 @@ describe('client preferences store and page', () => {
     await screen.findByText('其他工具 1 个');
     expect(screen.queryByText(/拉不到后端工具清单/)).not.toBeInTheDocument();
   });
+
+  it('says why the catalog did not load and reads it again on request', async () => {
+    vi.mocked(getAllToolNames).mockRejectedValueOnce(new Error('503 工具名清单读不了')).mockResolvedValue([...ALL_TOOL_NAMES]);
+
+    render(<AutoApproveSection />);
+
+    expect(await screen.findByText(/拉不到后端工具清单：503 工具名清单读不了/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重新读取工具清单' }));
+
+    await waitFor(() => expect(screen.queryByText(/拉不到后端工具清单/)).not.toBeInTheDocument());
+    expect(getAllToolNames).toHaveBeenCalledTimes(2);
+  });
 });

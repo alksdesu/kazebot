@@ -98,10 +98,11 @@ export const SkillsSettingsPage = () => {
     if (!window.confirm(`确定要删除技能目录 ${dir} 吗？`)) return;
     if (!confirmNavigation()) return;
     try {
-      await deleteSkill(adminToken, dir);
+      // 回执读不懂时目录也已经删了：照删完收尾，再交代回执的事。
+      const { receiptProblem } = await receipted(deleteSkill(adminToken, dir));
       if (!requests.isCurrent()) return;
       setSelectedSkill(null);
-      setMessage('技能已删除');
+      setMessage('技能已删除', receiptProblem);
       await load();
     } catch (caught) {
       if (!requests.isCurrent()) return;

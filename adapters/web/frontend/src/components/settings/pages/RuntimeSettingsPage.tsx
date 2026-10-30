@@ -40,15 +40,19 @@ const sizeText = (bytes: number): string => {
 /** 调度器自己的死活。它挂了这一页的其余内容全都读不到，所以判据不能只靠带鉴权的接口。 */
 const SupervisorBlock = () => {
   const [health, setHealth] = useState<HealthState | null>(null);
+  // 没通过的原因：回包读不懂也算没通过，可那时它其实连得上，光说「连不上」会把人往错的方向引。
+  const [failure, setFailure] = useState('');
 
   useEffect(() => {
-    const probe = () => checkHealth().then(setHealth).catch(() => setHealth(null));
+    const probe = () => checkHealth()
+      .then((next) => { setHealth(next); setFailure(''); })
+      .catch((caught: unknown) => { setHealth(null); setFailure(errorMessage(caught, '健康检查没有应答')); });
     return startPolling(probe, POLL_MS, { first: probe });
   }, []);
 
   const uptime = health?.uptime_seconds;
   // health.status 是给程序看的字面量（"ok"），别原样摆在中文界面上。
-  const state = !health ? '连不上' : health.status === 'ok' ? '在线' : health.status || '在线';
+  const state = health ? (health.status === 'ok' ? '在线' : health.status || '在线') : failure ? '连不上' : '正在检查…';
 
   return (
     <Block hint="控制台、任务路由与审批都跑在它里面" title="Supervisor">
@@ -63,6 +67,7 @@ const SupervisorBlock = () => {
           )}
         </Row>
       </List>
+      {!health && failure && <ErrorText>{failure}</ErrorText>}
     </Block>
   );
 };
@@ -298,7 +303,7 @@ const RuntimeSettingsPageBody = () => {
           hint={status ? `supervisor 已运行 ${duration(status.uptime_sec)}` : ''}
           title="Engine Worker"
         >
-          {!status ? <Empty>正在读取…</Empty>
+          {!status ? <Empty>{error ? '运行状态没读到，原因见下。' : '正在读取…'}</Empty>
             : !status.supervised ? (
               <Empty>这个部署的 engine 不由 supervisor 拉起，这里测不到它的状态。</Empty>
             ) : workers.length === 0 ? <Empty>没有配置 worker。</Empty> : (

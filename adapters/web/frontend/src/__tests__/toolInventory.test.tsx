@@ -49,6 +49,32 @@ describe('工具清单', () => {
     vi.restoreAllMocks();
   });
 
+  // 读失败时手上是空表：说成「共 0 个」「没有符合条件的工具」，就是说一个工具都没有。
+  it('清单没读成不说共 0 个，也不说没有符合条件的工具；刷新读到了照常列出', async () => {
+    let failFirst = true;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('all-tool-names')) return jsonResponse(CATALOG.map((tool) => tool.name));
+      if (url.endsWith('/admin/config/tools')) {
+        if (!failFirst) return jsonResponse(CATALOG);
+        failFirst = false;
+        return new Response(JSON.stringify({ detail: '工具目录读不了' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+      }
+      return jsonResponse([]);
+    }));
+    render(<ToolsSettingsPage />);
+
+    expect(await screen.findByText('工具清单没读到，原因见下。点「刷新工具」重读。')).toBeInTheDocument();
+    expect(screen.getByText(/503 工具目录读不了/)).toBeInTheDocument();
+    expect(screen.queryByText(/工具清单 · 共/)).toBeNull();
+    expect(screen.queryByText('没有符合条件的工具。')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新工具' }));
+
+    expect(await screen.findByRole('button', { name: /exa_search/ })).toBeInTheDocument();
+    expect(screen.getByText('工具清单 · 共 3')).toBeInTheDocument();
+  });
+
   it('内置和插件工具跟外部工具排在同一张表里', async () => {
     await renderInventory();
 

@@ -5,6 +5,7 @@ import { ExecutionProgressCard } from './ExecutionProgressCard';
 import { RemindersPage } from './RemindersPage';
 import type { ExecutionPlan } from './types';
 import { downloadFeature, featureRequest } from '../client';
+import { ReceiptUnreadable } from '../../api/shape';
 
 vi.mock('../client', () => ({ featureRequest: vi.fn(), downloadFeature: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('./ScopeSelect', () => ({ ScopeSelect: ({ value, onChange }: { value: string; onChange: (value: string) => void }) => <select aria-label="所属会话" value={value} onChange={event => onChange(event.target.value)}><option value="web:console">控制台</option><option value="qq_group:other">其他群</option></select> }));
@@ -84,7 +85,7 @@ describe('execution feature pages', () => {
   });
 
   it('rejects invalid plan lists and card payloads without crashing or offering confirmation', async () => {
-    vi.mocked(featureRequest).mockResolvedValue({ plans: [null] });
+    vi.mocked(featureRequest).mockImplementation(async path => path.endsWith('/tools') ? { tools: [] } : { plans: [null] });
     const { unmount } = render(<ExecutionPage />);
     expect(await screen.findByRole('alert')).toHaveTextContent('执行计划响应格式无效');
     unmount();
@@ -408,5 +409,39 @@ describe('polling waits for the round already in flight', () => {
     expect(reads('/v1/reminders')).toBe(2);
     await tick(5000);
     expect(reads('/v1/reminders')).toBe(3);
+  });
+});
+
+describe('replies the execution pages cannot read', () => {
+  // 读成空表的话，页面会说没有可用工具，步骤也就选不了工具。
+  it('says the tool list was not read instead of offering no tools', async () => {
+    vi.mocked(featureRequest).mockImplementation(async path => path.endsWith('/tools') ? { tools: [{ name: 'write_file', effect: 'external' }] } : { plans: [] });
+    render(<ExecutionPage />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('工具列表读取失败：可用工具列表格式不对：缺 tools[0].description');
+  });
+
+  // 确认已经交上了：报成失败的话，人会再点一次。
+  it('treats a plan action whose reply it cannot read as done', async () => {
+    vi.mocked(featureRequest).mockImplementation(async (_path, options) => options?.method === 'POST' ? { ok: true } : initial());
+    render(<ExecutionProgressCard planId={initial().id} scope="web:console" />);
+    fireEvent.click(await screen.findByRole('button', { name: '确认此版本执行' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '计划已经确认，可回执读不懂：执行计划响应格式无效，请刷新或检查服务版本。进度以下一次读到的为准',
+    );
+    expect(vi.mocked(featureRequest).mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('a reminder whose receipt it cannot read still counts as created', async () => {
+    vi.mocked(featureRequest).mockImplementation(async (_path, options) => {
+      if (options?.method === 'POST') throw new ReceiptUnreadable('提醒已经建好，可回执不是 JSON');
+      return { reminders: [] };
+    });
+    render(<RemindersPage embedded />);
+    fireEvent.change(await screen.findByLabelText('提醒内容'), { target: { value: '交材料' } });
+    fireEvent.change(screen.getByLabelText('当地时间'), { target: { value: '2030-01-01T10:00' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建提醒' }));
+    expect(await screen.findByText('提醒已创建。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('提醒已经建好，可回执不是 JSON');
+    expect(screen.getByLabelText('提醒内容')).toHaveValue('');
   });
 });

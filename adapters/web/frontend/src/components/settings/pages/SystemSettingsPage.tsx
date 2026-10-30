@@ -9,12 +9,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 
-import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
+import { checkHealth, getAdminState, receipted, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
-import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
+import { countActiveTasks, countPendingApprovals, formatUptime, restartRefusal, unreadRestartMessage } from '../../../utils/systemStatus';
 import { Block, Button, Feedback, PageShell } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
@@ -94,25 +94,28 @@ const SystemSettingsPageBody = () => {
     return startPolling(() => load(false), 15000, { first: () => load() });
   }, [adminToken, isAuthenticated, load]);
 
+  // 一次都没读成就说没数据：计数摆成 0、引擎摆成「无工作进程」，看着像真的什么都没有。
+  const unread = loading ? '…' : '无数据';
   const engineInfo = useMemo(() => {
     // [2026-06-02] Normalize the loose engine_runtime payload for display.
     // Why: Supervisor may report either one worker_id or a workers array. How: prefer
     // worker_id, then join string workers, then show an explicit empty value. Purpose:
     // the System tab remains useful across backend runtime schema variants.
-    const runtime = adminState?.engine_runtime || {};
+    if (!adminState) return unread;
+    const runtime = adminState.engine_runtime;
     const workerId = typeof runtime.worker_id === 'string' ? runtime.worker_id : '';
     const workers = Array.isArray(runtime.workers) ? runtime.workers.filter((item): item is string => typeof item === 'string') : [];
     if (workerId) return workerId;
     if (workers.length > 0) return workers.join(', ');
     return '无工作进程';
-  }, [adminState]);
+  }, [adminState, unread]);
 
   const handleReload = () => run(async () => {
     if (!adminToken) return;
     try {
-      await reloadConfig(adminToken);
+      const { receiptProblem } = await receipted(reloadConfig(adminToken));
       if (!requests.isCurrent()) return;
-      report('配置已重载');
+      report(receiptProblem || '配置已重载');
       await load(false);
     } catch (caught) {
       if (!requests.isCurrent()) return;
@@ -123,10 +126,11 @@ const SystemSettingsPageBody = () => {
     if (!adminToken) return;
     if (!window.confirm('确认要重启引擎吗？运行中的任务会全部中断，调度器与本页面的连接不受影响。')) return;
     try {
-      const result = await restartEngine(adminToken);
+      const { result, receiptProblem } = await receipted(restartEngine(adminToken));
       if (!requests.isCurrent()) return;
-      // 没说排上就当没排上：报成功会让人白等。
-      if (result?.scheduled) report('已请求重启引擎');
+      // 没说排上就当没排上：报成功会让人白等。回执读不懂时请求已经到了，当成失败人会再点一次。
+      if (!result) report(unreadRestartMessage(receiptProblem));
+      else if (result.scheduled) report('已请求重启引擎');
       else reportFailure(`未能重启：${restartRefusal(result)}`);
     } catch (caught) {
       if (!requests.isCurrent()) return;
@@ -138,9 +142,9 @@ const SystemSettingsPageBody = () => {
       <>
         <Block frame="boxed" title="系统状态" hint="数据来自管理员状态接口和健康检查接口，每 15 秒自动刷新。">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <Stat label="会话数" value={adminState?.sessions ?? (loading ? '…' : '无数据')} />
-            <Stat label="待审批数" value={adminState?.approvals?.pending ?? adminState?.pending_approvals?.length ?? 0} />
-            <Stat label="运行中任务数" value={countActiveTasks(adminState?.tasks)} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
+            <Stat label="会话数" value={adminState?.sessions ?? unread} />
+            <Stat label="待审批数" value={adminState ? countPendingApprovals(adminState) : unread} />
+            <Stat label="运行中任务数" value={adminState ? countActiveTasks(adminState.tasks) : unread} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
             <Stat label="运行时间" value={formatUptime(health?.uptime_seconds)} />
           </div>
           <div className="mt-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 text-xs leading-5">

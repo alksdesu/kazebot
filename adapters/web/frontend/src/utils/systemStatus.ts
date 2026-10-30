@@ -1,5 +1,6 @@
-import type { RestartInProgress, RestartResult } from '../api/supervisorClient';
+import type { AdminState, RestartInProgress, RestartResult } from '../api/supervisorClient';
 import type { ConnectionStatus } from '../store/chatStore';
+import { appendSentence } from './sentence';
 
 // Shared derivations for Supervisor status surfaces (dashboard and settings).
 export function formatUptime(seconds: number | undefined): string {
@@ -18,6 +19,11 @@ export function formatUptime(seconds: number | undefined): string {
 export function countActiveTasks(tasks: Record<string, number> | undefined): number {
   // Suspended and pending tasks are still non-terminal work, so they count as active.
   return (tasks?.running || 0) + (tasks?.pending || 0) + (tasks?.suspended || 0);
+}
+
+// The counter covers every pending approval; the list is the fallback when the counter has no pending key.
+export function countPendingApprovals(state: AdminState): number {
+  return state.approvals.pending ?? state.pending_approvals.length;
 }
 
 export function connectionDotClass(status: ConnectionStatus): string {
@@ -51,6 +57,11 @@ function inProgressRefusal(inProgress: RestartInProgress): string | undefined {
   if (Number.isNaN(since.getTime())) return undefined;
   const what = RESTART_TARGETS[inProgress.target] ?? '重启';
   return `上一次${what}（${CLOCK.format(since)} 开始）还没收尾，稍后再试`;
+}
+
+/** The request reached the supervisor but its receipt was unreadable: whether a restart got queued is unknown. */
+export function unreadRestartMessage(receiptProblem: string): string {
+  return appendSentence(receiptProblem, '不知道排没排上，去运行页看 worker 有没有重新拉起');
 }
 
 export function restartRefusal(result: RestartResult | undefined): string {

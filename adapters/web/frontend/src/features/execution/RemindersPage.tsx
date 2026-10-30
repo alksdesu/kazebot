@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { receipted } from '../../api/shape';
 import { featureRequest } from '../client';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
@@ -9,6 +10,8 @@ import { ScopeSelect } from './ScopeSelect';
 
 interface Reminder { id: string; text: string; due_at: string; timezone: string; revision: number; status: string; delivery_status: string; owner_label?: string }
 const deliveries: Record<string, string> = { scheduled: '等待到期', sending: '准备发送', queued: '等待送达', delivered: '已送达', failed: '发送失败', outcome_unknown: '送达结果待核对' };
+type ReminderAction = 'complete' | 'snooze' | 'cancel';
+const ACTION_RECEIPTS: Record<ReminderAction, string> = { complete: '提醒已经完成，可回执', snooze: '提醒已经延后，可回执', cancel: '提醒已经取消，可回执' };
 
 function readReminders(value: unknown): Reminder[] {
   const data = value as { reminders?: unknown } | null;
@@ -45,7 +48,7 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
   const refresh = useCallback(async () => {
     const request = requests.begin('reminders');
     try {
-      const result = await featureRequest<unknown>('/v1/reminders', { scope, signal: request.signal });
+      const result = await featureRequest('/v1/reminders', { what: '提醒列表', scope, signal: request.signal });
       if (!request.isCurrent()) return;
       setItems(readReminders(result)); setReadError('');
     } catch (reason) { if (request.isCurrent()) setReadError(errorMessage(reason)); }
@@ -55,24 +58,29 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
     setItems([]); setLoading(true); setError(''); setReadError(''); setNotice('');
     return startPolling(async () => { if (!mutating.current) await refresh(); }, 5000, { first: refresh });
   }, [refresh]);
-  const run = async (action: () => Promise<unknown>, message: string) => {
+  // action 交回回执读不懂的原因：写已经做完了，照常交代，原因另起一行报。
+  const run = async (action: () => Promise<string>, message: string) => {
     if (mutating.current) return;
     mutating.current = true; requests.drop('reminders'); setBusy(true); setError(''); setNotice('');
-    try { await action(); if (requests.isCurrent()) { setNotice(message); await refresh(); } }
+    try {
+      const receiptProblem = await action();
+      if (requests.isCurrent()) { setNotice(message); if (receiptProblem) setError(receiptProblem); await refresh(); }
+    }
     catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); }
     finally { mutating.current = false; if (requests.isCurrent()) setBusy(false); }
   };
   const validMinutes = /^\d+$/.test(minutes) && Number(minutes) >= 1 && Number(minutes) <= 525600;
-  const act = (item: Reminder, action: string) => run(() => featureRequest(`/v1/reminders/${item.id}/${action}`, {
-    scope, method: 'POST', body: { expected_revision: item.revision, ...(action === 'snooze' ? { minutes: Number(minutes) } : {}), action_id: crypto.randomUUID() },
-  }), action === 'complete' ? '提醒已完成。' : action === 'cancel' ? '提醒已取消。' : `已延后 ${minutes} 分钟。`);
+  const act = (item: Reminder, action: ReminderAction) => run(async () => (await receipted(featureRequest(`/v1/reminders/${item.id}/${action}`, {
+    scope, method: 'POST', receipt: ACTION_RECEIPTS[action], body: { expected_revision: item.revision, ...(action === 'snooze' ? { minutes: Number(minutes) } : {}), action_id: crypto.randomUUID() },
+  }))).receiptProblem, action === 'complete' ? '提醒已完成。' : action === 'cancel' ? '提醒已取消。' : `已延后 ${minutes} 分钟。`);
   const visible = items.filter(item => (filter === 'all' || item.status === filter) && `${item.text} ${item.owner_label || ''} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   return <FeaturePage title="提醒与待办" embedded={embedded} description="提醒送达后仍保持未完成。核对时间和时区后创建；完成、取消与延后可以分别操作。">
     <ScopeSelect value={scope} disabled={busy} onChange={value => { if (confirmDiscard()) { setText(''); setDue(''); setScope(value); } }} />
     <FeatureFeedback error={error || readError} notice={notice} retry={() => void refresh()} />
     <form className={sectionClass} onSubmit={event => { event.preventDefault(); void run(async () => {
-      await featureRequest('/v1/reminders', { scope, method: 'POST', body: { text, due_at: due, timezone: zone } });
+      const { receiptProblem } = await receipted(featureRequest('/v1/reminders', { scope, method: 'POST', receipt: '提醒已经建好，可回执', body: { text, due_at: due, timezone: zone } }));
       if (requests.isCurrent()) { setText(''); setDue(''); }
+      return receiptProblem;
     }, '提醒已创建。'); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-4"><legend className="font-semibold">新提醒</legend>
         <label className="block space-y-1">提醒内容<textarea aria-label="提醒内容" required maxLength={4000} rows={3} className={controlClass} value={text} onChange={event => setText(event.target.value)} /></label>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { ReceiptUnreadable, readReceipt, receipted } from '../../api/shape';
 import { uploadAttachment } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { featureRequest, downloadFeature } from '../client';
@@ -9,7 +10,16 @@ import { startPolling } from '../../utils/polling';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { ScopeSelect } from './ScopeSelect';
 import { StepEditor } from './StepEditor';
-import { readExecutionPlan, readExecutionPlans, statusLabel, type ExecutionPlan, type PlanInput, type PlanStep, type ToolOption } from './types';
+import { PLAN_ACTION_RECEIPTS, readExecutionPlan, readExecutionPlans, readExecutionTools, statusLabel, type ExecutionPlan, type PlanAction, type PlanInput, type PlanStep, type ToolOption } from './types';
+import { appendSentence } from '../../utils/sentence';
+
+// 传上了却读不懂回执：文件已经在服务器上，只是拿不到路径，加不进清单。
+const uploadSource = (file: File, scope: string, token: string) => uploadAttachment(file, scope, token).catch((reason: unknown) => {
+  throw reason instanceof ReceiptUnreadable ? new Error(appendSentence(reason.message, '没有加进输入清单，重新选择会再传一份')) : reason;
+});
+
+const PLANS = '执行计划列表';
+const TOOLS = '可用工具列表';
 
 export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?: string }) {
   const [scope, setScope] = useState(initialScope);
@@ -37,7 +47,7 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
   const refresh = useCallback(async () => {
     const request = requests.begin('plans');
     try {
-      const response = await featureRequest<unknown>('/v1/execution/plans', { scope, signal: request.signal });
+      const response = await featureRequest('/v1/execution/plans', { what: PLANS, scope, signal: request.signal });
       if (!request.isCurrent()) return;
       const plans = readExecutionPlans(response);
       setPlans(plans); setReadError('');
@@ -49,28 +59,38 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
     setLoading(true); setReadError(''); setTools([]);
     const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 3000, { first: refresh });
     const request = requests.begin('tools');
-    void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope, signal: request.signal }).then(result => { if (request.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (request.isCurrent()) setError(`工具列表读取失败：${errorMessage(reason)}`); });
+    void featureRequest('/v1/execution/tools', { what: TOOLS, scope, signal: request.signal }).then(result => { if (request.isCurrent()) setTools(readExecutionTools(TOOLS, result)); }).catch(reason => { if (request.isCurrent()) setError(`工具列表读取失败：${errorMessage(reason)}`); });
     return stop;
   }, [requests, refresh, scope]);
   const choose = (plan: ExecutionPlan | null) => {
     setSelected(plan); setEditRevision(plan?.revision ?? null); setGoal(plan?.goal || ''); setWorkScope(plan?.work_scope || ''); setSources(plan?.inputs || []); setSteps(plan?.steps || []); setFailedIds([]); setSourceText(''); setError(''); setNotice(''); setStepsValid(true);
   };
-  const run = async (action: () => Promise<void>) => {
+  // action 交回回执读不懂的原因：写已经做完了，照常收尾，原因另起一行报。
+  const run = async (action: () => Promise<string | void>) => {
     if (mutating.current) return;
     mutating.current = true; requests.drop('plans'); setBusy(true); setError(''); setNotice('');
-    try { await action(); if (requests.isCurrent()) { await refresh(); setNotice('操作已完成。'); } } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { mutating.current = false; if (requests.isCurrent()) setBusy(false); }
+    try {
+      const receiptProblem = await action();
+      if (requests.isCurrent()) { await refresh(); setNotice('操作已完成。'); if (receiptProblem) setError(receiptProblem); }
+    } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { mutating.current = false; if (requests.isCurrent()) setBusy(false); }
   };
   const preview = () => run(async () => {
     const body = { goal, work_scope: workScope, inputs: sources, steps };
-    const plan = readExecutionPlan(await featureRequest<unknown>(selected ? `/v1/execution/plans/${selected.id}` : '/v1/execution/plans', {
-      scope, method: selected ? 'PATCH' : 'POST', body: selected ? { ...body, expected_revision: editRevision } : body,
-    }));
-    if (requests.isCurrent()) choose(plan);
+    const receipt = selected ? '计划已经改好，可回执' : '计划已经建好，可回执';
+    const { result: plan, receiptProblem } = await receipted(featureRequest(selected ? `/v1/execution/plans/${selected.id}` : '/v1/execution/plans', {
+      scope, method: selected ? 'PATCH' : 'POST', receipt, body: selected ? { ...body, expected_revision: editRevision } : body,
+    }).then(value => readReceipt(receipt, value, readExecutionPlan)));
+    if (requests.isCurrent() && plan) choose(plan);
+    // 手上的版本号没换成新的：不重新选中，再存会被当成别处改过。
+    return receiptProblem && appendSentence(receiptProblem, '在列表里重新选中这份计划再接着改');
   });
-  const action = (name: string, body: unknown = {}) => run(async () => {
+  const action = (name: PlanAction, body: unknown = {}) => run(async () => {
     if (!selected) return;
-    const updated = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${selected.id}/${name}`, { scope, method: 'POST', body }));
-    if (requests.isCurrent()) setSelected(updated);
+    const receipt = PLAN_ACTION_RECEIPTS[name];
+    const { result: updated, receiptProblem } = await receipted(featureRequest(`/v1/execution/plans/${selected.id}/${name}`, { scope, method: 'POST', receipt, body })
+      .then(value => readReceipt(receipt, value, readExecutionPlan)));
+    if (requests.isCurrent() && updated) setSelected(updated);
+    return receiptProblem;
   });
   const editable = !selected || selected.status === 'draft';
   const staleDraft = selected?.status === 'draft' && editRevision !== selected.revision;
@@ -92,7 +112,7 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
       <button className={actionClass} type="button" onClick={() => { if (sourceText.trim()) { setSources([...sources, { kind: /^https?:\/\//.test(sourceText.trim()) ? 'url' : 'text', value: sourceText.trim(), label: `资料 ${sources.length + 1}` }]); setSourceText(''); setSteps([]); } }}>加入输入清单</button>
       <label className="block min-w-0">选择文件<input aria-label="选择文件" className="block max-w-full" type="file" multiple onChange={event => {
         const files = Array.from(event.target.files || []);
-        void run(async () => { const uploaded = await Promise.all(files.map(file => uploadAttachment(file, scope, token || ''))); requests.check(); setSources(current => [...current, ...uploaded.map((file, index): PlanInput => ({ kind: 'file', value: file.path, label: files[index].name }))]); setSteps([]); });
+        void run(async () => { const uploaded = await Promise.all(files.map(file => uploadSource(file, scope, token || ''))); requests.check(); setSources(current => [...current, ...uploaded.map((file, index): PlanInput => ({ kind: 'file', value: file.path, label: files[index].name }))]); setSteps([]); });
       }} /></label>
       <ul>{sources.map((source, index) => <li className="flex min-w-0 flex-wrap justify-between gap-3 border-b py-2 [overflow-wrap:anywhere]" key={`${index}-${source.value}`}>{source.label}: {source.kind === 'text' ? source.value.slice(0, 100) : source.value}<button type="button" onClick={() => { setSources(sources.filter((_, at) => at !== index)); setSteps([]); }}>移除</button></li>)}</ul>
       <StepEditor steps={steps} tools={tools} onChange={setSteps} onValidityChange={setStepsValid} />

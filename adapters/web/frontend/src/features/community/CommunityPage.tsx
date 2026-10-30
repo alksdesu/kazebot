@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { receipted } from '../../api/shape';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass } from '../ui';
-import type { Activity, CommunityState } from './types';
+import { readActivities, readCommunityState, type Activity, type CommunityState } from './types';
+import { appendSentence, rereadMissed } from '../../utils/sentence';
 import { useScopePicker } from '../useScopePicker';
 
 const INPUT = controlClass;
 const BUTTON = actionClass;
 const states: Record<string, string> = { open: '进行中', closed: '已结束', cancelled: '已取消', joined: '待确认', confirmed: '已确认', waiting: '候补', left: '已退出' };
+const ACTIVITIES = '活动列表';
+const STATE = '群指引和欢迎设置';
+const ACTION_RECEIPTS = { remind: '提醒已经排上，可回执', close: '活动已经结束，可回执', cancel: '活动已经取消，可回执' } as const;
 
 export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) {
   const [scope, setScope] = useState(initialScope);
@@ -42,12 +47,14 @@ export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) 
     if (!picker.valid || !requests.isCurrent()) return;
     const request = requests.begin('state');
     try {
-      const [activityResult, current] = await Promise.all([
-        featureRequest<{ items: Activity[] }>('/v1/community/activities', { scope, signal: request.signal }),
-        featureRequest<CommunityState>('/v1/community/state', { scope, signal: request.signal }),
+      const [activityResult, stateResult] = await Promise.all([
+        featureRequest('/v1/community/activities', { what: ACTIVITIES, scope, signal: request.signal }),
+        featureRequest('/v1/community/state', { what: STATE, scope, signal: request.signal }),
       ]);
       if (!request.isCurrent()) return;
-      setItems(activityResult.items); setState(current); setLoadedKey(requests.key);
+      const activities = readActivities(ACTIVITIES, activityResult);
+      const current = readCommunityState(STATE, stateResult);
+      setItems(activities); setState(current); setLoadedKey(requests.key);
       if (resetDraft || !dirtyRef.current) { setGuide(current.guide); setWelcome(current.settings.welcome_enabled); }
       setLoading(false);
     } catch (reason) {
@@ -56,10 +63,16 @@ export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) 
   }, [requests, scope, picker.valid]);
   useEffect(() => { mutating.current = false; setState(null); setLoadedKey(''); setItems([]); setGuide({}); setWelcome(false); setTitle(''); setOptions(''); setDeadline(''); setReminder(''); dirtyRef.current = false; setBusy(false); setError(''); setNotice(''); }, [viewKey]);
   useEffect(() => { setLoading(picker.valid); if (picker.valid) void refresh().catch(reason => { if (requests.isCurrent()) { setError(errorMessage(reason)); setLoading(false); } }); return () => { requests.drop('state'); }; }, [requests, refresh, picker.valid]);
-  const run = async (action: () => Promise<unknown>, message = '操作已完成。', resetDraft = false) => {
+  // action 交回回执读不懂的原因：写已经做完了，照常收尾，原因另起一行报。之后的重读没成也只补一句，不把「已完成」换成一条失败。
+  const run = async (action: () => Promise<string | void>, message = '操作已完成。', resetDraft = false) => {
     if (!picker.valid || !requests.isCurrent() || mutating.current) return; mutating.current = true;
     setBusy(true); setError(''); setNotice('');
-    try { await action(); if (requests.isCurrent()) { await refresh(resetDraft); if (requests.isCurrent()) setNotice(message); } } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); } }
+    try {
+      const receiptProblem = await action() || '';
+      if (!requests.isCurrent()) return;
+      const rereadProblem = await refresh(resetDraft).then(() => '', (reason: unknown) => rereadMissed(errorMessage(reason)));
+      if (requests.isCurrent()) { setNotice(message); setError(appendSentence(receiptProblem, rereadProblem)); }
+    } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); } }
   };
   const visible = items.filter(item => (filter === 'all' || item.status === filter) && `${item.title} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   return <FeaturePage title="群协作" description="先选择当前账号的群聊，再管理活动、投票和群指引。不会自动选群，也不会发布到控制台或私聊。">
@@ -69,11 +82,12 @@ export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) 
     {loading && <p role="status">正在读取活动和群指引…</p>}
     {picker.valid && loadedKey === viewKey && <>
     <form className="space-y-3 border border-[var(--duties-border)] p-4" onSubmit={event => { event.preventDefault(); void run(async () => {
-      await featureRequest('/v1/community/activities', { scope, method: 'POST', body: {
+      const { receiptProblem } = await receipted(featureRequest('/v1/community/activities', { scope, method: 'POST', receipt: '活动已经创建，可回执', body: {
         kind, title, options: options.split('\n').map(value => value.trim()).filter(Boolean), capacity: Number(capacity),
         deadline: deadline ? new Date(deadline).getTime() / 1000 : 0,
         reminder_at: reminder ? new Date(reminder).getTime() / 1000 : 0,
-      } }); if (requests.isCurrent()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); }
+      } })); if (requests.isCurrent()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); }
+      return receiptProblem;
     }); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-3"><legend className="font-semibold">创建投票或活动</legend>
       <label className="block">类型<select aria-label="活动类型" className={INPUT} value={kind} onChange={event => setKind(event.target.value as 'poll' | 'event')}><option value="event">活动报名</option><option value="poll">投票</option></select></label>
@@ -92,13 +106,14 @@ export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) 
       {item.kind === 'poll' ? <ol>{item.options.map((option, index) => <li key={option}>{index + 1}. {option}：{item.counts[index]} 票</li>)}</ol> : <><p>名额 {item.capacity} · 剩余 {item.remaining}</p><ul>{item.participants.map((member, index) => <li key={`${member.name}-${index}`}>{member.name} · {states[member.status]}</li>)}</ul></>}
       {item.status === 'open' && <div className="flex flex-wrap gap-2">{(['remind', 'close', 'cancel'] as const).filter(action => item.kind === 'event' || action !== 'remind').map(action => <button key={action} className={BUTTON} disabled={busy} onClick={() => {
         if (action === 'cancel' && !window.confirm(`取消「${item.title}」并停止其后续提醒？`)) return;
-        void run(() => featureRequest(`/v1/community/activities/${item.id}/${action}`, { scope, method: 'POST', body: {} }));
+        void run(async () => (await receipted(featureRequest(`/v1/community/activities/${item.id}/${action}`, { scope, method: 'POST', receipt: ACTION_RECEIPTS[action], body: {} }))).receiptProblem);
       }}>{action === 'remind' ? '提醒未确认者' : action === 'close' ? '结束' : '取消'}</button>)}</div>}
     </article>)}
     {state && <form className="space-y-3 border border-[var(--duties-border)] p-4" onSubmit={event => { event.preventDefault(); void run(async () => {
-      await featureRequest('/v1/community/guide', { scope, method: 'PUT', body: guide });
+      const published = await receipted(featureRequest('/v1/community/guide', { scope, method: 'PUT', receipt: '群指引已经发布，可回执', body: guide }));
       requests.check();
-      await featureRequest('/v1/community/settings', { scope, method: 'PATCH', body: { welcome_enabled: welcome } });
+      const welcomed = await receipted(featureRequest('/v1/community/settings', { scope, method: 'PATCH', receipt: '欢迎开关已经存上，可回执', body: { welcome_enabled: welcome } }));
+      return appendSentence(published.receiptProblem, welcomed.receiptProblem);
     }, '群指引已发布。', true); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-3"><legend className="font-semibold">群指引{guideDirty ? ' · 有未发布修改' : ''}</legend><p className="text-sm">发布后，群成员发送 /群规、/群资料、/常见问题 即可读取。未填写的内容不会由模型补造。</p>
       {(['rules', 'resources', 'faq', 'welcome'] as const).map(key => <label className="block" key={key}>{{ rules: '群规', resources: '资料和链接', faq: '常见问题', welcome: '欢迎词' }[key]}<textarea aria-label={{ rules: '群规', resources: '资料和链接', faq: '常见问题', welcome: '欢迎词' }[key]} className={INPUT} value={guide[key] || ''} onChange={event => setGuide(current => ({ ...current, [key]: event.target.value }))} /></label>)}

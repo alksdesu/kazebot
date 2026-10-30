@@ -17,7 +17,7 @@ class FakeWebSocket {
   readyState = FakeWebSocket.CONNECTING;
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
   onerror: (() => void) | null = null;
 
   // [2026-06-03] Why: MainApp now opens the long-lived global WebSocket during
@@ -27,7 +27,7 @@ class FakeWebSocket {
   constructor(public readonly url: string) {}
 
   send(_data: string) {}
-  close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
+  close(code = 1000, reason = '') { this.readyState = FakeWebSocket.CLOSED; this.onclose?.({ code, reason } as CloseEvent); }
 }
 
 describe('Clonoth web app', () => {

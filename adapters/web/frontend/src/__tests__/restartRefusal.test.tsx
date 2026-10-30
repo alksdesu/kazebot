@@ -7,6 +7,7 @@ import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsP
 import { RestartEngine } from '../console/LinkFacts';
 import { useSettingsStore } from '../store/settingsStore';
 import { restartRefusal } from '../utils/systemStatus';
+import { adminState } from './fixtures/systemReplies';
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -38,7 +39,7 @@ const stubFetch = (restart: RestartResult) => {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.endsWith('/v1/admin/state')) {
-      return jsonResponse({ sessions: 1, approvals: { pending: 0 }, tasks: { running: 0 }, pending_approvals: [] });
+      return jsonResponse(adminState({ sessions: 1 }));
     }
     if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
     if (url.endsWith('/v1/admin/restart')) return jsonResponse(restart);
@@ -122,8 +123,8 @@ describe('被拒的重启在界面上', () => {
       .toHaveTextContent(`未能重启：上一次全量重启（${at(SINCE)} 开始）还没收尾，稍后再试`);
   });
 
-  it('系统设置页碰上缺字段的回复不当成排上了', async () => {
-    // 判据是「说排上了才算」，不是「说没排上才算没排」：缺字段的 200 也要照实说。
+  it('系统设置页碰上缺字段的回复：不当成排上了，也不当成没排上', async () => {
+    // 缺字段的 200 报成已请求，人会白等；请求其实已到调度器，报成未能重启，人再点一次可能重启两回。
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     const fetchMock = stubFetch({ target: 'engine' } as RestartResult);
 
@@ -131,7 +132,11 @@ describe('被拒的重启在界面上', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('未能重启：调度器没有排上这次重启');
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      '重启请求已经交上，可回执格式不对：缺 scheduled。不知道排没排上，去运行页看 worker 有没有重新拉起',
+    );
+    expect(screen.queryByText('已请求重启引擎')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('系统设置页排上了就不提原因', async () => {
@@ -163,6 +168,19 @@ describe('被拒的重启在界面上', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认重启' }));
 
     expect(await screen.findByText('没能重启：调度器没有排上这次重启。')).toBeInTheDocument();
+  });
+
+  it('控制台碰上读不懂的回执：说请求已经交上，排没排上去运行页看', async () => {
+    stubFetch({ scheduled: 'yes', target: 'engine' } as unknown as RestartResult);
+
+    render(<RestartEngine />);
+    fireEvent.click(screen.getByRole('button', { name: '重启' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认重启' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      '重启请求已经交上，可回执格式不对：scheduled 不是 true 或 false。不知道排没排上，去运行页看 worker 有没有重新拉起',
+    );
+    expect(screen.queryByText(/没能重启/)).not.toBeInTheDocument();
   });
 
   it('控制台排上了照旧报成功', async () => {

@@ -1,11 +1,20 @@
 import { useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { NON_EMPTY_TEXT, NUMBER, TEXT, optional, readReceipt, receipted, shaped, shapedRows } from '../../api/shape';
 import { Block, Button, ErrorText } from '../../components/settings/pages/settingsControls';
 import { downloadFeature, featureRequest } from '../client';
+import { appendSentence } from '../../utils/sentence';
 
 interface Check { name: string; status: string; detail: string; action: string; latency_ms?: number }
 interface Report { id: string; created_at: string; status: string; checks: Check[] }
 const LABELS: Record<string, string> = { passed: '正常', failed: '异常', warning: '需关注', skipped: '未检查' };
+const REPORT = '诊断已经做完，可报告';
+const CHECK = { name: TEXT, status: TEXT, detail: TEXT, action: TEXT, latency_ms: optional(NUMBER) };
+
+function readReport(value: unknown): Report {
+  const report = shaped(REPORT, value, { id: NON_EMPTY_TEXT, created_at: TEXT, status: TEXT });
+  return { id: report.id, created_at: report.created_at, status: report.status, checks: shapedRows(REPORT, report.checks, CHECK, 'checks') };
+}
 
 export function DiagnosticsPanel() {
   const [busy, setBusy] = useState(false);
@@ -19,9 +28,12 @@ export function DiagnosticsPanel() {
     setBusy(true); setError(''); setStale(Boolean(report));
     const submitted = { testModel, includeLogs };
     try {
-      setReport(await featureRequest<Report>('/v1/operations/diagnostics', {
-        method: 'POST', body: { test_model: testModel, include_logs: includeLogs },
-      })); setOptions(submitted); setStale(false);
+      const { result, receiptProblem } = await receipted(featureRequest('/v1/operations/diagnostics', {
+        method: 'POST', receipt: REPORT, body: { test_model: testModel, include_logs: includeLogs },
+      }).then(value => readReceipt(REPORT, value, readReport)));
+      // 检查已经跑过了，只是报告读不懂：再点一次会重新检查一遍，勾了模型请求的还要再计一次费。
+      if (!result) { setError(appendSentence(receiptProblem, '这次的结果显示不了，要看结果只能再诊断一次')); return; }
+      setReport(result); setOptions(submitted); setStale(false);
     } catch (failure) { setError(errorMessage(failure)); }
     finally { setBusy(false); }
   }
@@ -35,7 +47,7 @@ export function DiagnosticsPanel() {
       {report && <Button tone="quiet" disabled={busy} onClick={() => void downloadFeature(`/v1/operations/diagnostics/${report.id}/export`, `diagnostics-${report.id}.json`).catch(failure => setError(errorMessage(failure)))}>导出报告</Button>}
     </div>
     {error && <ErrorText role="alert">{error}</ErrorText>}
-    {stale && <p role="status">下方保留的是上一份诊断报告；本次诊断{busy ? '仍在进行' : '未完成'}。</p>}
+    {stale && <p role="status">下方保留的是上一份诊断报告；本次诊断{busy ? '仍在进行' : '的结果没能显示'}。</p>}
     {report && <div aria-live="polite" className="space-y-3">
       <p className="text-xs text-[var(--duties-secondary)]">本报告：{options.testModel ? '包含最小模型请求' : '未请求模型'} · {options.includeLogs ? '附带脱敏日志' : '未附日志'}</p>
       <p>{new Date(report.created_at).toLocaleString()} · {LABELS[report.status] || report.status}</p>

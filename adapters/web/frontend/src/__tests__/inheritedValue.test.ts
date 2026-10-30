@@ -46,6 +46,16 @@ describe('继承链的顺序', () => {
       .toEqual({ known: true, source: 'default', value: '', origin: '' });
   });
 
+  // engine 读节点时把 $ENV{} 展开成空串，和没写一样；会话覆盖原样送上游，那里的 $ENV{} 就是它本身。
+  it('节点写的 $ENV{} 当没写，往下一层找；会话覆盖里的照原样算', () => {
+    expect(inheritedField(sources({ node: { status: 'loaded', id: 'main', fields: { model: '$ENV{}' } } }), 'model'))
+      .toEqual({ known: true, source: 'global', value: 'global-model', origin: '' });
+    expect(inheritedField(sources({ node: { status: 'loaded', id: 'main', fields: { model: '$ENV{MAIN_MODEL}' } } }), 'model'))
+      .toEqual({ known: true, source: 'node', value: '$ENV{MAIN_MODEL}', origin: 'main' });
+    expect(inheritedField(sources({ session: { status: 'loaded', fields: { model: '$ENV{}' } } }), 'model'))
+      .toEqual({ known: true, source: 'session', value: '$ENV{}', origin: '' });
+  });
+
   it('节点自己写了模型就轮不到它点名的渠道块', () => {
     const resolved = inheritedField(sources({
       node: { status: 'loaded', id: 'main', fields: { model: 'node-model', provider: 'relay' } },

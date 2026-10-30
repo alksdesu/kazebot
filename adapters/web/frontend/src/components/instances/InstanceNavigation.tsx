@@ -4,7 +4,7 @@ import { clearInstanceToken, instanceEntryHref, navigateToInstance } from '../..
 import { useInstanceDirectory } from './useInstanceDirectory';
 
 export function InstanceNavigation() {
-  const { status, instances, currentPath, retry } = useInstanceDirectory();
+  const { status, instances, currentPath, reason, retry } = useInstanceDirectory();
   const selectId = useId();
   const current = instances.find(instance => instance.path === currentPath);
 
@@ -25,9 +25,12 @@ export function InstanceNavigation() {
       </select>
     </div>}
     {status === 'loading' && <p role="status" className="sr-only">正在读取实例目录…</p>}
-    {status === 'error' && <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--duties-secondary)]">
-      <a className="underline underline-offset-2" href={instanceEntryHref()} referrerPolicy="no-referrer" onClick={clearInstanceToken}>选择实例</a>
-      <button type="button" onClick={retry} className="underline underline-offset-2">重试实例目录</button>
+    {status === 'error' && <div className="space-y-1 text-xs text-[var(--duties-secondary)]">
+      <p className="break-words">实例目录没读到：{reason}</p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <a className="underline underline-offset-2" href={instanceEntryHref()} referrerPolicy="no-referrer" onClick={clearInstanceToken}>选择实例</a>
+        <button type="button" onClick={retry} className="underline underline-offset-2">重试实例目录</button>
+      </div>
     </div>}
   </nav>;
 }

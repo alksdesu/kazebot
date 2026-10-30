@@ -1,7 +1,9 @@
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { waitFor } from '@testing-library/react';
 import * as api from '../api/supervisorClient';
+import { ReceiptUnreadable } from '../api/supervisorClient';
 import { useChatStore } from '../store/chatStore';
+import { scopedKey } from '../store/storageKey';
 
 vi.mock('../api', async importOriginal => ({
   ...await importOriginal<typeof import('../api')>(), connectGlobalWS: vi.fn(), disconnectGlobalWS: vi.fn(),
@@ -35,7 +37,7 @@ it('rejects real HTTP and payload failures instead of treating them as an empty 
   vi.stubGlobal('fetch', fetch);
   await expect(actual.listSessions()).rejects.toThrow('503');
   await expect(actual.listSessions()).rejects.toThrow('network down');
-  await expect(actual.listSessions()).rejects.toThrow('格式无效');
+  await expect(actual.listSessions()).rejects.toThrow('会话列表格式不对：返回的不是数组');
   await expect(actual.deleteSession('a')).rejects.toThrow('未确认');
   await expect(actual.deleteSession('a')).rejects.toThrow('403');
   await expect(actual.deleteSession('a/b')).resolves.toEqual({ ok: true });
@@ -101,11 +103,53 @@ it('keeps generating state on failed cancellation and never unlocks a different 
   vi.mocked(api.cancelActiveTasks).mockRejectedValueOnce(new Error('503'));
   await expect(useChatStore.getState().cancelCurrentTask()).rejects.toThrow('503');
   expect(useChatStore.getState().isGenerating).toBe(true);
-  const request = deferred<void>(); vi.mocked(api.cancelActiveTasks).mockReturnValue(request.promise);
+  const request = deferred<api.CancelResult>(); vi.mocked(api.cancelActiveTasks).mockReturnValue(request.promise);
   const cancel = useChatStore.getState().cancelCurrentTask();
-  useChatStore.setState({ activeConversationId: 'b' }); request.resolve(); await cancel;
+  useChatStore.setState({ activeConversationId: 'b' }); request.resolve({ ok: true, cancelled_count: 1 }); await cancel;
   expect(useChatStore.getState().generatingBySession['session-a']).toBe(false);
   expect(useChatStore.getState().isGenerating).toBe(true);
+});
+// 回执读不懂时服务端已经做完了：当成失败，人会照着再发、再删、再取消一次。
+it('treats a sent message with an unreadable receipt as sent and hands the problem back', async () => {
+  vi.mocked(api.postInbound).mockRejectedValue(new ReceiptUnreadable('消息已经发出，可回执格式不对：缺 session_id'));
+  await expect(useChatStore.getState().sendMessage('text')).resolves.toBe('消息已经发出，可回执格式不对：缺 session_id');
+  expect(useChatStore.getState().sendingByConversation.a).toBe(false);
+  expect(useChatStore.getState().conversations.find(item => item.id === 'a')?.sessionId).toBe('session-a');
+});
+it('stops a send whose attachment upload receipt is unreadable and says the file is already on the server', async () => {
+  vi.mocked(api.uploadAttachment).mockRejectedValue(new ReceiptUnreadable('附件 x 已经传上，可回执格式不对：缺 path'));
+  await expect(useChatStore.getState().sendMessage('text', [{ name: 'x', file: new File(['x'], 'x') }]))
+    .rejects.toThrow('附件 x 已经传上，可回执格式不对：缺 path。消息没有发出，重发会把附件再传一份');
+  expect(api.postInbound).not.toHaveBeenCalled();
+  expect(useChatStore.getState().sendingByConversation.a).toBe(false);
+});
+it('removes a deleted conversation even when the delete receipt is unreadable', async () => {
+  vi.mocked(api.deleteSession).mockRejectedValue(new ReceiptUnreadable('会话已经删掉，可回执格式不对：缺 ok'));
+  await expect(useChatStore.getState().deleteConversation('a')).resolves.toBe('会话已经删掉，可回执格式不对：缺 ok');
+  expect(useChatStore.getState().conversations.map(item => item.id)).toEqual(['b']);
+  expect(useChatStore.getState().conversationIdsBySession['session-a']).toBeUndefined();
+});
+it('unlocks the composer after a cancel request whose receipt is unreadable', async () => {
+  useChatStore.setState({ generatingBySession: { 'session-a': true }, isGenerating: true });
+  vi.mocked(api.cancelActiveTasks).mockRejectedValue(new ReceiptUnreadable('取消请求已经交上，可回执不是 JSON'));
+  await expect(useChatStore.getState().cancelCurrentTask()).resolves.toBe('取消请求已经交上，可回执不是 JSON');
+  expect(useChatStore.getState().generatingBySession['session-a']).toBe(false);
+  expect(useChatStore.getState().isGenerating).toBe(false);
+});
+it('keeps only string titles from a damaged title cache', async () => {
+  useChatStore.getState().resetState();
+  localStorage.setItem(scopedKey('clonoth_conversation_titles'), JSON.stringify({ kept: 'Kept title', broken: 42 }));
+  vi.mocked(api.listSessions).mockResolvedValue([
+    { session_id: 'session-kept', conversation_key: 'web:kept', created_at: '', updated_at: '', channel: 'web' },
+    { session_id: 'session-broken', conversation_key: 'web:broken', created_at: '', updated_at: '', channel: 'web' },
+  ]);
+  useChatStore.getState().loadStartup();
+  await waitFor(() => expect(useChatStore.getState().conversations).toHaveLength(2));
+  const titles = Object.fromEntries(useChatStore.getState().conversations.map(item => [item.id, item.title]));
+  expect(titles.kept).toBe('Kept title');
+  expect(titles.broken).not.toBe(42);
+  expect(typeof titles.broken).toBe('string');
+  localStorage.removeItem(scopedKey('clonoth_conversation_titles'));
 });
 it('resets only the exact confirmed conversation and session revision', () => {
   useChatStore.setState({ generatingBySession: { 'session-a': true, 'session-b': true }, isGenerating: true });

@@ -43,7 +43,8 @@ export interface AppViewContext {
   onExitChildSession?: () => void;
   onCreateConversation: () => void;
   onSelectConversation: (conversationId: string) => void;
-  onDeleteConversation: (conversationId: string) => Promise<void> | void;
+  /** 删掉了却读不懂回执时给回执的问题。 */
+  onDeleteConversation: (conversationId: string) => Promise<string | void> | void;
   activeSettingsTab?: string;
   onSendMessage: (text: string, attachments?: Attachment[]) => Promise<void> | void;
   onCancel: () => void;

@@ -11,6 +11,7 @@ import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { KEYWORD_INPUT_HINT } from '../../../utils/keywords';
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
 import { reloadBeforeEditing, savedMessage } from '../../../utils/sentence';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
@@ -25,6 +26,7 @@ import {
   scheduleUpdateEdits,
   serializeNodeConfig,
   serializeSkillQuickFields,
+  skillKeywordsLock,
   type McpClientFormState,
   type NodeConfigFormState,
   type NodeConfigType,
@@ -503,8 +505,8 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       // calls use the new code. How: call the existing reloadTools admin endpoint from
       // the panel. Purpose: users can save and reload tools without requesting an
       // engine restart.
-      await reloadTools(adminToken);
-      setToolMessage('工具已重载。');
+      const { receiptProblem } = await receipted(reloadTools(adminToken));
+      setToolMessage('工具已重载。', receiptProblem);
     } catch (caught) {
       setToolError(errorMessage(caught, '重载工具失败'));
     } finally {
@@ -617,6 +619,12 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
   const confirmDiscard = useUnsavedChanges(loaded && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
+  const keywordsLockId = useId();
+  // 按当前原文算：在原文里把关键词改成表达得了的写法，这里就解锁
+  const keywordsLock = useMemo(() => {
+    if (!loaded || source.parseError) return '';
+    try { return skillKeywordsLock(source.raw); } catch { return ''; }
+  }, [loaded, source.parseError, source.raw]);
 
   useEffect(() => {
     if (!adminToken || !skill) return undefined;
@@ -688,9 +696,16 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
                   </select>
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[var(--duties-tertiary)]">关键词，使用英文逗号分隔</span>
-                  <input className={SKILL_INPUT_CLASS} onChange={(event) => update({ keywords: event.target.value })} value={edit.keywords} />
+                  <span className="mb-1 block text-[var(--duties-tertiary)]">关键词，{KEYWORD_INPUT_HINT}</span>
+                  <input
+                    aria-describedby={keywordsLock ? keywordsLockId : undefined}
+                    className={SKILL_INPUT_CLASS}
+                    onChange={(event) => update({ keywords: event.target.value })}
+                    readOnly={Boolean(keywordsLock)}
+                    value={edit.keywords}
+                  />
                 </label>
+                {keywordsLock && <p className="text-[var(--duties-secondary)]" id={keywordsLockId}>{keywordsLock}</p>}
                 <div className="grid grid-cols-3 gap-2">
                   {(['order', 'priority', 'scan_depth'] as const).map((key) => (
                     <label className="block" key={key}>

@@ -9,6 +9,7 @@ import { useEffect, useId, useMemo, useState } from 'react';
 import {
   channelChoices,
   clearSessionProviderOverride,
+  receipted,
   switchNode,
   updateSessionProviderOverride,
 } from '../../api/supervisorClient';
@@ -30,6 +31,7 @@ import { describeEnvRef, envRefNames } from '../../utils/envRef';
 import { inheritedField, inheritedProvider, type Inherited, type InheritedSource, type LayerStatus } from '../../utils/inheritedValue';
 import { literalModelsOnly, mergeModelChoices, modelsFromProviders } from '../../utils/modelChoices';
 import { connectionDotClass } from '../../utils/systemStatus';
+import { appendSentence } from '../../utils/sentence';
 import { Button } from '../settings/pages/settingsControls';
 import { errorMessage } from '../../api/request';
 
@@ -314,13 +316,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     }
     setNodeSaving(true);
     try {
-      const result = await switchNode(sid, targetId);
+      const { result, receiptProblem } = await receipted(switchNode(sid, targetId));
       if (!session.isCurrent()) return;
-      if (result?.ok) {
-        setActiveNode(result.target_node_id, result.is_override, result.default_node_id || '', sid);
+      if (result) {
+        setActiveNode(result.target_node_id, result.is_override, result.default_node_id, sid);
         setNodeMsg('已保存');
       } else {
-        setNodeMsg('切换失败');
+        // 切好了却读不懂回执：不知道现在交给了谁，重读当前节点。
+        setNodeMsg(appendSentence(receiptProblem, '下拉框里是重新读到的当前节点'));
+        setNodeAttempt(value => value + 1);
       }
     } catch (err) {
       if (!session.isCurrent()) return;
@@ -328,6 +332,14 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     } finally {
       if (session.isCurrent()) setNodeSaving(false);
     }
+  };
+
+  // 写上了却读不懂回执：编辑框里的不一定是服务端现在那份，锁住编辑重读一遍；已经存上了，离开时不再提示没保存。
+  const rereadOverride = (receiptProblem: string) => {
+    setSavedEdit(edit);
+    setModelLoaded(false);
+    setOverrideAttempt(value => value + 1);
+    setModelMsg(appendSentence(receiptProblem, '会话覆盖以重新读到的为准'));
   };
 
   const handleSaveModel = async () => {
@@ -346,8 +358,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       }
       if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
 
-      const saved = await updateSessionProviderOverride(sid, adminToken, next);
+      const { result: saved, receiptProblem } = await receipted(updateSessionProviderOverride(sid, adminToken, next));
       if (!session.isCurrent()) return;
+      if (!saved) { rereadOverride(receiptProblem); return; }
       setSessionProviderOverride(saved, sid);
       setEdit(editOf(saved));
       setSavedEdit(editOf(saved));
@@ -369,8 +382,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
     setModelSaving(true);
     try {
-      const cleared = await clearSessionProviderOverride(sid, adminToken);
+      const { result: cleared, receiptProblem } = await receipted(clearSessionProviderOverride(sid, adminToken));
       if (!session.isCurrent()) return;
+      if (!cleared) { rereadOverride(receiptProblem); return; }
       setSessionProviderOverride(cleared, sid);
       setEdit(editOf(null));
       setSavedEdit(editOf(null));

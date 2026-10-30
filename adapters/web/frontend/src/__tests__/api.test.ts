@@ -2,9 +2,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError, clearNodeFallbacks, deleteProvider, getNodes, getProviders, ReceiptUnreadable, setActiveProvider, updateFallbacks, updateNodeFallbacks, upsertProvider, postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getConversations, getDrawtoolsBundle, getInstanceDirectory, getInstanceProgress, getInstances, getMemoryEntries, getMemoryOverview, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, getProviderProfiles, getSessionChildren, getSessionRunningTasks, listLogFiles, listUpstreamModels, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import * as chat from '../api/supervisorClient';
 import { MOUNT } from '../instances/paths';
 import { useSettingsStore } from '../store/settingsStore';
 import { fallbackEntry, providerBlock, providerTable } from './fixtures/providerTable';
+import { instancePlanReply, instanceProgressReply, scopeMigrationReply, scopeStatusReply } from './fixtures/accountReplies';
+import { adminState, configReloadReply, pendingApproval, restartReply, toolsReloadReply } from './fixtures/systemReplies';
+import { dryRunReply, featuresStateReply, publishedStateReply, qqSnapshot, unpublishedStateReply } from './fixtures/consoleReplies';
+import schemaSnapshot from './fixtures/consoleSchemas.json';
+import { featureRequest } from '../features/client';
+import { readReceipt } from '../api/shape';
 
 function stubFetch(body: unknown = {}) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
@@ -158,7 +165,10 @@ describe('Admin token on requests', () => {
 
   it('keeps the token off the public health check and instance directory', async () => {
     useSettingsStore.setState({ adminToken: 'secret-token' });
-    const fetchMock = stubFetch({ current_path: MOUNT, instances: [{ label: '本实例', path: MOUNT }] });
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => new Response(JSON.stringify(
+      url.endsWith('/health') ? { status: 'ok', uptime_seconds: 12 } : { current_path: MOUNT, instances: [{ label: '本实例', path: MOUNT }] },
+    ), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
 
     await checkHealth();
     await getInstanceDirectory();
@@ -181,6 +191,31 @@ describe('Platform account client', () => {
     vi.unstubAllGlobals();
   });
 
+  // 各接口按后端真实回包答：这里看的是路径和请求体，回包读不懂会先在前面抛出来。
+  const ACCOUNT_REPLIES: ReadonlyArray<readonly [RegExp, unknown]> = [
+    [/\/account\/scope\/migrate$/, scopeMigrationReply()],
+    [/\/account\/scope(\?|$)/, scopeStatusReply()],
+    [/\/account\/qrcode$/, { qrcode: '', reachable: true }],
+    [/\/account\/switch$/, { ok: true, account: '1000002', pinned: true, pin_error: '' }],
+    [/\/account\/pin$/, { ok: true, account: '1000002' }],
+    [/\/account\/relogin$/, { ok: true }],
+    [/\/account$/, { configured: true, reachable: true, account: '1000001' }],
+  ];
+  const stubAccountReplies = () => {
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => new Response(
+      JSON.stringify(ACCOUNT_REPLIES.find(([pattern]) => pattern.test(url))?.[1] ?? {}),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+  const preview = {
+    source_scope: '1000001', target_scope: '2000002',
+    conversations: [{ old_namespace: 'ns-old', new_namespace: 'ns-new', has_memory: true, blocked: false }],
+    unknown_namespaces: [], unresolved_namespaces: ['ns-lost'], other_scopes: [{ scope: '', conversations: 2 }],
+    stores: { sessions: { label: '会话注册表', moved: 3, replaced: 1 } },
+  };
+
   it('reads the account of the addressed platform', async () => {
     const fetchMock = stubFetch({ configured: true, account: '1000001' });
 
@@ -191,14 +226,102 @@ describe('Platform account client', () => {
     });
   });
 
-  it('reads an empty account response as unconfigured', async () => {
-    stubFetch(null);
+  // 读成「没配」的话，页面叫人去配 WebUI token，可那份配置本来没问题。
+  it.each([
+    [null, '返回的不是 JSON 对象'],
+    [{ account: '1000001' }, '缺 configured'],
+    [{ configured: 'yes' }, 'configured 不是 true 或 false'],
+    [{ configured: true, reachable: 'no' }, 'reachable 不是 true 或 false'],
+    [{ configured: true, quick_login: {} }, 'quick_login 不是数组'],
+    [{ configured: true, quick_login: [{ nick: '备用号' }] }, '缺 quick_login[0].account'],
+    [{ configured: true, quick_login: [{ account: '2000002', available: 'false' }] }, 'quick_login[0].available 不是 true 或 false'],
+  ])('an account reply that does not match its shape is refused (%j)', async (body, problem) => {
+    stubFetch(body);
 
-    await expect(getPlatformAccount('secret-token', 'qq')).resolves.toEqual({ configured: false });
+    await expect(getPlatformAccount('secret-token', 'qq')).rejects.toThrow(`账号状态格式不对：${problem}`);
+  });
+
+  it('reads the switchable accounts and a scope preview that match their shapes', async () => {
+    const status = {
+      configured: true, reachable: true, account: '1000001', nick: '当前机器人', online: true, is_login: true,
+      login_error: '', qrcode: '',
+      quick_login: [{ account: '2000002', nick: '备用号', avatar: '', available: false, dead_reason: '登录态失效' }],
+    };
+    stubFetch(status);
+    await expect(getPlatformAccount('secret-token', 'qq')).resolves.toEqual(status);
+
+    const scope = scopeStatusReply({ preview });
+    stubFetch(scope);
+    await expect(getAccountScope('secret-token', 'qq', '2000002')).resolves.toEqual(scope);
+  });
+
+  // 补成「还没绑定账号」「无需搬迁」的话，页面替后端下了结论。
+  it.each([
+    [{ ...scopeStatusReply(), current_scope: undefined }, '缺 current_scope'],
+    [{ ...scopeStatusReply(), bot_alive: 'no' }, 'bot_alive 不是 true 或 false'],
+    [{ ...scopeStatusReply(), preview: undefined }, '缺 preview'],
+    [{ ...scopeStatusReply(), ambiguous_sources: undefined }, '缺 ambiguous_sources'],
+    [{ ...scopeStatusReply(), ambiguous_sources: [{ scope: '1000001' }] }, '缺 ambiguous_sources[0].conversations'],
+    [{ ...scopeStatusReply(), preview: { ...preview, conversations: undefined } }, '缺 preview.conversations'],
+    [{ ...scopeStatusReply(), preview: { ...preview, unresolved_namespaces: 'ns-lost' } }, 'preview.unresolved_namespaces 不是字符串数组'],
+    [
+      { ...scopeStatusReply(), preview: { ...preview, stores: { sessions: { label: '会话注册表', moved: '3', replaced: 0 } } } },
+      'preview.stores.sessions.moved 不是数字',
+    ],
+  ])('a scope reply that does not match its shape is refused (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(getAccountScope('secret-token', 'qq')).rejects.toThrow(`记忆归属格式不对：${problem}`);
+  });
+
+  it.each([
+    [{ reachable: true }, '缺 qrcode'],
+    [{ qrcode: 'qr-payload', reachable: 'yes' }, 'reachable 不是 true 或 false'],
+    [{ qrcode: '', reachable: false, reason: 503 }, 'reason 不是字符串'],
+  ])('a qrcode reply that does not match its shape is refused (%j)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(getPlatformLoginQrcode('secret-token', 'qq')).rejects.toThrow(`登录二维码格式不对：${problem}`);
+  });
+
+  it('reads the roster problem a switch or pin hands back', async () => {
+    stubFetch({ ok: true, account: '2000002', pinned: true, pin_error: '', roster_error: ' 号已经换上，但没记进实例清单：Permission denied ' });
+    await expect(switchPlatformAccount('secret-token', 'qq', '2000002'))
+      .resolves.toEqual({ rosterError: '号已经换上，但没记进实例清单：Permission denied' });
+
+    stubFetch({ ok: true, account: '2000002' });
+    await expect(pinPlatformAccount('secret-token', 'qq')).resolves.toEqual({ rosterError: '' });
+
+    stubFetch(scopeMigrationReply());
+    await expect(migrateAccountScope('secret-token', 'qq', '2000002')).resolves.toEqual(scopeMigrationReply());
+  });
+
+  // 号已经换上、数据已经搬完，只是回执读不懂：报成失败的话，人会再做一次。
+  it('treats a switch, pin or migration whose receipt it cannot read as done', async () => {
+    stubFetch({ ok: true });
+    const switched = await switchPlatformAccount('secret-token', 'qq', '2000002').catch((error: unknown) => error);
+    expect(switched).toBeInstanceOf(ReceiptUnreadable);
+    expect(switched).toMatchObject({ message: '已经切到 2000002，可回执格式不对：缺 account' });
+    const migrated = await migrateAccountScope('secret-token', 'qq', '2000002').catch((error: unknown) => error);
+    expect(migrated).toBeInstanceOf(ReceiptUnreadable);
+    expect(migrated).toMatchObject({ message: '记忆归属已经搬完，可回执格式不对：缺 moved_memory_dirs' });
+
+    stubFetch({ ok: true, account: 1000001 });
+    await expect(pinPlatformAccount('secret-token', 'qq'))
+      .rejects.toThrow('已经设成重启后自动登录，可回执格式不对：account 不是字符串');
+  });
+
+  it('an explicit ok false in a switch, pin or migration reply reads as not done', async () => {
+    stubFetch({ ok: false, account: '' });
+    await expect(switchPlatformAccount('secret-token', 'qq', '2000002')).rejects.toThrow('服务端没有切到 2000002，请重试');
+    await expect(pinPlatformAccount('secret-token', 'qq')).rejects.toThrow('服务端没有设成重启后自动登录，请重试');
+
+    stubFetch(scopeMigrationReply({ ok: false }));
+    await expect(migrateAccountScope('secret-token', 'qq', '2000002')).rejects.toThrow('服务端没有搬迁，请重试');
   });
 
   it('escapes the platform id in every account path', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubAccountReplies();
 
     await getPlatformAccount('secret-token', 'we chat/v2');
     await switchPlatformAccount('secret-token', 'we chat/v2', '1000002');
@@ -220,7 +343,7 @@ describe('Platform account client', () => {
   });
 
   it('names the switch target with the platform-neutral account field', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubAccountReplies();
 
     await switchPlatformAccount('secret-token', 'qq', '1000002');
 
@@ -232,7 +355,7 @@ describe('Platform account client', () => {
   });
 
   it('posts an empty body for relogin and pin', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubAccountReplies();
 
     await enterPlatformLoginMode('secret-token', 'qq');
     await pinPlatformAccount('secret-token', 'qq');
@@ -243,11 +366,11 @@ describe('Platform account client', () => {
     ]);
   });
 
-  it('requests the login qrcode and fills in the missing fields', async () => {
-    const fetchMock = stubFetch({ qrcode: 'qr-payload' });
+  it('requests the login qrcode', async () => {
+    const fetchMock = stubFetch({ qrcode: 'qr-payload', reachable: true });
 
     await expect(getPlatformLoginQrcode('secret-token', 'qq')).resolves.toEqual({
-      qrcode: 'qr-payload', reachable: true, reason: '',
+      qrcode: 'qr-payload', reachable: true,
     });
     expect(fetchMock).toHaveBeenCalledWith('/v1/platforms/qq/account/qrcode', {
       method: 'POST',
@@ -257,7 +380,7 @@ describe('Platform account client', () => {
   });
 
   it('keeps an unreachable platform out of the qrcode result', async () => {
-    stubFetch({ reachable: false, reason: '容器还没起来' });
+    stubFetch({ qrcode: '', reachable: false, reason: '容器还没起来' });
 
     await expect(getPlatformLoginQrcode('secret-token', 'qq')).resolves.toEqual({
       qrcode: '', reachable: false, reason: '容器还没起来',
@@ -265,7 +388,7 @@ describe('Platform account client', () => {
   });
 
   it('sends the picked migration source, an empty one included', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubAccountReplies();
 
     await getAccountScope('secret-token', 'qq');
     await getAccountScope('secret-token', 'qq', '20002');
@@ -279,7 +402,7 @@ describe('Platform account client', () => {
   });
 
   it('carries the same source rule into the migration body', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubAccountReplies();
 
     await migrateAccountScope('secret-token', 'qq', '20002');
     await migrateAccountScope('secret-token', 'qq', '20002', '');
@@ -312,7 +435,7 @@ describe('Instance provisioning client', () => {
   });
 
   it('sends an empty account when the new instance claims no account yet', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubFetch(instancePlanReply('xiaoyu'));
 
     await createInstance('secret-token', 'xiaoyu', '', 'qq', '');
 
@@ -322,7 +445,7 @@ describe('Instance provisioning client', () => {
   });
 
   it('escapes the instance id in the progress and archive paths', async () => {
-    const fetchMock = stubFetch();
+    const fetchMock = stubFetch(instanceProgressReply('a b/c'));
 
     await getInstanceProgress('secret-token', 'a b/c');
     await deleteInstance('secret-token', 'a b/c');
@@ -331,6 +454,37 @@ describe('Instance provisioning client', () => {
       ['/v1/instances/a%20b%2Fc/progress', undefined],
       ['/v1/instances/a%20b%2Fc', 'DELETE'],
     ]);
+  });
+
+  // 回执读不懂时工作区已经建好、交给 root 侧了：报成没建成，人会拿同一个名字再建一次。
+  it('treats a creation whose receipt it cannot read as started', async () => {
+    stubFetch({ ...instancePlanReply('xiaoyu'), ports: undefined });
+    const failure = await createInstance('secret-token', 'xiaoyu', '', 'qq', '').catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ReceiptUnreadable);
+    expect(failure).toMatchObject({ message: '实例 xiaoyu 已经开始建，可回执格式不对：缺 ports' });
+
+    stubFetch({ ...instancePlanReply('xiaoyu'), ports: { napcat: '6103' } });
+    await expect(createInstance('secret-token', 'xiaoyu', '', 'qq', ''))
+      .rejects.toThrow('实例 xiaoyu 已经开始建，可回执格式不对：ports 不是 JSON 对象，或有一项不是数字');
+  });
+
+  it('reads a finished progress without the fields only a running one carries', async () => {
+    const done = { id: 'xiaoyu', lines: ['DONE ok'], finished: true, ok: true, detail: '' };
+    stubFetch(done);
+
+    await expect(getInstanceProgress('secret-token', 'xiaoyu')).resolves.toEqual(done);
+  });
+
+  // 补成空的话，没跑完的会被当成跑完了没成功，或者一直等下去。
+  it.each([
+    [{ ...instanceProgressReply('xiaoyu'), finished: undefined }, '缺 finished'],
+    [{ ...instanceProgressReply('xiaoyu'), lines: 'DONE ok' }, 'lines 不是字符串数组'],
+    [{ ...instanceProgressReply('xiaoyu'), state: 'paused' }, 'state 不是 queued、running 之一'],
+    [{ ...instanceProgressReply('xiaoyu'), action: 'rename' }, 'action 不是 create、remove 之一'],
+  ])('a progress reply that does not match its shape is refused (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(getInstanceProgress('secret-token', 'xiaoyu')).rejects.toThrow(`实例 xiaoyu 的进度格式不对：${problem}`);
   });
 });
 
@@ -435,6 +589,13 @@ describe('Instance list client', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/v1/instances');
   });
 
+  it('reads a creation still in progress with its progress', async () => {
+    const building = { ...other, provisioning: instanceProgressReply('xiaoyu') };
+    stubFetch({ current_prefix: '', instances: [root, building] });
+
+    await expect(getInstances('secret-token')).resolves.toEqual([root, building]);
+  });
+
   it('a row from an older roster without index, platform and account still reads', async () => {
     const legacy = { id: 'main', label: '主实例', path: '', current: true };
     stubFetch({ instances: [legacy] });
@@ -451,6 +612,7 @@ describe('Instance list client', () => {
     [{ instances: [root, { ...other, path: undefined }] }, '缺 instances[1].path'],
     [{ instances: [{ ...other, idx: '1' }] }, 'instances[0].idx 不是数字'],
     [{ instances: [{ ...other, provisioning: 'running' }] }, 'instances[0].provisioning 不是 JSON 对象'],
+    [{ instances: [{ ...other, provisioning: { ...instanceProgressReply('xiaoyu'), lines: 'x' } }] }, 'instances[0].provisioning.lines 不是字符串数组'],
   ])('a reply that does not match its shape is refused (%j)', async (body, problem) => {
     stubFetch(body);
 
@@ -553,6 +715,36 @@ describe('Memory console client', () => {
 
     await expect(getMemoryEntries('secret-token', 'conv_abc')).rejects.toThrow(`记忆条目列表格式不对：${problem}`);
   });
+
+  it('reads the saved entry and the cleared count from their receipts', async () => {
+    const saved = { ...memoryEntry, source: 'manual', created_at: '2026-10-28T01:00:00+00:00', updated_at: '2026-10-28T01:00:00+00:00' };
+    stubFetch({ ok: true, entry: saved });
+    await expect(chat.saveMemoryEntry('secret-token', 'conv_abc', { id: 'm1', content: '记一笔' })).resolves.toEqual(saved);
+
+    stubFetch({ ok: true, removed: 3 });
+    await expect(chat.clearMemoryNamespace('secret-token', 'conv_abc')).resolves.toBe(3);
+  });
+
+  // 存上了、清空了，只是回执读不懂：报成失败的话，人会再做一次。
+  it('treats a save or clear whose receipt it cannot read as done', async () => {
+    stubFetch({ ok: true, entry: { ...memoryEntry, constant: undefined } });
+    const save = await chat.saveMemoryEntry('secret-token', 'conv_abc', { id: 'm1' }).catch((error: unknown) => error);
+    expect(save).toBeInstanceOf(ReceiptUnreadable);
+    expect(save).toMatchObject({ message: '这条记忆已经存上，可回执格式不对：缺 entry.constant' });
+
+    // 补成 0 的话页面会说「已清空 0 条」。
+    stubFetch({ ok: true });
+    const clear = await chat.clearMemoryNamespace('secret-token', 'conv_abc').catch((error: unknown) => error);
+    expect(clear).toBeInstanceOf(ReceiptUnreadable);
+    expect(clear).toMatchObject({ message: '这一份记忆已经清空，可回执格式不对：缺 removed' });
+  });
+
+  it('an explicit ok false in a save or clear reply reads as not done', async () => {
+    stubFetch({ ok: false, entry: memoryEntry, removed: 0 });
+
+    await expect(chat.saveMemoryEntry('secret-token', 'conv_abc', { id: 'm1' })).rejects.toThrow('服务端没有存上这条记忆，请重试');
+    await expect(chat.clearMemoryNamespace('secret-token', 'conv_abc')).rejects.toThrow('服务端没有清空这一份记忆，请重试');
+  });
 });
 
 describe('Conversation list client', () => {
@@ -596,6 +788,45 @@ describe('Conversation list client', () => {
     stubFetch(body);
 
     await expect(getConversations('secret-token')).rejects.toThrow(`会话列表格式不对：${problem}`);
+  });
+
+  it('reads the latest messages of one conversation, multimodal content included', async () => {
+    const reply = {
+      total: 3,
+      messages: [
+        { id: 'm1', role: 'user', content: [{ type: 'text', text: '看图' }, { type: 'image_url', image_url: { url: 'data/attachments/a.png' } }] },
+        { id: 'm2', role: 'assistant', content: '是一只猫', tool_calls: [] },
+      ],
+    };
+    const fetchMock = stubFetch(reply);
+
+    await expect(chat.getConversationMessages('secret-token', 'sess 1', 2)).resolves.toEqual(reply);
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/admin/conversations/sess%201/messages?limit=2');
+  });
+
+  // 补成空表的话，预览会说「共 0 条」。
+  it.each([
+    [{ messages: [] }, '缺 total'],
+    [{ total: 1 }, '缺 messages'],
+    [{ total: 1, messages: [{ content: 'hi' }] }, '缺 messages[0].role'],
+    [{ total: 1, messages: [{ role: 'user', content: null }] }, 'messages[0].content 不是字符串，也不是对象数组'],
+  ])('a message preview that does not match its shape is refused (%j)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.getConversationMessages('secret-token', 'sess-1')).rejects.toThrow(`会话记录格式不对：${problem}`);
+  });
+
+  it('treats a context deletion whose receipt it cannot read as done', async () => {
+    stubFetch({ ok: true, old_session_id: 'sess-1', conversation_key: 'qq_group:abc', cleared_children: 0 });
+    await expect(chat.resetConversationBySession('secret-token', 'sess-1')).resolves.toMatchObject({ ok: true });
+
+    stubFetch({ ok: true });
+    const failure = await chat.resetConversationBySession('secret-token', 'sess-1').catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ReceiptUnreadable);
+    expect(failure).toMatchObject({ message: '会话上下文已经删掉，可回执格式不对：缺 old_session_id' });
+
+    stubFetch({ ok: false, old_session_id: '', conversation_key: '', cleared_children: 0 });
+    await expect(chat.resetConversationBySession('secret-token', 'sess-1')).rejects.toThrow('服务端没有重置会话，请重试');
   });
 });
 
@@ -847,5 +1078,582 @@ describe('Node and provider table client', () => {
       await expect(write).rejects.toBeInstanceOf(ReceiptUnreadable);
       await expect(write).rejects.toThrow(`${receipt}格式不对：缺 active_provider`);
     }
+  });
+});
+
+describe('Chat endpoint shapes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const stubText = (text: string) => vi.stubGlobal('fetch', vi.fn(async () => new Response(text, {
+    status: 200, headers: { 'Content-Type': 'text/html' },
+  })));
+
+  // 代理把登录页、报错页原样回成 200 时也是这一句：SyntaxError 的英文原话说不出是哪一份没读懂。
+  it('a 2xx body that is not JSON reads as a format problem of that reply', async () => {
+    stubText('<html>login</html>');
+    await expect(chat.getActiveNode('sess-1')).rejects.toThrow('会话的当前节点格式不对：返回的不是 JSON');
+    stubText('');
+    await expect(chat.listSessions()).rejects.toThrow('会话列表格式不对：返回的不是 JSON');
+  });
+
+  it('reads sessions, history and the active node that match their shapes', async () => {
+    const session = { session_id: 'sess-1', conversation_key: 'web:a', channel: 'web', created_at: '', updated_at: '' };
+    stubFetch([session]);
+    await expect(chat.listSessions()).resolves.toEqual([session]);
+
+    const rows = [
+      { id: 'u1', cursor: 0, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      { id: 'a1', cursor: 1, role: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'finish', arguments: {} }] },
+    ];
+    stubFetch(rows);
+    await expect(chat.getSessionHistory('sess-1')).resolves.toEqual(rows);
+
+    stubFetch({ node_id: 'main', is_override: false, default_node_id: 'main' });
+    await expect(chat.getActiveNode('sess-1')).resolves.toEqual({ node_id: 'main', is_override: false, default_node_id: 'main' });
+  });
+
+  // 会话列表读成空就是「一个对话都没有」；历史读成空，已有的消息会被当成没落盘清掉。
+  it.each([
+    [() => chat.listSessions(), {}, '会话列表格式不对：返回的不是数组'],
+    [() => chat.listSessions(), [{ conversation_key: 'web:a' }], '会话列表格式不对：缺 [0].session_id'],
+    [() => chat.listSessions(), [{ session_id: 's', conversation_key: 'web:a', channel: 'web', created_at: 0, updated_at: '' }], '会话列表格式不对：[0].created_at 不是字符串'],
+    [() => chat.getSessionHistory('s'), [{ id: 'u1', role: 'user', content: 42 }], '历史消息格式不对：[0].content 不是字符串，也不是对象数组'],
+    [() => chat.getSessionHistory('s'), [{ id: 'u1', content: 'hi' }], '历史消息格式不对：缺 [0].role'],
+    [() => chat.getSessionHistory('s'), [{ id: 'u1', role: 'user', content: '', cursor: '3' }], '历史消息格式不对：[0].cursor 不是数字'],
+    [() => chat.getSessionHistory('s'), [{ id: 'a1', role: 'assistant', content: '', tool_calls: [null] }], '历史消息格式不对：[0].tool_calls 不是数组，或有一项不是 JSON 对象'],
+    [() => chat.getSessionMessages('s'), [{ role: 'user' }], '会话消息格式不对：缺 [0].content'],
+    [() => chat.getActiveNode('s'), { node_id: 'main', is_override: 'no', default_node_id: 'main' }, '会话的当前节点格式不对：is_override 不是 true 或 false'],
+    [() => chat.getConfig(), { provider: 'openai', openai: { base_url: '' }, default_entry_node_id: 'main' }, '全局配置格式不对：缺 openai.model'],
+    [() => chat.getConfig(), { provider: 'openai', openai: { model: '', base_url: '' } }, '全局配置格式不对：缺 default_entry_node_id'],
+    [() => chat.getSessionProviderOverride('s', 'secret-token'), [], '会话的渠道覆盖格式不对：返回的不是 JSON 对象'],
+  ])('a reply that does not match its shape is refused (%#)', async (read, body, problem) => {
+    stubFetch(body);
+
+    await expect(read()).rejects.toThrow(problem);
+  });
+
+  it('treats a chat write whose receipt it cannot read as done, saying what was done first', async () => {
+    stubFetch({ unexpected: true });
+    const writes: Array<[() => Promise<unknown>, string]> = [
+      [() => chat.uploadAttachment(new File(['x'], 'a.png'), 'web:a'), '附件 a.png 已经传上，可回执格式不对：缺 path'],
+      [() => postInbound({ conversation_key: 'web:a', text: 'hi' }), '消息已经发出，可回执格式不对：缺 session_id'],
+      [() => decideApproval('secret-token', 'ap-1', 'allow'), '审批决定已经交上，可回执格式不对：缺 approval_id'],
+      [() => chat.cancelActiveTasks('sess-1'), '取消请求已经交上，可回执格式不对：缺 ok'],
+      [() => chat.resetConversation('web:a'), '会话已经重置，可回执格式不对：缺 ok'],
+      [() => chat.switchNode('sess-1', 'main'), '节点已经切换，可回执格式不对：缺 ok'],
+      [() => chat.deleteSession('sess-1'), '会话已经删掉，可回执格式不对：缺 ok'],
+      [() => chat.updateModelConfig('secret-token', { model: 'gpt-5.5' }), '模型配置已经存上，可回执格式不对：缺 provider'],
+    ];
+    for (const [write, problem] of writes) {
+      const failure = await write().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(ReceiptUnreadable);
+      expect(failure).toMatchObject({ message: problem });
+    }
+
+    stubText('ok');
+    await expect(chat.updateSessionProviderOverride('sess-1', 'secret-token', {})).rejects.toThrow('会话的渠道覆盖已经存上，可回执不是 JSON');
+    await expect(chat.clearSessionProviderOverride('sess-1', 'secret-token')).rejects.toThrow('会话的渠道覆盖已经清掉，可回执不是 JSON');
+  });
+
+  // 一个已经定案的审批回执里没有状态，就分不出生效的是不是这一次。
+  it('an approval receipt without its status cannot be read', async () => {
+    stubFetch({ approval_id: 'ap-1', operation: 'read_file' });
+
+    await expect(decideApproval('secret-token', 'ap-1', 'allow')).rejects.toThrow('审批决定已经交上，可回执格式不对：缺 status');
+  });
+
+  it('a 2xx that says ok false is a refusal, not an unreadable receipt', async () => {
+    stubFetch({ ok: false });
+
+    await expect(chat.cancelActiveTasks('sess-1')).rejects.toThrow('服务端没有取消任务，请重试');
+    await expect(chat.deleteSession('sess-1')).rejects.toThrow('服务端未确认删除会话，请重试');
+    stubFetch({ ok: false, target_node_id: '', is_override: false, default_node_id: 'main' });
+    await expect(chat.switchNode('sess-1', 'main')).rejects.toThrow('服务端没有切换节点，请重试');
+  });
+
+  it('puts the session id into the provider override path as one segment', async () => {
+    const fetchMock = stubFetch({});
+
+    await chat.getSessionProviderOverride('a/b', 'secret-token');
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/sessions/a%2Fb/provider_override');
+  });
+});
+
+describe('System endpoint shapes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const task = {
+    task_id: 'task-1', session_id: 'sess-1', node_id: null, status: 'running', kind: 'node',
+    created_at: '2026-06-01T00:00:00Z', updated_at: '2026-06-01T00:00:01Z', worker_id: null, caller_task_id: null,
+    input_summary: '', cancel_requested: false, current_phase: '', current_detail: '', lane: 'interactive', awaiting_approval: false,
+  };
+  const worker = {
+    alive: true, pid: 9001, uptime_sec: 12, failures: 0, respawns: 0, given_up: false,
+    last_exit_code: null, last_log: '', retry_in_sec: 0, generation: 'gen-1',
+  };
+  const runtime = { supervised: true, workers: { 'engine-1': worker }, tasks: { queued: 0, running: 1 }, started_at: '2026-06-01T00:00:00Z', uptime_sec: 12 };
+
+  it('reads health, admin state, active tasks, runtime status and a log tail that match their shapes', async () => {
+    stubFetch({ status: 'ok', uptime_seconds: 3 });
+    await expect(checkHealth()).resolves.toEqual({ status: 'ok', uptime_seconds: 3 });
+
+    const state = adminState({ pending_approvals: [pendingApproval('ap-1')] });
+    stubFetch(state);
+    await expect(getAdminState('secret-token')).resolves.toEqual(state);
+
+    stubFetch([task, { ...task, task_id: 'task-2', lane: undefined }]);
+    await expect(fetchActiveTasks('secret-token')).resolves.toHaveLength(2);
+
+    stubFetch(runtime);
+    await expect(chat.getRuntimeStatus('secret-token')).resolves.toEqual(runtime);
+
+    stubFetch({ name: 'engine.log', text: 'ready', truncated: false });
+    await expect(chat.readLogTail('secret-token', 'engine.log')).resolves.toMatchObject({ text: 'ready', truncated: false });
+  });
+
+  // 计数补成 0、列表补成空：页面会说「没有待审批」「没有在跑的任务」「一个 worker 都没起来」。
+  it.each([
+    [() => checkHealth(), {}, '健康检查格式不对：缺 status'],
+    [() => checkHealth(), { status: 'ok', uptime_seconds: '12' }, '健康检查格式不对：uptime_seconds 不是数字'],
+    [() => getAdminState('t'), adminState({ sessions: undefined } as never), '管理状态格式不对：缺 sessions'],
+    [() => getAdminState('t'), adminState({ approvals: { pending: '1' } } as never), '管理状态格式不对：approvals 不是 JSON 对象，或有一项不是数字'],
+    [() => getAdminState('t'), adminState({ pending_approvals: [{ operation: 'x' }] } as never), '管理状态格式不对：缺 pending_approvals[0].approval_id'],
+    [() => fetchActiveTasks('t'), { tasks: [] }, '活跃任务列表格式不对：返回的不是数组'],
+    [() => fetchActiveTasks('t'), [{ ...task, status: 'completed' }], '活跃任务列表格式不对：[0].status 不是 running、pending、suspended 之一'],
+    [() => fetchActiveTasks('t'), [{ ...task, awaiting_approval: undefined }], '活跃任务列表格式不对：缺 [0].awaiting_approval'],
+    [() => chat.getRuntimeStatus('t'), { ...runtime, workers: [] }, '运行状态格式不对：workers 不是 JSON 对象'],
+    [() => chat.getRuntimeStatus('t'), { ...runtime, workers: { 'engine-1': { ...worker, pid: '9001' } } }, '运行状态格式不对：workers.engine-1.pid 不是数字，也不是 null'],
+    [() => chat.getRuntimeStatus('t'), { ...runtime, tasks: { queued: 0 } }, '运行状态格式不对：缺 tasks.running'],
+    [() => chat.readLogTail('t', 'engine.log'), { text: 'ready' }, '日志 engine.log 的内容格式不对：缺 truncated'],
+  ])('a reply that does not match its shape is refused (%#)', async (read, body, problem) => {
+    stubFetch(body);
+
+    await expect(read()).rejects.toThrow(problem);
+  });
+
+  it('treats a restart or config reload whose receipt it cannot read as done', async () => {
+    stubFetch({ target: 'engine' });
+    const restart = await chat.restartEngine('secret-token').catch((error: unknown) => error);
+    expect(restart).toBeInstanceOf(ReceiptUnreadable);
+    expect(restart).toMatchObject({ message: '重启请求已经交上，可回执格式不对：缺 scheduled' });
+
+    stubFetch(restartReply({ scheduled: false, in_progress: { target: 'all', since: 12 } } as never));
+    await expect(chat.restartEngine('secret-token')).rejects.toThrow('重启请求已经交上，可回执格式不对：in_progress.since 不是字符串');
+
+    stubFetch({ ok: true });
+    await expect(chat.reloadConfig('secret-token')).rejects.toThrow('配置已经重新读取，可回执格式不对：缺 config');
+    stubFetch(configReloadReply());
+    await expect(chat.reloadConfig('secret-token')).resolves.toMatchObject({ ok: true });
+    stubFetch(restartReply());
+    await expect(chat.restartEngine('secret-token')).resolves.toEqual(restartReply());
+  });
+});
+
+describe('System model slot shapes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const slot = {
+    key: 'compact', label: '上下文压缩', desc: '', supports_provider: true, env_prefix: 'CLONOTH_COMPACT',
+    model: '', base_url: '', model_raw: '', base_url_raw: '', provider: '', api_key_present: false, api_key_redacted: '',
+  };
+  const reply = { slots: [slot], image_tools: [{ name: 'gemini_image', slot: 'image_gemini', available: true }], image_default_channel: '' };
+
+  it('reads the slots and hands back the full state after a write', async () => {
+    stubFetch(reply);
+    await expect(chat.getSystemModels('secret-token')).resolves.toEqual(reply);
+    await expect(chat.updateSystemModel('secret-token', 'compact', { model: 'm' })).resolves.toEqual(reply);
+    await expect(chat.updateImageDefaultChannel('secret-token', '')).resolves.toEqual(reply);
+  });
+
+  // model_raw 补成空串的话，编辑器回填的就是空的，保存一次就把变量引用抹掉了。
+  it.each([
+    [{ image_tools: [] }, '缺 slots'],
+    [{ slots: [{ ...slot, model_raw: undefined }] }, '缺 slots[0].model_raw'],
+    [{ slots: [{ ...slot, supports_provider: 'yes' }] }, 'slots[0].supports_provider 不是 true 或 false'],
+    [{ slots: [slot], image_tools: [{ name: 'gpt_image', slot: 'image_gpt' }] }, '缺 image_tools[0].available'],
+    [{ slots: [slot], image_default_channel: null }, 'image_default_channel 不是字符串'],
+  ])('a slot list that does not match its shape is refused (%j)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.getSystemModels('secret-token')).rejects.toThrow(`系统槽位格式不对：${problem}`);
+  });
+
+  it('treats a slot write whose receipt it cannot read as done', async () => {
+    stubFetch({ ok: true });
+    await expect(chat.updateSystemModel('secret-token', 'compact', { model: 'm' }))
+      .rejects.toThrow('系统槽位 compact 已经存上，可回执格式不对：缺 slots');
+    await expect(chat.updateImageDefaultChannel('secret-token', 'gemini_image'))
+      .rejects.toBeInstanceOf(ReceiptUnreadable);
+  });
+});
+
+describe('Sticker library client', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const sticker = {
+    sha256: 'abc', name: '猫', state: 'library', source: 'upload', tags: ['猫'], auto_tags: ['猫'], manual_tags: [],
+    manual_override: false, caption_state: 'done', caption_error: '', width: 120, height: 120, animated: false, size: 2048,
+    from_group: '', from_user: '', sent_count: 0, last_sent_at: 0, created_at: 1761613200, usable: true,
+  };
+  const counts = { pending: 1, library: 2, discarded: 0, usable: 1, awaiting_caption: 1 };
+
+  it('reads a page of stickers with the counts of every state', async () => {
+    const fetchMock = stubFetch({ items: [sticker], counts });
+
+    await expect(chat.listStickers('secret-token', { state: 'library' })).resolves.toEqual({ items: [sticker], counts });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/stickers?state=library&search=&limit=60&offset=0');
+  });
+
+  // 补成空表、0 张的话，页面会说「这一档还没有图」「在库 0 张」。
+  it.each([
+    [{ counts }, '缺 items'],
+    [{ items: [sticker] }, '缺 counts'],
+    [{ items: [sticker], counts: { ...counts, usable: undefined } }, '缺 counts.usable'],
+    [{ items: [{ ...sticker, state: 'archived' }], counts }, 'items[0].state 不是 pending、library、discarded 之一'],
+    [{ items: [{ ...sticker, caption_state: 'queued' }], counts }, 'items[0].caption_state 不是 pending、running、done、failed 之一'],
+    [{ items: [{ ...sticker, tags: '猫' }], counts }, 'items[0].tags 不是字符串数组'],
+  ])('a sticker page that does not match its shape is refused (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.listStickers('secret-token')).rejects.toThrow(`图库格式不对：${problem}`);
+  });
+
+  it('a sticker deleted right after the change comes back as null, not as an unreadable receipt', async () => {
+    stubFetch({});
+    await expect(chat.updateSticker('secret-token', 'abc', { name: '猫' })).resolves.toBeNull();
+    await expect(chat.acceptSticker('secret-token', 'abc')).resolves.toBeNull();
+
+    stubFetch(sticker);
+    await expect(chat.acceptSticker('secret-token', 'abc')).resolves.toEqual(sticker);
+  });
+
+  // 改动已经做完，只是回执读不懂：报成失败的话，人会再做一次。
+  it('treats a sticker write whose receipt it cannot read as done', async () => {
+    stubFetch({ ...sticker, usable: undefined });
+    const update = await chat.updateSticker('secret-token', 'abc', { name: '猫' }).catch((error: unknown) => error);
+    expect(update).toBeInstanceOf(ReceiptUnreadable);
+    expect(update).toMatchObject({ message: '这张图的名字和标签已经存上，可回执格式不对：缺 usable' });
+
+    stubFetch({ queued: '3' });
+    await expect(chat.recaptionStickers('secret-token', false))
+      .rejects.toThrow('已经重新排进打标队列，可回执格式不对：queued 不是数字');
+
+    stubFetch({ id: 'abc' });
+    await expect(chat.uploadSticker('secret-token', new File(['x'], 'cat.png')))
+      .rejects.toThrow('这张图已经传上，可回执格式不对：缺 sha256');
+
+    stubFetch({ scanned: 3, added: 1, known: 1 });
+    await expect(chat.importStickers('secret-token', 'data/inbox', false))
+      .rejects.toThrow('目录已经导入，可回执格式不对：缺 skipped');
+  });
+});
+
+describe('Config page endpoint shapes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const tool = {
+    name: 'exa_search', source: 'external', editable: true, description: '语义搜索', input_schema: {}, has_spec: true,
+    file: 'tools/exa_search.py', timeout_sec: 30, origin: 'bundled',
+  };
+  const skill = {
+    name: '读网页', dir: 'jina-reader', path: 'config/skills/jina-reader/SKILL.md', description: '', enabled: true,
+    strategy: 'normal', keywords: ['网页'], order: 0, priority: 0, scan_depth: 0, node_ids: [], body_preview: '',
+  };
+  const nodeFile = {
+    name: 'qq.orchestrator.yaml', path: 'defaults/nodes/qq.orchestrator.yaml', kind: 'node', suffix: '.yaml', is_example: false,
+    base_name: 'qq.orchestrator.yaml', size: 120, updated_at: 1761613200.5, source: 'default', same_as_default: false,
+  };
+  const effective = { name: 'read_file', registered: true, external: false, guarded: null, gated: '', automatic: '' };
+
+  it('reads the tool, skill, node file and tool name lists that match their shapes', async () => {
+    stubFetch([tool]);
+    await expect(chat.getTools('secret-token')).resolves.toEqual([tool]);
+
+    const broken = { name: 'broken', dir: 'broken', path: 'config/skills/broken/SKILL.md', problem: '第 2 行：frontmatter 写坏了' };
+    stubFetch([skill, broken]);
+    await expect(chat.getSkills('secret-token')).resolves.toEqual([skill, broken]);
+
+    stubFetch([nodeFile]);
+    await expect(chat.getNodeFiles('secret-token')).resolves.toEqual([nodeFile]);
+
+    stubFetch(['read_file', 'exa_search']);
+    await expect(getAllToolNames('secret-token')).resolves.toEqual(['read_file', 'exa_search']);
+
+    const reply = { node_id: 'qq.orchestrator', mode: 'allowlist', dead_names: ['typo_tool'], tools: [effective] };
+    stubFetch(reply);
+    await expect(chat.getEffectiveTools('secret-token', 'qq.orchestrator')).resolves.toEqual(reply);
+  });
+
+  // 补成空表的话，页面会说「共 0 个」「暂无」，授权页一个「不可用」都不标。
+  it.each([
+    [() => chat.getTools('t'), { tools: [] }, '工具清单格式不对：返回的不是数组'],
+    [() => chat.getTools('t'), [{ ...tool, source: 'mcp' }], '工具清单格式不对：[0].source 不是 builtin、plugin、external 之一'],
+    [() => chat.getTools('t'), [{ ...tool, editable: undefined }], '工具清单格式不对：缺 [0].editable'],
+    [() => chat.getSkills('t'), [{ ...skill, keywords: '网页' }], '技能列表格式不对：[0].keywords 不是字符串数组'],
+    [() => chat.getSkills('t'), [{ ...skill, dir: '' }], '技能列表格式不对：[0].dir 不是非空字符串'],
+    [() => chat.getNodeFiles('t'), [{ ...nodeFile, source: 'system' }], '节点文件列表格式不对：[0].source 不是 default、override、custom 之一'],
+    [() => getAllToolNames('t'), ['read_file', 3], '工具名清单格式不对：返回的不是字符串数组'],
+    [
+      () => chat.getEffectiveTools('t', 'n'), { node_id: 'n', mode: 'all', dead_names: [], tools: [{ ...effective, guarded: 'no' }] },
+      '节点 n 实际能用的工具格式不对：tools[0].guarded 不是 true 或 false，也不是 null',
+    ],
+    [() => chat.getEffectiveTools('t', 'n'), { node_id: 'n', mode: 'all', tools: [] }, '节点 n 实际能用的工具格式不对：缺 dead_names'],
+    [() => chat.getMcpClients('t'), [{ transport: 'stdio' }], 'MCP Client 列表格式不对：缺 [0].id'],
+  ])('a config list that does not match its shape is refused (%#)', async (read, body, problem) => {
+    stubFetch(body);
+
+    await expect(read()).rejects.toThrow(problem);
+  });
+
+  // 后端已照运行时的读法规整好；没规整过的开关报格式不对，不在前端替它纠正。
+  it('reads the MCP client list as the backend normalizes it and refuses a raw switch', async () => {
+    const alpha = { id: 'alpha', enabled: false, share_sessions: false, transport: 'stdio', command: 'run-me', args: ['--x'], env: {} };
+    const beta = { id: 'beta', enabled: true, share_sessions: true, transport: 'streamable_http', url: 'http://x', headers: {} };
+    stubFetch([alpha, beta]);
+
+    await expect(chat.getMcpClients('secret-token')).resolves.toEqual([alpha, beta]);
+
+    stubFetch([{ ...alpha, enabled: 'no' }]);
+    await expect(chat.getMcpClients('secret-token')).rejects.toThrow('MCP Client 列表格式不对：[0].enabled 不是 true 或 false');
+  });
+
+  it('reads the receipts of a removal, a tool reload and a drawtools init', async () => {
+    stubFetch({ ok: true, restored: true });
+    await expect(chat.deleteNodeFile('secret-token', 'a.yaml')).resolves.toEqual({ ok: true, restored: true });
+
+    stubFetch(toolsReloadReply(3));
+    await expect(chat.reloadTools('secret-token')).resolves.toEqual(toolsReloadReply(3));
+
+    stubFetch({ ok: true, created: ['config/drawtools/settings.yaml'] });
+    await expect(chat.initDrawtoolsConfigs('secret-token')).resolves.toEqual({ ok: true, created: ['config/drawtools/settings.yaml'] });
+  });
+
+  // 删了、重载了、补上了、清理了，只是回执读不懂：报成失败的话，人会再做一次。
+  it('treats a config write whose receipt it cannot read as done', async () => {
+    stubFetch({ ok: true });
+    const removed = await chat.deleteNode('secret-token', 'chat.intent').catch((error: unknown) => error);
+    expect(removed).toBeInstanceOf(ReceiptUnreadable);
+    expect(removed).toMatchObject({ message: '节点 chat.intent 本实例那份已经删掉，可回执格式不对：缺 restored' });
+    await expect(chat.resetRuntime('secret-token')).rejects.toThrow('runtime.yaml 本实例那份已经删掉，可回执格式不对：缺 restored');
+    await expect(chat.reloadTools('secret-token')).rejects.toThrow('工具重载已经交上，可回执格式不对：缺 run_id');
+    await expect(chat.initDrawtoolsConfigs('secret-token')).rejects.toThrow('缺的绘图配置已经补上，可回执格式不对：缺 created');
+    await expect(chat.cleanupDrawtoolsAttachments('secret-token'))
+      .rejects.toThrow('绘图附件已经清理，可回执格式不对：缺 deleted_count');
+
+    stubFetch({ deleted: true });
+    await expect(chat.deleteSkill('secret-token', 'jina-reader')).rejects.toThrow('技能 jina-reader 已经删掉，可回执格式不对：缺 ok');
+  });
+
+  it('an explicit ok false in a config write reads as not done', async () => {
+    stubFetch({ ok: false, restored: false });
+    await expect(chat.deleteTool('secret-token', 'demo_tool')).rejects.toThrow('服务端没有删掉这份配置，请重试');
+
+    stubFetch({ ...toolsReloadReply(), ok: false });
+    await expect(chat.reloadTools('secret-token')).rejects.toThrow('服务端没有重载工具，请重试');
+  });
+});
+
+describe('Hot config endpoint shapes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads an unpublished and a published platform state as the supervisor sends them', async () => {
+    stubFetch(unpublishedStateReply());
+    await expect(chat.getPlatformState('secret-token', 'qq')).resolves.toEqual(unpublishedStateReply());
+
+    stubFetch(publishedStateReply());
+    await expect(chat.getPlatformState('secret-token', 'qq')).resolves.toEqual(publishedStateReply());
+  });
+
+  // 心跳时间没写或读不懂时后端给 null，这是一种正常的回答。
+  it('a heartbeat age of null still reads', async () => {
+    stubFetch(publishedStateReply(qqSnapshot(), { age_sec: null }));
+
+    expect((await chat.getPlatformState('secret-token', 'qq')).age_sec).toBeNull();
+  });
+
+  // 补成空的话，来源会被说成「都跟着默认」，可写的层、生效值出自哪一版文件也一样。
+  it.each([
+    [{ ...unpublishedStateReply(), file: {} }, '缺 file.exists'],
+    [publishedStateReply(qqSnapshot(), { age_sec: 'soon' as never }), 'age_sec 不是数字，也不是 null'],
+    [{ ...publishedStateReply(), state: null }, 'state 不是 JSON 对象'],
+    [
+      publishedStateReply(qqSnapshot({ sources: { signal_at: 'elsewhere' as never } })),
+      'state.sources 不是 JSON 对象，或有一项不是 platform、global、legacy、env、default 之一',
+    ],
+    [publishedStateReply(qqSnapshot({ layers: { signal_at: 'global' as never } })), 'state.layers 不是 JSON 对象，或有一项不是字符串数组'],
+    [publishedStateReply(qqSnapshot({ loaded: { exists: true } as never })), '缺 state.loaded.mtime_ns'],
+    [
+      publishedStateReply(qqSnapshot({
+        defaults: { config_path: 'features.yaml', file: { exists: false, mtime_ns: 0, size: 0 }, parse_error: '' } as never,
+      })),
+      '缺 state.defaults.loaded',
+    ],
+    [
+      publishedStateReply(qqSnapshot({ capabilities: [{ ...qqSnapshot().capabilities![0], grants: 'admin' as never }] })),
+      'state.capabilities[0].grants 不是字符串数组',
+    ],
+    [
+      publishedStateReply(qqSnapshot({ input_rules: { allowed_groups: { kind: 'phone' as never } } })),
+      'state.input_rules.allowed_groups.kind 不是 id、word 之一',
+    ],
+    [
+      publishedStateReply(qqSnapshot({ runtime: { volatile: { cached_groups: '3' as never } } })),
+      'state.runtime.volatile.cached_groups 不是数字',
+    ],
+  ])('a platform state that does not match its shape says where (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.getPlatformState('secret-token', 'qq')).rejects.toThrow(`平台 qq 的生效状态格式不对：${problem}`);
+  });
+
+  it('a state body that is not JSON says which one, not a SyntaxError', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>502</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })));
+
+    await expect(chat.getPlatformState('secret-token', 'qq')).rejects.toThrow('平台 qq 的生效状态格式不对：返回的不是 JSON');
+  });
+
+  it('reads the global state with its adoption, fallbacks and central switches', async () => {
+    stubFetch(featuresStateReply());
+    await expect(chat.getFeaturesState('secret-token')).resolves.toEqual(featuresStateReply());
+
+    const { fallbacks: _fallbacks, central: _central, ...older } = featuresStateReply();
+    stubFetch(older);
+    const read = await chat.getFeaturesState('secret-token');
+    expect(read).not.toHaveProperty('fallbacks');
+    expect(read).not.toHaveProperty('central');
+  });
+
+  // 生效情况读成空表，页面会说「后端没给出 bot 的生效情况」；兜底读丢了，页面会把平台实际用着的值说成默认值。
+  it.each([
+    [{ ...featuresStateReply(), platforms: undefined }, '缺 platforms'],
+    [featuresStateReply({ platforms: [{ id: 'qq', display_name: 'QQ · NapCat', published: true } as never] }), '缺 platforms[0].applied'],
+    [
+      featuresStateReply({
+        fallbacks: { sticker_auto_tag: [{ ...featuresStateReply().fallbacks!.sticker_auto_tag[0], source: 'default' as never }] },
+      }),
+      'fallbacks.sticker_auto_tag[0].source 不是 legacy、env 之一',
+    ],
+    [
+      { ...featuresStateReply(), fallbacks: { sticker_auto_tag: [{ platform: 'qq', display_name: 'QQ · NapCat', source: 'env', file: '' }] } },
+      '缺 fallbacks.sticker_auto_tag[0].value',
+    ],
+    [
+      featuresStateReply({ central: { sticker_auto_tag: { enabled: 'yes' as never, set_globally: false } } }),
+      'central.sticker_auto_tag.enabled 不是 true 或 false',
+    ],
+  ])('a global state that does not match its shape says where (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.getFeaturesState('secret-token')).rejects.toThrow(`全局设置的生效状态格式不对：${problem}`);
+  });
+
+  // 快照由后端测试盯着和 console_schema 的声明逐项一致，读得通才算认得后端真正发的布局。
+  it('reads every console schema the backend declares', async () => {
+    stubFetch(schemaSnapshot.features);
+    await expect(chat.getFeaturesSchema('secret-token')).resolves.toEqual(schemaSnapshot.features);
+
+    for (const [platformId, schema] of Object.entries(schemaSnapshot.platforms)) {
+      stubFetch(schema);
+      await expect(chat.getPlatformSchema('secret-token', platformId)).resolves.toEqual(schema);
+    }
+  });
+
+  const signalAt = { kind: 'bool', label: '被 @ 时回应', path: 'trigger.signals.at', layers: ['global', 'platform'], default: null };
+  const schemaWith = (nodes: unknown[], fields: Record<string, unknown> = { signal_at: signalAt }) => ({
+    version: 1,
+    sections: [{ id: 'trigger', label: '触发时机', icon: 'timer', note: '', paths: ['trigger'], nodes }],
+    fields,
+  });
+
+  // 认不出的节点照猜着画，页面会少一块或摆错控件。
+  it.each([
+    [{ ...schemaWith([]), version: '1' }, 'version 不是数字'],
+    [{ ...schemaWith([]), fields: undefined }, '缺 fields'],
+    [schemaWith([{ kind: 'tabs' }]), 'sections[0].nodes[0].kind 不是 block、grid、panel、loose、fixed、field、desc、note、custom 之一'],
+    [schemaWith([{ kind: 'grid' }]), '缺 sections[0].nodes[0].children'],
+    [schemaWith([{ kind: 'block', title: '触发条件', children: [{ kind: 'field' }] }]), '缺 sections[0].nodes[0].children[0].key'],
+    [schemaWith([{ kind: 'block', title: '触发条件', frame: 'dotted' }]), 'sections[0].nodes[0].frame 不是 ruled、boxed 之一'],
+    [schemaWith([{ kind: 'field', key: 'signal_at' }], { signal_at: { ...signalAt, default: undefined } }), '缺 fields.signal_at.default'],
+    [
+      schemaWith([], { mode: { ...signalAt, kind: 'choice', choices: [['group']] } }),
+      'fields.mode.choices 不是数组，或有一项不是「值、名字」两个字符串',
+    ],
+  ])('a console schema that does not match its shape says where (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.getPlatformSchema('secret-token', 'qq')).rejects.toThrow(`平台 qq 的控制台布局格式不对：${problem}`);
+  });
+
+  it('reads an audition the way the platform judged it', async () => {
+    stubFetch(dryRunReply());
+    await expect(chat.dryRunPlatformTrigger('secret-token', 'qq', [{ text: '小风在吗' }])).resolves.toEqual(dryRunReply());
+
+    const { presence: _presence, ...older } = dryRunReply();
+    stubFetch(older);
+    expect(await chat.dryRunPlatformTrigger('secret-token', 'qq', [{ text: '小风在吗' }])).not.toHaveProperty('presence');
+  });
+
+  // 缺一项就会把「会不会接话」「被谁拦下」念错。
+  it.each([
+    [{ ...dryRunReply(), results: undefined }, '缺 results'],
+    [dryRunReply({ results: [{ ...dryRunReply().results[0], triggered: 'yes' as never }] }), 'results[0].triggered 不是 true 或 false'],
+    [
+      dryRunReply({ results: [{ ...dryRunReply().results[0], quiet: 'expired' as never }] }),
+      'results[0].quiet 不是 空串、waiting、merged、due、cancelled 之一',
+    ],
+    [dryRunReply({ presence: { active: true } as never }), '缺 presence.window_sec'],
+  ])('an audition that does not match its shape says where (%#)', async (body, problem) => {
+    stubFetch(body);
+
+    await expect(chat.dryRunPlatformTrigger('secret-token', 'qq', [{ text: '小风在吗' }])).rejects.toThrow(`试听结果格式不对：${problem}`);
+  });
+});
+
+describe('Feature request client', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('hands the JSON body of a read back for the page to check', async () => {
+    const fetchMock = stubFetch({ items: [] });
+
+    await expect(featureRequest('/v1/community/activities', { what: '活动列表', scope: 'qq_group:a' })).resolves.toEqual({ items: [] });
+    expect(fetchMock.mock.calls[0][0]).toBe(`${MOUNT}/v1/community/activities?scope=qq_group%3Aa`);
+  });
+
+  it('says which read came back as something other than JSON', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>ok</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })));
+
+    await expect(featureRequest('/v1/community/activities', { what: '活动列表' })).rejects.toThrow('活动列表格式不对：返回的不是 JSON');
+  });
+
+  // 写已经做完：正文读不懂报成失败的话，人会再做一次。
+  it('a write whose receipt is not JSON reads as done but unreadable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('done', { status: 200 })));
+
+    const outcome = await featureRequest('/v1/reminders', { method: 'POST', receipt: '提醒已经建好，可回执', body: {} }).catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(ReceiptUnreadable);
+    expect(outcome).toMatchObject({ message: '提醒已经建好，可回执不是 JSON' });
+  });
+
+  it('a receipt reader that does not say what was done gets the done half put in front', () => {
+    expect(() => readReceipt('计划已经确认，可回执', {}, () => { throw new Error('执行计划响应格式无效'); }))
+      .toThrow('计划已经确认，可回执读不懂：执行计划响应格式无效');
+    expect(() => readReceipt('计划已经确认，可回执', {}, () => { throw new Error('计划已经确认，可回执格式不对：缺 id'); }))
+      .toThrow(/^计划已经确认，可回执格式不对：缺 id$/);
   });
 });

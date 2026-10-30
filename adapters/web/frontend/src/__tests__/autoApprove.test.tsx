@@ -18,7 +18,7 @@ class FakeWebSocket {
 
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   readyState = FakeWebSocket.CONNECTING;
   sent: string[] = [];
@@ -31,9 +31,9 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close() {
+  close(code = 1000, reason = '') {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code, reason } as CloseEvent);
   }
 
   open() {
@@ -160,6 +160,65 @@ describe('client auto-approval', () => {
 
     await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-auto', 'allow', 'auto-approved by client preference'));
     await waitFor(() => expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).not.toContain('approval-auto'));
+  });
+
+  // 决定已经到了服务端，只是回执读不懂：撤掉记录的话，刷新之后同一条会再自动放一次。
+  it('keeps an automatic approval id when the decision went through but its receipt is unreadable', async () => {
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval')
+      .mockRejectedValue(new supervisorClient.ReceiptUnreadable('审批决定已经交上，可回执不是 JSON'));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/inbound')) {
+        return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    const conversationId = useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('read file', undefined, 'ereuna_main');
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive(event(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'read file' }));
+    ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
+    ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
+
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-auto', 'allow', 'auto-approved by client preference'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).toContain('approval-auto');
+  });
+
+  // 记录在模块载入时读一次：存坏的项不能混进去，否则写回时一并带上，还可能把字符拆成一个个 id。
+  it('drops ids of the wrong type from a damaged auto-approval record', async () => {
+    localStorage.setItem('clonoth_auto_approved_ids', JSON.stringify([42, null, 'approval-auto']));
+    vi.resetModules();
+    const fresh = await import('../store/chatStore');
+    const freshSettings = await import('../store/settingsStore');
+    const freshClient = await import('../api/supervisorClient');
+    freshSettings.useSettingsStore.setState({ adminToken: TOKEN, isAuthenticated: true });
+    const approvalSpy = vi.spyOn(freshClient, 'decideApproval').mockResolvedValue(allowed('approval-next'));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/inbound')) {
+        return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    try {
+      const conversationId = fresh.useChatStore.getState().createConversation();
+      await fresh.useChatStore.getState().sendMessage('read file', undefined, 'ereuna_main');
+      const ws = FakeWebSocket.instances[0];
+      ws.open();
+      ws.receive(event(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'read file' }));
+      ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-old', tool_name: 'read_file', arguments: { path: 'a.md' } }));
+      ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-old', operation: 'read_file', details: { path: 'a.md' }, status: 'pending' }));
+      ws.receive(event(4, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-next', tool_name: 'read_file', arguments: { path: 'b.md' } }));
+      ws.receive(event(5, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-next', tool_call_id: 'call-next', operation: 'read_file', details: { path: 'b.md' }, status: 'pending' }));
+
+      await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-next', 'allow', 'auto-approved by client preference'));
+      expect(approvalSpy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).toEqual(['approval-auto', 'approval-next']);
+    } finally {
+      fresh.useChatStore.getState().resetState();
+    }
   });
 
   it('shows auto-approved pending tool approvals as a badge instead of manual buttons', () => {

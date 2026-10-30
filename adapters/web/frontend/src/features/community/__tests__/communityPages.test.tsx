@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as api from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { ReceiptUnreadable } from '../../../api/shape';
 import { featureRequest } from '../../client';
 import { CommunityPage } from '../CommunityPage';
 import { ConversationSettings } from '../ConversationSettings';
@@ -26,10 +27,11 @@ beforeEach(() => {
   const { welcome_enabled: _welcome, ...policy } = state.settings;
   state.defaults = { ...policy }; state.overrides = { ...policy }; state.inherited_fields = []; state.defaults_revision = 0;
   request.mockReset();
-  request.mockImplementation(async (path, options = {}) => {
+  request.mockImplementation(async (path, options) => {
     if (path.endsWith('/settings/scopes')) return { items: [] };
     if (path.endsWith('/activities') && options.method === 'POST') {
-      activities = [{ id: 'A123', ...(options.body as object), status: 'open', participants: [], remaining: 8 }];
+      // 后端回的是整理过的整条：票数按选项数、报名的人和剩余名额都给齐。
+      activities = [{ id: 'A123', ...(options.body as object), status: 'open', counts: [], participants: [], remaining: 8, mine: null, my_vote: [] }];
       return activities[0];
     }
     if (path.endsWith('/activities')) return { items: activities };
@@ -109,7 +111,7 @@ it.each([
   ['设置', ConversationSettings, '保存会话覆盖', '/settings/overrides'],
 ] as const)('切换群后丢弃旧群%s操作的迟到刷新', async (_name, Page, button, endpoint) => {
   let finish!: (value: unknown) => void;
-  request.mockImplementation(async (path, options = {}) => {
+  request.mockImplementation(async (path, options) => {
     if (path.endsWith('/settings/scopes')) return { items: [] };
     if (path.endsWith(endpoint) && options.scope === 'qq_group:a') return new Promise(resolve => { finish = resolve; });
     if (path.endsWith('/activities') || path.endsWith('/decisions')) return { items: [] };
@@ -170,4 +172,64 @@ it('preserves decimal input while editing and validates the numeric range before
   for (const value of ['1', '1.', '1.2']) { fireEvent.change(input, { target: { value } }); expect(input).toHaveValue(value); }
   fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
   await waitFor(() => expect(state.settings.merge_window_sec).toBe(1.2));
+});
+
+describe('回包对不上形状', () => {
+  // 读成空表的话，页面会说这个会话暂无活动。
+  it('活动列表读不懂时说没读成，不说暂无活动', async () => {
+    activities = [{ id: 'A1', kind: 'event', title: '周六聚餐', status: 'open', options: [], capacity: 8, remaining: 8, deadline: 0, participants: [] }];
+    render(<CommunityPage scope="qq_group:a" />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('活动列表格式不对：缺 items[0].counts');
+    expect(screen.queryByText('这个会话暂无活动，可在上方创建。')).toBeNull();
+  });
+
+  // 判定记录只是参考：读不懂就在那一块说，策略照样能改。
+  it('判定记录读不懂时在那一块说没读成，策略照样能改', async () => {
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (path, options) => path.endsWith('/decisions') ? { items: [{ message_id: 'm1', action: 'reply' }] } : original(path, options));
+    render(<ConversationSettings scope="qq_group:a" />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('接话判定记录格式不对：缺 items[0].reason');
+    expect(screen.getByRole('button', { name: '保存会话覆盖' })).toBeInTheDocument();
+    expect(screen.queryByText('启用策略并收到消息后，这里会显示当前会话的实际判定。')).toBeNull();
+  });
+
+  it('作用域列表读不懂时说没读成，不当成没有覆盖', async () => {
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (path, options) => path.endsWith('/settings/scopes') ? { items: [{ scope: 'qq_group:a', owner: null }] } : original(path, options));
+    render(<ConversationSettings scope="qq_group:a" />);
+    expect(await screen.findByText(/社区设置的作用域列表格式不对：缺 items\[0\]\.current_account/)).toBeInTheDocument();
+  });
+});
+
+describe('写完之后重读没成', () => {
+  // 发布已经做完：重读的失败顶掉「已发布」的话，人会再发一次。
+  it('群指引发布后重读没成，照样说已发布，另说重读没成', async () => {
+    const original = request.getMockImplementation()!;
+    let published = false;
+    request.mockImplementation(async (path, options) => {
+      if (path.endsWith('/guide')) published = true;
+      if (published && path.endsWith('/state')) throw new Error('网络断了');
+      return original(path, options);
+    });
+    render(<CommunityPage scope="qq_group:a" />);
+    fireEvent.change(await screen.findByLabelText('群规'), { target: { value: '友善交流' } });
+    fireEvent.click(screen.getByRole('button', { name: '发布群指引' }));
+    expect(await screen.findByText('群指引已发布。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('刚才重新读取也没成：网络断了');
+  });
+
+  it('会话覆盖存上了却读不懂回执、重读也没成时，照样说已保存', async () => {
+    const original = request.getMockImplementation()!;
+    let saved = false;
+    request.mockImplementation(async (path, options) => {
+      if (path.endsWith('/settings/overrides')) { saved = true; throw new ReceiptUnreadable('会话覆盖已经存上，可回执不是 JSON'); }
+      if (saved && path.endsWith('/state')) throw new Error('网络断了');
+      return original(path, options);
+    });
+    render(<ConversationSettings scope="qq_group:a" />);
+    fireEvent.click(await screen.findByLabelText('统一选择忽略、表态、短答和办事'));
+    fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
+    expect(await screen.findByText('会话覆盖已保存。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('会话覆盖已经存上，可回执不是 JSON。刚才重新读取也没成：网络断了');
+  });
 });

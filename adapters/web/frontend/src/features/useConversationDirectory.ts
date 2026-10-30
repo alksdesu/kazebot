@@ -1,11 +1,25 @@
 import { useCallback, useEffect, useState } from 'react';
 import { errorMessage } from '../api/request';
-import { getConversations, type ConversationRow } from '../api/supervisorClient';
+import { BOOLEAN, NON_EMPTY_TEXT, at, formatError, shaped, shapedRows } from '../api/shape';
+import { getConversations, MEMORY_OWNER, type ConversationRow, type MemoryOwner } from '../api/supervisorClient';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { isConversationScope, platformForScope } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { featureRequest } from './client';
 import type { PolicyScope } from './community/types';
+
+const POLICY_SCOPES = '社区设置的作用域列表';
+const POLICY_SCOPE = { scope: NON_EMPTY_TEXT, current_account: BOOLEAN };
+
+// 认不出平台的键并进会话清单，选中之后哪个平台的设置都对不上。
+function readPolicyScopes(value: unknown): PolicyScope[] {
+  return shapedRows(POLICY_SCOPES, shaped(POLICY_SCOPES, value, {}).items, POLICY_SCOPE, 'items').map((row, index) => {
+    const path = at('items', index);
+    if (!isConversationScope(row.scope)) throw formatError(POLICY_SCOPES, row.scope, at(path, 'scope'), '不是认得的会话键');
+    const owner = row.owner === null ? null : shaped(POLICY_SCOPES, row.owner, MEMORY_OWNER, at(path, 'owner')) as unknown as MemoryOwner;
+    return { scope: row.scope, current_account: row.current_account, owner };
+  });
+}
 
 export function useConversationDirectory(includePolicies = false) {
   const token = useSettingsStore(state => state.adminToken);
@@ -18,15 +32,14 @@ export function useConversationDirectory(includePolicies = false) {
     try {
       const [result, policies] = await Promise.all([
         getConversations(token),
-        includePolicies ? featureRequest<{ items: PolicyScope[] }>('/v1/community/settings/scopes', { signal: request.signal }) : Promise.resolve(null),
+        includePolicies ? featureRequest('/v1/community/settings/scopes', { what: POLICY_SCOPES, signal: request.signal }) : Promise.resolve(null),
       ]);
       if (!request.isCurrent()) return;
       let rows = result;
       const policyOnlyScopes: string[] = [];
       if (includePolicies) {
-        if (!Array.isArray(policies?.items) || policies.items.some(row => !row || typeof row.scope !== 'string' || !isConversationScope(row.scope) || typeof row.current_account !== 'boolean')) throw new Error('社区设置的作用域列表格式不对');
         const merged = new Map(rows.map(row => [row.conversation_key, row]));
-        for (const policy of policies.items) {
+        for (const policy of readPolicyScopes(policies)) {
           const existing = merged.get(policy.scope);
           if (existing) {
             const owner = existing.owner?.name_available === true ? existing.owner : policy.owner?.name_available === true ? policy.owner : existing.owner || policy.owner;

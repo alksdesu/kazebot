@@ -2,6 +2,8 @@
 import yaml from 'js-yaml';
 
 import { StaleKeysError } from '../../console/yamlCommit';
+import { parseBoolFlag } from '../../utils/boolFlag';
+import { splitKeywords } from '../../utils/keywords';
 import {
   editYamlKeys,
   parseYamlMapping,
@@ -91,18 +93,7 @@ function str(value: any, fallback = ''): string {
   return String(value);
 }
 
-// 与 clonoth_runtime.parse_bool 认同一套写法：手写的 yes、on、1 算开，no、off、0 算关，认不出的照 fallback，和引擎读出同一个结论
-const PARSE_BOOL_TRUE_WORDS = new Set(['1', 'true', 'yes', 'y', 'on']);
-const PARSE_BOOL_FALSE_WORDS = new Set(['0', 'false', 'no', 'n', 'off']);
-
-export function parseBoolFlag(value: unknown, fallback = false): boolean {
-  if (typeof value === 'boolean') return value;
-  if (value === null || value === undefined) return fallback;
-  const text = String(value).trim().toLowerCase();
-  if (PARSE_BOOL_TRUE_WORDS.has(text)) return true;
-  if (PARSE_BOOL_FALSE_WORDS.has(text)) return false;
-  return fallback;
-}
+export { parseBoolFlag };
 
 function normalizeEngineToolMode(value: string, fallback: EngineToolMode = 'fake-native'): EngineToolMode {
   const normalized = value.trim().toLowerCase().replace(/_/g, '-');
@@ -489,15 +480,39 @@ function splitFrontmatter(raw: string): SkillParts {
   return { eol: match[1], meta: match[2], close: match[3], body: raw.slice(match[0].length) };
 }
 
-export function parseSkillQuickFields(raw: string): SkillQuickFields {
-  const { meta } = splitFrontmatter(raw);
-  const parsed = yaml.load(meta);
+function skillMeta(raw: string): Record<string, unknown> {
+  const parsed = yaml.load(splitFrontmatter(raw).meta);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('技能 frontmatter 必须是对象。');
-  const value = parsed as Record<string, unknown>;
+  return parsed as Record<string, unknown>;
+}
+
+const keywordsText = (value: unknown): string => (Array.isArray(value) ? value.map(String).join(', ') : String(value || ''));
+
+// 和 knowledge_inject._as_string_list 同一个读法：列表只认字符串项，写成一个字符串时整串算一个词；null 是快速编辑框表达不了的写法
+function engineKeywords(value: unknown): string[] | null {
+  if (value === undefined || value === null) return [];
+  if (typeof value === 'string') return value.trim() ? [value.trim()] : [];
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) return null;
+  return value.map((item: string) => item.trim()).filter(Boolean);
+}
+
+const UNEDITABLE_KEYWORDS = '这份技能的关键词有快速编辑框表达不了的写法（不是字符串的项、写成一整串的关键词，或带逗号又不是正则的词），这里只读，改关键词请到原文里改。';
+
+/** 关键词在快速编辑框里改得了没有：表达不了的写法一改就被转成字符串或按逗号拆开，命中跟着变。改得了是空串，否则是原因。 */
+export function skillKeywordsLock(raw: string): string {
+  const value = skillMeta(raw).keywords;
+  const expected = engineKeywords(value);
+  if (!expected) return UNEDITABLE_KEYWORDS;
+  const words = splitKeywords(keywordsText(value));
+  return words.length === expected.length && words.every((word, index) => word === expected[index]) ? '' : UNEDITABLE_KEYWORDS;
+}
+
+export function parseSkillQuickFields(raw: string): SkillQuickFields {
+  const value = skillMeta(raw);
   return {
     enabled: parseBoolFlag(value.enabled, true),
     strategy: String(value.strategy || 'normal'),
-    keywords: Array.isArray(value.keywords) ? value.keywords.map(String).join(', ') : String(value.keywords || ''),
+    keywords: keywordsText(value.keywords),
     order: String(value.order ?? 0),
     priority: String(value.priority ?? 0),
     scan_depth: String(value.scan_depth ?? 0),
@@ -512,7 +527,9 @@ export function serializeSkillQuickFields(raw: string, fields: SkillQuickFields)
   if (fields.enabled !== current.enabled) edits.push({ path: ['enabled'], value: fields.enabled });
   if (fields.strategy !== current.strategy) edits.push({ path: ['strategy'], value: fields.strategy || 'normal' });
   if (fields.keywords !== current.keywords) {
-    edits.push({ path: ['keywords'], value: fields.keywords.split(',').map((item) => item.trim()).filter(Boolean) });
+    const lock = skillKeywordsLock(raw);
+    if (lock) throw new Error(lock);
+    edits.push({ path: ['keywords'], value: splitKeywords(fields.keywords) });
   }
   for (const key of ['order', 'priority', 'scan_depth'] as const) {
     if (fields[key] === current[key]) continue;

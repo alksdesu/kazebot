@@ -9,6 +9,7 @@ import {
   getNodes,
   getProviders,
   getSessionProviderOverride,
+  type ActiveNode,
   type AdminNode,
   type AppConfigPublic,
   type ProvidersResponse,
@@ -34,16 +35,14 @@ export function adoptActiveNode(writes: number, nodeId: string, isOverride: bool
 /** 会话当前交给哪个节点，给节点 id。读的期间没人写过当前节点才记进 store。 */
 export async function readActiveNode(sid: string, request: RequestTicket): Promise<SessionRead<string> | null> {
   const writes = useSettingsStore.getState().activeNodeWrites;
-  let result: Awaited<ReturnType<typeof getActiveNode>>;
+  let result: ActiveNode;
   try {
     result = await getActiveNode(sid);
-    if (!result || typeof result.node_id !== 'string') throw new Error('节点状态回来的格式不对');
   } catch (caught) {
     return request.isCurrent() ? { ok: false, error: errorMessage(caught) } : null;
   }
   if (!request.isCurrent()) return null;
-  const defaultId = typeof result.default_node_id === 'string' ? result.default_node_id : '';
-  adoptActiveNode(writes, result.node_id, Boolean(result.is_override), defaultId, sid);
+  adoptActiveNode(writes, result.node_id, result.is_override, result.default_node_id, sid);
   return { ok: true, value: result.node_id };
 }
 
@@ -52,7 +51,6 @@ export async function readSessionOverride(sid: string, token: string, request: R
   let result: SessionProviderOverride;
   try {
     result = await getSessionProviderOverride(sid, token);
-    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('会话覆盖回来的格式不对');
   } catch (caught) {
     return request.isCurrent() ? { ok: false, error: errorMessage(caught) } : null;
   }
@@ -66,21 +64,12 @@ export async function readGlobalConfig(request: RequestTicket): Promise<boolean>
   let config: AppConfigPublic;
   try {
     config = await getAppConfig();
-    // 默认入口要拿去替人挑入口：不是字符串就算没读成，当成没配会挑错
-    if (!config || typeof config.openai !== 'object' || config.openai === null || typeof config.default_entry_node_id !== 'string') {
-      throw new Error('全局配置回来的格式不对');
-    }
   } catch (caught) {
     if (request.isCurrent()) useSettingsStore.getState().failGlobalConfig(errorMessage(caught));
     return false;
   }
   if (!request.isCurrent()) return false;
-  const { model, base_url: baseUrl } = config.openai;
-  useSettingsStore.getState().setGlobalConfig(
-    typeof model === 'string' ? model : '',
-    typeof baseUrl === 'string' ? baseUrl : '',
-    config.default_entry_node_id,
-  );
+  useSettingsStore.getState().setGlobalConfig(config.openai.model, config.openai.base_url, config.default_entry_node_id);
   return true;
 }
 

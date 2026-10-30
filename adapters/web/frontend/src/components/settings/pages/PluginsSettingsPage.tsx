@@ -18,7 +18,7 @@ import {
   ReadOnlyRow, Select, StatusBar, Tag, Textarea,
 } from './settingsControls';
 import { errorMessage } from '../../../api/request';
-import { appendSentence, reloadBeforeEditing } from '../../../utils/sentence';
+import { appendSentence, reloadBeforeEditing, rereadMissed } from '../../../utils/sentence';
 
 type Choices = Record<keyof PluginSelectors, string[]>;
 type Action = (action: () => Promise<void>) => Promise<void>;
@@ -33,7 +33,7 @@ const json = (value: unknown) => JSON.stringify(value, null, 2);
 /** 存上了、回执没读懂时交代的那半句。重读也没成（problem 非空）时手上还是存之前的指纹，得先刷新再改。 */
 function unreadReceipt(receiptProblem: string, problem: string): string {
   if (!problem) return receiptProblem;
-  return appendSentence(reloadBeforeEditing(receiptProblem, '点「刷新列表」读入最新内容'), `刚才重新读取也没成：${problem}`);
+  return appendSentence(reloadBeforeEditing(receiptProblem, '点「刷新列表」读入最新内容'), rereadMissed(problem));
 }
 
 function configObject(text: string): Record<string, unknown> {

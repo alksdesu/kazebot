@@ -1,11 +1,12 @@
 import { useEffect } from 'react';
 
 import { clearInstanceToken, navigateToInstance, useRecentInstance } from '../../instances/navigation';
+import { appendSentence } from '../../utils/sentence';
 import { Button } from '../settings/pages/settingsControls';
 import { useInstanceDirectory } from './useInstanceDirectory';
 
 export function InstanceDirectory() {
-  const { status, instances, currentPath, retry } = useInstanceDirectory();
+  const { status, instances, currentPath, reason, retry } = useInstanceDirectory();
   const recentPath = useRecentInstance();
   const recent = instances.find(instance => instance.path === recentPath);
   useEffect(clearInstanceToken, []);
@@ -19,7 +20,7 @@ export function InstanceDirectory() {
       <p className="mt-5 text-sm leading-relaxed text-[var(--duties-secondary)]">选择要进入的控制台。每个实例使用自己的管理员令牌，登录状态彼此独立。</p>
       {status === 'loading' && <p role="status" className="py-8 text-sm text-[var(--duties-secondary)]">正在读取实例目录…</p>}
       {status === 'error' && <div className="mt-6 space-y-4 border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-        <p role="alert" className="text-sm">暂时无法读取实例目录。可以重试，或直接进入当前实例。</p>
+        <p role="alert" className="break-words text-sm">{appendSentence(`暂时无法读取实例目录：${reason}`, '可以重试，或直接进入当前实例。')}</p>
         <div className="flex flex-wrap gap-2"><Button onClick={retry}>重试</Button><Button tone="quiet" onClick={() => navigateToInstance(currentPath, false)}>进入当前实例</Button></div>
       </div>}
       {status === 'ready' && <div className="mt-6 space-y-5">

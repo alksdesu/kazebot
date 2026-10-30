@@ -98,7 +98,7 @@ const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'v
       if (box.stateDown) throw new Error('读不到 bot 的状态');
       box.beat += 1;
       return json({
-        published: true, applied: box.applied, age_sec: box.beat, file: {},
+        published: true, applied: box.applied, age_sec: box.beat, file: { exists: true, mtime_ns: 1, size: 1 },
         state: { values, paths: PATHS }, platforms: [],
       });
     }
@@ -739,7 +739,9 @@ describe('save', () => {
       requests.push(`${init?.method || 'GET'} ${String(input)}`);
       if (init?.method === 'PUT') return json({ ok: true, hash: 'h3', warnings: [] });
       if (String(input).endsWith('/config/state')) {
-        return json({ published: true, applied: true, file: {}, state: { values: {}, paths: PATHS }, platforms: [] });
+        return json({
+          published: true, applied: true, file: { exists: true, mtime_ns: 1, size: 1 }, state: { values: {}, paths: PATHS }, platforms: [],
+        });
       }
       // 别人刚改过全局文件：写回之后读到的不是自己写的那份。
       return json({ content: 'version: 2\n', hash: 'h2', exists: true });

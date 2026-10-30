@@ -8,6 +8,7 @@ import {
   importStickers,
   listStickers,
   recaptionStickers,
+  receipted,
   stickerImageUrl,
   updateSticker,
   uploadSticker,
@@ -38,6 +39,7 @@ import { StandaloneFeatureSection, STICKER_LIBRARY_SECTION } from './FeatureSect
 import { sizeText } from './format';
 import { VisionChannelBlock } from './VisionChannelBlock';
 import { errorMessage } from '../api/request';
+import { appendSentence } from '../utils/sentence';
 
 const PAGE_SIZE = 60;
 
@@ -67,9 +69,11 @@ const CAPTION_TEXT: Record<Sticker['caption_state'], string> = {
   failed: '打标失败',
 };
 
-const EMPTY_COUNTS: StickerCounts = {
-  pending: 0, library: 0, discarded: 0, usable: 0, awaiting_caption: 0,
-};
+/** 操作做成的那句。回执读不懂时改动也已经做完，receiptProblem 写着哪里没读懂。 */
+interface JobOutcome {
+  done: string;
+  receiptProblem?: string;
+}
 
 const EMPTY_DRAFT = { name: '', tags: '', override: false };
 
@@ -85,7 +89,8 @@ const LibraryBlock = () => {
   const [items, setItems] = useState<Sticker[]>([]);
   // 这一页没读成时手上的图可能是上一个页签、上一次搜索留下的：不摆出来，也不说「还没有图」
   const [listFailed, setListFailed] = useState(false);
-  const [counts, setCounts] = useState<StickerCounts>(EMPTY_COUNTS);
+  // 一次都没读成时是 null：各档摆成 0 张，就是说图库是空的。
+  const [counts, setCounts] = useState<StickerCounts | null>(null);
   const [editing, setEditing] = useState('');
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [editBaseline, setEditBaseline] = useState('');
@@ -139,16 +144,16 @@ const LibraryBlock = () => {
     if (offset > 0 && items.length === 0) setOffset(Math.max(0, offset - PAGE_SIZE));
   }, [items, offset]);
 
-  const run = async (job: (token: string) => Promise<string>) => {
+  const run = async (job: (token: string) => Promise<JobOutcome>) => {
     if (!adminToken || busy) return;
     setBusy(true);
     setMessage('');
     try {
-      const done = await job(adminToken);
+      const { done, receiptProblem = '' } = await job(adminToken);
       if (!requests.isCurrent()) return;
       await load();
       if (!requests.isCurrent()) return;
-      setMessage(done);
+      setMessage(done, receiptProblem);
     } catch (caught) {
       if (!requests.isCurrent()) return;
       setError(errorMessage(caught));
@@ -171,18 +176,18 @@ const LibraryBlock = () => {
   };
 
   const saveEdit = (row: Sticker) => run(async (token) => {
-    await updateSticker(token, row.sha256, {
+    const { receiptProblem } = await receipted(updateSticker(token, row.sha256, {
       name: draft.name.trim(),
       manual_tags: splitTags(draft.tags),
       manual_override: draft.override,
-    });
+    }));
     setEditing('');
-    return '已保存';
+    return { done: '已保存', receiptProblem };
   });
 
   const accept = (row: Sticker) => run(async (token) => {
-    await acceptSticker(token, row.sha256);
-    return '已转正，进候选了';
+    const { receiptProblem } = await receipted(acceptSticker(token, row.sha256));
+    return { done: '已转正，进候选了', receiptProblem };
   });
 
   const discard = (row: Sticker) => {
@@ -190,7 +195,7 @@ const LibraryBlock = () => {
     if (!window.confirm(`丢弃「${label}」？文件会删掉，哈希会记住，同一张图不会再被收第二次。`)) return;
     void run(async (token) => {
       await discardSticker(token, row.sha256);
-      return '已丢弃';
+      return { done: '已丢弃' };
     });
   };
 
@@ -199,7 +204,7 @@ const LibraryBlock = () => {
     if (!window.confirm(`彻底删除「${label}」？记录一起删，这张图重新出现在群里还会被收。`)) return;
     void run(async (token) => {
       await deleteSticker(token, row.sha256);
-      return '已删除';
+      return { done: '已删除' };
     });
   };
 
@@ -207,27 +212,37 @@ const LibraryBlock = () => {
     const scope = onlyFailed ? '打标失败的图' : '全部在库与待审的图';
     if (!window.confirm(`把${scope}重新排进打标队列？打标要走视觉模型，量大时会占一阵子。`)) return;
     void run(async (token) => {
-      const queued = await recaptionStickers(token, onlyFailed);
-      return `已排队 ${queued} 张，打标在后台跑`;
+      const { result: queued, receiptProblem } = await receipted(recaptionStickers(token, onlyFailed));
+      return queued === null
+        ? { done: '已重新排进打标队列，打标在后台跑', receiptProblem: appendSentence(receiptProblem, '排了几张没读到') }
+        : { done: `已排队 ${queued} 张，打标在后台跑` };
     });
   };
 
   const upload = () => run(async (token) => {
     if (!file) throw new Error('先选一个文件');
-    const row = await uploadSticker(token, file, { name: uploadName.trim(), accept: uploadAccept });
+    const { result: row, receiptProblem } = await receipted(
+      uploadSticker(token, file, { name: uploadName.trim(), accept: uploadAccept }),
+    );
+    // 回执读不懂时图也已经传上了：照传完清掉选择，免得人再传一次撞上「库里已经有了」。
     setFile(null);
     setUploadName('');
     if (filePicker.current) filePicker.current.value = '';
-    return `已上传「${row.name}」`;
+    return { done: row ? `已上传「${row.name}」` : '已上传', receiptProblem };
   });
 
   const importDir = () => run(async (token) => {
-    const result = await importStickers(token, importPath.trim(), importAccept);
-    return `扫了 ${result.scanned} 个文件，收下 ${result.added} 张，`
-      + `${result.known} 张已经有了，${result.skipped} 张不是能用的图片`;
+    const { result, receiptProblem } = await receipted(importStickers(token, importPath.trim(), importAccept));
+    if (!result) {
+      return { done: '已导入', receiptProblem: appendSentence(receiptProblem, '收下几张没读到，上面的张数以重新读到的为准') };
+    }
+    return {
+      done: `扫了 ${result.scanned} 个文件，收下 ${result.added} 张，`
+        + `${result.known} 张已经有了，${result.skipped} 张不是能用的图片`,
+    };
   });
 
-  const total = counts[tab];
+  const total = counts ? counts[tab] : 0;
 
   const card = (row: Sticker) => (
     <figure
@@ -323,14 +338,18 @@ const LibraryBlock = () => {
     <>
       <Block hint="待审的转正之后模型才挑得到；丢弃会记住哈希，彻底删不会" title="图库">
         <Facts>
-          在库 {counts.library} 张，其中 {counts.usable} 张打过标能用 ·
-          待审 {counts.pending} 张 · 已弃 {counts.discarded} 张 ·
-          还有 {counts.awaiting_caption} 张没打标
+          {counts ? (
+            <>
+              在库 {counts.library} 张，其中 {counts.usable} 张打过标能用 ·
+              待审 {counts.pending} 张 · 已弃 {counts.discarded} 张 ·
+              还有 {counts.awaiting_caption} 张没打标
+            </>
+          ) : listFailed ? '各档的张数没读到，原因见下。' : '正在读取图库…'}
         </Facts>
 
         <div className="my-3 flex flex-wrap items-center gap-2">
           <Segmented
-            choices={STATE_TABS.map(([key, label]) => [key, `${label} ${counts[key]}`] as const)}
+            choices={STATE_TABS.map(([key, label]) => [key, counts ? `${label} ${counts[key]}` : label] as const)}
             onPick={(key) => { setTab(key); setOffset(0); setEditing(''); }}
             value={tab}
           />
@@ -347,6 +366,9 @@ const LibraryBlock = () => {
           </Button>
         </div>
 
+        {listFailed && (
+          <Button className="mb-2" disabled={busy} onClick={() => void load()} tone="quiet">重新读取这一页</Button>
+        )}
         {!listFailed && (items.length === 0 ? (
           <Empty>{search ? '没有名字或标签含「' + search + '」的图。' : '这一档还没有图。'}</Empty>
         ) : (

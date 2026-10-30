@@ -322,3 +322,15 @@ describe('application extension hosts', () => {
     expect(useViewStore.getState().activeSettingsTab).toBe('plugin-settings');
   });
 });
+
+describe('frontend catalog shape', () => {
+  it('a catalog entry it cannot read stops the sync and says where', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => input.endsWith('/frontend')
+      ? response({ generation: '1', plugins: [{ ...plugin(), entry: { path: 'frontend.js' } }] })
+      : new Response('first')));
+    runtime = new FrontendPluginRuntime(async () => ({ activate: () => undefined }));
+    runtime.start('token-a'); await runtime.refresh();
+    expect(browserPluginState().error).toBe('前端插件清单格式不对：缺 plugins[0].entry.hash');
+    expect(document.querySelectorAll('style[data-plugin-owner]')).toHaveLength(0);
+  });
+});

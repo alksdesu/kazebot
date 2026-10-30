@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
-import { checkHealth, getActiveNode, HEALTH_TIMEOUT_MS, MOUNT, resetConversation } from './api/supervisorClient';
+import { checkHealth, getActiveNode, HEALTH_TIMEOUT_MS, MOUNT, receipted, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { Icon, Modal } from './components/common';
 import { PageBoundary } from './components/common/PageBoundary';
@@ -29,6 +29,7 @@ import { InstanceDirectory } from './components/instances/InstanceDirectory';
 import { InstanceDirectoryProvider, useInstanceDirectory } from './components/instances/useInstanceDirectory';
 import { isInstanceEntry, rememberInstance } from './instances/navigation';
 import { errorMessage } from './api/request';
+import { appendSentence } from './utils/sentence';
 
 const defaultLayout: LayoutRenderer = (props) => <AppLayout {...props} />;
 extensions.builtin('slots', 'app.layout', defaultLayout);
@@ -100,12 +101,16 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
         }
       }
     }
-    await sendMessage(text, attachments, nodeId || undefined);
+    const receiptProblem = await sendMessage(text, attachments, nodeId || undefined);
+    if (receiptProblem) setNotice({ text: appendSentence(receiptProblem, '不用重发，重发会再发一条') });
   };
   const handleCancel = async () => {
     if (cancelLock.current || useChatStore.getState().viewingChildSessionId) return;
     cancelLock.current = true; setCancelling(true); setNotice(null);
-    try { await cancelCurrentTask(); setNotice({ text: '已提交取消请求。' }); }
+    try {
+      const receiptProblem = await cancelCurrentTask();
+      setNotice({ text: receiptProblem ? appendSentence(receiptProblem, '停没停下以对话里的状态为准') : '已提交取消请求。' });
+    }
     catch (error) { setNotice({ text: errorMessage(error, '取消失败，请重试。'), error: true }); }
     finally { cancelLock.current = false; setCancelling(false); }
   };
@@ -116,9 +121,11 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     try {
       const current = useChatStore.getState().conversations.find(item => item.id === target.id);
       if (!current || current.sessionId !== target.sessionId) throw new Error('会话已变化，请重新选择要重置的对话。');
-      await resetConversation(`web:${target.id}`);
+      // 回执读不懂也已经重置过了：不清本地视图，摆着的就是服务端已经清掉的上下文。
+      const { receiptProblem } = await receipted(resetConversation(`web:${target.id}`));
       useChatStore.getState().resetConversationView(target.id, target.sessionId);
-      setResetTarget(null); setNotice({ text: `已重置“${target.title}”，下一条消息将开始新的上下文。` });
+      setResetTarget(null);
+      setNotice({ text: receiptProblem ? appendSentence(receiptProblem, '下一条消息将开始新的上下文') : `已重置“${target.title}”，下一条消息将开始新的上下文。` });
     } catch (error) { setNotice({ text: errorMessage(error, '重置失败，请重试。'), error: true }); }
     finally { resetLock.current = false; setResetting(false); }
   };

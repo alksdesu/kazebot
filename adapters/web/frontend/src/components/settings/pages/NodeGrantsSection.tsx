@@ -216,7 +216,7 @@ const NodeRow = ({ node, tools, onSaved }: {
       .then((data) => {
         if (!request.isCurrent()) return;
         setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
-        setDeadNames(data.dead_names || []);
+        setDeadNames(data.dead_names);
         setEffectiveError('');
         setFileUnusable(false);
       })

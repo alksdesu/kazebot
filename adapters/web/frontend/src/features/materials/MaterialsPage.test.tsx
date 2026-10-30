@@ -260,7 +260,10 @@ it.each([null, '', 'fixture-bot'])('uses the same bot partition for upload, prev
   const original = mockedRequest.getMockImplementation()!;
   mockedRequest.mockImplementation(async (path, options) => path.endsWith('/scopes') ? (botScope === null ? [] : [{ scope: 'web:materials', bot_scope: botScope }]) : original(path, options));
   vi.mocked(fetch).mockImplementation(async url => String(url).includes('/sources/upload')
-    ? new Response(JSON.stringify({ id: 's1', name: 'fixture.txt' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    ? new Response(JSON.stringify({
+      id: 's1', kind: 'source', scope: 'web:materials', created: 1, name: 'fixture.txt', sha256: 'fixture-sha', size: 7,
+      mime_type: 'text/plain', message_id: '', source_time: null, status: 'registered', warnings: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     : new Response(new Blob(['synthetic preview or document']), { status: 200 }));
   const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
   try {
@@ -315,4 +318,65 @@ it('sends no further job progress reads while one is pending and resumes once it
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(pending).toHaveLength(2);
   } finally { vi.useRealTimers(); }
+});
+
+describe('materials replies that do not match their shape', () => {
+  // 读成空表的话，页面会说「尚无资料」，人以为这个会话里什么都没传过。
+  it('says the source list was not read instead of showing no material', async () => {
+    const original = mockedRequest.getMockImplementation()!;
+    mockedRequest.mockImplementation(async (path, options) => path.endsWith('/sources') ? [{ id: 's1', name: 'Source' }] : original(path, options));
+    render(<MaterialsPage />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('资料列表格式不对：缺 [0].status');
+    expect(screen.queryByText(/尚无资料/)).toBeNull();
+    expect(screen.queryByText(/尚无作品/)).toBeNull();
+  });
+
+  it('says the render capabilities were not read instead of calling them not ready', async () => {
+    const original = mockedRequest.getMockImplementation()!;
+    mockedRequest.mockImplementation(async (path, options) => path.endsWith('/capabilities')
+      ? { office_renderer: true, modules: { pdf_preview: 'yes' } }
+      : original(path, options));
+    render(<MaterialsPage />);
+    expect(await screen.findByText('Office 渲染：没读到；PDF 预览：没读到')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Office 渲染、PDF 预览没读到：资料处理能力格式不对：modules 不是 JSON 对象，或有一项不是 true 或 false',
+    );
+    mockedRequest.mockImplementation(original);
+    fireEvent.click(screen.getByRole('button', { name: '重读处理能力' }));
+    expect(await screen.findByText('Office 渲染：可用；PDF 预览：可用')).toBeInTheDocument();
+  });
+
+  // 发送已经交上了：报成失败的话，人会再发一次，群里收到两份。
+  it('a send whose receipt it cannot read still says it was handed over', async () => {
+    approved = true;
+    const original = mockedRequest.getMockImplementation()!;
+    mockedRequest.mockImplementation(async (path, options) => path.endsWith('/send') ? { status: 'delivery_requested' } : original(path, options));
+    await openReport();
+    fireEvent.click(screen.getByRole('button', { name: '发送到当前会话' }));
+    expect(await screen.findByText('已提交发送；实际投递由平台确认。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('发送已经交上，可回执格式不对：缺 message');
+  });
+});
+
+describe('materials writes whose follow-up read fails', () => {
+  // 传已经做完：重读的失败顶掉「已登记」的话，人会再传一份。
+  it('an upload whose follow-up read fails still says it was registered', async () => {
+    const original = mockedRequest.getMockImplementation()!;
+    let uploaded = false;
+    vi.mocked(fetch).mockImplementation(async () => {
+      uploaded = true;
+      return new Response(JSON.stringify({
+        id: 's2', kind: 'source', scope: 'web:materials', created: 1, name: 'fixture.txt', sha256: 'fixture-sha', size: 7,
+        mime_type: 'text/plain', message_id: '', source_time: null, status: 'registered', warnings: [],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+    mockedRequest.mockImplementation(async (path, options) => {
+      if (uploaded && path.endsWith('/sources')) throw new Error('网络断了');
+      return original(path, options);
+    });
+    render(<MaterialsPage />); await screen.findByRole('option', { name: 'Report' });
+    fireEvent.change(screen.getByLabelText('上传资料'), { target: { files: [new File(['fixture'], 'fixture.txt', { type: 'text/plain' })] } });
+    expect(await screen.findByText('已登记 fixture.txt。')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('刚才重新读取也没成：网络断了');
+  });
 });

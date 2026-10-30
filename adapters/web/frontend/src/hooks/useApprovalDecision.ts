@@ -1,8 +1,9 @@
 // 审批决定只从这里提交：同一条审批同时只发一次，服务端回执的状态和本次决定对得上才算生效。
 import { useCallback, useRef, useState } from 'react';
 
-import { decideApproval, type ApprovalDecision } from '../api/supervisorClient';
+import { decideApproval, ReceiptUnreadable, type AdminApproval, type ApprovalDecision } from '../api/supervisorClient';
 import { errorMessage } from '../api/request';
+import { appendSentence } from '../utils/sentence';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRequestGuard } from './useRequestGuard';
 
@@ -20,11 +21,13 @@ const STATUS_AFTER: Readonly<Record<ApprovalDecision, string>> = {
 };
 
 export interface ApprovalReceipt {
-  /** false：这条审批在本次提交之前已被别处处理或已失效，status 是它现在的状态。 */
+  /** false：这条审批在本次提交之前已被别处处理或已失效，status 是它现在的状态；回执读不懂时也是 false。 */
   applied: boolean;
   status: string;
   /** 没人定案、随任务失效被系统收掉时的原因；人批的没有这一项。 */
   expiredReason?: string;
+  /** 决定交上了却读不懂回执：不知道生效没有，status 是空串。读懂了没有这一项。 */
+  receiptProblem?: string;
 }
 
 export interface ApprovalOutcome extends ApprovalReceipt {
@@ -39,19 +42,29 @@ export const staleApprovalMessage = (status: string, expiredReason = ''): string
   expiredReason ? `该审批已失效：${expiredReason}` : `该审批已被处理，当前状态：${approvalStatusLabel(status)}`
 );
 
+export const unreadApprovalMessage = (receiptProblem: string): string => (
+  appendSentence(receiptProblem, '生效没有，以审批现在的状态为准')
+);
+
 interface ApprovalStanding {
   status: string;
   expiredReason?: string;
+  receiptProblem?: string;
 }
 
 // 按审批 id 合并并发提交，共享的是服务端回的状态；各调用方再拿自己的决定去比。
 const inflight = new Map<string, Promise<ApprovalStanding>>();
 
-function standingOf(approval: unknown): ApprovalStanding {
-  const record = approval && typeof approval === 'object' ? approval as Record<string, unknown> : {};
-  const status = typeof record.status === 'string' ? record.status : '';
-  const reason = typeof record.expired_reason === 'string' ? record.expired_reason.trim() : '';
+function standingOf(approval: AdminApproval): ApprovalStanding {
+  const status = approval.status || '';
+  const reason = approval.expired_reason?.trim() || '';
   return reason ? { status, expiredReason: reason } : { status };
+}
+
+// 决定已经到了服务端，只是回执读不懂：当成失败的话，人会照着再点，或者自动审批会被撤回重来。
+function unreadStanding(error: unknown): ApprovalStanding {
+  if (error instanceof ReceiptUnreadable) return { status: '', receiptProblem: error.message };
+  throw error;
 }
 
 export async function submitApprovalDecision(
@@ -63,14 +76,15 @@ export async function submitApprovalDecision(
   let pending = inflight.get(approvalId);
   if (!pending) {
     pending = decideApproval(token, approvalId, decision, comment)
-      .then(standingOf)
+      .then(standingOf, unreadStanding)
       .finally(() => { inflight.delete(approvalId); });
     inflight.set(approvalId, pending);
   }
   const standing = await pending;
+  if (standing.receiptProblem) return { applied: false, status: '', receiptProblem: standing.receiptProblem };
   // 已失效的审批状态也是 denied：带着失效原因就说明不是这次的拒绝生效了
   const applied = standing.status === STATUS_AFTER[decision] && !standing.expiredReason;
-  return standing.expiredReason ? { applied, ...standing } : { applied, status: standing.status };
+  return standing.expiredReason ? { applied, status: standing.status, expiredReason: standing.expiredReason } : { applied, status: standing.status };
 }
 
 export interface ApprovalDecisionControls {
@@ -104,7 +118,9 @@ export function useApprovalDecision(): ApprovalDecisionControls {
       outcome = {
         ...receipt,
         failed: false,
-        message: receipt.applied ? '' : staleApprovalMessage(receipt.status, receipt.expiredReason),
+        message: receipt.receiptProblem
+          ? unreadApprovalMessage(receipt.receiptProblem)
+          : receipt.applied ? '' : staleApprovalMessage(receipt.status, receipt.expiredReason),
       };
     } catch (failure) {
       outcome = { applied: false, status: '', failed: true, message: errorMessage(failure, '提交审批失败，请重试') };

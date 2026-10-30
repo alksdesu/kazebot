@@ -17,9 +17,12 @@ import {
   getSessionRunningTasks,
   listSessions,
   postInbound,
+  receipted,
+  ReceiptUnreadable,
   uploadAttachment,
   type AdminApproval,
   type ChildSessionInfo,
+  type InboundReceipt,
   type SessionListItem,
   type SessionRunningTask,
   type StructuredMessage,
@@ -29,6 +32,7 @@ import type { Attachment, ChatState, WsMessage } from '../types/message';
 import { shouldAutoApproveToolCall, useClientPrefsStore, type ApprovalMatch } from './clientPrefsStore';
 import { useSettingsStore } from './settingsStore';
 import { scopedKey } from './storageKey';
+import { appendSentence } from '../utils/sentence';
 import { createInitialChatState, findToolByCallId, reduceChatEvent } from './eventReducer';
 import {
   buildHistoryEntries,
@@ -82,6 +86,8 @@ export interface HistoryView {
   olderError: string;
   /** 子会话列表这一轮没读成的原因：子节点面板摆的还是上一次读成的那些，不是「没有子会话」。读成了是空串。 */
   childrenError: string;
+  /** 待审批这一轮没读成的原因：断线期间要的审批没补成卡片，聊天区看着像没有待审批。读成了是空串。 */
+  approvalsError: string;
 }
 
 export interface SessionPaging {
@@ -110,11 +116,14 @@ export interface ChatStoreState extends ChatState {
   selectChildNodes: (conversationId: string) => ChildNodeState[];
   selectHasActiveChildNodes: (conversationId: string) => boolean;
   createConversation: () => string;
-  deleteConversation: (id: string) => Promise<void>;
+  /** Resolves with the receipt problem when the server deleted the session but its receipt was unreadable, '' otherwise. */
+  deleteConversation: (id: string) => Promise<string>;
   resetConversationView: (id: string, previousSessionId: string) => void;
   renameConversation: (id: string, newTitle: string) => void;
-  sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<void>;
-  cancelCurrentTask: () => Promise<void>;
+  /** Resolves with the receipt problem when the message was sent but its receipt was unreadable, '' otherwise. */
+  sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<string>;
+  /** Resolves with the receipt problem when the cancel request went through but its receipt was unreadable, '' otherwise. */
+  cancelCurrentTask: () => Promise<string>;
   resetState: () => void;
   viewChildSession: (sessionId: string, taskId?: string) => void;
   exitChildSession: () => void;
@@ -145,7 +154,7 @@ const SESSION_PAGE_SIZE = 50;
 // Stream deltas arrive dozens per second; an unchanged phase is re-stamped at most once per interval.
 const TASK_ACTIVITY_REFRESH_MS = 1000;
 const IDLE_HISTORY: HistoryView = {
-  loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '',
+  loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '', childrenError: '', approvalsError: '',
 };
 const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
 // Only these move a conversation's sidebar timestamp; stream deltas would re-render the sidebar every frame.
@@ -164,9 +173,12 @@ const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus | unde
   task_cancelled: 'cancelled',
 };
 const LS_KEY_TITLES = scopedKey('clonoth_conversation_titles');
+const STREAM_REFUSED_TOKEN = '实时消息通道不认当前令牌（令牌无效或已过期），请重新登录。';
 const LS_KEY_AUTO_APPROVED = scopedKey('clonoth_auto_approved_ids');
 
 let startupLoaded = false;
+// The token the open stream authenticated with; null while no stream is wanted.
+let streamToken: string | null = null;
 // Session-list reads and deletes belong to one startup; resetState voids whatever is still in flight.
 const startupRequests = new RequestScope();
 let sessionOffset = 0;
@@ -187,8 +199,9 @@ function loadTitleCache(): Record<string, string> {
   // first-message titles. How: read a small browser-local title map defensively.
   // Purpose: refreshing the page can restore readable conversation titles.
   try {
-    const raw = localStorage.getItem(LS_KEY_TITLES);
-    return raw ? JSON.parse(raw) : {};
+    const parsed: unknown = JSON.parse(localStorage.getItem(LS_KEY_TITLES) || '{}');
+    if (!isRecord(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([, title]) => typeof title === 'string')) as Record<string, string>;
   } catch {
     return {};
   }
@@ -210,8 +223,8 @@ function loadAutoApproved(): Set<string> {
   // refresh. How: parse the localStorage array into the same Set used at runtime.
   // Purpose: the client does not resubmit or re-show controls for already handled ids.
   try {
-    const raw = localStorage.getItem(LS_KEY_AUTO_APPROVED);
-    return raw ? new Set(JSON.parse(raw)) : new Set();
+    const parsed: unknown = JSON.parse(localStorage.getItem(LS_KEY_AUTO_APPROVED) || '[]');
+    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : []);
   } catch {
     return new Set();
   }
@@ -239,6 +252,7 @@ function forgetHistory(viewKey: string) {
 // Only a full reset closes the stream; switching conversations or finishing a task keeps it open.
 function stopRealtimeAndHistory() {
   disconnectGlobalWS();
+  streamToken = null;
   historyRequests.reset();
   historyCaches.clear();
   realtimeRevisions.clear();
@@ -1115,7 +1129,12 @@ function afterTaskFinished(conversationId: string, set: StoreSetter, get: StoreG
 }
 
 function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
-  if (get().connectionStatus !== 'open') set({ connectionStatus: 'connecting' });
+  const token = useSettingsStore.getState().adminToken || '';
+  // The stream checks the token once, from its first frame; a connection opened with another token keeps that identity.
+  const tokenChanged = streamToken !== null && streamToken !== token;
+  if (tokenChanged) disconnectGlobalWS();
+  streamToken = token;
+  if (tokenChanged || get().connectionStatus !== 'open') set({ connectionStatus: 'connecting' });
   connectGlobalWS({
     onEvent: (event) => applyRealtimeEvent(event, set, get),
     onOpen: ({ reconnected }) => {
@@ -1124,6 +1143,10 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
       if (reconnected) void resyncAfterReconnect(set, get);
     },
     onClose: () => set({ connectionStatus: 'reconnecting' }),
+    onUnauthorized: () => {
+      set({ connectionStatus: 'closed' });
+      useSettingsStore.getState().expireLogin(STREAM_REFUSED_TOKEN);
+    },
   });
 }
 
@@ -1312,6 +1335,7 @@ async function syncConversation(conversationId: string, set: StoreSetter, get: S
       loading: false,
       error: '',
       childrenError: children.status === 'fulfilled' ? '' : errorMessage(children.reason, '子会话列表读取失败'),
+      approvalsError: admin.status === 'fulfilled' ? '' : errorMessage(admin.reason, '待审批读取失败'),
     };
     if (history.status === 'fulfilled') {
       const applied = applyHistoryPage(state, conversationId, sessionId, history.value, 'latest', keepLive);
@@ -1328,7 +1352,7 @@ async function syncConversation(conversationId: string, set: StoreSetter, get: S
     const routedState = { ...chat, conversationIdsBySession };
     if (admin.status === 'fulfilled' && admin.value) {
       const sessionIds = new Set([sessionId, ...(runningTasks || []).map((task) => task.branch_session_id).filter(Boolean)]);
-      replay = missedApprovals(routedState, admin.value.pending_approvals || [], conversationId, sessionIds);
+      replay = missedApprovals(routedState, admin.value.pending_approvals, conversationId, sessionIds);
     }
 
     return {
@@ -1511,17 +1535,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     return conversation.id;
   }),
 
-  deleteConversation: commandAction('session.delete', async (id: string) => {
+  deleteConversation: commandAction('session.delete', async (id: string): Promise<string> => {
     if (get().sendingByConversation[id]) throw new Error('消息仍在发送，请发送结束后再删除会话');
     if (get().deletingByConversation[id]) throw new Error('会话正在删除，请稍候');
     const conversation = get().conversations.find((item) => item.id === id);
-    if (!conversation) return;
+    if (!conversation) return '';
     const request = startupRequests.begin();
     set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: true } }));
     try {
-      if (conversation.sessionId) {
-        await deleteSession(conversation.sessionId);
-      }
+      // An unreadable receipt still means the server deleted it; keeping the row would invite a second delete that 404s.
+      const { receiptProblem } = conversation.sessionId ? await receipted(deleteSession(conversation.sessionId)) : { receiptProblem: '' };
 
       if (!request.isCurrent() || get().conversations.find(item => item.id === id)?.sessionId !== conversation.sessionId) {
         throw new Error('原会话已删除，但当前会话已变更；新上下文未移除');
@@ -1560,6 +1583,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           isGenerating: isConversationGenerating(conversations, activeConversationId, generatingBySession, false, sendingByConversation),
         };
       });
+      return receiptProblem;
     } finally {
       if (request.isCurrent()) set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: false } }));
     }
@@ -1600,7 +1624,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
   sendMessage: async (text, attachments, entryNodeId) => {
     const trimmed = text.trim();
-    if (!trimmed && (!attachments || attachments.length === 0)) return;
+    if (!trimmed && (!attachments || attachments.length === 0)) return '';
 
     const state = get();
     let conversationId = state.activeConversationId;
@@ -1629,7 +1653,8 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       connectionStatus: current.connectionStatus === 'open' ? 'open' : 'connecting',
     }));
 
-    let sessionId = '';
+    let receipt: InboundReceipt | null;
+    let receiptProblem: string;
     try {
       // Files picked in this browser are uploaded first; the inbound message carries their workspace paths.
       let uploadedAttachments: { name: string; size: number; type?: string; path?: string; mime_type?: string }[] | undefined;
@@ -1637,7 +1662,10 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         const uploaded = await Promise.all(
           attachments.map(async (attachment: Attachment) => {
             if (attachment.file) {
-              const result = await uploadAttachment(attachment.file, conversationKey);
+              const result = await uploadAttachment(attachment.file, conversationKey).catch((error: unknown) => {
+                // The file is on the server but its path is unknown, so the message cannot reference it.
+                throw error instanceof ReceiptUnreadable ? new Error(appendSentence(error.message, '消息没有发出，重发会把附件再传一份')) : error;
+              });
               return {
                 name: result.name,
                 size: result.size,
@@ -1658,17 +1686,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         uploadedAttachments = uploaded;
       }
 
-      const result = await postInbound({
+      ({ result: receipt, receiptProblem } = await receipted(postInbound({
         conversation_key: conversationKey,
         text: trimmed,
         attachments: uploadedAttachments,
         use_context: true,
         entry_node_id: entryNodeId,
-      });
-      sessionId = result.session_id;
-      // Shown before the inbound_message echo; the id matches the reducer's, so the echo updates it in place.
-      const inboundSeq = result.inbound_seq;
-      if (inboundSeq != null) {
+      })));
+      if (receipt) {
+        // Shown before the inbound_message echo; the id matches the reducer's, so the echo updates it in place.
+        const { session_id: sessionId, inbound_seq: inboundSeq } = receipt;
         const optimisticId = `message:${conversationId}:user:inbound:${inboundSeq}`;
         const now = new Date().toISOString();
         set((current) => {
@@ -1725,6 +1752,20 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       throw error;
     }
 
+    if (!receipt) {
+      // The server took the message: its inbound_message echo on the stream brings the session id and the task flags.
+      set((current) => {
+        const sendingByConversation = { ...current.sendingByConversation, [conversationId]: false };
+        return {
+          sendingByConversation,
+          isGenerating: isConversationGenerating(current.conversations, current.activeConversationId, current.generatingBySession, false, sendingByConversation),
+        };
+      });
+      startGlobalWebSocket(set, get);
+      return receiptProblem;
+    }
+
+    const sessionId = receipt.session_id;
     set((current) => ({
       conversations: upsertConversationMeta(current.conversations, {
         id: conversationId,
@@ -1749,13 +1790,15 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     // Keeps the one global stream, or opens it if this is the tab's first message.
     startGlobalWebSocket(set, get);
+    return '';
   },
 
   cancelCurrentTask: async () => {
     const activeConversation = getActiveConversation(get());
-    if (!activeConversation?.sessionId) return;
+    if (!activeConversation?.sessionId) return '';
 
-    await cancelActiveTasks(activeConversation.sessionId);
+    // An unreadable receipt still means the server took the request, so the composer unlocks the same way.
+    const { receiptProblem } = await receipted(cancelActiveTasks(activeConversation.sessionId));
 
     // [2026-06-03] Why: cancellation should not manage the global WebSocket and
     // should unlock the active composer immediately. How: clear only the active
@@ -1769,6 +1812,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         [activeConversation.sessionId]: false,
       },
     }));
+    return receiptProblem;
   },
 
   loadStartup: () => {

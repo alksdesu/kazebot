@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 import * as api from '../api/supervisorClient';
 import type { AdminNode, AdminSkill, AdminTool, McpClient } from '../api/supervisorClient';
+import { toolsReloadReply } from './fixtures/systemReplies';
 import { AgentsSettingsPage } from '../components/settings/pages/AgentsSettingsPage';
 import { AutomationSettingsPage } from '../components/settings/pages/AutomationSettingsPage';
 import { McpSettingsPage } from '../components/settings/pages/McpSettingsPage';
@@ -347,9 +348,9 @@ beforeEach(() => {
   vi.mocked(api.createSkill).mockResolvedValue({ ok: true, hash: 'skill-1' });
   vi.mocked(api.createTool).mockResolvedValue({ ok: true, hash: 'tool-1' });
   vi.mocked(api.deleteNode).mockResolvedValue({ ok: true, restored: false });
-  vi.mocked(api.deleteSkill).mockResolvedValue({ ok: true });
+  vi.mocked(api.deleteSkill).mockResolvedValue(undefined);
   vi.mocked(api.deleteTool).mockResolvedValue({ ok: true, restored: false });
-  vi.mocked(api.reloadTools).mockResolvedValue({ seq: 7 });
+  vi.mocked(api.reloadTools).mockResolvedValue(toolsReloadReply(7));
   vi.mocked(api.updateMcpClientsRaw).mockResolvedValue({ ok: true, hash: 'raw-2' });
   vi.mocked(api.updateSchedulesRaw).mockResolvedValue({ ok: true, hash: 'raw-2' });
 });
@@ -768,7 +769,7 @@ describe('工具页重载之后的提示', () => {
   });
 
   it('重载完 token 已经换掉，不写序号也不用旧 token 重读', async () => {
-    const write = deferred<{ seq: number }>();
+    const write = deferred<api.ToolsReload>();
     vi.mocked(api.reloadTools).mockReturnValueOnce(write.promise);
     render(<ToolsSettingsPage />);
     await waitFor(() => expect(api.getTools).toHaveBeenCalledOnce());
@@ -778,7 +779,7 @@ describe('工具页重载之后的提示', () => {
     await waitFor(() => expect(api.reloadTools).toHaveBeenCalledOnce());
     await act(async () => {
       useSettingsStore.setState({ adminToken: ROTATED_TOKEN });
-      write.resolve({ seq: 7 });
+      write.resolve(toolsReloadReply(7));
     });
     await settled('刷新工具');
 
@@ -787,7 +788,7 @@ describe('工具页重载之后的提示', () => {
   });
 
   it('重载失败时 token 已经换掉，不把失败原因写到新会话', async () => {
-    const write = deferred<{ seq: number }>();
+    const write = deferred<api.ToolsReload>();
     vi.mocked(api.reloadTools).mockReturnValueOnce(write.promise);
     render(<ToolsSettingsPage />);
     await waitFor(() => expect(api.getTools).toHaveBeenCalledOnce());

@@ -21,7 +21,9 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
   const requests = useRequestGuard('', { anonymous: true });
   const pending = useRef<RequestTicket | null>(null);
   const [tokenInput, setTokenInput] = useState(urlToken);
-  const [error, setError] = useState('');
+  // 登录刚被收回时先说原因、不自动再验：后端认 HTTP 却不认事件流的话，自动再验会反复登进登出。
+  const [notice] = useState(() => useSettingsStore.getState().loginNotice);
+  const [error, setError] = useState(notice);
   const [verifying, setVerifying] = useState<VerificationMode | null>(null);
 
   const verify = useCallback(async (value: string, mode: VerificationMode) => {
@@ -37,6 +39,7 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
       setError('连接超时。请检查服务是否运行，然后重新登录；已保存的令牌未删除。');
     }, AUTH_TIMEOUT_MS);
     setError('');
+    if (useSettingsStore.getState().loginNotice) useSettingsStore.getState().setLoginNotice('');
     setVerifying(mode);
     try {
       const ok = await verifyAdminAuth(token, request.signal);
@@ -66,8 +69,8 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
       url.searchParams.delete('token');
       window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
     }
-    if (initialToken.current) void verify(initialToken.current, urlToken ? 'link' : 'saved');
-  }, [urlToken, verify]);
+    if (initialToken.current && (urlToken || !notice)) void verify(initialToken.current, urlToken ? 'link' : 'saved');
+  }, [urlToken, verify, notice]);
 
   useEffect(() => {
     if (!verifying && focusInput.current) { inputRef.current?.focus(); focusInput.current = false; }
