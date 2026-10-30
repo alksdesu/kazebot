@@ -2354,10 +2354,22 @@ export async function restartEngine(
   return receiptOf(receipt, resp, (body) => restartResultOf(receipt, body));
 }
 
-export async function enableCodeWrite(token: string): Promise<void> {
-  await apiFetch('/admin/runtime/code-write', {
+/** 宿主机接下了代码目录写权限：instance_id 是随后要重启的那个实例。 */
+export interface CodeWriteResult {
+  instance_id: string;
+}
+
+const CODE_WRITE_RECEIPT = { ok: BOOLEAN, instance_id: NON_EMPTY_TEXT };
+
+/** 宿主机回绝照常抛；交上了却读不懂回执时抛 ReceiptUnreadable：重启已经排上，当成失败会让人再开一次、再重启一回。 */
+export async function enableCodeWrite(token: string): Promise<CodeWriteResult> {
+  const resp = await apiFetch('/admin/runtime/code-write', {
     method: 'POST', token,
   });
+  const receipt = '代码目录写权限已经提交，可回执';
+  const { ok, instance_id } = await receiptOf(receipt, resp, (body) => shaped(receipt, body, CODE_WRITE_RECEIPT));
+  if (!ok) throw new Error('服务端没有接下这次请求，请重试');
+  return { instance_id };
 }
 
 // ── 热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单 ──

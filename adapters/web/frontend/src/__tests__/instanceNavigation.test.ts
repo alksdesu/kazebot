@@ -37,6 +37,20 @@ describe('实例地址与最近入口', () => {
     expect(instanceConsoleHref(path, false)).toBe(`${path}/web/`);
   });
 
+  it.each([
+    ['/i/miaomiao', 'miaomiao'],
+    ['/i/1000001', '1000001'],
+    ['', null],
+    ['/web/1', null],
+    ['/i', null],
+    ['/i/a/b', null],
+    ['/i/..', null],
+    ['//external.example', null],
+  ])('挂载 %s 的多开实例名是 %s', async (path, id) => {
+    const { multiInstanceId } = await import('../instances/paths');
+    expect(multiInstanceId(path)).toBe(id);
+  });
+
   it('主实例的空路径与尚无最近记录有区别', async () => {
     const { getRecentInstance, rememberInstance } = await import('../instances/navigation');
     expect(getRecentInstance()).toBeNull();

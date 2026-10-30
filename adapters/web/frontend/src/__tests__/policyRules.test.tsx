@@ -235,30 +235,97 @@ describe('服务端策略', () => {
     expect(lastPut.restart.default).toBe('auto');
   });
 
-  it('二次确认时勾选代码目录写入才调用宿主机权限接口', async () => {
+  // 后端只给多开实例开代码目录写权限：根实例上摆出这个勾选项，勾了必然失败。
+  it('根实例确认全自动放行时不给代码目录写入的选项，也不碰宿主机接口', async () => {
     await renderPolicy();
 
     fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
-    expect(screen.getByText(/一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效）/)).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText(/同时开放 \/opt\/kazebot/));
+    expect(screen.queryByLabelText(/同时开放/)).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
 
-    await waitFor(() => expect(codeWriteCalls).toBe(1));
-    expect(lastPut.execute_command).toMatchObject({
-      default: 'auto', deny_patterns: [], sensitive_patterns: [], sensitive_path_patterns: [],
-    });
+    expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+    expect(codeWriteCalls).toBe(0);
   });
 
-  it('策略存上了、代码目录写权限没开成：存上的照常交代，没开成的另起一行报错', async () => {
-    await renderPolicy(POLICY, () => errorResponse(503, '宿主机拒绝了'));
+  // MOUNT 在页面模块载入时从地址栏取一次：先换到多开实例的地址，再重新载入页面和它读的设置。
+  describe('多开实例的代码目录写权限', () => {
+    const INSTANCE = 'beta_bot';
+    const CODE_WRITE_LABEL = /同时开放 \/opt\/kazebot 写入并重启本实例 beta_bot（/;
+    const SUBMITTED = '策略已保存，已提交 /opt/kazebot 写入权限，实例 beta_bot 随后重启';
+    let MountedSection: typeof PolicyRulesSection;
 
-    fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
-    fireEvent.click(screen.getByLabelText(/同时开放 \/opt\/kazebot/));
-    fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+    beforeEach(async () => {
+      window.history.replaceState(null, '', `/i/${INSTANCE}/web/`);
+      vi.resetModules();
+      const [page, settings] = await Promise.all([
+        import('../components/settings/pages/PolicyRulesSection'),
+        import('../store/settingsStore'),
+      ]);
+      settings.useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
+      MountedSection = page.PolicyRulesSection;
+    });
 
-    expect(await screen.findByText('代码目录写权限没能启用：503 宿主机拒绝了')).toHaveAttribute('role', 'alert');
-    expect(screen.getByRole('status')).toHaveTextContent('策略已保存。');
-    expect(codeWriteCalls).toBe(1);
+    afterEach(() => {
+      window.history.replaceState(null, '', '/');
+    });
+
+    const renderMounted = async (codeWrite = () => jsonResponse({ ok: true, instance_id: INSTANCE, workspace: '/w' })) => {
+      stubPolicy(POLICY, codeWrite);
+      render(<MountedSection />);
+      await screen.findByRole('button', { name: /写入/ });
+    };
+
+    const confirmWithCodeWrite = () => {
+      fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+      fireEvent.click(screen.getByLabelText(CODE_WRITE_LABEL));
+      fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+    };
+
+    it('不勾代码目录写入就只存策略，不碰宿主机接口', async () => {
+      await renderMounted();
+
+      fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+      expect(screen.getByLabelText(CODE_WRITE_LABEL)).not.toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+      expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+      expect(codeWriteCalls).toBe(0);
+    });
+
+    it('勾上之后存完策略再请求宿主机，勾选项和提示都说本实例的名字', async () => {
+      await renderMounted();
+
+      fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+      expect(screen.getByText(/一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效）/)).toBeInTheDocument();
+      fireEvent.click(screen.getByLabelText(CODE_WRITE_LABEL));
+      fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+      expect(await screen.findByText(SUBMITTED)).toBeInTheDocument();
+      expect(codeWriteCalls).toBe(1);
+      expect(lastPut.execute_command).toMatchObject({
+        default: 'auto', deny_patterns: [], sensitive_patterns: [], sensitive_path_patterns: [],
+      });
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    // 重启已经排上了：当成没开成，人会再开一次、再重启一回。
+    it('写权限交上了只是回执读不懂：照样交代会重启，回执的事另起一行', async () => {
+      await renderMounted(() => jsonResponse({ ok: true }));
+      confirmWithCodeWrite();
+
+      expect(await screen.findByText(SUBMITTED)).toBeInTheDocument();
+      expect(screen.getByText('代码目录写权限已经提交，可回执格式不对：缺 instance_id')).toHaveAttribute('role', 'alert');
+      expect(codeWriteCalls).toBe(1);
+    });
+
+    it('策略存上了、代码目录写权限没开成：存上的照常交代，没开成的另起一行报错', async () => {
+      await renderMounted(() => errorResponse(503, '宿主机拒绝了'));
+      confirmWithCodeWrite();
+
+      expect(await screen.findByText('代码目录写权限没能启用：503 宿主机拒绝了')).toHaveAttribute('role', 'alert');
+      expect(screen.getByRole('status')).toHaveTextContent('策略已保存。');
+      expect(codeWriteCalls).toBe(1);
+    });
   });
 
   it('保存整份文档，没显示的字段不会被吞掉', async () => {

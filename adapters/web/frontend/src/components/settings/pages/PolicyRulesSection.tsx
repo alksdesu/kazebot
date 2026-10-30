@@ -5,7 +5,9 @@ import {
   enableCodeWrite,
   getPolicy,
   isEditConflict,
+  MOUNT,
   ReceiptUnreadable,
+  receipted,
   updatePolicy,
   type ApprovalGrantSettings,
   type PolicyDecision,
@@ -15,6 +17,7 @@ import {
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
+import { multiInstanceId } from '../../../instances/paths';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
 import { appendSentence } from '../../../utils/sentence';
@@ -128,6 +131,8 @@ const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; p
 
 const EMPTY_SECTION: RuleSection = { default: 'auto', rules: [] };
 const KAZEBOT_ROOT = '/opt/kazebot';
+// 后端只给挂在 /i/<实例名> 下的多开实例开代码目录写权限，根实例一律回绝。
+const CODE_WRITE_INSTANCE = multiInstanceId(MOUNT);
 
 const clonePolicy = (policy: PolicyDoc): PolicyDoc => JSON.parse(JSON.stringify(policy)) as PolicyDoc;
 
@@ -608,7 +613,7 @@ export const PolicyRulesSection = () => {
       setError(`没有保存：${grantError.text}`);
       return;
     }
-    const enableCodeWriteAfterSave = fullAutoPending && codeWriteRequested;
+    const codeWriteInstance = fullAutoPending && codeWriteRequested ? CODE_WRITE_INSTANCE : null;
     setBusy(true);
     setMessage('');
     try {
@@ -629,10 +634,15 @@ export const PolicyRulesSection = () => {
       setFullAutoPending(false);
       setFullAutoOriginal(null);
       setCodeWriteRequested(false);
-      if (enableCodeWriteAfterSave) {
+      if (codeWriteInstance) {
         try {
-          await enableCodeWrite(adminToken);
-          if (requests.isCurrent()) setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao', receiptProblem);
+          const submitted = await receipted(enableCodeWrite(adminToken));
+          if (requests.isCurrent()) {
+            setMessage(
+              `策略已保存，已提交 ${KAZEBOT_ROOT} 写入权限，实例 ${submitted.result?.instance_id ?? codeWriteInstance} 随后重启`,
+              appendSentence(receiptProblem, submitted.receiptProblem),
+            );
+          }
         } catch (caught) {
           if (requests.isCurrent()) {
             setMessage('策略已保存。', appendSentence(receiptProblem, `代码目录写权限没能启用：${errorMessage(caught, '宿主机操作失败')}`));
@@ -704,18 +714,20 @@ export const PolicyRulesSection = () => {
           </div>
           {fullAutoPending ? (
             <div className="flex flex-col items-start gap-2">
-              <label className="flex items-start gap-2 text-micro text-[var(--duties-secondary)]">
-                <input
-                  checked={codeWriteRequested}
-                  disabled={busy}
-                  onChange={(event) => setCodeWriteRequested(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>
-                  同时开放 <code>/opt/kazebot</code> 写入并重启 miaomiao（高风险，仅本控制台管理员）。
-                  一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效），仅限开发调试使用。
-                </span>
-              </label>
+              {CODE_WRITE_INSTANCE ? (
+                <label className="flex items-start gap-2 text-micro text-[var(--duties-secondary)]">
+                  <input
+                    checked={codeWriteRequested}
+                    disabled={busy}
+                    onChange={(event) => setCodeWriteRequested(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>
+                    同时开放 <code>{KAZEBOT_ROOT}</code> 写入并重启本实例 <code>{CODE_WRITE_INSTANCE}</code>（高风险，仅本控制台管理员）。
+                    一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效），仅限开发调试使用。
+                  </span>
+                </label>
+              ) : null}
               <div className="flex flex-wrap gap-2">
                 <Button disabled={busy} onClick={() => void save()} tone="danger">确认并保存全自动放行</Button>
                 <Button disabled={busy} onClick={() => { if (fullAutoOriginal) setDoc(fullAutoOriginal); setFullAutoOriginal(null); setFullAutoPending(false); setCodeWriteRequested(false); setMessage('已取消全自动放行保存。'); }} tone="quiet">取消</Button>

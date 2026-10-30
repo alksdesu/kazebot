@@ -11,6 +11,13 @@ export function isInstancePath(value: unknown): value is string {
   ));
 }
 
+/** 多开实例挂在 /i/<实例名> 下，取出实例名；根实例和别的前缀返回 null。 */
+export function multiInstanceId(path: string): string | null {
+  if (!isInstancePath(path)) return null;
+  const match = /^\/i\/([^/]+)$/.exec(path);
+  return match ? match[1] : null;
+}
+
 export function instanceConsoleHref(path: string, preserveLocation = true): string {
   if (!isInstancePath(path)) throw new Error('实例地址无效');
   const query = new URLSearchParams(preserveLocation ? window.location.search : '');
