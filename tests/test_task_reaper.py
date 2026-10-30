@@ -712,6 +712,33 @@ def test_running_tasks_endpoint_reaps_and_omits_the_stuck_task(
     assert stuck.status == TaskStatus.failed
 
 
+def test_running_tasks_lists_a_task_waiting_on_sub_agents_only_when_asked(tmp_path: Path) -> None:
+    # 控制台要知道会话还在等子 agent；适配器按这张表挑打断目标，挂起的不能混进去
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    now = datetime.now(timezone.utc)
+    alive = _running(state, session_id, lease_in=timedelta(minutes=2), now=now)
+    waiting = _running(state, session_id, lease_in=None, status=TaskStatus.suspended, now=now)
+    app = create_app(
+        state=state,
+        process_manager=None,
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
+    )
+
+    async def _call(**params: str) -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.get(f"/v1/sessions/{session_id}/running_tasks", params=params)
+
+    adapter_view = asyncio.run(_call()).json()["tasks"]
+    console_view = asyncio.run(_call(include_suspended="true")).json()["tasks"]
+
+    assert [item["task_id"] for item in adapter_view] == [alive.task_id]
+    assert {item["task_id"]: item["status"] for item in console_view} == {
+        alive.task_id: "running", waiting.task_id: "suspended",
+    }
+
+
 def test_scheduler_cleanup_leaves_a_stale_running_task_alone(tmp_path: Path) -> None:
     state = _make_state(tmp_path)
     session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")

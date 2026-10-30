@@ -720,11 +720,13 @@ describe('Session running tasks client', () => {
     vi.unstubAllGlobals();
   });
 
-  it('reads the queued and running tasks of the session', async () => {
-    const fetchMock = stubFetch({ tasks: [task, { ...task, task_id: 'task-2', source_inbound_seq: null }] });
+  it('reads the queued, running and waiting tasks of the session', async () => {
+    const waiting = { ...task, task_id: 'task-3', status: 'suspended' };
+    const fetchMock = stubFetch({ tasks: [task, { ...task, task_id: 'task-2', source_inbound_seq: null }, waiting] });
 
-    await expect(getSessionRunningTasks('web:a')).resolves.toEqual([task, { ...task, task_id: 'task-2', source_inbound_seq: null }]);
-    expect(fetchMock.mock.calls[0][0]).toBe('/v1/sessions/web%3Aa/running_tasks');
+    await expect(getSessionRunningTasks('web:a')).resolves.toEqual([task, { ...task, task_id: 'task-2', source_inbound_seq: null }, waiting]);
+    // 挂起等子 agent 的也要列上，不然正在等子 agent 的会话重连后会被标成空闲
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/sessions/web%3Aa/running_tasks?include_suspended=true');
   });
 
   // 读成空表就是「什么都没在跑」，会话的生成中标记会被错清掉；抛出来的话调用方按「不知道」处理。

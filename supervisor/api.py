@@ -844,15 +844,17 @@ def create_app(
         return result
 
     @app.get("/v1/sessions/{session_id}/running_tasks")
-    def session_running_tasks(session_id: str) -> dict[str, Any]:
+    def session_running_tasks(session_id: str, include_suspended: bool = Query(False)) -> dict[str, Any]:
         """Bot 查询当前 session（含入口分支）中 running/pending 状态的 task 列表。
 
         列之前先按后台回收线程的同一套规则收掉卡死的 running 任务，适配器据此决定抢占还是排队，
-        不能拿一个已经死掉的任务当目标。
+        不能拿一个已经死掉的任务当目标。include_suspended 时挂起等子任务的也列上：控制台按它认会话还在忙；
+        适配器不带，挂起的任务不会成为打断目标。
         """
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
+        listed = (TaskStatus.running, TaskStatus.pending, *((TaskStatus.suspended,) if include_suspended else ()))
         tasks: list[dict[str, Any]] = []
         with st._lock:
             # [Fork/Merge 2026-05-12] running_tasks 查询主 session 时也返回入口分支任务。
@@ -864,7 +866,7 @@ def create_app(
             for task in st.tasks.values():
                 if task.session_id not in session_ids:
                     continue
-                if task.status not in (TaskStatus.running, TaskStatus.pending):
+                if task.status not in listed:
                     continue
                 branch_session_id = str(task.input.get("branch_session_id") or "")
                 if not branch_session_id and task.session_id != session_id:

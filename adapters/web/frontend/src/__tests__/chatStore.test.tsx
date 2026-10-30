@@ -906,6 +906,36 @@ describe('chatStore', () => {
     expect(selectMessages(state, 'conv-stale').map(textOf)).toEqual(['question', 'the whole answer']);
   });
 
+  // A round suspended on its sub-agents is still at work: re-reading must not mark the conversation idle.
+  it('keeps a conversation generating while its round waits on a sub-agent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-wait/history')) {
+        return jsonResponse([
+          { id: 'hist-user', role: 'user', content: 'question', message_type: 'user_input', created_at: '2026-05-31T03:08:00.000Z' },
+        ]);
+      }
+      if (url.includes('/v1/sessions/sess-wait/running_tasks')) {
+        return jsonResponse({ tasks: [{ ...runningTask('sess-wait'), status: 'suspended' }] });
+      }
+      return jsonResponse([]);
+    }));
+    useChatStore.setState((state) => ({
+      ...state,
+      conversations: [{ id: 'conv-wait', sessionId: 'sess-wait', title: 'Wait', updatedAt: '2026-05-31T03:08:00.000Z' }],
+      activeConversationId: 'conv-wait',
+      isGenerating: true,
+      generatingBySession: { ...state.generatingBySession, 'sess-wait': true },
+      conversationIdsBySession: { ...state.conversationIdsBySession, 'sess-wait': 'conv-wait' },
+    }));
+
+    useChatStore.getState().selectConversation('conv-wait');
+
+    await waitFor(() => expect(useChatStore.getState().historyByConversation['conv-wait']).toMatchObject({ loading: false }));
+    expect(useChatStore.getState().generatingBySession['sess-wait']).toBe(true);
+    expect(useChatStore.getState().isGenerating).toBe(true);
+  });
+
   // Events sent while the stream was down are never replayed: a reconnect re-reads what is on screen.
   it('re-reads the open conversation after the stream reconnects and drops a task that ended meanwhile', async () => {
     let finished = false;

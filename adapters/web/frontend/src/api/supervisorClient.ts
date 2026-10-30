@@ -2751,8 +2751,9 @@ const RUNNING_TASK = {
 };
 
 // 补成空表就是「什么都没在跑」：会话的生成中标记会被错清掉。
+// 挂起等子 agent 的也要：不带的话，正等子 agent 的会话重连后被标成空闲。
 export async function getSessionRunningTasks(sessionId: string): Promise<SessionRunningTask[]> {
-  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/running_tasks`);
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/running_tasks?include_suspended=true`);
   const body = shaped('运行中的任务列表', await resp.json(), {});
   return shapedRows('运行中的任务列表', body.tasks, RUNNING_TASK, 'tasks') as SessionRunningTask[];
 }
