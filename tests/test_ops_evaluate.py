@@ -207,17 +207,15 @@ class TestTheEndpoint:
         assert api("POST", "/v1/ops/evaluate", json=body).status_code == 422
         assert api("POST", "/v1/ops/request", json=body).status_code == 422
 
-    def test_an_unauthenticated_caller_is_recorded_with_the_endpoint(self, api: Any, state: SupervisorState, tmp_path: Path) -> None:
+    def test_an_unauthenticated_caller_is_rejected(self, api: Any, state: SupervisorState, tmp_path: Path) -> None:
         sid = state.get_or_create_session(channel="cli", conversation_key="cli:default")
         body = {"session_id": sid, "op": "read_file", "parameters": {"path": "notes.txt"}}
 
-        assert api("POST", "/v1/ops/evaluate", json=body, auth=False).status_code == 200
-        assert api("POST", "/v1/ops/request", json=body, auth=False).status_code == 200
-        assert api("POST", "/v1/ops/evaluate", json=body).status_code == 200
+        # 观察期结束：这两个入口和别的端点一样走令牌门，没带令牌当场 401、不记旁路事件。
+        assert api("POST", "/v1/ops/evaluate", json=body, auth=False).status_code == 401
+        assert api("POST", "/v1/ops/request", json=body, auth=False).status_code == 401
 
-        rows = logged_events(tmp_path, "ops_request_unauthenticated")
-        assert [row["payload"]["endpoint"] for row in rows] == ["/v1/ops/evaluate", "/v1/ops/request"]
-        assert _TOKEN not in json.dumps(rows)
+        assert logged_events(tmp_path, "ops_request_unauthenticated") == []
 
 
 class TestTheToolContext:

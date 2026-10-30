@@ -103,11 +103,13 @@ class TestWhereThingsLive:
     @pytest.mark.parametrize("rel", [
         "config/models.yaml", "config/policy.yaml", "config/mcp.yaml",
         "data/platform_secrets.yaml", "config/drawtools/settings.yaml",
+        # 节点可以单配 api_key，整个目录按私有处理：yaml、md 片段、备份都是 0600
+        "config/nodes/a.yaml", "config/nodes/sub/b.yaml", "config/nodes/frag.md", "config/nodes/a.yaml.bak",
     ])
     def test_files_holding_plaintext_keys_are_owner_only(self, ws: Path, rel: str) -> None:
         assert config_layout.private_mode_for(ws, ws / rel) == 0o600
 
-    @pytest.mark.parametrize("rel", ["config/runtime.yaml", "config/nodes/a.yaml", "data/events.jsonl"])
+    @pytest.mark.parametrize("rel", ["config/runtime.yaml", "config/other.yaml", "data/events.jsonl"])
     def test_everything_else_is_left_to_the_umask(self, ws: Path, rel: str) -> None:
         assert config_layout.private_mode_for(ws, ws / rel) is None
 

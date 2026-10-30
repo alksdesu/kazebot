@@ -477,12 +477,19 @@ class TestSdk:
 
 
 @pytest.mark.asyncio
-async def test_sdk_api_and_engine_swap_the_same_guide(state: SupervisorState, tmp_path: Path) -> None:
+async def test_sdk_api_and_engine_swap_the_same_guide(
+    state: SupervisorState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "test-token")
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
     task = _inbound(state, _session(state), output_guide=_GUIDE)
     task.status = TaskStatus.running
     app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path))
     loop = _loop(tmp_path, {})
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    # preempt、context_window 等接口现在都要管理员令牌
+    auth = {"Authorization": "Bearer test-token"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=auth) as client:
         sdk = ClonothClient("http://test")
         sdk._client = client
         assert await sdk.preempt_task(task.task_id, message="follow-up", output_guide=_NEW_GUIDE)

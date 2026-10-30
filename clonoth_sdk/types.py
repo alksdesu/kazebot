@@ -301,7 +301,8 @@ class ApprovalDecision:
 class HealthInfo:
     """Supervisor 健康状态信息。
 
-    对应 GET /v1/health 返回。workspace_root 可用于启动时动态获取工作区路径。
+    对应 GET /v1/health 返回。workspace_root 可用于启动时动态获取工作区路径；
+    run_id、workspace_root、started_at 只在带了管理员令牌时才有。
     """
     status: str
     run_id: str
@@ -314,7 +315,7 @@ class HealthInfo:
 class OpenAIConfig:
     """OpenAI 兼容 API 的公开配置信息。
 
-    对应 GET /v1/config/openai 返回。这个端点没有令牌门，所以密钥只报有没有。
+    对应 GET /v1/config/openai 返回（要管理员令牌）。密钥只报有没有，原文走 /v1/config/openai/secret。
     """
     base_url: str
     model: str

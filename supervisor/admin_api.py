@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
+import json
 import logging
 import os
 import shutil
@@ -12,11 +14,19 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
+from fastapi.requests import HTTPConnection
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config_layout
-from clonoth_runtime import check_runtime_text, load_runtime_config, runtime_defaults
+from clonoth_runtime import (
+    AUTH_BACKOFF_MAX_SEC,
+    SESSION_EVENT_TOKEN_HEADER,
+    check_runtime_text,
+    load_runtime_config,
+    runtime_defaults,
+    session_event_token,
+)
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import (
     declares_internal,
@@ -144,24 +154,31 @@ def get_admin_token() -> str:
     return _admin_token
 
 
-# 认证失败退避。前几次留给手滑，之后按 IP 指数退避 —— 没有这一层的话，本机上
-# 一个脚本可以不受限地枚举 token。
+# 认证失败退避：前几次留给手滑，之后按来源地址指数退避，最长 AUTH_BACKOFF_MAX_SEC。
 _AUTH_FREE_ATTEMPTS = 3
 _AUTH_BACKOFF_BASE_SEC = 1.0
-_AUTH_BACKOFF_MAX_SEC = 60.0
 # 记录条数封顶，否则源 IP 随机的探测会把这张表本身变成内存泄漏。
 _AUTH_TRACK_MAX_CLIENTS = 1024
 _auth_failures: "OrderedDict[str, tuple[int, float]]" = OrderedDict()
 
 
-def _auth_client_key(request: Request) -> str:
-    """退避按哪个键计。
+def _auth_client_key(connection: HTTPConnection) -> str:
+    """退避按哪个键计：连接的来源地址。
 
-    刻意不读 X-Forwarded-For：那个头谁都能伪造，认它等于让退避形同虚设。反代后面
-    所有请求会共用一个键，但成功一次就清零，正常使用碰不到这条线。
+    这里不读 X-Forwarded-For：uvicorn 只认 127.0.0.1 转来的那个头，经隧道来的请求到这里已经换成了真实来源。
     """
-    client = request.client
+    client = connection.client
     return (client.host if client else "") or "unknown"
+
+
+def _is_loopback(key: str) -> bool:
+    try:
+        address = ipaddress.ip_address(key)
+    except ValueError:
+        return False
+    # 双栈监听时本机的 IPv4 连接写成 ::ffff:127.0.0.1，3.11 的 is_loopback 不认这种写法
+    mapped = getattr(address, "ipv4_mapped", None)
+    return (mapped or address).is_loopback
 
 
 def _auth_backoff_remaining(key: str, now: float) -> float:
@@ -176,16 +193,19 @@ def _record_auth_failure(key: str, now: float) -> None:
     extra = failures - _AUTH_FREE_ATTEMPTS
     delay = 0.0
     if extra > 0:
-        delay = min(_AUTH_BACKOFF_BASE_SEC * (2 ** (extra - 1)), _AUTH_BACKOFF_MAX_SEC)
+        delay = min(_AUTH_BACKOFF_BASE_SEC * (2 ** (extra - 1)), AUTH_BACKOFF_MAX_SEC)
     _auth_failures[key] = (failures, now + delay)
     _auth_failures.move_to_end(key)
     while len(_auth_failures) > _AUTH_TRACK_MAX_CLIENTS:
         _auth_failures.popitem(last=False)
 
 
-def verify_admin_token(request: Request) -> None:
-    token = get_admin_token()
-    key = _auth_client_key(request)
+def _verify_credential(connection: HTTPConnection, presented: str, expected: str) -> None:
+    """presented 对不上 expected 抛 401，来源正在退避抛 429。
+
+    没出示凭据的不记失败：空串不是一次猜测，记了只会把没带令牌的老客户端所在的来源锁住。
+    """
+    key = _auth_client_key(connection)
     now = time.time()
     blocked = _auth_backoff_remaining(key, now)
     if blocked > 0:
@@ -195,15 +215,86 @@ def verify_admin_token(request: Request) -> None:
             headers={"Retry-After": str(max(1, int(blocked + 0.5)))},
         )
 
-    auth = request.headers.get("Authorization", "")
-    presented = auth[7:].strip() if auth.startswith("Bearer ") else (request.query_params.get("token") or "")
-    # compare_digest 而不是 ==：后者会在第一个不同字节就返回，逐字节试探能问出 token。
-    if presented and secrets.compare_digest(presented, token):
+    # compare_digest 而不是 ==：后者会在第一个不同字节就返回，逐字节试探能问出 token。按字节比，带非 ASCII 字符的也只是对不上。
+    if presented and expected and secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
         _auth_failures.pop(key, None)
         return
 
-    _record_auth_failure(key, now)
+    # 本机进程能伪造 XFF 换桶，在本机做退避挡不住爆破，只会锁死 engine。
+    if presented and not _is_loopback(key):
+        _record_auth_failure(key, now)
     raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def presented_token(connection: HTTPConnection) -> str:
+    """请求出示的管理令牌：Authorization 的 Bearer，没有就取 ?token=（img 标签带不了请求头）；没出示是空串。"""
+    auth = connection.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return connection.query_params.get("token") or ""
+
+
+def verify_admin_credential(connection: HTTPConnection, presented: str) -> None:
+    """presented 是不是管理令牌：不是抛 401，来源正在退避抛 429。WebSocket 首帧里的令牌也走这里。"""
+    _verify_credential(connection, presented, get_admin_token())
+
+
+def verify_admin_token(request: Request) -> None:
+    verify_admin_credential(request, presented_token(request))
+
+
+def verify_session_event_credential(connection: HTTPConnection, session_id: str, presented: str) -> None:
+    """presented 是不是这个会话的事件凭据（clonoth_runtime.session_event_token），失败的处理同管理令牌。"""
+    _verify_credential(connection, presented, session_event_token(get_admin_token(), session_id))
+
+
+# 不要令牌的路由，按路由模板认，不分方法。
+_ANONYMOUS_ROUTES = frozenset({
+    # 存活探测：启动等待时调用方可能还没读到令牌，登录前的状态灯也要亮；匿名只回存活字段。
+    "/v1/health",
+    # 登录前列出各实例，各实例的令牌不同。
+    "/v1/instance-directory",
+    # 只是跳到登录页。
+    "/",
+})
+# 端点自己验：附件的 401 要带安全头，登录页的校验把退避也报成 401。
+_SELF_AUTHENTICATED_ROUTES = frozenset({"/v1/files/{rel:path}", "/v1/admin/auth/check"})
+# 浏览器的 WebSocket 带不了请求头，令牌放在首帧里，由端点 accept 之后验。
+_FIRST_FRAME_WEBSOCKETS = frozenset({"/v1/ws"})
+_SESSION_EVENT_ROUTE = "/v1/sessions/{session_id}/events"
+_SCRIPT_EVENT_TYPES = frozenset({"intermediate_reply"})
+
+
+async def require_admin(connection: HTTPConnection) -> None:
+    """挂在整个 app 上的令牌门：除了上面几张表里的，HTTP 和 WebSocket 路由一律要管理令牌。"""
+    route = getattr(connection.scope.get("route"), "path", "")
+    if route in _ANONYMOUS_ROUTES or route in _SELF_AUTHENTICATED_ROUTES or route in _FIRST_FRAME_WEBSOCKETS:
+        return
+    presented = presented_token(connection)
+    if (
+        not presented
+        and route == _SESSION_EVENT_ROUTE
+        and connection.scope.get("method") == "POST"
+        and isinstance(connection, Request)
+    ):
+        event_token = connection.headers.get(SESSION_EVENT_TOKEN_HEADER, "").strip()
+        if event_token:
+            await _verify_script_event(connection, event_token)
+            return
+    verify_admin_credential(connection, presented)
+
+
+async def _verify_script_event(request: Request, presented: str) -> None:
+    """脚本工具拿会话事件凭据发事件：只认路径里那一个会话，只收中间回复。"""
+    verify_session_event_credential(request, str(request.path_params.get("session_id") or ""), presented)
+    # FastAPI 解析请求体时已经读过一遍，这里拿到的是缓存
+    try:
+        body = json.loads(await request.body())
+    except ValueError:
+        body = None
+    event_type = body.get("type") if isinstance(body, dict) else None
+    if not isinstance(event_type, str) or event_type not in _SCRIPT_EVENT_TYPES:
+        raise HTTPException(status_code=403, detail=f"会话事件凭据只能发 {'、'.join(sorted(_SCRIPT_EVENT_TYPES))}")
 
 
 def create_admin_router(workspace_root: Path) -> APIRouter:

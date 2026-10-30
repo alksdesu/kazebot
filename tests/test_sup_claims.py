@@ -75,7 +75,13 @@ def _children(state: SupervisorState, task: Task) -> list[Task]:
     return [t for t in state.tasks.values() if t.caller_task_id == task.task_id]
 
 
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
+
 def _client_call(app: Any, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    # 没显式给 headers 就带上管理员令牌：task 接口现在都要令牌
+    kwargs.setdefault("headers", _AUTH)
+
     async def _run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:

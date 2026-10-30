@@ -13,8 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import secrets
-from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
@@ -112,7 +111,13 @@ from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router
 from .platform_api import create_platform_router
 from .restart_gate import RestartGate
 from .usage_report import create_usage_router
-from .admin_api import init_admin_token, verify_admin_token
+from .admin_api import (
+    init_admin_token,
+    presented_token,
+    require_admin,
+    verify_admin_credential,
+    verify_admin_token,
+)
 
 
 log = logging.getLogger(__name__)
@@ -120,43 +125,6 @@ log = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _audit_ops_caller(st: Any, request: Request, inp: Any) -> None:
-    """观察期：只记录，不拦。
-
-    /v1/ops/request 和 /v1/ops/evaluate 是全部策略判定的入口，而 is_admin 由调用方自报，端点本身不认凭证 ——
-    能连上这个端口的进程都可以把 approval_required 换成 auto。改成拒绝之前先跑一段，
-    确认日志里除了 engine 没有别的调用方，免得漏掉某条路径把工具调用全打死。
-
-    不走 verify_admin_token：那个失败会进退避表，观察期不该有任何副作用。
-    """
-    from .admin_api import get_admin_token
-
-    auth = request.headers.get("Authorization", "")
-    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
-    expected = get_admin_token()
-    if presented and expected and secrets.compare_digest(presented, expected):
-        return
-    try:
-        st.eventlog.append(
-            session_id="__system__",
-            component="supervisor",
-            type_="ops_request_unauthenticated",
-            # 只记有没有带、带了多长，不记值本身。
-            payload={
-                "endpoint": str(getattr(getattr(request, "url", None), "path", "") or ""),
-                "op": str(getattr(inp, "op", "") or ""),
-                "node_id": str(getattr(inp, "node_id", "") or ""),
-                "session_id": str(getattr(inp, "session_id", "") or ""),
-                "token_presented": bool(presented),
-                "token_len": len(presented),
-                "client": getattr(getattr(request, "client", None), "host", "") or "",
-                "ts": _now().isoformat(),
-            },
-        )
-    except Exception:
-        pass  # 观察用的旁路，记不上不能影响工具执行
 
 
 def _verify_channel_ref(cs: ConfigStore, name: str) -> None:
@@ -184,9 +152,13 @@ def _verify_channel_ref(cs: ConfigStore, name: str) -> None:
 # the EventLog schema.
 _WS_HEARTBEAT_SEC = 30.0
 
-# [2026-06-03] Why: clients may send an optional initial message for backward
-# compat; the server consumes and ignores it. How: brief timeout, then proceed.
+# 握手已带凭据时首帧是可选的，只等这一小会儿
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
+# 令牌在首帧里时要给隧道留足往返时间
+_WS_AUTH_TIMEOUT_SEC = 10.0
+# 4000 起是应用自定的关闭码，按 HTTP 状态码取后三位
+_WS_CLOSE_UNAUTHORIZED = 4401
+_WS_CLOSE_AUTH_BACKOFF = 4429
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
 # 超了上限按这个顺序截：工具卡片先读 result 里的正文，读不到再退回 raw_inline；arguments 是 tool_call_start 带的参数
@@ -268,6 +240,34 @@ def _clip_ws_field(key: str, value: Any) -> Any:
     return str(value)[:_WS_CLIPPED_FIELD_CHARS] + "... [truncated for WS]"
 
 
+async def _authorized_first_frame(websocket: WebSocket) -> dict[str, Any] | None:
+    """已 accept 的连接验令牌：通过时返回首帧（没收到就是空映射），没通过时已关掉连接、返回 None。
+
+    握手带了令牌（SDK）就按它认，首帧只带协议参数；没带就认首帧里的 token。两处都有时以握手的为准。
+    被拒用 4401 关；来源正在退避用 4429 关，reason 是要等的秒数。
+    """
+    handshake = presented_token(websocket)
+    timeout = _WS_INITIAL_MESSAGE_TIMEOUT_SEC if handshake else _WS_AUTH_TIMEOUT_SEC
+    try:
+        initial = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=timeout))
+    except (asyncio.TimeoutError, ValueError, KeyError):
+        # KeyError：首帧是二进制帧
+        initial = {}
+    if not isinstance(initial, dict):
+        initial = {}
+    frame_token = initial.get("token")
+    presented = handshake or (frame_token if isinstance(frame_token, str) else "")
+    try:
+        verify_admin_credential(websocket, presented)
+    except HTTPException as exc:
+        if exc.status_code == 429:
+            await websocket.close(code=_WS_CLOSE_AUTH_BACKOFF, reason=(exc.headers or {}).get("Retry-After", ""))
+        else:
+            await websocket.close(code=_WS_CLOSE_UNAUTHORIZED, reason="Unauthorized")
+        return None
+    return initial
+
+
 def create_app(
     *,
     state: SupervisorState,
@@ -277,7 +277,16 @@ def create_app(
     port: int = 8765,
 ) -> FastAPI:
     from .features import feature_lifespan, register_features
-    app = FastAPI(title="Clonoth Supervisor", version="0.1.0", lifespan=feature_lifespan)
+    app = FastAPI(
+        title="Clonoth Supervisor",
+        version="0.1.0",
+        lifespan=feature_lifespan,
+        dependencies=[Depends(require_admin)],
+        # 接口文档把每个端点的形状都摊给了没登录的人
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.state = state
     app.state.process_manager = process_manager
     # 管理接口的重启同一时刻只跑一个：两个 engine 重启一起跑，先收尾的会在另一个停起中途放开 _restarting_engine；
@@ -286,10 +295,14 @@ def create_app(
     app.state.config_store = config_store
     app.state.platform_accounts = PlatformAccounts(state.workspace_root)
 
-    @app.get("/v1/health", response_model=HealthOut)
-    async def health() -> HealthOut:
+    @app.get("/v1/health", response_model=HealthOut, response_model_exclude_none=True)
+    async def health(request: Request) -> HealthOut:
         st: SupervisorState = app.state.state
         uptime = (_now() - st.started_at).total_seconds()
+        # 匿名能到：没出示令牌只回存活字段，出示了就照常验，错令牌一样计退避
+        if not presented_token(request):
+            return HealthOut(uptime_seconds=uptime)
+        verify_admin_token(request)
         return HealthOut(
             run_id=st.eventlog.run_id, started_at=st.started_at,
             uptime_seconds=uptime,
@@ -1075,90 +1088,6 @@ def create_app(
                 continue
         return out
 
-    @app.websocket("/v1/sessions/{session_id}/ws")
-    async def session_ws(websocket: WebSocket, session_id: str) -> None:
-        """Stream durable EventLog rows for one session over WebSocket."""
-        st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
-            await websocket.close(code=4004, reason="session not found")
-            return
-        await websocket.accept()
-
-        # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
-        # Clients rebuild historical state via GET /v1/sessions/{id}/history.
-        # How: consume the optional initial message for backward compat, then go
-        # straight to the live event loop. Purpose: eliminate catch-up replay that
-        # caused stale events (e.g. old approval_requested) to be re-delivered.
-        try:
-            await asyncio.wait_for(
-                websocket.receive_text(),
-                timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            pass
-        except WebSocketDisconnect:
-            return
-        except Exception:
-            pass
-
-        queue = st.eventlog.subscribe(session_id)
-        sent_seq = 0
-        receive_task: asyncio.Task | None = None
-        try:
-            receive_task = asyncio.create_task(websocket.receive_text())
-            while True:
-                event_task = asyncio.create_task(queue.get())
-                done, _pending = await asyncio.wait(
-                    {event_task, receive_task},
-                    timeout=_WS_HEARTBEAT_SEC,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                if not done:
-                    event_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await event_task
-                    await _send_ws_json(websocket, {"type": "ping"})
-                    continue
-
-                if event_task in done:
-                    evt = event_task.result()
-                    try:
-                        evt_seq = int(evt.get("seq", 0) or 0)
-                    except Exception:
-                        evt_seq = 0
-                    if evt_seq > sent_seq:
-                        await _send_ws_json(websocket, evt)
-                        sent_seq = evt_seq
-                else:
-                    event_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await event_task
-
-                if receive_task in done:
-                    try:
-                        receive_task.result()
-                    except WebSocketDisconnect:
-                        break
-                    except Exception:
-                        break
-                    # [WS events 2026-05-17] Why: clients may send harmless control
-                    # frames after the initial last_seq. How: consume and ignore the
-                    # text, then wait for the next client frame. Purpose: a normal
-                    # client message does not terminate the event stream.
-                    receive_task = asyncio.create_task(websocket.receive_text())
-        except WebSocketDisconnect:
-            pass
-        finally:
-            if receive_task is not None and not receive_task.done():
-                receive_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await receive_task
-            elif receive_task is not None and receive_task.done():
-                with contextlib.suppress(Exception):
-                    receive_task.result()
-            st.eventlog.unsubscribe(session_id, queue)
-
     @app.websocket("/v1/ws")
     async def global_ws(websocket: WebSocket) -> None:
         """Stream durable EventLog rows for all sessions over WebSocket."""
@@ -1170,18 +1099,10 @@ def create_app(
         event_task: asyncio.Task | None = None
         try:
             await websocket.accept()
-            try:
-                initial = json.loads(await asyncio.wait_for(
-                    websocket.receive_text(), timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
-                ))
-            except (asyncio.TimeoutError, ValueError):
-                initial = {}
-            if isinstance(initial, dict) and initial.get("replay_outbound") is True:
-                try:
-                    verify_admin_token(websocket)
-                except HTTPException:
-                    await websocket.close(code=1008, reason="Unauthorized outbound replay")
-                    return
+            initial = await _authorized_first_frame(websocket)
+            if initial is None:
+                return
+            if initial.get("replay_outbound") is True:
                 cursor = initial.get("last_seq")
                 if cursor is not None and (type(cursor) is not int or cursor < 0 or cursor > snapshot_seq):
                     await websocket.close(code=1008, reason="Invalid outbound cursor")
@@ -1204,6 +1125,9 @@ def create_app(
                         cursor = checkpoint
                 await _send_ws_json(websocket, {"type": "outbound_checkpoint", "seq": snapshot_seq})
                 sent_seq = snapshot_seq
+            else:
+                # 浏览器 accept 时就触发 onopen，连接真的能用要等这一帧
+                await _send_ws_json(websocket, {"type": "stream_ready"})
             receive_task = asyncio.create_task(websocket.receive_text())
             while True:
                 event_task = asyncio.create_task(queue.get())
@@ -1413,23 +1337,6 @@ def create_app(
         results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         return results[offset:offset + limit]
 
-    @app.post("/v1/sessions/get_or_create")
-    async def get_or_create_session(
-        request: Request,
-        body: dict[str, Any] = Body(...),
-    ) -> dict[str, Any]:
-        """Get or create a session by channel + conversation_key. No task created."""
-        st: SupervisorState = app.state.state
-        channel = str(body.get("channel") or "").strip()
-        conv_key = str(body.get("conversation_key") or "").strip()
-        if not conv_key:
-            raise HTTPException(status_code=400, detail="conversation_key is required")
-        if not channel:
-            channel = conv_key.split(":", 1)[0] if ":" in conv_key else "unknown"
-        with st._lock:
-            session_id = st.get_or_create_session(channel=channel, conversation_key=conv_key)
-        return {"session_id": session_id, "conversation_key": conv_key}
-
     @app.delete("/v1/sessions/{session_id}")
     def delete_session(session_id: str) -> dict[str, Any]:
         """Delete a session and its conversation store."""
@@ -1485,12 +1392,6 @@ def create_app(
     async def session_cancelled(session_id: str) -> dict[str, Any]:
         st: SupervisorState = app.state.state
         return {"cancelled": st.is_cancelled(session_id)}
-
-    @app.post("/v1/sessions/{session_id}/cancel/clear")
-    async def session_cancel_clear(session_id: str) -> dict[str, Any]:
-        st: SupervisorState = app.state.state
-        st.clear_cancelled(session_id)
-        return {"ok": True}
 
     def _reset_conversation(st: "SupervisorState", conv_key: str) -> dict[str, Any]:
         """重置一个会话。控制台和 /clear 走同一条路，否则一边清了另一边还留着。"""
@@ -1787,9 +1688,8 @@ def create_app(
         return ApprovalGrantRevokeOut(revoked=revoked, count=len(revoked))
 
     @app.post("/v1/ops/request", response_model=OpRequestOut)
-    def ops_request(inp: OpRequestIn, request: Request) -> OpRequestOut:
+    def ops_request(inp: OpRequestIn) -> OpRequestOut:
         st: SupervisorState = app.state.state
-        _audit_ops_caller(st, request, inp)
         # [AutoC 2026-05-31] Why: ops/request is the policy path used by tools.
         # How: pass optional tool_call_id/node_id/task_id through to the supervisor
         # state layer. Purpose: approval_requested events can update the active tool
@@ -1805,9 +1705,8 @@ def create_app(
 
     # 只问结论：和 /v1/ops/request 同一套判定，但不创建审批，回的只有 safety_level 和 reason
     @app.post("/v1/ops/evaluate", response_model=OpRequestOut, response_model_exclude={"approval_id"})
-    def ops_evaluate(inp: OpRequestIn, request: Request) -> OpRequestOut:
+    def ops_evaluate(inp: OpRequestIn) -> OpRequestOut:
         st: SupervisorState = app.state.state
-        _audit_ops_caller(st, request, inp)
         return st.evaluate_operation(
             session_id=inp.session_id,
             op=inp.op,

@@ -167,6 +167,20 @@ class TestConfigWritesNeedApproval:
         "config/models.yaml",
         "config/tools/scraper.py",
         "defaults/nodes/qq.orchestrator.yaml",
+        # 顶层模块、平台和插件运行时、依赖清单、重启即执行的 git/venv/pyc：单实例部署里这些就在工作区
+        "platforms/protection.py",
+        "plugin_runtime/host.py",
+        "plugin_sdk/anything.py",
+        "stickers/imagebed.py",
+        "config_layout.py",
+        "real_paths.py",
+        "file_lock.py",
+        "workspace.py",
+        "requirements.txt",
+        ".git/config",
+        ".venv/lib/x.pth",
+        "__pycache__/config_layout.cpython-311.pyc",
+        "engine/__pycache__/runner.cpython-311.pyc",
     ])
     def test_execution_affecting_paths_are_not_auto(self, tmp_path: Path, path: str) -> None:
         """这些路径写入后都会被执行或进提示词，落在 default:auto 上等于免审批改行为。"""

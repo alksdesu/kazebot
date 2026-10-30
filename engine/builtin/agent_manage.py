@@ -155,7 +155,10 @@ async def _add_delegate_target(ctx: ToolContext, caller_node_id: str, name: str)
     if err is not None:
         return _CallerUpdate(denied=str(err.get("error", "denied")) if isinstance(err, dict) else str(err))
     try:
-        config_layout.write_config_text(caller_target, caller_yaml, base_hash=base_hash)
+        config_layout.write_config_text(
+            caller_target, caller_yaml, base_hash=base_hash,
+            mode=config_layout.private_mode_for(workspace_root, caller_target),
+        )
     except config_layout.ConfigConflict:
         return _CallerUpdate(error=f"{caller_rel} 在等审批的时候被改过，没有写，免得盖掉那次改动")
     except OSError as exc:
@@ -272,7 +275,10 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if err is not None:
         return _guard_err(err)
 
-    config_layout.write_config_text(target_path, _node_yaml)
+    # 节点 YAML 可以单配 api_key，新建就只给属主
+    config_layout.write_config_text(
+        target_path, _node_yaml, mode=config_layout.private_mode_for(workspace_root, target_path),
+    )
 
     # Step 6: 更新调用者的 delegate_targets（如果指定了 caller_node_id）
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点

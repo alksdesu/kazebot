@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import config_layout
+
 from .. import edit_journal, file_state
 from ..context import ToolContext, project_origin_of, project_root_of
 from .._common import request_guard, resolve_under_allowed_roots
@@ -55,7 +57,8 @@ def _commit(
         )
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            stamp = file_state.commit_locked(resolved, data, expected=snapshot)
+            new_mode = None if snapshot.exists else config_layout.private_mode_for(scope.workspace_root, resolved)
+            stamp = file_state.commit_locked(resolved, data, expected=snapshot, new_file_mode=new_mode)
         except BaseException:
             pending.discard()
             raise

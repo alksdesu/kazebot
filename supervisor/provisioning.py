@@ -258,8 +258,12 @@ def _env_body(plan: Plan) -> str:
 def scaffold(plan: Plan, workspace_root: Path) -> None:
     """建目录骨架。到这一步为止全都在 kazebot 权限内，失败不会留下半个服务。"""
     repo = _repo_root()
-    (plan.workspace / "data").mkdir(parents=True, exist_ok=True)
-    (plan.workspace / "config").mkdir(parents=True, exist_ok=True)
+    # config/ 有密钥、data/ 有令牌和会话，只给属主，和 bootstrap.sh 的 0700 对齐；mkdir 的 mode 受 umask 削，再 chmod 补上
+    for name in ("data", "config"):
+        directory = plan.workspace / name
+        directory.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
     # NapCat 要按同一个绝对路径读写附件，容器挂载前目录得先在。
     (plan.workspace / "data" / "attachments").mkdir(parents=True, exist_ok=True)
 

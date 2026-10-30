@@ -26,6 +26,7 @@ from clonoth_runtime import (  # noqa: E402
     TASK_REAP_INTERVAL_SECONDS,
     task_max_running_seconds,
 )
+import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -50,6 +51,17 @@ from supervisor.types import (  # noqa: E402
 
 _NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 _MAX_RUNNING = 3600.0
+
+_TOKEN = "task-reaper-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    # running_tasks 这类读接口现在要管理员令牌
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
 
 # tests/ 之外的代码只有 clonoth_runtime 该读这个变量，别处再读一次就会各有各的默认值。
 _TIME_LIMIT_ENV = "CLONOTH_TASK_MAX_RUNNING_SECONDS"
@@ -702,7 +714,7 @@ def test_running_tasks_endpoint_reaps_and_omits_the_stuck_task(
     async def _call() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            return await client.get(f"/v1/sessions/{session_id}/running_tasks")
+            return await client.get(f"/v1/sessions/{session_id}/running_tasks", headers=_AUTH)
 
     response = asyncio.run(_call())
 
@@ -728,7 +740,7 @@ def test_running_tasks_lists_a_task_waiting_on_sub_agents_only_when_asked(tmp_pa
     async def _call(**params: str) -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            return await client.get(f"/v1/sessions/{session_id}/running_tasks", params=params)
+            return await client.get(f"/v1/sessions/{session_id}/running_tasks", params=params, headers=_AUTH)
 
     adapter_view = asyncio.run(_call()).json()["tasks"]
     console_view = asyncio.run(_call(include_suspended="true")).json()["tasks"]

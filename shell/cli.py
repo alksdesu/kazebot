@@ -15,11 +15,26 @@ from clonoth_runtime import (
     admin_auth_headers,
     get_float,
     load_runtime_config,
+    retry_after_sec,
     strip_tool_trace_blocks,
     wait_supervisor,
 )
 from shell.approvals import approval_settled_text, decision_took_effect
 from workspace import resolve_workspace_root
+
+_AUTH_REJECTED = frozenset({401, 403})
+
+
+def _auth_problem(response: httpx.Response) -> str:
+    """令牌被拒、来源正在认证退避时给用户看的一句话；别的回答是空串。"""
+    if response.status_code in _AUTH_REJECTED:
+        return (
+            f"supervisor 拒绝了令牌（HTTP {response.status_code}），"
+            "确认 CLONOTH_ADMIN_TOKEN 或 data/.admin_token 是 supervisor 现在用的那个"
+        )
+    if response.status_code == 429:
+        return f"认证失败次数过多，supervisor 要求等 {response.headers.get('Retry-After', '?')} 秒再试"
+    return ""
 
 
 def _print_outbound(text: str) -> None:
@@ -105,6 +120,8 @@ class _PushPoller:
         self._lock = threading.Lock()
         self._global_seq: int = global_seq
         self._paused: bool = False
+        # 令牌被拒就停：每轮再问一次只会给 supervisor 多记一次认证失败
+        self._stopped: bool = False
         # 推送过、还没定案的审批：在别处定案或失效时补一句，免得还照着旧提示去批
         self._announced_approvals: set[str] = set()
 
@@ -129,13 +146,18 @@ class _PushPoller:
         with self._lock:
             return self._global_seq
 
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
+
     def forget_approval(self, approval_id: str) -> None:
         """这条审批由用户在这里亲自定了，之后的定案事件不用再提示。"""
         with self._lock:
             self._announced_approvals.discard(approval_id)
 
     def _loop(self) -> None:
-        while True:
+        while not self.stopped:
             try:
                 self._tick()
             except Exception:
@@ -144,7 +166,7 @@ class _PushPoller:
 
     def _tick(self) -> None:
         with self._lock:
-            if self._paused:
+            if self._paused or self._stopped:
                 return
             seq = self._global_seq
 
@@ -153,6 +175,13 @@ class _PushPoller:
                 f"{self._base_url}/v1/events",
                 params={"after_seq": seq, "types": "outbound_message,approval_requested,approval_decided"},
             )
+            if r.status_code in _AUTH_REJECTED:
+                with self._lock:
+                    self._stopped = True
+                sys.stdout.write(f"\n[push] {_auth_problem(r)}；后台推送已停\nyou> ")
+                sys.stdout.flush()
+                return
+            # 429（来源正在认证退避）和别的临时错误：这一轮跳过
             if r.status_code != 200:
                 return
             events = r.json()
@@ -255,9 +284,18 @@ def main() -> None:
     )
     events_poll_interval_sec = get_float(runtime_cfg, "shell.events_poll_interval_sec", 0.5, min_value=0.1, max_value=10.0)
 
+    auth_headers = admin_auth_headers(workspace_root)
+    if not auth_headers:
+        print(
+            "[shell-cli] 读不到管理令牌：supervisor 的接口都要它。"
+            f"设 CLONOTH_ADMIN_TOKEN，或先启动一次 supervisor 让它写出 {workspace_root / 'data' / '.admin_token'}",
+            flush=True,
+        )
+        sys.exit(1)
+
     with httpx.Client(
         timeout=client_timeout_sec, trust_env=False,
-        headers=admin_auth_headers(workspace_root),
+        headers=auth_headers,
     ) as client:
         wait_supervisor(
             base_url,
@@ -343,6 +381,11 @@ def main() -> None:
                     "text": text,
                 },
             )
+            problem = _auth_problem(r)
+            if problem:
+                print(f"[shell-cli] 没发出去：{problem}", flush=True)
+                push.resume()
+                continue
             r.raise_for_status()
             session_id = r.json()["session_id"]
 
@@ -381,6 +424,12 @@ def main() -> None:
                         f"{base_url}/v1/sessions/{session_id}/events",
                         params={"after_seq": after_seq},
                     )
+                    if er.status_code == 429:
+                        time.sleep(retry_after_sec(er.headers, events_poll_interval_sec))
+                        continue
+                    if er.status_code in _AUTH_REJECTED:
+                        print(f"\n[shell-cli] 不再等回复：{_auth_problem(er)}", flush=True)
+                        break
                     er.raise_for_status()
                     events = er.json()
 

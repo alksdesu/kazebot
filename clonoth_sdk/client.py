@@ -3,6 +3,7 @@
 Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 中提取所有直接 HTTP 调用。
 使用 httpx.AsyncClient 作为底层 HTTP 库。
 SDK 是纯协议层，不包含任何平台（OneBot / Telegram 等）相关逻辑。
+下面的端点都要管理员令牌；/v1/health 不带令牌也应答，但只回 status 和 uptime_seconds。
 
 封装的 API 端点及对应原始代码位置：
   POST   /v1/inbound                         ← _submit_inbound()
@@ -331,7 +332,7 @@ class ClonothClient:
     ) -> list[Event]:
         """从全局事件流拉取新事件。
 
-        对应 GET /v1/events。
+        对应 GET /v1/events，要管理员令牌。
         提取自 bot_adapter.py _outbound_poller() 中的事件轮询逻辑。
 
         Args:
@@ -353,7 +354,10 @@ class ClonothClient:
         return [Event.from_dict(e) for e in resp.json()]
 
     async def ws_connect(self, last_seq: int | None = None) -> AsyncGenerator[dict[str, Any], None]:
-        """连接事件流，并从已持久接收的位置补收回复；首次连接只接收新事件。"""
+        """连接事件流，并从已持久接收的位置补收回复；首次连接只接收新事件。
+
+        令牌放在握手的 Authorization 头里；没有令牌或令牌不对，supervisor 用 4401 关掉连接。
+        """
         try:
             import websockets
         except ImportError as exc:  # pragma: no cover - exercised only in lean installs.
@@ -497,7 +501,7 @@ class ClonothClient:
         return result.effective
 
     async def get_approval(self, approval_id: str) -> dict[str, Any] | None:
-        """查一条审批的当前状态，对应 GET /v1/approvals/{approval_id}；不存在返回 None。"""
+        """查一条审批的当前状态，对应 GET /v1/approvals/{approval_id}（要管理员令牌）；不存在返回 None。"""
         resp = await self._http().get(f"{self._base_url}/v1/approvals/{_path_id(approval_id)}")
         if resp.status_code == 404:
             return None
@@ -633,7 +637,8 @@ class ClonothClient:
 
         对应 GET /v1/health。
         提取自 bot_adapter.py on_ready() 中获取 workspace_root 的逻辑。
-        启动时可通过此方法动态获取工作区路径。
+        启动时可通过此方法动态获取工作区路径；run_id、workspace_root、started_at 只回给带了管理员令牌的请求，
+        没带令牌时这几项是空串。
 
         Raises:
             httpx.HTTPStatusError: Supervisor 不可达时抛出

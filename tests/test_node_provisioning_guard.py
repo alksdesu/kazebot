@@ -116,6 +116,20 @@ async def test_allowed_create_agent_still_works(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(__import__("os").name == "nt", reason="Windows 不用 POSIX 权限位")
+async def test_a_new_node_file_is_owner_only(tmp_path: Path) -> None:
+    # 节点 YAML 可以单配 api_key，落盘就只给属主
+    _seed(tmp_path, caller="boss")
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    import os
+    node = tmp_path / "config" / "nodes" / "helper.yaml"
+    assert node.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 async def test_denied_caller_update_leaves_delegate_targets_alone(tmp_path: Path) -> None:
     """节点建得成、扩委派图不一定。两次写入各自送审，不能一次放行管两件事。"""
     _seed(tmp_path, caller="boss")

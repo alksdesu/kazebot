@@ -849,7 +849,8 @@ def write_locked(
         try:
             shutil.copy2(path, path.with_name(f"{path.name}.bak"))
         except OSError as exc:
-            raise ConfigBackupError(f"备份 {path.name} 失败，未写入：{exc}") from exc
+            # str(exc) 带源和目标的绝对路径，config_error_text 只给 strerror
+            raise ConfigBackupError(f"备份 {path.name} 失败，未写入：{config_error_text(exc)}") from exc
     target_mode = existing_mode if existing_mode is not None else mode
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
     try:
@@ -891,13 +892,24 @@ def write_config_text(
         return write_locked(path, content, base_hash=base_hash, backup=backup, mode=mode)
 
 
+def _is_private_rel(rel: str) -> bool:
+    """按逻辑名算，这份文件新建时只给属主：装密钥的配置，和可能单配 api_key 的节点文件（含 .md 片段、.bak）。"""
+    return is_secret_bearing(rel) or rel == NODES_DIR or rel.startswith(f"{NODES_DIR}/")
+
+
 def private_mode_for(workspace_root: Path | str, path: Path) -> int | None:
-    """这份配置新建时该给的权限：装密钥的只给属主，其余交给 umask。"""
+    """这份配置新建时该给的权限：装密钥的和节点文件只给属主，其余交给 umask。
+
+    节点文件可能经共享组的 config/ 链接通到外面，relative_to 认不出，退回按受信链接认逻辑名。
+    """
+    p = Path(path)
     try:
-        rel = Path(path).relative_to(Path(workspace_root)).as_posix()
+        rel = p.relative_to(Path(workspace_root)).as_posix()
     except ValueError:
+        rel = workspace_logical_path(workspace_root, p)
+    if rel is None:
         return None
-    return _PRIVATE_MODE if is_secret_bearing(rel) else None
+    return _PRIVATE_MODE if _is_private_rel(rel) else None
 
 
 def remove_config_file(path: Path, *, base_hash: str | None = None) -> bool:

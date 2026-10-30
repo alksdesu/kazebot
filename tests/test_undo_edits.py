@@ -389,6 +389,34 @@ class TestUndo:
         assert path.read_bytes() == b"one\n"
         assert path.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_a_deleted_node_file_comes_back_no_broader_than_owner_only(self, tmp_path: Path) -> None:
+        # 节点可能单配 api_key，恢复已删的节点文件时和原权限取交集，不会比 0600 更宽
+        nodes = tmp_path / "config" / "nodes"
+        nodes.mkdir(parents=True)
+        path = seed(nodes / "agent.yaml", b"model: x\n")
+        os.chmod(path, 0o644)
+        ctx = _Ctx(tmp_path)
+        diff(ctx, "config/nodes/agent.yaml", "model: x", "model: y")
+        path.unlink()
+
+        assert undo(ctx, force=True)["ok"] is True
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_a_stricter_recorded_mode_is_kept_on_restore(self, tmp_path: Path) -> None:
+        nodes = tmp_path / "config" / "nodes"
+        nodes.mkdir(parents=True)
+        path = seed(nodes / "agent.yaml", b"model: x\n")
+        os.chmod(path, 0o400)
+        ctx = _Ctx(tmp_path)
+        diff(ctx, "config/nodes/agent.yaml", "model: x", "model: y")
+        path.unlink()
+
+        assert undo(ctx, force=True)["ok"] is True
+        # 0o400 & 0o600 = 0o400，比 0600 更严的照旧
+        assert path.stat().st_mode & 0o777 == 0o400
+
 
 class TestForceValues:
     @staticmethod

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from clonoth_runtime import switch_arg
 
 from .. import file_state
@@ -428,7 +429,12 @@ def _undo_locked(
         stamp: file_state.Stamp | None = None
         if plan.action == "restore":
             original = data if data is not None else journal.load_pre_image(task.session, task.task_id, current)
-            stamp = _restore_locked(path, original, snapshot, current.pre.mode)
+            # 恢复已删的节点等私有文件：和原权限取交集，重建出来的不会比 0600 更宽
+            restore_mode = current.pre.mode
+            private = config_layout.private_mode_for(journal.workspace_root, path)
+            if restore_mode is not None and private is not None:
+                restore_mode &= private
+            stamp = _restore_locked(path, original, snapshot, restore_mode)
             action = RESTORED
         elif plan.action == "delete":
             _delete_locked(path, snapshot)

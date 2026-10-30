@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Literal, Mapping
 
 import config_layout
-from clonoth_runtime import get_float, load_runtime_config, parse_bool
+from clonoth_runtime import get_float, load_runtime_config, parse_bool, read_admin_token, session_event_token
 
 from . import builtins as _builtins
 from . import edit_journal
@@ -266,7 +266,16 @@ _SCRIPT_IDENTITY_ENV_KEYS = {
     "CLONOTH_TOOL_CALL_ID",
     "CLONOTH_REQUEST_ID",
     "CLONOTH_TOOL_INVOCATION_ID",
+    "CLONOTH_EVENT_TOKEN",
 }
+
+
+def _script_event_token(ctx: Any, session_id: str) -> str:
+    """脚本往 session_id 这个会话发中间回复用的凭据；supervisor 只认它发到这个会话的 intermediate_reply。"""
+    root = getattr(ctx, "workspace_root", None)
+    if not session_id or not isinstance(root, Path):
+        return ""
+    return session_event_token(read_admin_token(root), session_id)
 
 
 def _script_tool_env(ctx: Any) -> dict[str, str]:
@@ -289,6 +298,9 @@ def _script_tool_env(ctx: Any) -> dict[str, str]:
         "CLONOTH_NODE_ID": str(getattr(ctx, "node_id", "") or ""),
         "CLONOTH_CONVERSATION_KEY": str(getattr(ctx, "conversation_key", "") or ""),
     })
+    event_token = _script_event_token(ctx, env["CLONOTH_PARENT_SESSION_ID"] or env["CLONOTH_SESSION_ID"])
+    if event_token:
+        env["CLONOTH_EVENT_TOKEN"] = event_token
 
     optional_identity = (
         ("CLONOTH_TOOL_CALL_ID", ("tool_call_id",)),

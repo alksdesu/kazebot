@@ -24,10 +24,13 @@ from supervisor.policy import PolicyEngine
 from supervisor.state import SupervisorState
 from supervisor.types import TaskKind, TaskStatus
 
+_TOKEN = "test-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
 
 @pytest.fixture()
 def app_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "test-token")
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
     state = SupervisorState(
@@ -50,7 +53,7 @@ def append(log, text, event_type="outbound_message", **kwargs):
 
 
 class Socket:
-    def __init__(self, initial, *, stop, during_handshake=None, token="test-token"):
+    def __init__(self, initial, *, stop, during_handshake=None, token=_TOKEN):
         self.initial = initial
         self.stop = stop
         self.during_handshake = during_handshake
@@ -135,19 +138,64 @@ def test_reconnect_replays_offline_reply_then_live_reply_once(app_state, monkeyp
     assert [f["payload"]["text"] for f in frames if "payload" in f] == ["while-offline", "during-replay"]
 
 
-def test_replay_requires_token_while_web_remains_live_only(app_state):
+def test_the_stream_requires_a_token(app_state):
     app, state = app_state
     append(state.eventlog, "old")
+
+    # 补收连接没带令牌：4401 关闭、一帧都不发、订阅退掉。
     unauthorized = Socket({"replay_outbound": True, "last_seq": 0}, stop=lambda _: False, token="")
     run_socket(app, unauthorized)
-    assert unauthorized.closed[0] == 1008
+    assert unauthorized.closed[0] == 4401
     assert unauthorized.sent == []
+    assert state.eventlog._global_subscribers == []
+
+    # 实时连接（不补收）没带令牌同样 4401：浏览器在首帧里带令牌，不是这条路。
+    live = Socket({"last_seq": 0}, token="", stop=lambda _: False)
+    run_socket(app, live)
+    assert live.closed[0] == 4401
+    assert live.sent == []
+
+
+def test_a_first_frame_token_opens_the_live_stream(app_state):
+    app, state = app_state
     frames = run_socket(app, Socket(
-        {"last_seq": 0}, token="",
+        {"token": _TOKEN}, token="",
         during_handshake=lambda: append(state.eventlog, "new"),
-        stop=lambda frame: frame["type"] == "outbound_message",
+        stop=lambda frame: frame.get("type") == "outbound_message",
     ))
-    assert [frame["payload"]["text"] for frame in frames] == ["new"]
+    # 认证通过先发 stream_ready，前端收到它才算真连上
+    assert frames[0] == {"type": "stream_ready"}
+    assert [f["payload"]["text"] for f in frames if "payload" in f] == ["new"]
+
+
+def test_a_wrong_first_frame_token_is_closed_and_counted(app_state):
+    app, state = app_state
+    bad = Socket({"token": "nope"}, token="", stop=lambda _: False)
+    run_socket(app, bad)
+    assert bad.closed[0] == 4401
+    assert bad.sent == []
+    assert admin_api._auth_failures.get("test", (0, 0.0))[0] == 1
+
+
+def test_a_source_in_backoff_is_closed_with_4429(app_state):
+    app, state = app_state
+    for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 1):
+        run_socket(app, Socket({"token": "nope"}, token="", stop=lambda _: False))
+    blocked = Socket({"token": _TOKEN}, token="", stop=lambda _: False)
+    run_socket(app, blocked)
+    assert blocked.closed[0] == 4429
+    assert blocked.closed[1]  # reason 里写要等几秒
+
+
+def test_a_handshake_header_wins_over_the_first_frame(app_state):
+    app, state = app_state
+    frames = run_socket(app, Socket(
+        {"token": "nope"}, token=_TOKEN,
+        during_handshake=lambda: append(state.eventlog, "ok"),
+        stop=lambda frame: frame.get("type") == "outbound_message",
+    ))
+    assert frames[0] == {"type": "stream_ready"}
+    assert [f["payload"]["text"] for f in frames if "payload" in f] == ["ok"]
 
 
 def test_trimmed_logs_report_gap_and_replay_retained_replies(app_state):
@@ -346,7 +394,7 @@ def test_replay_pages_follow_a_rotation_between_pages(tmp_path, monkeypatch):
 
 def post(app, path, content):
     async def exercise():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=_AUTH) as client:
             return await client.post(path, content=content)
     return asyncio.run(exercise())
 
@@ -383,7 +431,7 @@ def test_delete_session_cancels_active_tasks_through_reset(app_state):
         task.status = TaskStatus.running
 
     async def exercise():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=_AUTH) as client:
             response = await client.delete(f"/v1/sessions/{session_id}")
             assert response.status_code == 200
             assert response.json() == {"ok": True, "session_id": session_id}

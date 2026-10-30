@@ -144,6 +144,8 @@ def _app(state: SupervisorState, workspace: Path) -> Any:
 
 
 def _call(app: Any, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    kwargs.setdefault("headers", _AUTH)
+
     async def run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -534,7 +536,7 @@ class TestResolveEndpoint:
         app = _app(state, tmp_path)
         url = f"/v1/tasks/{entry.task_id}/family/resolve"
 
-        assert _call(app, "GET", url, params={"ref": "bob"}).status_code == 401
+        assert _call(app, "GET", url, params={"ref": "bob"}, headers={}).status_code == 401
         assert _call(app, "GET", url, params={"ref": ""}, headers=_AUTH).status_code == 422
         assert _call(app, "GET", url, headers=_AUTH).status_code == 422
 

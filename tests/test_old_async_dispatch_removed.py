@@ -118,6 +118,8 @@ def _app(state: SupervisorState, workspace: Path) -> Any:
 
 
 def _call(app: Any, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    kwargs.setdefault("headers", _AUTH)
+
     async def run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

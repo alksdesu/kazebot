@@ -99,7 +99,7 @@ class TestBackoff:
         assert delays[:free] == [0.0] * free
         assert delays[free] == pytest.approx(admin_api._AUTH_BACKOFF_BASE_SEC)
         assert delays[free + 1] > delays[free]
-        assert max(delays) == pytest.approx(admin_api._AUTH_BACKOFF_MAX_SEC)
+        assert max(delays) == pytest.approx(admin_api.AUTH_BACKOFF_MAX_SEC)
 
     def test_a_success_clears_the_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for _ in range(admin_api._AUTH_FREE_ATTEMPTS):
@@ -116,7 +116,7 @@ class TestBackoff:
         for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 1):
             _fail()
 
-        monkeypatch.setattr(time, "time", lambda: base + admin_api._AUTH_BACKOFF_MAX_SEC + 1)
+        monkeypatch.setattr(time, "time", lambda: base + admin_api.AUTH_BACKOFF_MAX_SEC + 1)
         admin_api.verify_admin_token(_Request(token=_TOKEN))
 
     def test_backoff_is_per_client(self) -> None:
@@ -150,10 +150,46 @@ class TestBackoff:
 
 class TestConstantTimeComparison:
     def test_it_uses_compare_digest(self) -> None:
-        # 逐字节短路的 == 能让攻击者按响应时间问出 token。
+        # 逐字节短路的 == 能让攻击者按响应时间问出 token。比较逻辑现在在 _verify_credential 里。
         source = Path(admin_api.__file__).read_text(encoding="utf-8")
-        body = source[source.index("def verify_admin_token"):]
+        body = source[source.index("def _verify_credential"):]
         body = body[:body.index("\ndef ", 1)]
 
         assert "compare_digest" in body
-        assert "== token" not in body
+        assert "== expected" not in body
+        assert "presented == " not in body
+
+
+class TestWhoEntersTheBackoff:
+    def test_an_empty_request_does_not_enter_the_backoff(self) -> None:
+        # 没出示令牌不是一次猜测：记了只会把没带令牌的老客户端所在来源锁死。
+        for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 5):
+            try:
+                admin_api.verify_admin_token(_Request(host="10.0.0.7"))
+            except HTTPException as exc:
+                assert exc.status_code == 401
+        assert "10.0.0.7" not in admin_api._auth_failures
+
+    def test_a_loopback_source_does_not_enter_the_backoff(self) -> None:
+        # 本机进程能伪造 XFF 换桶，在本机做退避挡不住爆破，只会锁死 engine。
+        for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 5):
+            _fail(host="127.0.0.1")
+        # 回环错令牌不计退避，拿对令牌照样直接过
+        admin_api.verify_admin_token(_Request(token=_TOKEN, host="127.0.0.1"))
+        assert "127.0.0.1" not in admin_api._auth_failures
+
+    def test_an_ipv6_mapped_loopback_is_recognised(self) -> None:
+        for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 5):
+            _fail(host="::ffff:127.0.0.1")
+        admin_api.verify_admin_token(_Request(token=_TOKEN, host="::ffff:127.0.0.1"))
+        assert "::ffff:127.0.0.1" not in admin_api._auth_failures
+
+    def test_a_non_loopback_source_still_enters_the_backoff(self) -> None:
+        for _ in range(admin_api._AUTH_FREE_ATTEMPTS + 1):
+            _fail(host="10.9.9.9")
+        try:
+            admin_api.verify_admin_token(_Request(token=_TOKEN, host="10.9.9.9"))
+        except HTTPException as exc:
+            assert exc.status_code == 429
+        else:
+            raise AssertionError("expected a non-loopback source to be throttled")

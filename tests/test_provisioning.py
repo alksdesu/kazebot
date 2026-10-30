@@ -466,6 +466,19 @@ def test_scaffold_links_code_dirs_and_writes_env(workspace: Path, monkeypatch: p
     assert (rows[0]["platform"], rows[0]["account"]) == ("qq", "1000000002")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不用 POSIX 权限位")
+def test_scaffold_gives_config_and_data_owner_only_directories(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # config/ 有密钥、data/ 有令牌和会话，和 bootstrap.sh 的 0700 对齐，挡住同机其他用户
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
+    plan = provisioning.plan_instance(workspace, instance_id="koki", label="")
+    provisioning.scaffold(plan, workspace)
+
+    assert (plan.workspace / "config").stat().st_mode & 0o777 == 0o700
+    assert (plan.workspace / "data").stat().st_mode & 0o777 == 0o700
+
+
 # ── .env 的内容 ──
 
 def _plan(workspace: Path, monkeypatch: pytest.MonkeyPatch, idx: int, instance_id: str = "koki") -> provisioning.Plan:

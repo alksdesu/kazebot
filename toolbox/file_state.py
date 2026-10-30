@@ -440,10 +440,13 @@ def edit_locks(paths: Iterable[Path], workspace_root: Path | str) -> Iterator[No
         yield
 
 
-def commit_locked(path: Path, data: bytes, *, expected: FileSnapshot) -> Stamp:
+def commit_locked(
+    path: Path, data: bytes, *, expected: FileSnapshot, new_file_mode: int | None = None,
+) -> Stamp:
     """确认文件仍是 expected 那一版，再原子写入 data，返回新戳。调用方须持有 edit_lock(path, 工作区)。
 
     engine worker 之间由 edit_lock 挡住；这里再比一次，挡的是不走这把锁的写入方（用户的编辑器、execute_command 跑的脚本）。
+    new_file_mode 只在新建文件时用：节点等私有文件落盘就是 0600。
     """
     current = take_snapshot(path)
     changed = current.exists != expected.exists or (
@@ -452,7 +455,7 @@ def commit_locked(path: Path, data: bytes, *, expected: FileSnapshot) -> Stamp:
     )
     if changed:
         raise ConcurrentEdit(CONCURRENT_MESSAGE)
-    replace_bytes(path, data)
+    replace_bytes(path, data, new_file_mode=new_file_mode)
     try:
         mtime_ns = os.stat(path).st_mtime_ns
     except OSError:

@@ -63,12 +63,17 @@ if __name__ == "__main__":
                 "attachments": attachments or [],
             },
         }
+        # 脚本拿不到管理令牌；engine 放进来的这个凭据只够往本会话发中间回复
+        headers = {"Content-Type": "application/json"}
+        event_token = os.environ.get("CLONOTH_EVENT_TOKEN", "")
+        if event_token:
+            headers["X-Clonoth-Event-Token"] = event_token
         try:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = urllib_request.Request(
                 f"{supervisor_url}/v1/sessions/{session_id}/events",
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             urllib_request.urlopen(req, timeout=3).read()

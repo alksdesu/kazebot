@@ -8,6 +8,7 @@ from typing import Any, TYPE_CHECKING
 from clonoth_runtime import strip_tool_trace_blocks
 
 from ...approvals import approval_settled_text
+from .supervisor_client import SupervisorAuthRejected
 from ..models import (
     ApprovalDecided,
     ApprovalRequested,
@@ -88,6 +89,9 @@ class EventPoller:
                     await self._poll_session_tick()
                 except asyncio.CancelledError:
                     raise
+                except SupervisorAuthRejected as rejected:
+                    self._give_up(rejected)
+                    return
                 except Exception:
                     pass  # 网络错误等，静默重试
                 interval = self._poll_fast if self._streaming else self._poll_slow
@@ -120,11 +124,25 @@ class EventPoller:
                     await self._poll_global_tick()
                 except asyncio.CancelledError:
                     raise
+                except SupervisorAuthRejected as rejected:
+                    self._give_up(rejected)
+                    return
                 except Exception:
                     pass
                 await asyncio.sleep(self._poll_slow * 4)
         except asyncio.CancelledError:
             pass
+
+    def _give_up(self, rejected: SupervisorAuthRejected) -> None:
+        """令牌被拒：两路轮询都停下，只提示一次。"""
+        if not self._running:
+            return
+        self._running = False
+        self._app.notify(
+            f"{rejected}，事件轮询已停；确认 CLONOTH_ADMIN_TOKEN 或 data/.admin_token 后重启 TUI",
+            severity="error",
+            timeout=15,
+        )
 
     async def _poll_global_tick(self) -> None:
         events = await self._client.get_global_events(

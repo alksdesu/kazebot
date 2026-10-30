@@ -289,6 +289,7 @@ _CORE_INJECTED_ENV: frozenset[str] = frozenset({
     "CLONOTH_LLM_REQUEST_ID",
     "CLONOTH_PROCESS_TAG",
     "CLONOTH_ORIGIN_VENV",
+    "CLONOTH_EVENT_TOKEN",
 })
 # httpx、urllib 从进程环境读的代理。Linux 上两种大小写是两个变量，部署的代理配置两种都设，urllib 先读小写的。
 _PROXY_ENV: frozenset[str] = frozenset({

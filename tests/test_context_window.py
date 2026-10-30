@@ -342,7 +342,13 @@ class TestReporting:
         assert report["threshold_source"] == "runtime_config"
         assert report["compact_threshold"] == 256_000
 
-    def test_the_endpoint_reports_what_the_engine_applied(self, tmp_path: Path) -> None:
+    def test_the_endpoint_reports_what_the_engine_applied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import supervisor.admin_api as admin_api
+        monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "context-window-token")
+        monkeypatch.setattr(admin_api, "_admin_token", "")
+        monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
         state = SupervisorState(
             workspace_root=tmp_path,
             eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="run-context-window"),
@@ -357,10 +363,12 @@ class TestReporting:
             "node_id": "worker", "task_id": "", "usage": {"prompt_tokens": 23_120}, "prompt_chars": 50_000,
             "compact_threshold": 115_600, "compact_hard_threshold": 136_000, "context_window": 200_000,
         }}
+        # context_window 读接口和写事件都要管理员令牌
+        auth = {"Authorization": "Bearer context-window-token"}
 
         async def run() -> tuple[dict[str, Any], dict[str, Any]]:
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver", headers=auth) as client:
                 before = (await client.get(f"/v1/sessions/{session_id}/context_window")).json()
                 posted = await client.post(f"/v1/sessions/{session_id}/events", json=usage_event)
                 assert posted.status_code == 200, posted.text

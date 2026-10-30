@@ -194,6 +194,49 @@ write_file:
     - pattern: "main.py"
       decision: approval_required
       reason: "entrypoint changes require approval"
+    # 顶层模块、平台和插件运行时等重启即执行的代码。单实例部署工作区就是代码目录，不补这些就落到 default:auto。
+    - pattern: "platforms/**"
+      decision: approval_required
+      reason: "platform adapters run as code"
+    - pattern: "plugin_runtime/**"
+      decision: approval_required
+      reason: "plugin runtime changes affect execution"
+    - pattern: "plugin_sdk/**"
+      decision: approval_required
+      reason: "plugin sdk changes affect execution"
+    - pattern: "stickers/**"
+      decision: approval_required
+      reason: "sticker pipeline runs as code"
+    - pattern: "config_layout.py"
+      decision: approval_required
+      reason: "top-level module changes require approval"
+    - pattern: "real_paths.py"
+      decision: approval_required
+      reason: "top-level module changes require approval"
+    - pattern: "file_lock.py"
+      decision: approval_required
+      reason: "top-level module changes require approval"
+    - pattern: "workspace.py"
+      decision: approval_required
+      reason: "top-level module changes require approval"
+    - pattern: "requirements*.txt"
+      decision: approval_required
+      reason: "dependency manifests are installed on deploy"
+    - pattern: ".git"
+      decision: approval_required
+      reason: "git config can run external programs during git commands"
+    - pattern: ".git/**"
+      decision: approval_required
+      reason: "git config can run external programs during git commands"
+    - pattern: ".venv/**"
+      decision: approval_required
+      reason: "a .pth file in the venv runs on every interpreter start"
+    - pattern: "__pycache__/**"
+      decision: approval_required
+      reason: "a stale pyc can be imported in place of its source"
+    - pattern: "**/__pycache__/**"
+      decision: approval_required
+      reason: "a stale pyc can be imported in place of its source"
     - pattern: ".env"
       decision: deny
       reason: "do not allow writing dotenv secrets"
@@ -250,6 +293,8 @@ execute_command:
   # 命令里提到这些路径时，按 read_file 对同一路径的档次处理。否则 read_file 拦住了
   # config/models.yaml，一句 cat 就绕过去。read_file 的规则会自动并进来，这里只补工作区
   # 之外的凭据位置；写成 [] 表示关掉这层。
+  # 读进程环境的命令（/proc/<pid>/environ、ps e 等）不管这里写什么都要审批，只有整个
+  # execute_command 都放行（default: auto 且三张列表都空）时才不拦。
   sensitive_path_patterns:
     - ".ssh/"
     - "id_rsa"

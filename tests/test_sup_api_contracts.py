@@ -56,6 +56,9 @@ def _app(state: SupervisorState, workspace: Path) -> Any:
 
 
 def _get(app: Any, url: str, **kwargs: Any) -> httpx.Response:
+    # 没显式给 headers 就带管理员令牌；验令牌的负路径用 headers={} 强制不带
+    kwargs.setdefault("headers", _AUTH)
+
     async def _run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -124,7 +127,7 @@ class TestTaskOrigin:
         _sid, _entry, child = _entry_with_child(state, _ADMIN)
         app = _app(state, tmp_path)
 
-        assert _get(app, f"/v1/tasks/{child.task_id}/origin").status_code == 401
+        assert _get(app, f"/v1/tasks/{child.task_id}/origin", headers={}).status_code == 401
         assert _get(app, "/v1/tasks/no-such-task/origin", headers=_AUTH).status_code == 404
 
 
@@ -220,7 +223,7 @@ class TestAttachmentHeaders:
         app = _app(state, tmp_path)
 
         missing = _get(app, "/v1/files/data/attachments/case/none.png", params={"token": _TOKEN})
-        unauthorized = _get(app, "/v1/files/data/attachments/case/none.png")
+        unauthorized = _get(app, "/v1/files/data/attachments/case/none.png", headers={})
 
         for response, status in ((missing, 404), (unauthorized, 401)):
             assert response.status_code == status

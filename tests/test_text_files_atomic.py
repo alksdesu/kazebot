@@ -173,6 +173,24 @@ class TestTheAtomicReplace:
 
         assert path.stat().st_mode & 0o777 == 0o750
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows 不用 POSIX 权限位")
+    def test_a_new_file_takes_the_given_mode(self, tmp_path: Path) -> None:
+        path = tmp_path / "node.yaml"
+
+        replace_bytes(path, b"model: x\n", new_file_mode=0o600)
+
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows 不用 POSIX 权限位")
+    def test_an_existing_file_ignores_the_new_file_mode(self, tmp_path: Path) -> None:
+        path = seed(tmp_path / "node.yaml", b"old\n")
+        os.chmod(path, 0o644)
+
+        replace_bytes(path, b"new\n", new_file_mode=0o600)
+
+        # 已有文件权限照旧，new_file_mode 只管新建
+        assert path.stat().st_mode & 0o777 == 0o644
+
     def test_a_symlink_is_written_through_and_stays_a_link(self, tmp_path: Path) -> None:
         target = seed(tmp_path / "real.txt", b"old\n")
         link = tmp_path / "link.txt"

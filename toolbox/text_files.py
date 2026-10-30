@@ -116,16 +116,19 @@ def _replace(source: Path, target: Path) -> None:
     os.replace(source, target)
 
 
-def replace_bytes(path: Path, data: bytes) -> int:
+def replace_bytes(path: Path, data: bytes, *, new_file_mode: int | None = None) -> int:
     """把 path 整份换成 data，返回落盘的字节数。目录须已存在。
 
     同目录临时文件写完 fsync 再 os.replace：读的人要么看到旧的整份，要么看到新的整份。
     已有文件的权限照旧；path 是软链时换的是它指向的文件，链接本身不动。
+    new_file_mode 只在 path 还不存在时给新文件用（节点等私有文件落盘就是 0600）。
     """
     target = Path(os.path.realpath(path))
     mode: int | None = None
     with contextlib.suppress(OSError):
         mode = target.stat().st_mode & 0o7777
+    if mode is None:
+        mode = new_file_mode
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
     try:
         # 建出来就是原文件的权限：先按 umask 建再 chmod 的话，中间那一瞬同机别的用户读得到内容。

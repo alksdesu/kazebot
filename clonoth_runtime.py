@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 import importlib.util
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -458,6 +461,32 @@ def admin_auth_headers(workspace_root: Path) -> dict[str, str]:
     """取不到令牌时返回空 dict：请求照发，由服务端决定拒不拒，不在客户端提前失败。"""
     token = read_admin_token(workspace_root)
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+# supervisor 认证失败退避的上限，客户端按它给 Retry-After 封顶
+AUTH_BACKOFF_MAX_SEC = 60.0
+
+
+def retry_after_sec(headers: Mapping[str, str], fallback: float, ceiling: float = AUTH_BACKOFF_MAX_SEC) -> float:
+    """429 回答里的 Retry-After 换成要等的秒数：读不出来按 fallback，不少于 fallback，不超过 ceiling。"""
+    try:
+        wait = float(headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(wait):
+        return fallback
+    return min(max(wait, fallback), ceiling)
+
+
+SESSION_EVENT_TOKEN_HEADER = "X-Clonoth-Event-Token"
+
+
+def session_event_token(admin_token: str, session_id: str) -> str:
+    """脚本工具往自己会话发中间回复用的凭据：管理令牌对会话 id 的 HMAC，推不回管理令牌，换个会话也用不了。"""
+    if not admin_token or not session_id:
+        return ""
+    message = f"session-event:{session_id}".encode("utf-8")
+    return hmac.new(admin_token.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
 def shared_env_value(key: str) -> str:

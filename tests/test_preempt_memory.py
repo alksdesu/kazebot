@@ -215,11 +215,15 @@ def test_inactive_task_rejects_preempt_without_mutating_identity(state: Supervis
 async def test_sdk_api_and_engine_update_the_same_preempt_memory(
     state: SupervisorState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import supervisor.admin_api as admin_api
     from clonoth_sdk.client import ClonothClient
     from engine.inference import ai_step, loop_state
     from supervisor.api import create_app
     from supervisor.config_store import ConfigStore
 
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "test-token")
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
     _archive(tmp_path, "UserA", constant=True)
     _archive(tmp_path, "UserB")
     app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path))
@@ -233,7 +237,9 @@ async def test_sdk_api_and_engine_update_the_same_preempt_memory(
         return context
 
     monkeypatch.setattr(loop_state, "ToolContext", capture_context)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    # preempt 接口现在要管理员令牌
+    auth = {"Authorization": "Bearer test-token"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=auth) as client:
         sdk = ClonothClient("http://test")
         sdk._client = client
         assert await sdk.preempt_task("task", message="UserB follow-up", memory_hints={"subjects": ["UserB"]})

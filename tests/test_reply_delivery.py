@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +26,7 @@ from engine.context import RunContext  # noqa: E402
 from engine.inference import async_delivery, pseudo_handlers  # noqa: E402
 from engine.inference.tool_format import create_tool_formatter  # noqa: E402
 from providers.base import ToolCall  # noqa: E402
+from supervisor import admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -33,6 +35,15 @@ from supervisor.state import SupervisorState  # noqa: E402
 
 CONV = "test:reply-delivery"
 SUPERVISOR = "http://testserver"
+_TOKEN = "reply-delivery-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
 
 
 def _state(workspace: Path, run_id: str = "reply-delivery") -> SupervisorState:
@@ -65,7 +76,7 @@ def _reply_event(delivery_id: str = "r-1", text: str = "稍等") -> dict[str, An
 
 def _post_events(app: Any, session_id: str, *bodies: dict[str, Any]) -> list[httpx.Response]:
     async def run() -> list[httpx.Response]:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=SUPERVISOR) as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=SUPERVISOR, headers=_AUTH) as client:
             return [await client.post(f"/v1/sessions/{session_id}/events", json=body) for body in bodies]
 
     return asyncio.run(run())
@@ -95,7 +106,7 @@ def test_a_reply_resent_after_its_answer_was_lost_lands_once(tmp_path: Path, mon
     transport = _AnswerLostOnce(httpx.ASGITransport(app=_app(state, tmp_path)))
 
     async def run() -> str:
-        async with httpx.AsyncClient(transport=transport, base_url=SUPERVISOR) as client:
+        async with httpx.AsyncClient(transport=transport, base_url=SUPERVISOR, headers=_AUTH) as client:
             rctx = RunContext(
                 workspace_root=tmp_path, supervisor_url=SUPERVISOR, session_id=session_id, worker_id="worker",
                 http=client, llm_http=client, task_id="task-1",
@@ -183,7 +194,7 @@ def test_the_event_endpoint_takes_its_locks_off_the_event_loop(tmp_path: Path) -
 
     async def run() -> tuple[int, list[int]]:
         loop_thread = threading.get_ident()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=SUPERVISOR) as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=SUPERVISOR, headers=_AUTH) as client:
             statuses = [(await client.post(f"/v1/sessions/{session_id}/events", json=body)).status_code for body in bodies]
         return loop_thread, statuses
 

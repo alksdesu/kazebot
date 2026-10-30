@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.state import APPROVAL_WAITER_SILENCE, ORPHANED_APPROVAL_COMMENT, SupervisorState  # noqa: E402
@@ -139,7 +140,12 @@ class TestSweep:
         assert _sweep(state) == [approval.approval_id]
         assert _expired(approval, "已经没有人在等这条审批")
 
-    def test_reading_an_approval_through_the_api_counts_as_waiting_for_it(self, tmp_path: Path) -> None:
+    def test_reading_an_approval_through_the_api_counts_as_waiting_for_it(
+        self, tmp_path: Path, monkeypatch: "Any",
+    ) -> None:
+        monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "test-token")
+        monkeypatch.setattr(admin_api, "_admin_token", "")
+        monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
         state = _state(tmp_path)
         sid = _session(state)
         task = _caller(state, sid)
@@ -155,7 +161,11 @@ class TestSweep:
         async def _read() -> httpx.Response:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                return await client.get(f"/v1/approvals/{approval.approval_id}")
+                # 读审批现在要管理员令牌
+                return await client.get(
+                    f"/v1/approvals/{approval.approval_id}",
+                    headers={"Authorization": "Bearer test-token"},
+                )
 
         assert asyncio.run(_read()).status_code == 200
         assert _sweep(state) == []

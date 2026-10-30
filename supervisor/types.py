@@ -433,10 +433,12 @@ class RestartOut(BaseModel):
 
 
 class HealthOut(BaseModel):
+    """存活探测的回答。run_id、workspace_root、started_at 只回给带对了令牌的请求。"""
+
     status: Literal["ok"] = "ok"
-    run_id: str
-    workspace_root: str = ""
-    started_at: datetime
+    run_id: str | None = None
+    workspace_root: str | None = None
+    started_at: datetime | None = None
     uptime_seconds: float
 
 

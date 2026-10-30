@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from clonoth_runtime import retry_after_sec
+
 from .approval_wait import waiting_for_approval
 
 # 工具按 0.2s 轮询取消，单次查询不能被无响应的 supervisor 拖住；超时当作没取消，下一轮再问。
@@ -245,10 +247,17 @@ class ToolContext:
             if await self.check_cancelled():
                 return {"approval_id": approval_id, "status": "cancelled"}
             r = await self.http.get(f"{self.supervisor_url}/v1/approvals/{approval_id}")
-            r.raise_for_status()
-            approval = r.json()
-            if approval.get("status") != "pending":
-                return approval
+            delay = interval
+            if r.status_code == 429:
+                # 这个来源正在认证退避（同一来源有人连发了错令牌）：审批仍按没结论算，退避过了再问
+                delay = retry_after_sec(r.headers, interval)
+                if timeout_sec > 0:
+                    delay = min(delay, max(interval, timeout_sec - (time.monotonic() - wait_started)))
+            else:
+                r.raise_for_status()
+                approval = r.json()
+                if approval.get("status") != "pending":
+                    return approval
             if timeout_sec > 0 and (time.monotonic() - wait_started) >= timeout_sec:
                 timeout_comment = f"approval timed out after {int(timeout_sec)}s with no decision; auto-denied"
                 # 先让 supervisor 落库 deny，审批卡才不会残留 pending；落不了库也照样按 deny 收手。
@@ -271,4 +280,4 @@ class ToolContext:
                 last_renew = now
                 if await self.renew_lease(_APPROVAL_RENEW_LEASE_SEC) is False:
                     return {"approval_id": approval_id, "status": "cancelled", "reason": "task claim is no longer held"}
-            await asyncio.sleep(interval)
+            await asyncio.sleep(delay)

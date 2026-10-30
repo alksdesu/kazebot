@@ -67,8 +67,16 @@ class GitOutput:
 
 
 def _base_command() -> list[str]:
-    # 不跑仓库里的钩子：worktree add 会触发 post-checkout，删分支会触发 reference-transaction
-    return ["git", "-c", f"core.hooksPath={os.devnull}", "-c", "core.longpaths=true"]
+    # .git/config 里配成程序路径的这些项，隔离副本的 git 操作一跑就执行它，所以每次都用命令行盖掉。
+    # clean/smudge 过滤器要配合 .gitattributes，命令行关不掉在仓库文件里的属性，靠 .git/** 的写策略挡住过滤器定义。
+    return [
+        "git",
+        # 不跑仓库里的钩子：worktree add 会触发 post-checkout，删分支会触发 reference-transaction
+        "-c", f"core.hooksPath={os.devnull}",
+        "-c", "core.longpaths=true",
+        # fsmonitor 配成一个程序，status/add/diff 都会去跑它，且不需要任何属性文件配合
+        "-c", "core.fsmonitor=false",
+    ]
 
 
 def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:

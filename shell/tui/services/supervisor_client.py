@@ -7,6 +7,16 @@ from typing import Any
 
 import httpx
 
+_AUTH_REJECTED = frozenset({401, 403})
+
+
+class SupervisorAuthRejected(Exception):
+    """supervisor 拒绝了令牌：照旧轮询只会每轮多记一次认证失败。"""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"supervisor 拒绝了令牌（HTTP {status_code}）")
+        self.status_code = status_code
+
 
 class SupervisorClient:
     """封装 Supervisor 全部 HTTP 端点，全部 async。"""
@@ -67,24 +77,20 @@ class SupervisorClient:
     # ---- 事件 ----
 
     async def get_session_events(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        """令牌被拒抛 SupervisorAuthRejected；别的非 200（含认证退避的 429）当作这一轮没有新事件。"""
         r = await self._client.get(
             f"/v1/sessions/{session_id}/events",
             params={"after_seq": after_seq},
         )
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
+        return _event_list(r)
 
     async def get_global_events(self, after_seq: int = 0, types: str | None = None) -> list[dict[str, Any]]:
+        """令牌被拒抛 SupervisorAuthRejected；别的非 200（含认证退避的 429）当作这一轮没有新事件。"""
         params: dict[str, Any] = {"after_seq": after_seq}
         if types:
             params["types"] = types
         r = await self._client.get("/v1/events", params=params)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
+        return _event_list(r)
 
     # ---- 会话控制 ----
 
@@ -139,3 +145,12 @@ class SupervisorClient:
             return r.status_code == 200 and bool(r.json().get("scheduled"))
         except Exception:
             return False
+
+
+def _event_list(response: httpx.Response) -> list[dict[str, Any]]:
+    if response.status_code in _AUTH_REJECTED:
+        raise SupervisorAuthRejected(response.status_code)
+    if response.status_code != 200:
+        return []
+    data = response.json()
+    return data if isinstance(data, list) else []

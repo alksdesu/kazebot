@@ -92,6 +92,37 @@ def _entrypoint_write_rules() -> list[dict[str, str]]:
     ]
 
 
+# 顶层模块、平台和插件运行时等重启即执行的代码，单实例部署里工作区就是代码目录，不补规则就落到 default:auto。
+# 第一个命中的规则赢，这些排在源码目录规则之后、.env 之前，彼此不交叠。
+_CODE_PATH_WRITE_FLOOR: tuple[tuple[str, str], ...] = (
+    ("platforms/**", "platform adapters run as code"),
+    ("plugin_runtime/**", "plugin runtime changes affect execution"),
+    ("plugin_sdk/**", "plugin sdk changes affect execution"),
+    ("stickers/**", "sticker pipeline runs as code"),
+    ("config_layout.py", "top-level module changes require approval"),
+    ("real_paths.py", "top-level module changes require approval"),
+    ("file_lock.py", "top-level module changes require approval"),
+    ("workspace.py", "top-level module changes require approval"),
+    ("requirements*.txt", "dependency manifests are installed on deploy"),
+    (".git", "git config can run external programs during git commands"),
+    (".git/**", "git config can run external programs during git commands"),
+    (".venv/**", "a .pth file in the venv runs on every interpreter start"),
+    ("__pycache__/**", "a stale pyc can be imported in place of its source"),
+    ("**/__pycache__/**", "a stale pyc can be imported in place of its source"),
+)
+
+
+def _code_path_write_rules() -> list[dict[str, str]]:
+    return [
+        {"pattern": pattern, "decision": "approval_required", "reason": reason}
+        for pattern, reason in _CODE_PATH_WRITE_FLOOR
+    ]
+
+
+def _compiled_code_path_floor() -> list[tuple[str, "SafetyLevel", str]]:
+    return [(pattern, SafetyLevel.approval_required, reason) for pattern, reason in _CODE_PATH_WRITE_FLOOR]
+
+
 def _default_policy_dict() -> dict[str, Any]:
     """Built-in default policy.
 
@@ -185,6 +216,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "shell/**", "decision": "approval_required", "reason": "shell source changes require approval"},
                 {"pattern": "clonoth_runtime.py", "decision": "approval_required", "reason": "runtime lib changes require approval"},
                 {"pattern": "main.py", "decision": "approval_required", "reason": "entrypoint changes require approval"},
+                *_code_path_write_rules(),
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 # 同上，虚拟路径。写的是 .env 里的单个键，值不经过 supervisor。
@@ -245,6 +277,72 @@ def _default_policy_dict() -> dict[str, Any]:
     }
 
 
+# 命令文本里读进程环境的写法。工具子进程 cat /proc/$PPID/environ 读到的是 engine 没剥过的完整环境，
+# 绕开 safe_subprocess_env 的剥离。任意 pid（数字、self、thread-self、$PPID、$$、通配）的 environ 都算。
+_PROC_ENVIRON_PATH = re.compile(r"/proc/[^\s'\"`|;&<>()]*environ", re.IGNORECASE)
+# pid 之后的路径段带通配或变量，可能展开成 environ（cat /proc/$PPID/*、cat /proc/self/e*）
+_PROC_PID_GLOB = re.compile(r"/proc/[^\s'\"`|;&<>()]*[*?\[{$`]", re.IGNORECASE)
+_PROC_REF = re.compile(r"/proc(?:/|\b)", re.IGNORECASE)
+_ENVIRON_WORD = re.compile(r"(?<![\w.])environ(?![\w.])", re.IGNORECASE)
+# ps 的 BSD 风格 e 选项打印别的进程环境；下面这些 BSD 选项字母后面跟一个值，值里带 e 不算
+_PS_SPLIT = re.compile(r"\n|[;&|]|\$\(|`")
+_PS_BSD_VALUE_OPTS = frozenset("oOpqtUkC")
+_PS_GNU_VALUE_OPTS = frozenset({
+    "-o", "-O", "--format", "--sort", "--pid", "--ppid", "-p", "-q", "-s", "-t",
+    "-u", "-U", "-g", "-G", "-C", "--user", "--group", "--tty", "--sid", "--quick-pid",
+})
+
+
+def _ps_reads_environment(cmd: str) -> bool:
+    """命令里有没有 ps e / ps eww / ps auxe 这类打印进程环境的调用。"""
+    for part in _PS_SPLIT.split(cmd):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            tokens = shlex.split(part)
+        except ValueError:
+            # 引号不配对等解析不了的，退回保守的文本判定
+            if re.search(r"(?:^|[\s;&|])ps\s+[A-Za-z]*e", part):
+                return True
+            continue
+        if not tokens or tokens[0].rsplit("/", 1)[-1] != "ps":
+            continue
+        skip_value = False
+        for tok in tokens[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if tok.startswith("--"):
+                skip_value = "=" not in tok and tok in _PS_GNU_VALUE_OPTS
+                continue
+            if tok.startswith("-"):
+                # GNU 风格：-e 是「列出全部」，不是环境
+                if tok in _PS_GNU_VALUE_OPTS:
+                    skip_value = True
+                continue
+            if not re.fullmatch(r"[A-Za-z]+", tok):
+                continue
+            if "e" in tok.lower():
+                return True
+            if tok and tok[-1] in _PS_BSD_VALUE_OPTS:
+                skip_value = True
+    return False
+
+
+def _process_environment_reader(cmd: str) -> str:
+    """命令是否读某个进程的环境。读了返回一句理由，没读返回空串。"""
+    if _PROC_ENVIRON_PATH.search(cmd):
+        return "command reads a process environment via /proc/<pid>/environ"
+    if _PROC_PID_GLOB.search(cmd):
+        return "command reads /proc/<pid> with a wildcard that may expand to environ"
+    if _PROC_REF.search(cmd) and _ENVIRON_WORD.search(cmd):
+        return "command combines a /proc reference with environ"
+    if _ps_reads_environment(cmd):
+        return "command prints a process environment via ps"
+    return ""
+
+
 # 工作区之外的经典凭据位置。read_file 的规则只覆盖工作区内，命令却能读任意路径。
 _DEFAULT_SENSITIVE_PATH_LITERALS: tuple[str, ...] = (
     ".ssh/", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
@@ -255,6 +353,11 @@ _DEFAULT_SENSITIVE_PATH_LITERALS: tuple[str, ...] = (
 
 # glob 从第一个通配符起截断，只留字面前缀：data/** → data/，**/.env → .env。
 _GLOB_TAIL = re.compile(r"[*?\[].*$")
+
+
+def _section_all_auto(default: "SafetyLevel", rules: list[tuple[str, "SafetyLevel", str]]) -> bool:
+    """这一类是不是全自动：default 是 auto，且每条规则都放行。控制台「一键全自动」产出的就是这个形态。"""
+    return default == SafetyLevel.auto and all(level == SafetyLevel.auto for _pat, level, _reason in rules)
 
 
 def _rule_path_literal(pattern: str) -> str:
@@ -589,7 +692,8 @@ def _load_policy_bytes(raw: bytes) -> dict[str, Any]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError(f"不是 UTF-8 文本：{exc}") from exc
+        # str(exc) 会带上出错字节附近的原文，config_error_text 只给位置
+        raise ValueError(config_layout.config_error_text(exc)) from exc
     return load_policy_text(text)
 
 
@@ -629,6 +733,8 @@ class PolicyEngine:
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
         self._command_default: SafetyLevel = SafetyLevel.approval_required
+        # execute_command 整类全自动时，读进程环境那层不生效
+        self._command_all_auto: bool = False
 
         self._read_rules: list[tuple[str, SafetyLevel, str]] = []
         self._write_rules: list[tuple[str, SafetyLevel, str]] = []
@@ -719,7 +825,11 @@ class PolicyEngine:
                 raw = self._policy_path.read_bytes()
             except OSError as exc:
                 # 不记指纹：权限、占用这类问题常常一会儿就好，下一次照样重读。
-                self._load_error = f"{self._policy_name} 读不了，{self._fallback_note_locked()}：{exc}"
+                # str(exc) 带绝对路径，config_error_text 只给 strerror，路径用逻辑名
+                self._load_error = (
+                    f"{self._policy_name} 读不了，{self._fallback_note_locked()}："
+                    f"{config_layout.config_error_text(exc)}"
+                )
                 if stamp != self._unreadable_stamp:
                     self._unreadable_stamp = stamp
                     _log.warning("%s", self._load_error)
@@ -815,6 +925,11 @@ class PolicyEngine:
         else:
             self._write_default, self._write_rules = SafetyLevel.auto, []
 
+        # 老 policy.yaml 没写这些代码路径时补一层兜底，排在管理员规则之后：管到的照管理员写的，没管到的要审批。
+        # 整类全自动（控制台一键放行的形态：default 是 auto 且所有规则都是 auto）时这层不生效。
+        if not _section_all_auto(self._write_default, self._write_rules):
+            self._write_rules = self._write_rules + _compiled_code_path_floor()
+
         # 平台声明的密钥文件和自有文件排在最前：第一个命中的规则赢，老部署的 policy.yaml 没写它们也照样护住。
         # 命令里的敏感路径由读规则推导，所以要在下面编译 sensitive_path_patterns 之前并进去。
         read_floor, write_floor = policy_floor(workspace=self._root)
@@ -845,6 +960,14 @@ class PolicyEngine:
             for p in (sensitive_pats if isinstance(sensitive_pats, list) else [])
             if isinstance(p, str) and p.strip()
         ]
+
+        # 整类全自动（default 是 auto 且三张列表都为空）时读进程环境那层也不生效，其余情况关不掉。
+        self._command_all_auto = (
+            self._command_default == SafetyLevel.auto
+            and not self._deny_command_patterns
+            and not self._sensitive_command_patterns
+            and isinstance(path_literals, list) and not path_literals
+        )
 
         if path_literals is None:
             # 升级上来的旧 policy.yaml 没有这一项。当成空表等于静默丢掉这层防护，
@@ -1055,6 +1178,13 @@ class PolicyEngine:
                 sensitive=True,
             )
 
+        # 读进程环境（/proc/<pid>/environ、ps e 等）绕开了 safe_subprocess_env 的剥离，一律要审批。
+        # 这层策略关不掉，只有整类全自动时才不生效，和敏感路径一样写空清单也挡不住。
+        if not self._command_all_auto:
+            env_reason = _process_environment_reader(cmd)
+            if env_reason:
+                return PolicyDecision(SafetyLevel.approval_required, env_reason, sensitive=True)
+
         # 敏感命令（下载落盘、包安装、chmod +x、监听等）：保持审批且标记敏感，
         # 使管理员任务也不自动放行，必须管理员亲自审批确认。
         for pat in self._sensitive_command_patterns:
@@ -1102,6 +1232,9 @@ class PolicyEngine:
         for path_pat, _level, _literal in self._sensitive_path_patterns:
             if path_pat.search(cmd):
                 return False
+        # 公网 curl 读网页永远不会去读进程环境，碰到就拒。
+        if _process_environment_reader(cmd):
+            return False
 
         try:
             tokens = shlex.split(cmd)
