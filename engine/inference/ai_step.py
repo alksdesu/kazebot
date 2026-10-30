@@ -33,7 +33,7 @@ from .pseudo_tools import (
     _filter_tool_specs,
     plan_delegation,
 )
-from .resume_builder import _build_resume_messages
+from .resume_builder import RESUME_RESULT_TYPES, _build_resume_messages, bound_resume_data
 from .loop_state import (
     TERMINAL_TOOLS,
     TOOL_CONTEXT_EXTRA_ATTRS,
@@ -998,42 +998,20 @@ async def _context_tool_text(
     return await asyncio.to_thread(inline_tool_output, workspace_root, session_id, tool_name, text, limits)
 
 
-# 这两种恢复数据把独立 tool task 的 raw_inline 原样拼进上下文
-_RESUME_TOOL_RESULT_TYPES = frozenset({"tool_results", "batch_results"})
-
-
 async def _resume_data_for_context(resume_data: dict[str, Any], rctx: Any, runtime_cfg: Any) -> dict[str, Any]:
-    """恢复数据里超长的工具结果换成落盘后的预览，只给拼上下文用。
+    """恢复数据里超长的子任务结果（工具输出、子节点的结果和报错）换成落盘后的预览，只给拼上下文用。
 
     原数据不改：收附件和循环状态还要用它。
     """
-    if str(resume_data.get("type") or "").strip() not in _RESUME_TOOL_RESULT_TYPES:
+    if str(resume_data.get("type") or "").strip() not in RESUME_RESULT_TYPES:
         return resume_data
-    limits = tool_output_limits(runtime_cfg)
-    session_id = context_archive_session_id(rctx)
-    copied: dict[str, Any] = dict(resume_data)
-    changed = False
-    for key in ("tool_results", "entries"):
-        entries = resume_data.get(key)
-        if not isinstance(entries, list):
-            continue
-        replaced: list[Any] = []
-        for entry in entries:
-            raw = entry.get("raw_inline") if isinstance(entry, dict) else None
-            if (
-                not isinstance(raw, str)
-                or len(raw) <= limits.max_inline_chars
-                or str(entry.get("kind") or "tool") != "tool"
-            ):
-                replaced.append(entry)
-                continue
-            preview = await _context_tool_text(
-                rctx.workspace_root, session_id, str(entry.get("name") or ""), raw, limits,
-            )
-            replaced.append({**entry, "raw_inline": preview})
-            changed = True
-        copied[key] = replaced
-    return copied if changed else resume_data
+    return await asyncio.to_thread(
+        bound_resume_data,
+        resume_data,
+        workspace_root=rctx.workspace_root,
+        session_id=context_archive_session_id(rctx),
+        limits=tool_output_limits(runtime_cfg),
+    )
 
 
 def _record_resumed_messages(ls: _LoopState, messages: list[dict[str, Any]]) -> None:
@@ -2338,8 +2316,8 @@ async def run_ai_node(
         logger.warning("image_gen_gating tool filter skipped: %s", _exc)
     if _delegation.merge_spec is not None:
         tool_specs.append(_delegation.merge_spec)
-    # 超长输出的 ref 只能用 read_tool_output 读回；它只读本会话自己的产物，不受 tool_access 限制，没有真工具的节点不加
-    if tool_specs and not any(s.get("name") == READ_TOOL_OUTPUT for s in tool_specs):
+    # 超长输出的 ref 只能用 read_tool_output 读回；它只读本会话自己的产物，不受 tool_access 限制，没有真工具又不委派的节点不加
+    if (tool_specs or delegate_targets) and not any(s.get("name") == READ_TOOL_OUTPUT for s in tool_specs):
         _reader_spec = next((s for s in _registry_specs if s.get("name") == READ_TOOL_OUTPUT), None)
         if _reader_spec is not None:
             tool_specs.append(_reader_spec)

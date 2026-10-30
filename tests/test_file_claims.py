@@ -817,6 +817,48 @@ class TestSuspendedTasks:
         assert _held(state, caller) == []
 
 
+class TestAFailedTaskWhoseWorkerHasNotStopped:
+    def test_it_keeps_its_claims_until_the_worker_reports(
+        self, app: Any, state: SupervisorState, tmp_path: Path,
+    ) -> None:
+        # 判失败时 worker 还拿着有效租约，可能还在写：认领留到它回报停手
+        _sid, holder = _conversation(state, "qq_group:stopping-hold")
+        _other, stranger = _conversation(state, "qq_group:stopping-stranger")
+        path = tmp_path / "a.txt"
+        holder.claim_id = "claim-1"
+        holder.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+        _begin(app, holder, path)
+
+        with state._lock:
+            state._fail_task_locked(holder, error="任务运行过久")
+            release_if_ended_locked(state, holder)
+
+        assert holder.status == TaskStatus.failed
+        assert _held(state, holder) == [file_state.path_key(path)]
+        refused = _begin(app, stranger, path)
+        assert refused["reason"] == "claimed" and refused["holder"]["task_id"] == holder.task_id
+
+        state.complete_task(
+            task_id=holder.task_id, worker_id="worker", result={"action": "cancelled"}, claim_id="claim-1",
+        )
+
+        assert _held(state, holder) == []
+        assert _begin(app, stranger, path)["ok"] is True
+
+    def test_a_task_whose_lease_already_ran_out_releases_at_once(
+        self, app: Any, state: SupervisorState, tmp_path: Path,
+    ) -> None:
+        _sid, holder = _conversation(state, "qq_group:stopping-gone")
+        holder.claim_id = "claim-1"
+        holder.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        _begin(app, holder, tmp_path / "a.txt")
+
+        with state._lock:
+            state._fail_task_locked(holder, error="任务租约过期")
+
+        assert _held(state, holder) == []
+
+
 def _tool_context(http: httpx.AsyncClient, *, task_id: str, session: str, base_url: str) -> ToolContext:
     return ToolContext(
         supervisor_url=base_url, session_id=session, run_id="run-1", worker_id="worker",

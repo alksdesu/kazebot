@@ -14,6 +14,7 @@ from ..attachments import build_multimodal_content, payload_attachments
 from ..conversation_store import MessageType
 from ..interrupted_calls import INTERRUPTED_RESUME_TYPE
 from ..run_budget import WRAPUP_TIME
+from ..tool_outputs import ToolOutputLimits, inline_tool_output, mentioned_refs
 from ..worktree_report import worktree_lines
 from .loop_state import TOOL_RESULT_ATTACHMENT_TYPE
 
@@ -39,6 +40,8 @@ _BATCH_NODE_RESUME_TYPES = {
     "preempted": "child_preempted",
 }
 _BATCH_INSTRUCTION_PREVIEW = 200
+# 这两种恢复数据把子任务交回的结果原样拼进上下文，超长的要先落盘
+RESUME_RESULT_TYPES = frozenset({"tool_results", "batch_results"})
 
 # await_dispatches 交回的项里还没结束的和拿不到结果的，取值要和 supervisor 写进恢复数据的一致
 AWAIT_RUNNING = "running"
@@ -324,35 +327,152 @@ def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> 
     if rtype == "batch_results":
         entries = resume_data.get("entries")
         if isinstance(entries, list) and entries:
-            msgs: list[dict[str, Any]] = []
-            all_atts: list[dict[str, Any]] = []
-            for e in entries:
-                if not isinstance(e, dict):
-                    continue
-                _kind = str(e.get("kind") or "node")
-                _status = str(e.get("status") or "")
-
-                if _kind == "tool":
-                    _name = e.get("name", "unknown")
-                    _raw = e.get("raw_inline", "")
-                    if _status == "fail":
-                        msgs.append(_tool_message(f'Tool "{_name}" 执行失败：{e.get("error", "")}'))
-                    else:
-                        msgs.append(_tool_message(f'Tool result for "{_name}":\n{_raw}'))
-                else:
-                    msgs.append(_batch_node_message(e, can_merge=can_merge))
-
-                atts = payload_attachments(e)
-                if atts:
-                    all_atts.extend(atts)
+            msgs, all_atts = _batch_entry_messages(entries, can_merge=can_merge)
+            capped = sum(
+                1 for e in entries
+                if isinstance(e, dict) and e.get("lifetime_capped") and str(e.get("status") or "") == "fail"
+            )
+            if capped:
+                msgs.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM] 这一批有 {capped} 项是因为本任务的总运行时长快到上限被提前收的；"
+                        "剩下的时间不多，先把已有的结果整理交回。"
+                    ),
+                    "_meta": {"message_type": MessageType.SYSTEM},
+                })
             if all_atts:
                 msgs.append(_attachments_message(
-                    "以上子任务产生了以下附件；finish 时不写 attachment_paths，它们会随最终回复一起发出：", all_atts,
+                    "以上子任务产生了以下附件；finish 时不写 attachment_paths，它们会随最终回复一起发出；"
+                    "只写其中几个就只发那几个：", all_atts,
                 ))
             return msgs
         return []
 
     return []
+
+
+def _batch_entry_messages(
+    entries: list[Any], *, can_merge: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """批次里每一项的结果消息，以及各项带回来的附件。"""
+    msgs: list[dict[str, Any]] = []
+    all_atts: list[dict[str, Any]] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        _kind = str(e.get("kind") or "node")
+        _status = str(e.get("status") or "")
+
+        if _kind == "tool":
+            _name = e.get("name", "unknown")
+            _raw = e.get("raw_inline", "")
+            if _status == "fail":
+                msgs.append(_tool_message(f'Tool "{_name}" 执行失败：{e.get("error", "")}'))
+            elif _status == "cancelled":
+                _error = str(e.get("error") or "").strip()
+                msgs.append(_tool_message(f'Tool "{_name}" 已取消，没有结果。' + (f"原因：{_error}" if _error else "")))
+            else:
+                msgs.append(_tool_message(f'Tool result for "{_name}":\n{_raw}'))
+        else:
+            msgs.append(_batch_node_message(e, can_merge=can_merge))
+
+        atts = payload_attachments(e)
+        if atts:
+            all_atts.extend(atts)
+    return msgs, all_atts
+
+
+def stopped_batch_messages(entries: list[Any], *, reason: str, unsent: bool = False) -> list[dict[str, Any]]:
+    """中间层挂起等一批子任务时被叫停（unsent：交回了这批委派、还没派出去就被叫停）：那一批写成和恢复时一样的结果消息，
+    补进它自己的会话历史。
+
+    它不会再恢复，子任务的附件不会随它的回复自动发出，只列出路径；隔离副本按没有合回工具的说法写。
+    """
+    msgs, attachments = _batch_entry_messages(entries, can_merge=False)
+    cause = str(reason or "").strip().rstrip("。.")
+    because = f"：{cause}" if cause else ""
+    if unsent:
+        lines = [
+            f"[SYSTEM] 这一轮交回了上面这批委派，还没派出去就被停下了{because}。",
+            "这些子任务一个都没有派出，不会有结果。接着做时以这些为准，需要的话重新派。",
+        ]
+    else:
+        lines = [
+            f"[SYSTEM] 这一轮在等上面这批子任务时被停下了{because}。",
+            "已经交回的结果照上面写的；没交回的已被叫停，不会再有结果。接着做时以这些为准，需要的话重新派。",
+        ]
+    paths = [str(item.get("path")) for item in attachments if isinstance(item, dict) and item.get("path")]
+    if paths:
+        lines.append(f"子任务留下的附件：{'，'.join(paths)}。要发出去，就在 finish 的 attachment_paths 里点名。")
+    msgs.append({"role": "user", "content": "\n".join(lines), "_meta": {"message_type": MessageType.SYSTEM}})
+    return msgs
+
+
+def bound_dispatch_text(
+    workspace_root: Path | str | None, session_id: str, node_id: str, text: str, limits: ToolOutputLimits,
+) -> str:
+    """一个子节点交回的正文进上下文的样子：没超 max_inline_chars 原样返回，超了全文落盘换成带 ref 的预览。
+
+    预览里没带出来、全文里提到的 ref 另起一行列出。存在 session_id 名下，read_tool_output 按同一个键读回。阻塞 I/O。
+    """
+    if not isinstance(text, str) or len(text) <= limits.max_inline_chars:
+        return text
+    preview = inline_tool_output(workspace_root, session_id, f"dispatch_to_{node_id or 'node'}", text, limits)
+    shown = set(mentioned_refs(preview))
+    dropped = [ref for ref in mentioned_refs(text) if ref not in shown]
+    if dropped:
+        preview += (
+            "\n[全文里还提到这些存档，预览里没显示："
+            + "，".join(f"ref={ref}" for ref in dropped)
+            + "，同样用 read_tool_output 读]"
+        )
+    return preview
+
+
+def bound_resume_data(
+    resume_data: dict[str, Any], *, workspace_root: Path | str | None, session_id: str, limits: ToolOutputLimits,
+) -> dict[str, Any]:
+    """恢复数据里超长的子任务结果落盘换成带 ref 的预览，只给拼上下文用：工具项换 raw_inline，节点项换 text 和 error。
+
+    原数据不改（收附件、循环状态还要用），没有要换的原样返回同一个对象。阻塞 I/O，调用方放到线程里。
+    """
+    if str(resume_data.get("type") or "").strip() not in RESUME_RESULT_TYPES:
+        return resume_data
+    copied: dict[str, Any] = dict(resume_data)
+    changed = False
+    for key in ("tool_results", "entries"):
+        entries = resume_data.get(key)
+        if not isinstance(entries, list):
+            continue
+        bounded = [
+            _bounded_entry(entry, workspace_root=workspace_root, session_id=session_id, limits=limits)
+            for entry in entries
+        ]
+        changed = changed or any(new is not old for new, old in zip(bounded, entries))
+        copied[key] = bounded
+    return copied if changed else resume_data
+
+
+def _bounded_entry(
+    entry: Any, *, workspace_root: Path | str | None, session_id: str, limits: ToolOutputLimits,
+) -> Any:
+    if not isinstance(entry, dict):
+        return entry
+    replaced: dict[str, Any] = {}
+    if str(entry.get("kind") or "tool") == "tool":
+        raw = entry.get("raw_inline")
+        if isinstance(raw, str) and len(raw) > limits.max_inline_chars:
+            replaced["raw_inline"] = inline_tool_output(
+                workspace_root, session_id, str(entry.get("name") or ""), raw, limits,
+            )
+    else:
+        node_id = str(entry.get("node_id") or "")
+        for field in ("text", "error"):
+            value = entry.get(field)
+            if isinstance(value, str) and len(value) > limits.max_inline_chars:
+                replaced[field] = bound_dispatch_text(workspace_root, session_id, node_id, value, limits)
+    return {**entry, **replaced} if replaced else entry
 
 
 # ---------------------------------------------------------------------------

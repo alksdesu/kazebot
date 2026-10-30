@@ -1,11 +1,12 @@
 """内存里只留最近一批已了结的任务。
 
-还没路由完、分支没收束、后置工作还在排队或在跑的不删；活着的任务还要读的也不删：
+还没路由完、分支没收束、后置工作还在排队或在跑的、被判失败但旧 worker 还没停手的不删；活着的任务还要读的也不删：
 批次里先结束的兄弟要等最后一个结束时一起打包给 caller，派发链上的祖先要拿来认身份。
 """
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.task_ending import clear_stopping, mark_stopping  # noqa: E402
 from supervisor.types import RouteStatus, Task, TaskKind, TaskStatus  # noqa: E402
 from tests.test_sup_settlement import _batch, _caller, _dispatch, _finish, _state  # noqa: E402
 
@@ -99,6 +101,16 @@ class TestUnfinishedBusiness:
             state._post_work_running.discard("post-1")
         assert _prune(state, 0) == 1
 
+    def test_a_failed_task_whose_worker_has_not_stopped_is_kept(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        task = _settled(state, _session(state))
+        task.status = TaskStatus.failed
+        mark_stopping(task, claim_id="claim-1", now=datetime.now(timezone.utc))
+
+        assert _prune(state, 0) == 0
+        clear_stopping(task, "claim-1")
+        assert _prune(state, 0) == 1
+
 
 class TestStillNeededByLiveTasks:
     def test_a_finished_batch_sibling_survives_until_the_caller_gets_every_result(self, tmp_path: Path) -> None:
@@ -130,3 +142,21 @@ class TestStillNeededByLiveTasks:
 
         origin = state.task_origin(child.task_id)
         assert origin is not None and origin.platform_auth == admin
+
+    def test_a_child_still_routing_its_dispatch_keeps_its_origin(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        entry = _settled(state, sid, task_context={"platform_auth": {"platform": "qq", "user_id": "u-1"}})
+        with state._lock:
+            child = state._create_task_locked(
+                session_id=sid, session_generation=1, kind=TaskKind.node, node_id="draw.node",
+                input_data={"_dispatch_origin": {"caller_task_id": entry.task_id, "parent_session_id": sid}},
+                continuation={}, source_inbound_seq=None,
+            )
+            child.status = TaskStatus.completed
+            child.result = {"action": "dispatch", "dispatch_batch": [{"kind": "node", "target": "a.node"}]}
+            child.delivery_id = f"task:{child.task_id}:completion:1:v1"
+            child.updated_at = datetime.now(timezone.utc)
+
+        assert _prune(state, 0) == 0
+        assert entry.task_id in state.tasks

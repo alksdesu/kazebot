@@ -1,4 +1,7 @@
-"""恢复后批次结果怎么交给模型：每个子节点带上调用、指令和结局，失败、取消、打断都明说没有结果；落盘用的消息类型和旧数据都兼容。"""
+"""恢复后批次结果怎么交给模型：每个子节点带上调用、指令和结局，失败、取消、打断都明说没有结果；落盘用的消息类型和旧数据都兼容。
+
+中间层被停下时，那一批按同样的写法补进它自己的历史。
+"""
 from __future__ import annotations
 
 import sys
@@ -17,6 +20,7 @@ from engine.inference.resume_builder import (  # noqa: E402
     DISPATCH_RESULT_TYPE,
     _build_resume_messages,
     resume_outcome,
+    stopped_batch_messages,
 )
 
 
@@ -135,6 +139,16 @@ class TestOldEntries:
         assert ok["_meta"] == {"message_type": "tool_result"}
         assert resume_outcome(ok) == ("", "")
 
+    def test_a_cancelled_tool_says_there_is_no_result_and_why(self) -> None:
+        with_reason, without_reason = _render(
+            {"kind": "tool", "name": "probe", "status": "cancelled", "error": "上级任务已失败"},
+            {"kind": "tool", "name": "probe", "status": "cancelled", "raw_inline": "stale output"},
+        )
+
+        assert with_reason["content"] == 'Tool "probe" 已取消，没有结果。原因：上级任务已失败'
+        assert without_reason["content"] == 'Tool "probe" 已取消，没有结果。'
+        assert with_reason["_meta"] == {"message_type": "tool_result"}
+
     def test_non_object_entries_are_skipped(self) -> None:
         messages = _render("junk", _node())  # type: ignore[arg-type]
 
@@ -151,7 +165,84 @@ class TestAttachments:
         assert attachments_message["_meta"] == {"message_type": TOOL_RESULT_ATTACHMENT_TYPE}
         text_part = attachments_message["content"][0]["text"]
         assert "finish 时不写 attachment_paths" in text_part
+        assert "只写其中几个就只发那几个" in text_part
         assert "data/attachments/x.png" in text_part
+
+
+class TestLifetimeCap:
+    def test_items_cut_short_by_the_callers_lifetime_get_one_note_at_the_end(self) -> None:
+        messages = _render(
+            _node(status="fail", text="", error="调用方的总运行时长快到上限", timed_out=True, lifetime_capped=True),
+            _node(call_id="w2", node_id="helper"),
+            {"kind": "tool", "name": "probe", "status": "fail", "error": "x", "timed_out": True, "lifetime_capped": True},
+        )
+
+        assert len(messages) == 4
+        assert messages[-1]["content"] == (
+            "[SYSTEM] 这一批有 2 项是因为本任务的总运行时长快到上限被提前收的；剩下的时间不多，先把已有的结果整理交回。"
+        )
+        assert messages[-1]["_meta"] == {"message_type": "system"}
+
+    def test_an_item_that_ran_out_of_its_own_timeout_adds_no_note(self) -> None:
+        messages = _render(_node(status="fail", text="", error="等待超时：30 秒内没有做完，已被停下。", timed_out=True))
+
+        assert len(messages) == 1
+
+
+class TestStoppedBatch:
+    def test_what_came_back_and_what_was_called_off_go_in_with_a_closing_note(self) -> None:
+        attachment = {"type": "image", "path": "data/attachments/x.png", "mime_type": "image/png"}
+
+        finished, cancelled, note = stopped_batch_messages(
+            [
+                _node(attachments=[attachment]),
+                _node(call_id="w2", status="cancelled", text="", error="它当时还没交回结果，已被一并叫停。"),
+            ],
+            reason="等待超时：60 秒内没有做完，已被停下。",
+        )
+
+        assert finished["content"].startswith("子节点 scout（调用 w1；指令：list the files）已完成。")
+        assert finished["_meta"]["message_type"] == DISPATCH_RESULT_TYPE
+        assert cancelled["content"].endswith("原因：它当时还没交回结果，已被一并叫停。")
+        assert note["_meta"] == {"message_type": "system"}
+        assert note["content"].splitlines() == [
+            "[SYSTEM] 这一轮在等上面这批子任务时被停下了：等待超时：60 秒内没有做完，已被停下。",
+            "已经交回的结果照上面写的；没交回的已被叫停，不会再有结果。接着做时以这些为准，需要的话重新派。",
+            "子任务留下的附件：data/attachments/x.png。要发出去，就在 finish 的 attachment_paths 里点名。",
+        ]
+
+    def test_a_batch_that_never_went_out_says_so(self) -> None:
+        node, tool, note = stopped_batch_messages(
+            [
+                {"kind": "node", "node_id": "scout", "instruction": "go", "status": "cancelled",
+                 "error": "这一项还没派出去。", "call_id": "w1"},
+                {"kind": "tool", "name": "probe", "status": "cancelled", "error": "这一项还没派出去。"},
+            ],
+            reason="交回的委派还没派出去就被取消了",
+            unsent=True,
+        )
+
+        assert node["content"] == "子节点 scout（调用 w1；指令：go）已被取消，没有结果。\n原因：这一项还没派出去。"
+        assert tool["content"] == 'Tool "probe" 已取消，没有结果。原因：这一项还没派出去。'
+        assert note["content"].splitlines() == [
+            "[SYSTEM] 这一轮交回了上面这批委派，还没派出去就被停下了：交回的委派还没派出去就被取消了。",
+            "这些子任务一个都没有派出，不会有结果。接着做时以这些为准，需要的话重新派。",
+        ]
+
+    def test_an_isolated_copy_is_handed_on_rather_than_merged(self) -> None:
+        worktree = {
+            "id": "wt-1", "handle": "child-1@child_abc", "path": "/tmp/wt-1", "file_count": 1,
+            "files": [{"path": "a.py", "status": "M", "added": 1, "deleted": 0}],
+        }
+
+        finished, _note = stopped_batch_messages([_node(worktree=worktree)], reason="任务已取消")
+
+        assert "这个节点不能调用 merge_worktree" in finished["content"]
+
+    def test_without_a_reason_the_note_still_reads(self) -> None:
+        [note] = stopped_batch_messages([], reason="")
+
+        assert note["content"].splitlines()[0] == "[SYSTEM] 这一轮在等上面这批子任务时被停下了。"
 
 
 class TestSingleChildResumes:

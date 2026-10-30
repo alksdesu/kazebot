@@ -17,10 +17,11 @@ from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
-from . import child_retention
+from . import child_retention, stopped_batch
 from ._helpers import _now
 from .auto_continue import chain_input
 from .context_calibration import calibrated_chars_per_token
+from .task_ending import TaskEnding, clear_stopping, mark_stopping, task_ending
 from .task_lanes import CLAIM_ORDER, LaneLimits, TaskLane, derive_lane, parse_lane
 from .task_traits import REQUEUE_MARK
 from .types import (
@@ -197,6 +198,10 @@ class TaskStoreMixin:
 
     def _task_terminal(self, task: Task) -> bool:
         return task.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+
+    def _task_ending_locked(self, task: Task, now: datetime | None = None) -> TaskEnding:
+        """终态之后还在不在过渡段：问「结束了没有」的都用它，再按自己的问题取 continues / still_writing / result_open。"""
+        return task_ending(task, now or _now())
 
     def _to_positive_int(self, value: Any) -> int | None:
         try:
@@ -477,9 +482,14 @@ class TaskStoreMixin:
         """取消一个任务：running 且租约还在时只记取消请求，等 worker 停下回报；其余直接终结并结算。
 
         force 用于 worker 已经不在的场合（引擎重启、分支拆除），不等回报直接终结。
+        交回了 dispatch、路由还没跑完的也只记取消请求：路由进锁时按取消收掉，不再派出子任务。
         """
         if self._task_terminal(task):
-            return CancelEffect.none
+            if task.cancel_requested or not self._task_ending_locked(task, now).continues:
+                return CancelEffect.none
+            task.cancel_requested = True
+            self._event_task_snapshot("task_cancel_requested", task)
+            return CancelEffect.requested
         newly_requested = not task.cancel_requested
         task.cancel_requested = True
         lease_alive = task.lease_expires_at is not None and task.lease_expires_at >= now
@@ -489,6 +499,17 @@ class TaskStoreMixin:
             task.updated_at = now
             self._event_task_snapshot("task_cancel_requested", task)
             return CancelEffect.requested
+        self._terminate_cancelled_locked(task, now, finalize_branch=finalize_branch, reason=reason)
+        return CancelEffect.cancelled
+
+    def _terminate_cancelled_locked(
+        self, task: Task, now: datetime, *, finalize_branch: bool = True, reason: str = "任务已取消",
+    ) -> None:
+        """直接把任务终结为取消并结算。在等一批子任务、会话又会留下来时，先记下那一批的现状。"""
+        captured = finalize_branch and stopped_batch.capture_locked(
+            self, task, reason=reason, now=now, batch_id=stopped_batch.waiting_batch_id(task), kept_only=True,
+        )
+        teardown_started = bool(task.input.get("_branch_finalize_worker_started"))
         task.status = TaskStatus.cancelled
         task.updated_at = now
         task.lease_expires_at = None
@@ -497,7 +518,9 @@ class TaskStoreMixin:
         task.result = {"action": "cancelled", "node_id": task.node_id or task.tool_name or "", "error": reason}
         self._event_task_snapshot("task_cancelled", task)
         self._settle_cancelled_task_locked(task, finalize_branch=finalize_branch)
-        return CancelEffect.cancelled
+        if captured and (teardown_started or not task.input.get("_branch_finalize_worker_started")):
+            # 那一批由取消后的收尾线程写进会话；这次没起收尾线程，就不能让它的会话一直算忙
+            stopped_batch.drop_locked(task)
 
     def _live_descendants_locked(self, root_task_id: str) -> list[Task]:
         """root 派出去、还没到终态的全部后代，父在子前。"""
@@ -579,16 +602,43 @@ class TaskStoreMixin:
         task.waiting_for_batch_id = None
         task.result = {"action": "fail", "node_id": task.node_id or task.tool_name or "", "error": error}
 
-    def _fail_task_locked(self, task: Task, *, error: str, now: datetime | None = None) -> None:
-        """由 supervisor 判定失败的任务：取消它派出去的后代，再按一次新的完成走正常路由。"""
+    def _fail_task_locked(
+        self, task: Task, *, error: str, now: datetime | None = None, worker_gone: bool = False,
+    ) -> None:
+        """由 supervisor 判定失败的任务：取消它派出去的后代，再按一次新的完成走正常路由。
+
+        还在跑、租约也有效的，旧 worker 要到下次续租或查取消才停手：记上停手记号，路由等它回报（最晚 STOP_GRACE）
+        再跑，diff、分支合并和交给调用方的那一项都在它停手之后。确定 worker 已经不在（引擎重启）时传 worker_gone=True。
+        """
         now = now or _now()
+        stopping_claim = "" if worker_gone else self._live_claim_locked(task, now)
+        stopped_batch_id = stopped_batch.waiting_batch_id(task)
         self._apply_failure_locked(task, error, now=now)
         self._reset_task_route_state_locked(task)
+        if stopping_claim:
+            mark_stopping(task, claim_id=stopping_claim, now=now)
         self._event_task_snapshot("task_completed", task, component="supervisor")
         for descendant in self._live_descendants_locked(task.task_id):
             self._cancel_task_locked(descendant, now, reason="上级任务已失败")
+        if stopped_batch_id:
+            stopped_batch.capture_locked(self, task, reason=error, now=now, batch_id=stopped_batch_id)
+        if stopping_claim:
+            self._watch_transit_locked(task)
+            return
         # 分支任务失败也要合并回父会话、给用户发错误，和正常完成走同一条路
         self._route_completed_task_locked(task)
+
+    def _live_claim_locked(self, task: Task, now: datetime) -> str:
+        """还在跑、租约也有效的那次领取；不是的给空串。"""
+        lease_alive = task.lease_expires_at is not None and task.lease_expires_at >= now
+        if task.status != TaskStatus.running or not lease_alive:
+            return ""
+        return str(task.claim_id or "").strip()
+
+    def _worker_reported_stop_locked(self, task: Task, claim_id: str) -> None:
+        """判失败时还在跑的那个 worker 回报了，说明它已经停手；推迟的路由由这次回报接着推。"""
+        if clear_stopping(task, claim_id):
+            logger.info("task %s: the worker stopped after the failure, routing it now", task.task_id[:12])
 
     def _cancel_session_tasks_locked(self, session_id: str) -> None:
         now = _now()
@@ -986,6 +1036,9 @@ class TaskStoreMixin:
         """终态之后的路由、分支收束、后置工作都做完了。"""
         if not self._task_terminal(task) or task.route_status != RouteStatus.routed:
             return False
+        # 旧 worker 还没停手的不能清出内存：会话忙不忙要靠它判
+        if self._task_ending_locked(task).still_writing:
+            return False
         if task.input.get("branch_session_id") and not task.input.get("_branch_finalized"):
             return False
         self._ensure_post_completion_state_locked()
@@ -996,7 +1049,8 @@ class TaskStoreMixin:
 
     def _tasks_still_needed_locked(self) -> set[str]:
         """活着的任务还要读的已了结任务：派发链上的祖先（认身份），以及批次里先结束的兄弟（等最后一个结束时一起打包）。"""
-        live = {task_id for task_id, task in self.tasks.items() if not self._task_terminal(task)}
+        now = _now()
+        live = {task_id for task_id, task in self.tasks.items() if self._task_ending_locked(task, now).continues}
         needed: set[str] = set()
         for task_id in live:
             current = self.tasks[task_id]
@@ -1433,6 +1487,8 @@ class TaskStoreMixin:
                 return None
             reset_cleanup = bool(task.input.get("_session_reset"))
             outcome = self._completion_outcome_locked(task, worker_id=wid, claim_id=claim)
+            if claim:
+                self._worker_reported_stop_locked(task, claim)
             if reset_cleanup:
                 pass
             elif outcome is CompletionOutcome.accepted:
@@ -1469,6 +1525,13 @@ class TaskStoreMixin:
                     logger.info(
                         "task completion already routed; skipping duplicate route",
                         extra=self._task_route_log_extra_locked(task, event="task_route_skipped"),
+                    )
+                elif self._task_ending_locked(task) is TaskEnding.stopping:
+                    # 判失败时还在跑的那个 worker 回报停手之前不路由，别的领取的回报不算
+                    should_route = False
+                    logger.info(
+                        "task %s: a report from claim %s while its failed worker has not stopped; route stays deferred",
+                        task.task_id[:12], claim[:12],
                     )
             elif outcome is CompletionOutcome.stale:
                 logger.info(

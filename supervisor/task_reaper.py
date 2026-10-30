@@ -119,7 +119,7 @@ def _wait_target_state(
         child = state.tasks.get(task.waiting_for_task_id)
         if child is None:
             return False, True, False
-        terminal = state._task_terminal(child)
+        terminal = not state._task_ending_locked(child).result_open
         return terminal, False, not terminal
     if task.waiting_for_batch_id:
         siblings = [
@@ -128,11 +128,11 @@ def _wait_target_state(
         ]
         if not siblings:
             return False, True, False
-        live = any(not state._task_terminal(child) for child in siblings)
+        live = any(state._task_ending_locked(child).result_open for child in siblings)
         return not live, False, live
     # 旧快照里批次挂起不记等待字段：还有没结束的批次子任务就算在等
     live_batch = any(
-        child.batch_id and not state._task_terminal(child)
+        child.batch_id and state._task_ending_locked(child).result_open
         for child in children.get(task.task_id, [])
     )
     return False, False, live_batch

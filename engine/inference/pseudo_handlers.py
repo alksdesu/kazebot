@@ -125,6 +125,26 @@ def _dispatch_result_attachments_already_sent(ls: _LoopState) -> bool:
     return bool(task_context.get("inbound_attachments_outbound_sent"))
 
 
+_BAD_ATTACHMENT_PATHS = "attachment_paths 要写成文件路径的列表（字符串数组）。"
+
+
+def _named_attachment_paths(args: dict[str, Any]) -> tuple[list[str] | None, str]:
+    """模型点名的 attachment_paths：(路径列表, 读不懂时交回模型的原因)。
+
+    没写、写 null 或写空都给 None，按没点名处理：不少模型给可选数组顺手填 []，不能因此把子任务的产物扣下。
+    一个字符串当一条路径，别的类型不猜。
+    """
+    raw = args.get("attachment_paths")
+    if raw is None:
+        return None, ""
+    if isinstance(raw, str):
+        return ([raw.strip()] if raw.strip() else None), ""
+    if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+        named = [item.strip() for item in raw if item.strip()]
+        return (named or None), ""
+    return None, _BAD_ATTACHMENT_PATHS
+
+
 def _reject_already_sent_dispatch_paths(ls: _LoopState, selected_paths: Any) -> list:
     """Drop attachment paths on a dispatch_result turn whose files the supervisor
     already auto-forwarded to the platform.
@@ -231,11 +251,14 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         reply_text = str(args.get("text") or "").strip()
         selected_atts = []
         refused: list[RefusedAttachment] = []
-        selected_paths = args.get("attachment_paths")
+        named_paths, path_problem = _named_attachment_paths(args)
+        if path_problem:
+            _emit_pseudo_tool_result(ls, pseudo_call, f"Error: {path_problem}这条 reply 没有发出，改好后再调用一次。")
+            return None
         # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment,
         # so the caller LLM cannot re-send generated draw images a second time.
-        selected_paths = _reject_already_sent_dispatch_paths(ls, selected_paths)
-        if isinstance(selected_paths, list) and selected_paths:
+        selected_paths = _reject_already_sent_dispatch_paths(ls, named_paths)
+        if selected_paths:
             allowed_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, selected_paths)
             if allowed_paths:
                 selected_atts = _select_attachments(
@@ -307,16 +330,23 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             )
             return None
 
-        # None 表示模型没点名附件，走下面的自动转发；点名了就只发点名且放行的
+        # None 表示模型没点名附件，走下面的自动转发；点名了就只发点名且放行的，点名的都已发过或被拒时一个都不发
         explicit_paths: list[str] | None = None
         refused: list[RefusedAttachment] = []
         if terminal_name == "finish":
-            _selected_paths = args.get("attachment_paths")
-            # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment
-            # (async draw images), so finish() cannot re-send the same files.
-            _selected_paths = _reject_already_sent_dispatch_paths(ls, _selected_paths)
-            if isinstance(_selected_paths, list) and _selected_paths:
-                explicit_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, _selected_paths)
+            _named_paths, _path_problem = _named_attachment_paths(args)
+            if _path_problem:
+                _emit_pseudo_tool_result(
+                    ls, pseudo_call, f"❌ REJECTED: {_path_problem}改好后再调用一次 {terminal_name}。",
+                )
+                return None
+            if _named_paths is not None:
+                explicit_paths = []
+                # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment
+                # (async draw images), so finish() cannot re-send the same files.
+                _selected_paths = _reject_already_sent_dispatch_paths(ls, _named_paths)
+                if _selected_paths:
+                    explicit_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, _selected_paths)
         _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
 
         ctx_ref = _persist_ctx(ls, step + 1)
@@ -996,8 +1026,9 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
     shared_contexts: set[tuple[str, str]] = set()
     continued_sessions: set[str] = set()
     timeouts = DispatchTimeouts.from_config(getattr(ls, "runtime_cfg", None))
-    for index, call in enumerate(calls):
-        if index >= MAX_DISPATCH_BATCH_ITEMS:
+    for call in calls:
+        # 按实际收进这一批的计：前面因为参数不对被拒的不占名额
+        if len(plan.items) >= MAX_DISPATCH_BATCH_ITEMS:
             plan.rejected.append((call, _wait_refusal(
                 f"没有派出：同一轮最多 {MAX_DISPATCH_BATCH_ITEMS} 个 wait 委派，这一个超出了；等这批结果回来后再派。"
             )))

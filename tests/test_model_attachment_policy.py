@@ -677,6 +677,100 @@ def test_a_short_reply_turn_screens_nothing(tmp_path: Path, emitted: list, guard
     assert guard.calls == []
 
 
+@pytest.mark.parametrize("paths", [[], "", ["  "]])
+def test_finish_with_an_empty_selection_still_forwards_tool_output(
+    tmp_path: Path, emitted: list, guard: _Guard, paths: Any,
+) -> None:
+    """写空和没写一样按没点名处理：不少模型给可选数组顺手填 []，不能因此把工具产物扣下。"""
+    produced = [{"path": "data/generated.png", "type": "image"}]
+    ls = _loop_state(tmp_path, tool_produced=produced)
+
+    action = _handle(ls, _call_with("finish", text="done", attachment_paths=paths))
+
+    assert action.result["attachments"] == produced
+    assert emitted == [("finish", "ok")]
+    assert guard.calls == []
+
+
+def test_finish_with_an_empty_list_still_forwards_dispatch_result_images(
+    tmp_path: Path, emitted: list, guard: _Guard,
+) -> None:
+    inbound = [{"path": "data/attachments/child/nai.png", "type": "image"}]
+    ls = _loop_state(tmp_path, task_context={
+        "inbound_message_type": "dispatch_result",
+        "inbound_attachments": inbound,
+    })
+
+    action = _handle(ls, _call_with("finish", text="done", attachment_paths=[]))
+
+    assert action.result["attachments"] == inbound
+
+
+def test_finish_naming_only_already_sent_paths_does_not_fall_back_to_tool_output(
+    tmp_path: Path, emitted: list, guard: _Guard,
+) -> None:
+    """点名的都已经随结果发过：这一轮一个都不发，不能退回去把工具产物自动带上。"""
+    ls = _loop_state(
+        tmp_path,
+        tool_produced=[{"path": "data/generated.png", "type": "image"}],
+        task_context={"inbound_message_type": "dispatch_result", "inbound_attachments_outbound_sent": True},
+    )
+
+    action = _handle(ls, _call_with("finish", text="done", attachment_paths=["data/attachments/child/nai.png"]))
+
+    assert action.result["attachments"] == []
+    assert guard.calls == []
+
+
+def test_finish_takes_a_single_path_written_as_a_string(tmp_path: Path, emitted: list, guard: _Guard) -> None:
+    ls = _loop_state(
+        tmp_path,
+        collected=[{"path": "data/a.png", "type": "image"}, {"path": "data/b.png", "type": "image"}],
+        tool_produced=[{"path": "data/generated.png", "type": "image"}],
+    )
+
+    action = _handle(ls, _call_with("finish", text="done", attachment_paths="data/a.png"))
+
+    assert action.result["attachments"] == [{"path": "data/a.png", "type": "image"}]
+
+
+@pytest.mark.parametrize("paths", [{"path": "data/a.png"}, 42, True, ["data/a.png", 7]])
+def test_finish_refuses_attachment_paths_it_cannot_read_instead_of_guessing(
+    tmp_path: Path, emitted: list, guard: _Guard, paths: Any,
+) -> None:
+    ls = _loop_state(tmp_path, tool_produced=[{"path": "data/generated.png", "type": "image"}])
+
+    action = _handle(ls, _call_with("finish", text="done", attachment_paths=paths))
+
+    assert action is None
+    [(name, said)] = emitted
+    assert name == "finish"
+    assert said.startswith("❌ REJECTED: attachment_paths 要写成文件路径的列表")
+    assert guard.calls == []
+
+
+def test_reply_takes_a_single_path_written_as_a_string(tmp_path: Path, emitted: list, guard: _Guard) -> None:
+    ls = _loop_state(tmp_path, collected=[{"path": "data/a.png", "type": "image"}])
+
+    _handle(ls, _call_with("reply", text="hi", attachment_paths="data/a.png"))
+
+    assert ls.events[0]["payload"]["attachments"] == [{"path": "data/a.png", "type": "image"}]
+    assert emitted == [("reply", "ok")]
+
+
+def test_reply_with_attachment_paths_it_cannot_read_is_not_sent(
+    tmp_path: Path, emitted: list, guard: _Guard,
+) -> None:
+    ls = _loop_state(tmp_path, collected=[{"path": "data/a.png", "type": "image"}])
+
+    _handle(ls, _call_with("reply", text="hi", attachment_paths={"path": "data/a.png"}))
+
+    assert ls.events == []
+    [(name, said)] = emitted
+    assert name == "reply" and said.startswith("Error: attachment_paths 要写成文件路径的列表")
+    assert "这条 reply 没有发出" in said
+
+
 def _dispatch_ls(tmp_path: Path, **kwargs: Any) -> _LoopState:
     response = SimpleNamespace(status_code=200, json=lambda: {"session_id": "child-1"})
     http = SimpleNamespace(post=AsyncMock(return_value=response))

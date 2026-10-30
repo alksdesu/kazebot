@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +19,10 @@ from pydantic import BaseModel
 
 from toolbox import file_state
 
-from .types import RouteStatus, Task, TaskStatus
+from .types import Task, TaskStatus
 
 log = logging.getLogger(__name__)
 
-# complete_task 先把派发子任务的任务记成 completed，路由里才改成 suspended：这段路上它的认领不能放
-_DISPATCH_TRANSIT_GRACE = timedelta(minutes=5)
 # 沿等待链往上找的最多层数，防着坏数据里的环
 _MAX_CHAIN_DEPTH = 32
 _DISPLAY_CHARS = 500
@@ -318,22 +316,20 @@ class FileLedger:
 
 
 def _live_locked(state: Any, task: Task, now: datetime) -> bool:
-    if not state._task_terminal(task):
-        return True
-    action = str((task.result or {}).get("action") or "").strip()
-    return (
-        task.status == TaskStatus.completed
-        and action == "dispatch"
-        and task.route_status != RouteStatus.routed
-        and now - task.updated_at < _DISPATCH_TRANSIT_GRACE
-    )
+    """任务还会接着跑，交回了 dispatch、正在路由去挂起的也算：worktree 按它判谁还在用副本、谁还能发起合回。"""
+    return state._task_ending_locked(task, now).continues
+
+
+def _writing_locked(state: Any, task: Task, now: datetime) -> bool:
+    """任务还可能改文件：会接着跑的，加上被判失败、旧 worker 还没停手的。认领按它放。"""
+    return state._task_ending_locked(task, now).still_writing
 
 
 def _view_locked(state: Any, task_id: str, now: datetime) -> TaskView | None:
     task = state.tasks.get(str(task_id or "").strip())
     if task is None:
         return None
-    live = _live_locked(state, task, now)
+    live = _writing_locked(state, task, now)
     return TaskView(
         task_id=task.task_id,
         live=live,
@@ -382,7 +378,7 @@ def release_if_ended_locked(state: Any, task: Task) -> None:
         return
     try:
         now = datetime.now(timezone.utc)
-        if _live_locked(state, task, now):
+        if _writing_locked(state, task, now):
             return
         ledger.end_task(task.task_id, ended_at=now.timestamp())
     except Exception:

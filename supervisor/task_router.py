@@ -20,12 +20,13 @@ from typing import Any
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
-from . import async_dispatches, auto_continue, child_retention, continuation, session_reuse
+from . import async_dispatches, auto_continue, child_retention, continuation, session_reuse, stopped_batch
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
 from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
+from .task_ending import TaskEnding, clear_stopping, stopping_expired, transit_due
 from engine.compact import COMPACT_SUMMARY_PREFIX
 from engine.dispatch_batch import (
     AWAITING_INPUT_KEY,
@@ -64,6 +65,8 @@ _TASK_END_ACTIONS = frozenset({"finish", "ask", "fail", "cancelled", "preempted"
 OUTBOUND_NO_REPLY = "no_reply"
 # 异步工具结果沿派发链往上找落点最多走几层，防着坏数据里的环
 _ASYNC_RESULT_MAX_HOPS = 16
+_WITHDRAWN_REASON = "这一批没有派完，已撤回"
+_UNSENT_DISPATCH_ERROR = "它交回了委派请求，但那些子任务没有派出去（路由失败，或迟迟没处理完），它没有做完。"
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1250,8 @@ class TaskRouterMixin:
                 ),
             )
             return
+        if self._call_off_dispatch_locked(task):
+            return
         worktrees = worktree_service_of(self)
         if worktrees.needs_outcome_locked(task) and not task.input.get(OUTCOME_WORKER_KEY):
             # 隔离副本的主人收尾：diff 要在锁外算，从 _route_completed_task 那条路走一遍，算完再回来路由
@@ -1256,6 +1261,16 @@ class TaskRouterMixin:
                 args=(task,),
                 daemon=True,
                 name=f"worktree-route-{task.task_id[:8]}",
+            ).start()
+            return
+        if stopped_batch.pending_locked(task) and not task.input.get(stopped_batch.WRITER_KEY):
+            # 被停下时在等的那一批先在锁外写进它的会话再路由：调用方恢复后马上接着派它，历史里也看得到
+            task.input[stopped_batch.WRITER_KEY] = True
+            threading.Thread(
+                target=self._route_completed_task,
+                args=(task,),
+                daemon=True,
+                name=f"stopped-batch-route-{task.task_id[:8]}",
             ).start()
             return
         worktrees.task_ended_locked(task)
@@ -1288,6 +1303,10 @@ class TaskRouterMixin:
                     task, event="task_route_failed",
                 ),
             )
+            try:
+                self._transit_ended_locked(task)
+            except Exception:
+                log.exception("settling the batch of task %s after its route failed failed", task.task_id[:12])
             raise
         # 结果先交出去，它等过却没收的异步委派结果才作为新消息排在后面
         async_dispatches.release_if_ended_locked(self, task)
@@ -1391,7 +1410,10 @@ class TaskRouterMixin:
             self._route_preempted_locked(task, action)
             return
         if act == "dispatch":
-            self._route_dispatch_locked(task, action)
+            try:
+                self._route_dispatch_locked(task, action)
+            except Exception as exc:
+                self._abandon_dispatch_locked(task, exc)
             if task.status != TaskStatus.failed:
                 return
             # 同一任务的压缩连续失败到上限，这次 dispatch 已改判为失败，按失败继续路由
@@ -1578,6 +1600,9 @@ class TaskRouterMixin:
                 (child.batch_id for child in existing_children.values() if child.batch_id), None,
             ) or str(uuid.uuid4())
             item_timeouts = DispatchTimeouts.from_config(load_runtime_config(self.workspace_root))
+            items_created_at = _now()
+            # 这一批最晚等到这个时刻：本任务的总寿命（和派它的那一层给的封顶）减去收尾余量，嵌套一层早一层
+            batch_wait_cap = async_dispatches.wait_cap(task)
             for idx, item in enumerate(dispatch_batch):
                 if not isinstance(item, dict):
                     continue
@@ -1590,8 +1615,17 @@ class TaskRouterMixin:
                     created_child_ids.append(reused.task_id)
                     async_dispatches.watch_item_locked(self, reused)
                     continue
+                if batch_wait_cap <= items_created_at:
+                    refused = self._create_refused_batch_child_locked(
+                        task, item, target=item_target, batch_id=batch_id, index=idx,
+                        delivery_key=delivery_key, error=async_dispatches.WAIT_CAP_PASSED,
+                    )
+                    created_child_ids.append(refused.task_id)
+                    continue
                 item_timeout = batch_item_timeout(item, item_timeouts)
-                item_deadline = async_dispatches.item_deadline_inputs(item_timeout) if item_timeout else {}
+                item_deadline = async_dispatches.item_deadline_inputs(
+                    item_timeout, cap=batch_wait_cap, now=items_created_at,
+                )
 
                 if item_kind == "tool":
                     _tool_input = {
@@ -1833,10 +1867,8 @@ class TaskRouterMixin:
                 waiting_batch_id=batch_id,
             )
             if batch_id:
-                children = [self.tasks[child_id] for child_id in created_child_ids if child_id in self.tasks]
-                # 一项都没真正派出去（比如 continue_from 全被拒），没有子任务的完成来唤醒它，这里直接交回结果
-                if children and all(self._task_terminal(child) for child in children):
-                    self._collect_batch_locked(children[0])
+                # 一项都没真正派出去（比如 continue_from 全被拒），没有子任务的完成来唤醒它，这里直接看能不能交回结果
+                self._resume_batch_if_settled_locked(task, batch_id)
 
     def _suspend_caller_locked(
         self, task: Task, *, waiting_task_id: str | None = None, waiting_batch_id: str | None = None,
@@ -1853,6 +1885,72 @@ class TaskRouterMixin:
         task.updated_at = _now()
         self._event_task_snapshot("task_suspended", task)
 
+    def _call_off_dispatch_locked(self, task: Task) -> bool:
+        """交回了 dispatch、路由进锁前就被叫停的。
+
+        被取消的、调用方已经不等它的，当场按取消收掉、不派子任务，返回 True；单项超时到点的改判失败，返回 False，
+        接着按失败路由。
+        """
+        if task.status != TaskStatus.completed or str((task.result or {}).get("action") or "").strip() != "dispatch":
+            return False
+        now = _now()
+        reason = self._dispatch_call_off_reason_locked(task)
+        if reason:
+            log.info("dispatch of task %s called off before it went out: %s", task.task_id[:12], reason)
+            task.cancel_requested = True
+            # 先记成路由完：task_cancelled 快照里就是终局，重启后的补路由不会再推一遍
+            task.route_status = RouteStatus.routed
+            task.routed_at = now
+            task.route_error = ""
+            self._terminate_cancelled_locked(task, now, reason=reason)
+            return True
+        if task.input.get(async_dispatches.ITEM_TIMED_OUT_KEY):
+            error = async_dispatches.item_timeout_error(task)
+            log.info("dispatch of task %s timed out before it went out", task.task_id[:12])
+            stopped_batch.capture_locked(self, task, reason=error, now=now)
+            self._apply_failure_locked(task, error, now=now)
+            self._event_task_snapshot("task_completed", task, component="supervisor")
+        return False
+
+    def _dispatch_call_off_reason_locked(self, task: Task) -> str:
+        if self._task_cancel_pending_locked(task):
+            return "交回的委派还没派出去就被取消了"
+        caller_id = (task.caller_task_id or "").strip()
+        if not caller_id:
+            return ""
+        caller = self.tasks.get(caller_id)
+        waits = (
+            self._caller_waits_for_batch_locked(caller, task) if task.batch_id
+            else self._caller_waits_for_child_locked(caller, task)
+        )
+        return "" if waits else "调用方已经不等它的结果了，交回的委派没有再派出去"
+
+    def _abandon_dispatch_locked(self, task: Task, exc: Exception) -> None:
+        """派子任务派到一半出错：这次完成已经派出的全部撤回，调用方按失败收尾并说明；重推这次完成不会再派。"""
+        log.error("dispatching the children of task %s failed; withdrawing them", task.task_id[:12], exc_info=exc)
+        now = _now()
+        withdrawn = list(self._existing_dispatch_children_locked(task, str(task.delivery_id or "").strip()).values())
+        detail = f"{type(exc).__name__}: {exc}"
+        if task.input.get("_compact_dispatch_pending"):
+            for child in withdrawn:
+                self._cancel_task_locked(child, now, force=True, reason=_WITHDRAWN_REASON)
+            # 等着压缩子任务的调用方，撤回时已经由压缩结果那条路收尾
+            if task.status in (TaskStatus.completed, TaskStatus.suspended):
+                context_ref = str((task.result or {}).get("context_ref") or task.input.get("context_ref") or "")
+                self._fail_compact_round_locked(
+                    task, context_ref, reason=f"派出压缩子任务时出错（{detail}）", in_route=True,
+                )
+            return
+        error = f"派出子任务时出错（{detail}），这一批已经派出的已全部撤回，没有结果。"
+        captured = stopped_batch.capture_locked(self, task, reason=error, now=now)
+        # 先判调用方失败再撤：撤下的子任务结算时调用方已经不在等，不会先被一批「已取消」唤醒
+        self._apply_failure_locked(task, error, now=now)
+        self._event_task_snapshot("task_completed", task, component="supervisor")
+        for child in withdrawn:
+            self._cancel_task_locked(child, now, force=True, reason=_WITHDRAWN_REASON)
+        if captured:
+            stopped_batch.write_soon_locked(self, task)
+
     def _create_refused_batch_child_locked(
         self,
         caller: Task,
@@ -1865,20 +1963,22 @@ class TaskRouterMixin:
         error: str,
     ) -> Task:
         """批次里派不出去的一项：照样建出子任务、当场判失败，原因随批次结果交回，调用方那次调用才有下文。"""
-        child_input: dict[str, Any] = {
-            "instruction": str(item.get("instruction") or "").strip(),
-            "use_context": False,
-        }
         call_id = str(item.get("call_id") or "").strip()
-        if call_id:
-            child_input["_dispatch_call_id"] = call_id
+        is_tool = str(item.get("kind") or "node").strip() == "tool"
+        if is_tool:
+            child_input: dict[str, Any] = {"arguments": item.get("arguments", {}), "call_id": call_id}
+        else:
+            child_input = {"instruction": str(item.get("instruction") or "").strip(), "use_context": False}
+            if call_id:
+                child_input["_dispatch_call_id"] = call_id
         if delivery_key:
             child_input["_dispatch_delivery_id"] = delivery_key
         child = self._create_task_locked(
             session_id=caller.session_id,
             session_generation=caller.session_generation,
-            kind=TaskKind.node,
-            node_id=target,
+            kind=TaskKind.tool if is_tool else TaskKind.node,
+            node_id=None if is_tool else target,
+            tool_name=target if is_tool else None,
             input_data=child_input,
             continuation={},
             source_inbound_seq=caller.source_inbound_seq,
@@ -2074,21 +2174,78 @@ class TaskRouterMixin:
         self._resume_suspended_task_locked(caller, resume_data, action_type=action_type)
 
     def _collect_batch_locked(self, child: Task) -> None:
-        """批次里有一个子任务到了终态：兄弟全部结束后打包结果恢复 caller，不区分 tool/node。"""
+        """批次里有一个子任务到了它这一程的终点（在它自己的结算里调用）：兄弟全都真正结束后打包结果恢复 caller，不区分 tool/node。"""
         caller = self.tasks.get((child.caller_task_id or "").strip())
         if not self._caller_waits_for_batch_locked(caller, child):
             self._log_dropped_child_result_locked(child, caller)
             return
+        self._resume_batch_if_settled_locked(caller, str(child.batch_id or ""), routing=child)
+
+    def _resume_batch_if_settled_locked(
+        self, caller: Task, batch_id: str, *, routing: Task | None = None, now: datetime | None = None,
+    ) -> bool:
+        """caller 等的这一批都真正结束了就打包结果恢复它，返回恢复了没有。
+
+        routing 是正在结算自己的那个子任务：它的路由就是现在，不算没结束。还在过渡段的兄弟登记到点复查，
+        路由一直没跑完或旧 worker 一直不回报也收得齐。
+        """
         siblings = sorted(
             (
                 sibling for sibling in self.tasks.values()
-                if sibling.batch_id == child.batch_id and sibling.caller_task_id == caller.task_id
+                if sibling.batch_id == batch_id and sibling.caller_task_id == caller.task_id
             ),
             key=lambda sibling: sibling.batch_index,
         )
-        if any(not self._task_terminal(sibling) for sibling in siblings):
-            return
+        if not siblings:
+            return False
+        now = now or _now()
+        open_siblings: list[tuple[Task, TaskEnding]] = []
+        for sibling in siblings:
+            if routing is not None and sibling.task_id == routing.task_id:
+                continue
+            ending = self._task_ending_locked(sibling, now)
+            if ending.result_open:
+                open_siblings.append((sibling, ending))
+        if open_siblings:
+            for sibling, ending in open_siblings:
+                due = transit_due(sibling, ending)
+                if due is not None:
+                    async_dispatches.watch_transit_locked(self, sibling.task_id, due)
+            return False
         self._resume_suspended_task_locked(caller, self._batch_resume_data(siblings))
+        return True
+
+    def _watch_transit_locked(self, task: Task) -> None:
+        """任务进了过渡段（比如被判失败、旧 worker 还没停手）：登记到点复查。"""
+        due = transit_due(task, self._task_ending_locked(task))
+        if due is not None:
+            async_dispatches.watch_transit_locked(self, task.task_id, due)
+
+    def _transit_check_due_locked(self, task_id: str, now: datetime) -> None:
+        """过渡段到点：旧 worker 过了 STOP_GRACE 还没回报的按它已经不在了路由；其余的看在等它的批次能不能收齐。"""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        if stopping_expired(task, now):
+            clear_stopping(task)
+            log.warning("task %s: the worker never reported after the failure; routing it anyway", task_id[:12])
+            if task.route_status != RouteStatus.routed:
+                self._route_completed_task_locked(task)
+                return
+        ending = self._task_ending_locked(task, now)
+        due = transit_due(task, ending)
+        if due is not None and due > now:
+            async_dispatches.watch_transit_locked(self, task.task_id, due)
+            return
+        self._transit_ended_locked(task, now=now)
+
+    def _transit_ended_locked(self, task: Task, *, now: datetime | None = None) -> None:
+        """任务的过渡段结束了（路由失败、到点）：它所在的批次如果只差它，现在收齐。"""
+        if not task.batch_id:
+            return
+        caller = self.tasks.get((task.caller_task_id or "").strip())
+        if self._caller_waits_for_batch_locked(caller, task):
+            self._resume_batch_if_settled_locked(caller, str(task.batch_id), now=now)
 
     def _batch_resume_data(self, siblings: list[Task]) -> dict[str, Any]:
         return {"type": "batch_results", "entries": [self._dispatch_result_entry_locked(t) for t in siblings]}
@@ -2097,6 +2254,10 @@ class TaskRouterMixin:
         """一个子任务交回调用方的那一项：同步批次和 await_dispatches 收异步委派都用这一份。"""
         tr = t.result.get("result") if isinstance(t.result.get("result"), dict) else {}
         act = self._task_outcome_action(t)
+        # 交回了 dispatch 却没能挂起（路由失败或过了宽限还没路由完）：对调用方来说它就是没做完
+        unsent = act == "dispatch"
+        if unsent:
+            act = "fail"
 
         entry: dict[str, Any] = {
             "kind": t.kind.value,
@@ -2124,9 +2285,11 @@ class TaskRouterMixin:
             entry["ref"] = str(tr.get("ref") or "")
 
         if act in ("fail", "cancelled"):
-            entry["error"] = str(t.result.get("error") or "")
+            entry["error"] = _UNSENT_DISPATCH_ERROR if unsent else str(t.result.get("error") or "")
         if t.input.get(async_dispatches.ITEM_TIMED_OUT_KEY):
             entry["timed_out"] = True
+            if t.input.get(async_dispatches.ITEM_LIFETIME_CAPPED_KEY):
+                entry["lifetime_capped"] = True
         entry.update(worktree_service_of(self).result_fields_locked(t))
 
         atts = tr.get("attachments")
@@ -2167,6 +2330,7 @@ class TaskRouterMixin:
 
     def _finish_cancelled_task(self, task: Task) -> None:
         """取消终结之后的收尾：先把分支合并回去，再拆这个任务独占的 fresh/fork 会话。"""
+        stopped_batch.write(self, task)
         try:
             if task.input.get("branch_session_id") and not task.input.get("_branch_finalized"):
                 if self._finalize_branch_task(task, merge=True) is None:
@@ -3156,6 +3320,7 @@ class TaskRouterMixin:
 
         算不出来就什么也不留，路由时退回锁内现算，结果一致。
         """
+        stopped_batch.write(self, task)
         self._prepare_worktree_outcome(task)
         self._adopt_child_outputs(task)
         try:

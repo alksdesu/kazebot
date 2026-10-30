@@ -24,6 +24,7 @@ from supervisor.task_reaper import (  # noqa: E402
     reap_reason,
     reap_stuck_tasks_locked,
 )
+from supervisor.task_ending import STOP_GRACE, TaskEnding  # noqa: E402
 from supervisor.task_store import CompletionOutcome  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
 
@@ -234,3 +235,57 @@ class TestReapingIsCancellation:
         assert caller.task_id in reaped
         assert caller.status == TaskStatus.failed and caller.cancel_requested
         assert all(child.status == TaskStatus.cancelled for child in children)
+
+
+def _reaped_while_running(state: SupervisorState) -> tuple[Task, Task, Task, datetime]:
+    """批次里一个子任务跑过了运行上限、worker 还拿着有效租约时被回收；另一个已经结束。"""
+    sid = state.get_or_create_session(channel="test", conversation_key="test:sup-reaper")
+    caller = _caller(state, sid)
+    first, second = _dispatch_batch(state, caller)
+    now = datetime.now(timezone.utc)
+    first.status = TaskStatus.running
+    first.worker_id = "worker-1"
+    first.claim_id = "claim-1"
+    first.claimed_at = now - timedelta(seconds=_MAX + 1)
+    first.lease_expires_at = now + timedelta(minutes=2)
+    second.status = TaskStatus.completed
+    second.result = {"action": "finish", "result": {"text": "second part"}}
+    caller.updated_at = now - timedelta(minutes=6)
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=now, session_ids={sid}) == [first.task_id]
+    return caller, first, second, now
+
+
+class TestAReapedChildWhoseWorkerHasNotStopped:
+    def test_its_caller_keeps_waiting_and_is_not_taken_for_a_zombie(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller, first, _second, now = _reaped_while_running(state)
+
+        assert first.status == TaskStatus.failed and first.cancel_requested
+        assert state._task_ending_locked(first) is TaskEnding.stopping
+        assert caller.status == TaskStatus.suspended
+        with state._lock:
+            assert reap_stuck_tasks_locked(state, now=now, session_ids={caller.session_id}) == []
+        assert caller.status == TaskStatus.suspended
+
+        late = state.complete_task(
+            task_id=first.task_id, worker_id="worker-1", result={"action": "cancelled"}, claim_id="claim-1",
+        )
+
+        assert late is not None and late.outcome is CompletionOutcome.stale
+        assert caller.status == TaskStatus.pending
+        failed, finished = caller.input["resume_data"]["entries"]
+        assert failed["status"] == "fail" and "运行过久" in failed["error"]
+        assert finished["text"] == "second part"
+
+    def test_a_worker_that_never_reports_is_given_up_by_a_sweep_after_the_grace(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller, first, _second, now = _reaped_while_running(state)
+
+        with state._lock:
+            reaped = reap_stuck_tasks_locked(state, now=now + STOP_GRACE + timedelta(seconds=1))
+
+        assert reaped == []
+        assert caller.status == TaskStatus.pending
+        assert state._task_ending_locked(first) is TaskEnding.ended
+        assert [entry["status"] for entry in caller.input["resume_data"]["entries"]] == ["fail", "finish"]

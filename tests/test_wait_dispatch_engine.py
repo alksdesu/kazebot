@@ -258,6 +258,28 @@ class TestRefusals:
         assert overflow["success"] is False and f"最多 {MAX_DISPATCH_BATCH_ITEMS} 个" in overflow["error"]
         assert answered_once(ls.messages)
 
+    def test_refused_calls_do_not_use_up_the_per_round_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        refused = [
+            _wait("scout", "bad timeout", call_id="bad-timeout", context_mode="fresh", timeout_sec="soon"),
+            _wait("scout", "   ", call_id="no-instruction", context_mode="fresh"),
+        ]
+        calls = [
+            _wait("scout", f"job {index}", call_id=f"w{index}", context_mode="fresh")
+            for index in range(MAX_DISPATCH_BATCH_ITEMS)
+        ]
+
+        action = _run(ls, *refused, *calls)
+
+        assert [item["call_id"] for item in action.dispatch_batch] == [
+            f"w{index}" for index in range(MAX_DISPATCH_BATCH_ITEMS)
+        ]
+        assert _payload(ls, "bad-timeout")["success"] is False
+        assert _payload(ls, "no-instruction")["success"] is False
+        assert answered_once(ls.messages)
+
     def test_an_empty_instruction_is_refused(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ls, _registry = _loop(tmp_path, monkeypatch)
 
@@ -611,3 +633,26 @@ class TestResume:
 
         assert action.action == ACTION_FINISH
         assert [item["path"] for item in action.result["attachments"]] == ["data/attachments/child.png"]
+
+    def test_a_finish_with_an_empty_list_still_sends_the_child_attachments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        image = tmp_path / "data" / "attachments" / "child.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        attachment = {"type": "image", "path": "data/attachments/child.png", "mime_type": "image/png", "name": "child.png"}
+        run = NodeRun(monkeypatch, tmp_path, registry=ScriptedRegistry(tools={"probe": echo()}), node=_delegating_node())
+
+        action = run.run(
+            turn(call("finish", {"text": "只说结论", "attachment_paths": []}, call_id="f")),
+            instruction="",
+            resume_data=_batch_resume(attachments=[attachment]),
+        )
+
+        assert action.action == ACTION_FINISH
+        assert [item["path"] for item in action.result["attachments"]] == ["data/attachments/child.png"]
+        captions = [
+            json.dumps(message.get("content"), ensure_ascii=False) for message in run.requests[0]["messages"]
+            if "以上子任务产生了以下附件" in json.dumps(message.get("content"), ensure_ascii=False)
+        ]
+        assert len(captions) == 1 and "只写其中几个就只发那几个" in captions[0]

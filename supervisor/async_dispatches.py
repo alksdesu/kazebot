@@ -17,10 +17,11 @@ from pydantic import BaseModel, Field
 from clonoth_runtime import load_runtime_config, task_max_running_seconds
 from engine.dispatch_batch import AWAIT_ANY, AWAITING_INPUT_KEY, AwaitRequest, DispatchTimeouts
 from engine.dispatch_handle import format_handle, parse_handle
-from engine.run_budget import lifetime_limit_seconds, lifetime_origin
+from engine.run_budget import lifetime_limit_seconds, lifetime_origin, parse_timestamp
 
 from . import child_retention
 from ._helpers import _now
+from .task_ending import TaskEnding
 from .task_store import CancelEffect
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
@@ -33,6 +34,10 @@ log = logging.getLogger(__name__)
 ITEM_TIMEOUT_SEC_KEY = "_wait_timeout_sec"
 ITEM_DEADLINE_KEY = "_wait_deadline"
 ITEM_TIMED_OUT_KEY = "_wait_timed_out"
+# 派它的那一层最晚等到什么时候：它自己挂起等结果时也不能等过这个时刻
+ITEM_LIFETIME_CAP_KEY = "_wait_lifetime_cap"
+# 这一项的截止时间来自调用方的总寿命，不是它自己写的 timeout_sec
+ITEM_LIFETIME_CAPPED_KEY = "_wait_lifetime_capped"
 
 DELIVERED_INBOUND = "inbound"
 DELIVERED_JOIN = "join"
@@ -49,14 +54,28 @@ LIST_SETTLED_LIMIT = 20
 _PREVIEW_CHARS = 160
 # 等待截止留出这段余量，挂起的任务先带着已有结果恢复，再被总寿命回收
 _LIFETIME_MARGIN = timedelta(minutes=10)
-# 刚交回 dispatch、路由还没跑完的任务算活着；路由一直没跑完的过了这段时间就不算了
-_TRANSIT_GRACE = timedelta(minutes=10)
 # 定时器早醒一点就会错过刚好到点的那一项
 _TIMER_SLACK_SEC = 0.05
 
 _NOT_FOUND = "找不到这个委派：句柄不对、不属于这段对话，或者它结束得太早、记录已经清掉了（那样的话结果早先已作为单独的消息交回过）。"
 _INVALID_HANDLE = "句柄格式不对：要照抄委派结果里给的句柄（task_id@session_id）。"
 _SYNC_HANDLE = "这是 wait=true 同步委派的句柄，它的结果已经随那一批结果交回，不用再等。"
+_SYNC_HANDLE_RUNNING = "这是 wait=true 同步委派的句柄：它的结果只交给挂起等这一批的那个任务，await_dispatches 收不到。"
+_SYNC_CANCEL_RUNNING = (
+    "这是 wait=true 同步委派的句柄，不能单独取消：它跟着挂起等它的那个任务走，"
+    "要停它就取消或停下那个任务，它会一起停下。"
+)
+_SYNC_CANCEL_FINISHED = "这是 wait=true 同步委派的句柄，它已经结束，结果已随那一批结果交回调用方，不用取消。"
+_SYNC_REASONS = frozenset({_SYNC_HANDLE, _SYNC_HANDLE_RUNNING, _SYNC_CANCEL_RUNNING, _SYNC_CANCEL_FINISHED})
+PURPOSE_AWAIT = "await"
+PURPOSE_CANCEL = "cancel"
+_LIFETIME_CAPPED_ERROR = (
+    "调用方的总运行时长快到上限，没等它做完就先收了，它已经停下（不是这一项自己写的 timeout_sec 到点）。"
+)
+WAIT_CAP_PASSED = (
+    f"没有派出：本任务离总运行时长上限已不到 {int(_LIFETIME_MARGIN.total_seconds() // 60)} 分钟，"
+    "再派需要等结果的子任务会来不及收尾；先把已有的结果整理交回。"
+)
 _SELF_HANDLE = "不能等自己，也不能等派出自己的那个任务。"
 _DUPLICATE_HANDLE = "和前面的句柄是同一个委派。"
 _SYSTEM_TASK = "系统任务不能挂起等待异步委派的结果。"
@@ -107,6 +126,8 @@ class AsyncDispatchRegistry:
         # 子任务 id -> 留给哪个任务：await 过它的任务活着时，结果不另开任务
         self.reserved: dict[str, str] = {}
         self.item_deadlines: dict[str, datetime] = {}
+        # 任务 id -> 它的过渡段最晚到什么时候：到点还没等来路由或回报，按结束处理，在等它的批次就此收齐
+        self.transit_checks: dict[str, datetime] = {}
         self.timer: threading.Timer | None = None
         self.timer_due: datetime | None = None
         self.timer_token: object | None = None
@@ -158,15 +179,8 @@ def handle_of_locked(state: "SupervisorState", task: Task) -> str:
 
 
 def _alive(state: "SupervisorState", task: Task, now: datetime) -> bool:
-    if not state._task_terminal(task):
-        return True
-    action = str((task.result or {}).get("action") or "").strip()
-    return (
-        task.status == TaskStatus.completed
-        and action == "dispatch"
-        and task.route_status != RouteStatus.routed
-        and now - task.updated_at < _TRANSIT_GRACE
-    )
+    """还会接着跑、还收得了结果：刚交回 dispatch、正在路由去挂起的也算。"""
+    return state._task_ending_locked(task, now).continues
 
 
 def _preview(text: Any, limit: int = _PREVIEW_CHARS) -> str:
@@ -359,9 +373,12 @@ def _dispatch_chain_ids(state: "SupervisorState", task: Task) -> set[str]:
 
 
 def _task_for_handle_locked(
-    state: "SupervisorState", registry: AsyncDispatchRegistry, caller: Task, text: str,
+    state: "SupervisorState", registry: AsyncDispatchRegistry, caller: Task, text: str, *, purpose: str,
 ) -> tuple[Task | None, str]:
-    """句柄对应的异步委派任务，以及认不出时给模型看的原因。家族外的和不存在一样。"""
+    """句柄对应的异步委派任务，以及认不出时给模型看的原因。
+
+    先核会话和家族，家族外的一律和不存在一样；家族里的同步委派按 purpose（await 或 cancel）和它结束没有照实说明。
+    """
     handle = parse_handle(text)
     if handle is None:
         return None, _INVALID_HANDLE
@@ -369,15 +386,24 @@ def _task_for_handle_locked(
     task = state.tasks.get(handle.task_id) or (record.task if record is not None else None)
     if task is None:
         return None, _NOT_FOUND
-    if not is_async_dispatch(task):
-        return None, _SYNC_HANDLE if (task.caller_task_id or "").strip() else _NOT_FOUND
     if _storage_session_id(state, task) != handle.session_id:
         return None, _NOT_FOUND
     caller_root = state._task_family_root_locked(caller)
     task_root = record.family_root if record is not None else state._task_family_root_locked(task)
     if not caller_root or caller_root != task_root:
         return None, _NOT_FOUND
+    if not is_async_dispatch(task):
+        if not (task.caller_task_id or "").strip():
+            return None, _NOT_FOUND
+        return None, _sync_handle_reason(state, task, purpose)
     return task, ""
+
+
+def _sync_handle_reason(state: "SupervisorState", task: Task, purpose: str) -> str:
+    running = state._task_ending_locked(task).result_open
+    if purpose == PURPOSE_CANCEL:
+        return _SYNC_CANCEL_RUNNING if running else _SYNC_CANCEL_FINISHED
+    return _SYNC_HANDLE_RUNNING if running else _SYNC_HANDLE
 
 
 def _holder_alive_locked(state: "SupervisorState", holder_id: str, now: datetime) -> bool:
@@ -395,7 +421,7 @@ def route_await_locked(state: "SupervisorState", waiter: Task, request: AwaitReq
     timeouts = DispatchTimeouts.from_config(load_runtime_config(state.workspace_root))
     timeout = timeouts.clamp(request.timeout_sec) if request.timeout_sec is not None else timeouts.await_default
     deadline = now + timedelta(seconds=timeout)
-    cap = _lifetime_end(waiter) - _LIFETIME_MARGIN
+    cap = wait_cap(waiter)
     lifetime_capped = cap < deadline
     join = Join(
         waiter_id=waiter.task_id,
@@ -414,7 +440,7 @@ def route_await_locked(state: "SupervisorState", waiter: Task, request: AwaitReq
         task: Task | None = None
         reason = refusal
         if not reason:
-            task, reason = _task_for_handle_locked(state, registry, waiter, text)
+            task, reason = _task_for_handle_locked(state, registry, waiter, text, purpose=PURPOSE_AWAIT)
         if task is not None and not reason:
             if task.task_id in own_chain:
                 reason = _SELF_HANDLE
@@ -585,20 +611,49 @@ def _catch_up_join_locked(state: "SupervisorState", registry: AsyncDispatchRegis
         _claim_settled(registry, join, record)
 
 
-def item_deadline_inputs(seconds: int, *, now: datetime | None = None) -> dict[str, Any]:
-    """建批次子任务时一并写进 input 的超时字段。"""
-    due = (now or _now()) + timedelta(seconds=int(seconds))
-    return {ITEM_TIMEOUT_SEC_KEY: int(seconds), ITEM_DEADLINE_KEY: due.isoformat()}
+def wait_cap(caller: Task) -> datetime:
+    """caller 挂起等结果最晚等到什么时候：它自己的总寿命和派它的那一层给的封顶取早的，再留出收尾的余量。"""
+    end = _lifetime_end(caller)
+    inherited = _inherited_cap(caller)
+    if inherited is not None and inherited < end:
+        end = inherited
+    return end - _LIFETIME_MARGIN
+
+
+def _inherited_cap(task: Task) -> datetime | None:
+    raw = str(task.input.get(ITEM_LIFETIME_CAP_KEY) or "").strip()
+    if not raw:
+        return None
+    cap = parse_timestamp(raw)
+    if cap is None:
+        # 派它的那一层到点照样会按自己记的截止时间收它，这里只退回按它自己的寿命算
+        log.warning("task %s has an unreadable wait cap %r", task.task_id[:12], raw)
+    return cap
+
+
+def item_deadline_inputs(seconds: int, *, cap: datetime, now: datetime | None = None) -> dict[str, Any]:
+    """建批次子任务时一并写进 input 的截止字段：写了 timeout_sec 的按它算，调用方的寿命封顶更早时按封顶。
+
+    封顶本身也记下：子任务自己再挂起等结果时，不能等过这个时刻。
+    """
+    explicit = (now or _now()) + timedelta(seconds=int(seconds)) if seconds else None
+    capped = explicit is None or cap < explicit
+    due = cap if capped else explicit
+    fields: dict[str, Any] = {ITEM_LIFETIME_CAP_KEY: cap.isoformat(), ITEM_DEADLINE_KEY: due.isoformat()}
+    if seconds:
+        fields[ITEM_TIMEOUT_SEC_KEY] = int(seconds)
+    if capped:
+        fields[ITEM_LIFETIME_CAPPED_KEY] = True
+    return fields
 
 
 def watch_item_locked(state: "SupervisorState", child: Task) -> None:
     """登记批次子任务的截止时刻（读它 input 里的字段），到点还没结束就按失败收掉。"""
     raw = str(child.input.get(ITEM_DEADLINE_KEY) or "").strip()
-    if not raw or state._task_terminal(child):
+    if not raw or not state._task_ending_locked(child).continues:
         return
-    try:
-        due = datetime.fromisoformat(raw)
-    except ValueError:
+    due = parse_timestamp(raw)
+    if due is None:
         log.warning("dispatch item %s has an unreadable deadline %r", child.task_id[:12], raw)
         return
     registry = registry_locked(state)
@@ -606,22 +661,43 @@ def watch_item_locked(state: "SupervisorState", child: Task) -> None:
     _arm_locked(state, registry)
 
 
+def item_timeout_error(child: Task) -> str:
+    """单项到点被停下的原因：调用方寿命封顶的，和它自己写的 timeout_sec 到点的分开说。"""
+    if child.input.get(ITEM_LIFETIME_CAPPED_KEY):
+        return _LIFETIME_CAPPED_ERROR
+    seconds = int(child.input.get(ITEM_TIMEOUT_SEC_KEY) or 0)
+    return f"等待超时：{seconds} 秒内没有做完，已被停下。"
+
+
 def _expire_item_locked(state: "SupervisorState", child_id: str, now: datetime) -> None:
     child = state.tasks.get(child_id)
-    if child is None or state._task_terminal(child):
+    if child is None:
         return
-    seconds = int(child.input.get(ITEM_TIMEOUT_SEC_KEY) or 0)
+    ending = state._task_ending_locked(child, now)
+    # 结局已经定了（结束、结局还在路由、旧 worker 还在停手），不用再计时
+    if not ending.continues:
+        return
     child.input[ITEM_TIMED_OUT_KEY] = True
     log.warning(
-        "dispatch item %s (node=%s) of task %s timed out after %ss",
-        child.task_id[:12], child.node_id, (child.caller_task_id or "")[:12], seconds,
+        "dispatch item %s (node=%s) of task %s timed out (%s)",
+        child.task_id[:12], child.node_id, (child.caller_task_id or "")[:12], ending.value,
     )
+    if ending is not TaskEnding.live:
+        # 交回的委派还在路由：路由进锁时按超时改判失败，不会再派出子任务
+        return
     # 按失败收掉：会话照失败的规矩保留，调用方能用句柄 continue_from 接着做
-    state._fail_task_locked(child, error=f"等待超时：{seconds} 秒内没有做完，已被停下。", now=now)
+    state._fail_task_locked(child, error=item_timeout_error(child), now=now)
+
+
+def watch_transit_locked(state: "SupervisorState", task_id: str, due: datetime) -> None:
+    """登记一个任务过渡段的最晚时刻：到点还没等来路由或 worker 回报，由 state._transit_check_due_locked 按结束处理。"""
+    registry = registry_locked(state)
+    registry.transit_checks[task_id] = due
+    _arm_locked(state, registry)
 
 
 def expire_due_locked(state: "SupervisorState", *, now: datetime | None = None) -> None:
-    """到点的汇合带着已有结果恢复调用方，到点的批次项按失败收掉，顺带清理任务已经结束的汇合和保留。"""
+    """到点的汇合带着已有结果恢复调用方，到点的批次项按失败收掉，过渡段到点的任务按结束处理，顺带清理任务已经结束的汇合、保留和批次项截止时间。"""
     registry = _existing_registry(state)
     if registry is None:
         return
@@ -640,6 +716,11 @@ def expire_due_locked(state: "SupervisorState", *, now: datetime | None = None) 
             except Exception:
                 log.exception("resuming task %s from its join failed", join.waiter_id[:12])
     for child_id, due in list(registry.item_deadlines.items()):
+        child = state.tasks.get(child_id)
+        # 每项都带寿命封顶，几小时后才到点：已经结束的在这里清掉，定时器不为它们空醒
+        if child is None or not state._task_ending_locked(child, now).continues:
+            registry.item_deadlines.pop(child_id, None)
+            continue
         if due > now:
             continue
         registry.item_deadlines.pop(child_id, None)
@@ -647,6 +728,14 @@ def expire_due_locked(state: "SupervisorState", *, now: datetime | None = None) 
             _expire_item_locked(state, child_id, now)
         except Exception:
             log.exception("timing out dispatch item %s failed", child_id[:12])
+    for task_id, due in list(registry.transit_checks.items()):
+        if due > now:
+            continue
+        registry.transit_checks.pop(task_id, None)
+        try:
+            state._transit_check_due_locked(task_id, now)
+        except Exception:
+            log.exception("settling task %s at the end of its transit failed", task_id[:12])
     holders = set(registry.reserved.values()) | {record.held_for for record in registry.ledger.values() if record.held_for}
     for holder_id in holders:
         if not _holder_alive_locked(state, holder_id, now):
@@ -664,7 +753,9 @@ def wait_target_state_locked(state: "SupervisorState", task: Task) -> tuple[bool
 
 
 def _next_due(registry: AsyncDispatchRegistry) -> datetime | None:
-    dues = [join.deadline for join in registry.joins.values()] + list(registry.item_deadlines.values())
+    dues = [
+        join.deadline for join in registry.joins.values()
+    ] + list(registry.item_deadlines.values()) + list(registry.transit_checks.values())
     return min(dues) if dues else None
 
 
@@ -716,7 +807,11 @@ def _caller_locked(state: "SupervisorState", caller_task_id: str) -> Task | None
 def _active_item_locked(
     state: "SupervisorState", registry: AsyncDispatchRegistry, caller: Task, task: Task, now: datetime,
 ) -> dict[str, Any]:
-    if state._task_terminal(task):
+    ending = state._task_ending_locked(task, now)
+    if ending is TaskEnding.dispatching:
+        # 交回了 dispatch、正在路由：接下来就是挂起等它派出去的子任务
+        status = "waiting"
+    elif ending is not TaskEnding.live:
         status = "finishing"
     elif task.status == TaskStatus.suspended:
         status = "waiting"
@@ -812,14 +907,16 @@ def cancel_locked(state: "SupervisorState", caller_task_id: str, raw_handle: str
     if caller is None:
         return _cancel_refusal("caller_not_found", "找不到发起这次取消的任务。")
     registry = registry_locked(state)
-    task, reason = _task_for_handle_locked(state, registry, caller, str(raw_handle or ""))
+    task, reason = _task_for_handle_locked(state, registry, caller, str(raw_handle or ""), purpose=PURPOSE_CANCEL)
     if task is None:
-        return _cancel_refusal("invalid_handle" if reason == _INVALID_HANDLE else "not_found", reason)
+        if reason == _INVALID_HANDLE:
+            return _cancel_refusal("invalid_handle", reason)
+        return _cancel_refusal("sync_dispatch" if reason in _SYNC_REASONS else "not_found", reason)
     if task.task_id in _dispatch_chain_ids(state, caller):
         return _cancel_refusal("self", "不能取消自己，也不能取消派出自己的那个任务。")
     now = _now()
     handle = handle_of_locked(state, task)
-    already_finished = state._task_terminal(task)
+    already_finished = not state._task_ending_locked(task, now).continues
     # 委派本身已经结束时，它派出去还在跑的后代照样取消
     targets = ([] if already_finished else [task]) + state._dispatched_descendants_locked(task.task_id)
     cancelled = 0
@@ -845,7 +942,7 @@ def cancel_locked(state: "SupervisorState", caller_task_id: str, raw_handle: str
     if already_finished:
         result["status"] = state._task_outcome_action(task) or "finished"
         result["already_finished"] = True
-    elif state._task_terminal(task):
+    elif not state._task_ending_locked(task, now).continues:
         result["status"] = "cancelled"
     else:
         result["status"] = "stopping"

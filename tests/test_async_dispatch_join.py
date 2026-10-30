@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
 from engine.conversation_store import ConversationStore, Message  # noqa: E402
 from engine.dispatch_batch import AWAIT_KEY, AWAITING_INPUT_KEY  # noqa: E402
 from engine.dispatch_handle import format_handle  # noqa: E402
+from engine.run_budget import AUTO_CONTINUE_KEY, CHAIN_STARTED_AT_KEY  # noqa: E402
 from supervisor import admin_api, async_dispatches  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -505,6 +506,37 @@ class TestAwaitRefusals:
 
         [entry] = _entries(other)
         assert entry["status"] == "unavailable" and "wait=true" in entry["error"]
+        assert "await_dispatches 收不到" in entry["error"]
+
+    def test_a_finished_wait_dispatch_handle_says_its_result_already_came_back(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        batch_caller = _caller(state, sid)
+        [child] = _wait_batch(state, batch_caller, _item())
+        _finish(state, child, "batch result")
+        other = _inbound(state, sid)
+
+        _await(state, other, format_handle(child.task_id, child.input["child_session_id"]))
+
+        [entry] = _entries(other)
+        assert entry["status"] == "unavailable" and "已经随那一批结果交回" in entry["error"]
+
+    def test_a_wait_dispatch_handle_from_another_conversation_is_unknown(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        batch_caller = _caller(state, sid)
+        [child] = _wait_batch(state, batch_caller, _item())
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+        handle = format_handle(child.task_id, child.input["child_session_id"])
+
+        _await(state, stranger, handle)
+        cancelled = async_dispatches.cancel_dispatch(state, stranger.task_id, handle)
+
+        [entry] = _entries(stranger)
+        assert entry["status"] == "unavailable" and "找不到这个委派" in entry["error"]
+        assert "wait=true" not in entry["error"]
+        assert (cancelled["ok"], cancelled["reason"]) == (False, "not_found")
+        assert child.status == TaskStatus.pending
 
     def test_a_task_cannot_await_itself_or_the_task_that_dispatched_it(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -698,6 +730,25 @@ class TestListAndCancel:
         assert (unknown_caller["ok"], unknown_caller["reason"]) == (False, "caller_not_found")
         assert child.status == TaskStatus.pending and grandchild.status == TaskStatus.pending
 
+    def test_a_wait_dispatch_cannot_be_cancelled_on_its_own(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        batch_caller = _caller(state, sid)
+        [child] = _wait_batch(state, batch_caller, _item())
+        other = _inbound(state, sid)
+        handle = format_handle(child.task_id, child.input["child_session_id"])
+
+        running = async_dispatches.cancel_dispatch(state, other.task_id, handle)
+        assert child.status == TaskStatus.pending
+        _finish(state, child, "batch result")
+        finished = async_dispatches.cancel_dispatch(state, other.task_id, handle)
+
+        assert (running["ok"], running["reason"]) == (False, "sync_dispatch")
+        assert "不能单独取消" in running["message"] and "挂起等它的那个任务" in running["message"]
+        assert (finished["ok"], finished["reason"]) == (False, "sync_dispatch")
+        assert "它已经结束" in finished["message"]
+        assert child.status == TaskStatus.completed and batch_caller.status == TaskStatus.pending
+
     def test_a_waiting_task_sees_a_cancelled_dispatch_as_cancelled(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         sid = _session(state)
@@ -856,7 +907,19 @@ class TestWaitItemTimeout:
         [entry] = _entries(caller)
         assert entry["status"] == "finish" and "timed_out" not in entry
 
-    def test_a_timeout_is_clamped_and_a_bad_one_ignored(self, tmp_path: Path) -> None:
+    def test_a_finished_item_is_dropped_from_the_deadlines_at_the_next_sweep(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        done, running = _wait_batch(state, caller, _item(), _item("b.node"))
+        _finish(state, done, "in time")
+
+        _expire(state, after=timedelta(seconds=1))
+
+        with state._lock:
+            assert set(async_dispatches.registry_locked(state).item_deadlines) == {running.task_id}
+        assert running.status == TaskStatus.pending
+
+    def test_a_timeout_is_clamped_and_a_bad_one_falls_back_to_the_lifetime_cap(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         sid = _session(state)
         caller = _caller(state, sid)
@@ -864,10 +927,129 @@ class TestWaitItemTimeout:
         big, bad = _wait_batch(state, caller, _item(timeout_sec=999999), _item("b.node", timeout_sec="abc"))
 
         assert big.input[async_dispatches.ITEM_TIMEOUT_SEC_KEY] == 3600
+        assert async_dispatches.ITEM_LIFETIME_CAPPED_KEY not in big.input
         assert async_dispatches.ITEM_TIMEOUT_SEC_KEY not in bad.input
-        assert async_dispatches.ITEM_DEADLINE_KEY not in bad.input
+        assert bad.input[async_dispatches.ITEM_LIFETIME_CAPPED_KEY] is True
+        assert bad.input[async_dispatches.ITEM_DEADLINE_KEY] == bad.input[async_dispatches.ITEM_LIFETIME_CAP_KEY]
         with state._lock:
-            assert set(async_dispatches.registry_locked(state).item_deadlines) == {big.task_id}
+            assert set(async_dispatches.registry_locked(state).item_deadlines) == {big.task_id, bad.task_id}
+
+
+class TestWaitLifetimeCap:
+    """wait 批次的每一项最晚收在调用方总寿命前 10 分钟；再往下一层，每层再早 10 分钟。"""
+
+    @pytest.fixture(autouse=True)
+    def _short_lifetime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 运行上限 300 秒，总寿命 30 分钟：留出 10 分钟余量，调用方派出的项最晚第 20 分钟收
+        monkeypatch.setenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "300")
+
+    def test_an_item_without_a_timeout_is_still_collected_before_the_caller_runs_out(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        quiet, patient = _wait_batch(
+            state, caller, _item(call_id="w1"), _item("b.node", call_id="w2", timeout_sec=3600),
+        )
+
+        cap = caller.created_at + timedelta(minutes=20)
+        assert datetime.fromisoformat(quiet.input[async_dispatches.ITEM_DEADLINE_KEY]) == cap
+        assert datetime.fromisoformat(patient.input[async_dispatches.ITEM_DEADLINE_KEY]) == cap
+        assert patient.input[async_dispatches.ITEM_TIMEOUT_SEC_KEY] == 3600
+        assert quiet.input[async_dispatches.ITEM_LIFETIME_CAPPED_KEY] is True
+        assert patient.input[async_dispatches.ITEM_LIFETIME_CAPPED_KEY] is True
+
+        _expire(state, after=timedelta(minutes=19))
+        assert caller.status == TaskStatus.suspended
+        _expire(state, after=timedelta(minutes=21))
+
+        assert [quiet.status, patient.status] == [TaskStatus.failed, TaskStatus.failed]
+        assert caller.status == TaskStatus.pending
+        first, second = _entries(caller)
+        assert first["timed_out"] is True and first["lifetime_capped"] is True
+        assert "总运行时长快到上限" in first["error"] and "不是这一项自己写的 timeout_sec" in first["error"]
+        assert second["lifetime_capped"] is True and first["continuable"] is True
+
+    def test_an_explicit_timeout_inside_the_cap_is_kept(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+
+        [child] = _wait_batch(state, caller, _item(timeout_sec=60))
+
+        assert async_dispatches.ITEM_LIFETIME_CAPPED_KEY not in child.input
+        cap = datetime.fromisoformat(child.input[async_dispatches.ITEM_LIFETIME_CAP_KEY])
+        assert cap == caller.created_at + timedelta(minutes=20)
+        _expire(state, after=timedelta(seconds=61))
+        [entry] = _entries(caller)
+        assert entry["error"] == "等待超时：60 秒内没有做完，已被停下。" and "lifetime_capped" not in entry
+
+    def test_a_continued_task_counts_from_where_its_chain_started(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        chain_started = caller.created_at - timedelta(minutes=5)
+        caller.input[AUTO_CONTINUE_KEY] = {CHAIN_STARTED_AT_KEY: chain_started.isoformat()}
+
+        [child] = _wait_batch(state, caller, _item())
+
+        assert datetime.fromisoformat(child.input[async_dispatches.ITEM_DEADLINE_KEY]) == (
+            chain_started + timedelta(minutes=20)
+        )
+
+    def test_a_nested_wait_ends_one_margin_before_the_level_above(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [middle] = _wait_batch(state, top, _item("mid.node"))
+
+        [leaf] = _wait_batch(state, middle, _item("leaf.node"))
+
+        top_cap = top.created_at + timedelta(minutes=20)
+        assert datetime.fromisoformat(middle.input[async_dispatches.ITEM_LIFETIME_CAP_KEY]) == top_cap
+        assert datetime.fromisoformat(leaf.input[async_dispatches.ITEM_LIFETIME_CAP_KEY]) == top_cap - timedelta(
+            minutes=10,
+        )
+        assert datetime.fromisoformat(leaf.input[async_dispatches.ITEM_DEADLINE_KEY]) == top_cap - timedelta(
+            minutes=10,
+        )
+
+    def test_an_unreadable_inherited_cap_falls_back_to_the_tasks_own_lifetime(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [middle] = _wait_batch(state, top, _item("mid.node"))
+        middle.input[async_dispatches.ITEM_LIFETIME_CAP_KEY] = "not a time"
+
+        [leaf] = _wait_batch(state, middle, _item("leaf.node"))
+
+        assert datetime.fromisoformat(leaf.input[async_dispatches.ITEM_DEADLINE_KEY]) == (
+            middle.created_at + timedelta(minutes=20)
+        )
+
+    def test_a_wait_dispatch_past_the_cap_is_refused_item_by_item(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        caller.created_at = datetime.now(timezone.utc) - timedelta(minutes=21)
+
+        node_child, tool_child = _wait_batch(
+            state, caller, _item(call_id="w1"),
+            {"kind": "tool", "target": "slow_tool", "arguments": {"x": 1}, "call_id": "t1"},
+        )
+
+        assert [node_child.status, tool_child.status] == [TaskStatus.failed, TaskStatus.failed]
+        assert caller.status == TaskStatus.pending
+        node_entry, tool_entry = _entries(caller)
+        assert node_entry["status"] == "fail" and node_entry["error"] == async_dispatches.WAIT_CAP_PASSED
+        assert node_entry["call_id"] == "w1"
+        assert tool_entry["kind"] == "tool" and tool_entry["name"] == "slow_tool"
+        assert tool_entry["status"] == "fail" and tool_entry["error"] == async_dispatches.WAIT_CAP_PASSED
+
+    def test_an_await_inside_a_wait_item_ends_by_the_cap_it_inherited(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _caller(state, sid)
+        [middle] = _wait_batch(state, top, _item("mid.node"))
+        child = _async_child(state, sid, middle, node="c.node", caller_node="mid.node")
+
+        _await(state, middle, _handle(child), timeout_sec=3600)
+
+        deadline = datetime.fromisoformat(middle.input[AWAITING_INPUT_KEY]["deadline"])
+        assert deadline == top.created_at + timedelta(minutes=10)
 
 
 class TestForkSource:

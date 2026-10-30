@@ -32,7 +32,7 @@ from engine.child_session_retention import child_session_ttl_hours, is_retained_
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
-from . import branch_recovery, child_retention
+from . import branch_recovery, child_retention, stopped_batch
 from .policy import ApprovalGrantSettings, PathScope, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
@@ -1495,14 +1495,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             self._session_store._flush()
 
     def _session_files_in_use_locked(self, session_id: str) -> bool:
-        """还有任务在这个会话上没结束，或它是还没合并回父会话的入口分支。"""
+        """还有任务在这个会话上没结束（含旧 worker 还没停手、被停下时那一批还没写进去的），或它是还没合并回父会话的入口分支。"""
+        now = _now()
         for task in self.tasks.values():
             task_input = task.input
             if session_id not in (
                 task.session_id, task_input.get("branch_session_id"), task_input.get("child_session_id"),
             ):
                 continue
-            if not self._task_terminal(task):
+            if self._task_ending_locked(task, now).still_writing or stopped_batch.pending_locked(task):
                 return True
             if task_input.get("branch_session_id") == session_id and not task_input.get("_branch_finalized"):
                 return True

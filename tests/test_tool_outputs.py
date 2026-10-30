@@ -614,10 +614,12 @@ class TestResumedToolResults:
     def test_a_long_batch_tool_result_is_saved_and_previewed(self, tmp_path: Path) -> None:
         text = _numbered(800)
         node_entry = {"kind": "node", "node_id": "helper", "status": "finish", "text": "x" * 40000}
+        short_node = {"kind": "node", "node_id": "helper", "status": "finish", "text": "fine"}
         resume = {"type": "batch_results", "entries": [
             {"kind": "tool", "name": "probe", "status": "finish", "raw_inline": text},
             node_entry,
             {"kind": "tool", "name": "probe", "status": "finish", "raw_inline": "short"},
+            short_node,
         ]}
 
         shown = asyncio.run(_resume_data_for_context(resume, _resume_rctx(tmp_path), {}))
@@ -625,10 +627,39 @@ class TestResumedToolResults:
         preview = shown["entries"][0]["raw_inline"]
         assert ToolOutputStore(tmp_path).load("parent-1", _ref_of(preview)) == text
         assert len(preview) <= LATEST_ROUND_VIEW_CHARS
-        assert shown["entries"][1] is node_entry
+        node_preview = shown["entries"][1]["text"]
+        assert ToolOutputStore(tmp_path).load("parent-1", _ref_of(node_preview)) == "x" * 40000
+        assert len(node_preview) <= LATEST_ROUND_VIEW_CHARS
         assert shown["entries"][2]["raw_inline"] == "short"
+        assert shown["entries"][3] is short_node
         # 原数据还要收附件、留在循环状态里，不能被改掉
         assert resume["entries"][0]["raw_inline"] == text
+        assert node_entry["text"] == "x" * 40000
+
+    def test_a_long_node_result_lists_the_refs_its_preview_leaves_out(self, tmp_path: Path) -> None:
+        refs = [f"to_{index:024x}" for index in (1, 2, 3)]
+        lines = _numbered(800).split("\n")
+        for ref, at in zip(refs, (5, 400, 795)):
+            lines[at] += f" 详见 ref={ref}"
+        text = "\n".join(lines)
+        failure = "e" * 40000
+        resume = {"type": "batch_results", "entries": [
+            {"kind": "node", "node_id": "helper", "status": "finish", "text": text, "call_id": "w1"},
+            {"kind": "node", "node_id": "helper", "status": "fail", "text": "", "error": failure, "call_id": "w2"},
+        ]}
+
+        shown = asyncio.run(_resume_data_for_context(resume, _resume_rctx(tmp_path), {}))
+
+        finished, failed = shown["entries"]
+        assert ToolOutputStore(tmp_path).load("parent-1", _ref_of(finished["text"])) == text
+        assert f"ref={refs[0]}" in finished["text"] and f"ref={refs[2]}" in finished["text"]
+        assert finished["text"].endswith(
+            f"[全文里还提到这些存档，预览里没显示：ref={refs[1]}，同样用 read_tool_output 读]",
+        )
+        assert finished["call_id"] == "w1" and finished["status"] == "finish"
+        assert ToolOutputStore(tmp_path).load("parent-1", _ref_of(failed["error"])) == failure
+        assert failed["status"] == "fail" and failed["text"] == ""
+        assert resume["entries"][0]["text"] == text
 
     def test_the_old_tool_results_shape_is_covered_too(self, tmp_path: Path) -> None:
         text = _numbered(800)
@@ -705,6 +736,20 @@ class TestReaderAvailability:
         run.run(turn(call("finish", {"text": "ok"}, call_id="f")))
 
         assert READ_TOOL_OUTPUT not in run.tool_names(0)
+
+    def test_a_node_that_only_delegates_gets_it_for_its_childrens_long_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        node = Node(
+            id="node-1", type="ai", prompt="Work.", tool_mode="native",
+            tool_access=ToolAccess(mode="none"), delegate_targets=["scout"],
+        )
+        run = NodeRun(monkeypatch, tmp_path, registry=self._registry(), node=node, runtime_cfg={"engine": {"max_steps": 4}})
+
+        run.run(turn(call("finish", {"text": "ok"}, call_id="f")))
+
+        assert READ_TOOL_OUTPUT in run.tool_names(0)
+        assert "probe" not in run.tool_names(0)
 
 
 class TestSessionKey:

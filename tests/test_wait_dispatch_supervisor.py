@@ -1,16 +1,22 @@
-"""supervisor 收到 wait 批次：节点项的附件校验后透传，子节点带上发起方的身份和根会话键，系统任务、超量和没有目标的批次被拒，恢复数据带回调用 id。"""
+"""supervisor 收到 wait 批次：节点项的附件校验后透传，子节点带上发起方的身份和根会话键，系统任务、超量和没有目标的批次被拒，
+恢复数据带回调用 id，派到一半出错时已经派出的全部撤回、调用方按失败收尾。"""
 from __future__ import annotations
 
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from engine.conversation_store import ConversationStore  # noqa: E402
 from engine.dispatch_batch import MAX_DISPATCH_BATCH_ITEMS, batch_item_attachments  # noqa: E402
+from supervisor import stopped_batch  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
@@ -18,6 +24,8 @@ from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
 
 CONV = "qq_group:1001"
 AUTH = {"platform": "qq", "user_id": "u-1", "is_admin": True}
+# 等另起的线程写完时的上限：出了问题测试失败，不会挂死
+_WAIT = 10.0
 
 
 def _state(workspace: Path) -> SupervisorState:
@@ -360,3 +368,93 @@ class TestResumeEntries:
         [entry] = caller.input["resume_data"]["entries"]
         assert "call_id" not in entry
         assert entry["child_task_id"] == child.task_id
+
+
+def _failing_on_second_child(state: SupervisorState, caller: Task, monkeypatch: pytest.MonkeyPatch) -> list[Task]:
+    """让 caller 派第二个子任务时出错；返回已经建出来的那些。"""
+    original = state._create_task_locked
+    created: list[Task] = []
+
+    def flaky(**kwargs: Any) -> Task:
+        mine = kwargs.get("caller_task_id") == caller.task_id
+        if mine and created:
+            raise RuntimeError("disk full")
+        task = original(**kwargs)
+        if mine:
+            created.append(task)
+        return task
+
+    monkeypatch.setattr(state, "_create_task_locked", flaky)
+    return created
+
+
+class _Written:
+    """等一个任务那一批的说明写完，写的线程是路由另起的。"""
+
+    def __init__(self, task: Task, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.done = threading.Event()
+        original = stopped_batch.write
+
+        def watched(state: SupervisorState, written: Task) -> None:
+            # 每次路由前都会先调一次 write，那时还没记下什么；只认真有东西要写的那一次
+            pending = written.task_id == task.task_id and stopped_batch.pending_locked(written)
+            try:
+                original(state, written)
+            finally:
+                if pending:
+                    self.done.set()
+
+        monkeypatch.setattr(stopped_batch, "write", watched)
+
+
+class TestDispatchFailingHalfway:
+    def test_what_was_sent_is_withdrawn_and_the_caller_fails_with_the_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state), task_context=_context())
+        created = _failing_on_second_child(state, caller, monkeypatch)
+        result = {"action": "dispatch", "dispatch_batch": [_item("a.node", call_id="w1"), _item("b.node", call_id="w2")]}
+
+        _report(state, caller, result)
+
+        [withdrawn] = _children(state, caller)
+        assert created == [withdrawn]
+        assert withdrawn.status == TaskStatus.cancelled and withdrawn.result["error"] == "这一批没有派完，已撤回"
+        assert caller.status == TaskStatus.failed
+        assert caller.result["error"].startswith("派出子任务时出错（RuntimeError: disk full）")
+        assert any(text.startswith("[错误] 派出子任务时出错（RuntimeError: disk full）") for text in _outbound_texts(state))
+
+        state.complete_task(task_id=caller.task_id, worker_id="worker-1", result=result)
+
+        assert _children(state, caller) == [withdrawn]
+        assert caller.status == TaskStatus.failed
+
+    def test_a_middle_task_is_reported_to_its_caller_once_and_its_history_says_what_went_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(tmp_path)
+        root = _caller(state, _session(state), task_context=_context())
+        [middle] = _dispatch(state, root, _item("mid.node", call_id="m1"))
+        _failing_on_second_child(state, middle, monkeypatch)
+        written = _Written(middle, monkeypatch)
+
+        _report(state, middle, {"action": "dispatch", "dispatch_batch": [
+            _item("a.node", call_id="w1"), _item("b.node", call_id="w2"),
+        ]})
+
+        assert middle.status == TaskStatus.failed
+        assert [child.status for child in _children(state, middle)] == [TaskStatus.cancelled]
+        # 撤下的子任务没有先把 root 唤醒成一批「已取消」：root 只收到 middle 失败这一项
+        assert root.status == TaskStatus.pending
+        [entry] = root.input["resume_data"]["entries"]
+        assert entry["status"] == "fail" and entry["call_id"] == "m1"
+        assert entry["error"].startswith("派出子任务时出错（RuntimeError: disk full）")
+        assert written.done.wait(_WAIT)
+        store = ConversationStore(tmp_path / "data" / "conversations")
+        notes = [
+            message for message in store.load(middle.input["child_session_id"])
+            if isinstance(message.meta, dict) and message.meta.get(stopped_batch.MARK_KEY) == middle.task_id
+        ]
+        assert [note.message_type for note in notes] == ["dispatch_result", "dispatch_result", "system"]
+        assert "还没派出去就被停下了：派出子任务时出错" in str(notes[2].content)
