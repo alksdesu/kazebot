@@ -4,8 +4,7 @@ name: "NovelAI 绘图分析与生成"
 description: "绘图分析流程，将用户绘图需求分析为 NovelAI V4.5 YAML 绘图任务，并调用生图工具生成图片。"
 
 provider: openai
-# [2026-08-01] 绘图分析(写 tag/prompt)专用模型，与压缩/摘要/读图/生图隔离。
-# 新变量 DRAW_TAG_* 优先，未配置时回退旧变量 DRAW_PLANNER_*（向后兼容）。
+# 写提示词用的模型，和压缩、摘要、读图、生图分开配；没配 DRAW_TAG_* 时照读旧变量名 DRAW_PLANNER_*
 model: $ENV{DRAW_TAG_MODEL|DRAW_PLANNER_MODEL}
 api_key: $ENV{DRAW_TAG_API_KEY|DRAW_PLANNER_API_KEY}
 base_url: $ENV{DRAW_TAG_BASE_URL|DRAW_PLANNER_BASE_URL}
@@ -13,9 +12,7 @@ base_url: $ENV{DRAW_TAG_BASE_URL|DRAW_PLANNER_BASE_URL}
 tool_mode: json
 output_mode: hybrid
 
-# [2026-08-01] 节点模型不支持视觉，收到带 image_url
-# 的多模态消息会 400 报错（unknown variant `image_url`, expected `text`）。开启后
-# 引擎在调用 provider 前自动剥离所有图片内容块，只保留文字，绘图请求不再因附带图片而炸。
+# 写提示词的模型多半看不了图，带图片块的请求会被拒（400）；剥掉只留文字，带图的绘图请求才不会整个失败
 strip_images: true
 
 tool_access:
@@ -28,10 +25,7 @@ tool_access:
     - nai_generate
     - web_search
 
-# [2026-07-11] finish 硬校验：生图模式下，只有当本任务内至少成功执行过
-# 下列任一真实工具时，才允许模型调用 finish 声称已生成/已发送图片。
-# 目的：阻止绘图节点模型“伪造工具调用”（在自然语言里编造 tool result 说成功，
-# 却从未真正调用生图工具）导致的假成功、图片从未生成也从未发送。
+# 本任务里没真调成功过 NovelAI 生图工具就不许 finish：挡住模型编一段「画好了」却从没出图
 finish_requires_tool:
   any:
     - nai_generate_from_plan

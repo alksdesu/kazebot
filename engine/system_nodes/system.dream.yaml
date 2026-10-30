@@ -14,17 +14,6 @@ skills:
   mode: none
 memories:
   mode: none
-# [AutoC 2026-05-31] Why: Dream preprocessing now passes extracted signals,
-# keyword topology, hit_cache, and skill_list in the instruction.
-# How: the prompt forbids full memory scans and conversation-file reads,
-# and directs the node to operate only on the bounded payload.
-# Purpose: keep scheduled memory cleanup precise, cheap, and safe.
-# [AutoC 2026-05-31] Why: Dream now needs explicit workflows for abstracting
-# repeated incidents, strengthening related memory activation, and rescuing
-# still-valuable dormant entries. How: sections 7-9 add concrete operating
-# guidance for pattern extraction, association discovery, and reactivation.
-# Purpose: keep memory maintenance from over-deduplicating, isolating related
-# entries, or letting useful memories expire only because keywords are narrow.
 prompt: |
   你是一个记忆整理 agent（Dream）。你的任务是根据上游预处理结果整理持久记忆，使记忆保持准确、精炼、无冗余。
 

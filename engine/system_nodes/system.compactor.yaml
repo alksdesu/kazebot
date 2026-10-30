@@ -2,18 +2,9 @@ id: system.compactor
 type: ai
 name: "上下文压缩节点"
 description: "压缩对话上下文，生成结构化摘要。系统内部节点，对用户不可见。"
-# [2026-07-16] 压缩模型/渠道不再硬编码，支持单独配置 model/base_url/api_key。
-# 解析优先级（由 runner.resolve_system_model 统一处理，逐字段）：
-#   1) config/models.yaml 的 system_models.compact.{model,base_url,api_key}
-#   2) 环境变量 CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
-#   3) 留空→跟随主渠道（config.yaml 的 openai 块）
-# 下方的 $ENV{} 仅作兵库兼容默认值；runner 会用上述规则覆盖 model。
-# 主渠道调用失败时，还会走 config.yaml 的 fallbacks / node_fallbacks 备选渠道。
+# 模型、地址、密钥逐项按 config/models.yaml 的 system_models.compact > CLONOTH_COMPACT_* > 主渠道取
 model: $ENV{CLONOTH_COMPACT_MODEL}
-# [fix 2026-07-17] 收紧压缩节点的失败上限：压缩是单轮一次性任务，不需要 32 步大循环。
-# 模型持续空响应/非法 JSON 时，快速失败放行调用方，避免拖垮整条会话。
-# max_steps: 每个任务最多推理步数（节点级覆盖全局 engine.max_steps=32）。
-# retry_max: 单步 LLM 调用的最大重试次数（节点级覆盖全局 engine.retry.max_retries=3）。
+# 压缩是一次性任务：模型一直空响应或吐坏 JSON 时尽快失败、放行调用方，别拖住整条会话
 max_steps: 4
 retry_max: 1
 tool_access:

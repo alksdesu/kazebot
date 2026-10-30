@@ -1,31 +1,18 @@
-# 长期方向专属 persistent 节点模板
-#
-# 用法：复制本文件为 config/nodes/<你的方向名>.yaml，替换 id/name/description，
-# 并按需要调整 delegate_targets / tool_access / provider。
-#
-# 关键约定：
-# - persistent: true  → 被 dispatch 时默认 context_mode=accumulate（长期累积上下文，
-#   触发轮摘要 / 压缩 / 记忆提取），不再像一次性节点那样默认 fresh。
-#   调用方设 wait: true 同步等它时，子会话随调用方那次任务结束清理，accumulate 只在那次任务里延续；
-#   要长期累积，调用方用默认的异步委派。
-# - memory_book        → 独立记忆命名空间，物理落在 data/memory/{memory_book}/，
-#   与其他节点/会话的记忆文件隔离，避免逸散与串扰。每个长期方向一个节点一个 book。
-#
-# 立项建议：一个长期方向（研究领域 / 项目 / 专属助手）= 一个 persistent 节点 = 一个 memory_book。
-# 不要用一个节点靠 context_key 分叉多个方向——那样对话隔离了，但记忆仍共用同一个 book。
+# 长期方向专属节点的模板：复制成 config/nodes/<方向名>.yaml，改 id、name、description，按需调整委派、工具和渠道。
+# 一个长期方向（研究领域、项目、专属助手）一个节点、一个 memory_book：靠 context_key 在一个节点里分出几个方向，对话隔开了，记忆还是共用一个 book。
+# 调用方用 wait: true 同步等它时，子会话随那次任务结束清理，accumulate 只在那次任务里延续；要长期累积就用默认的异步委派。
 
 id: my_persistent_agent
 type: ai
 name: "长期专属 Agent"
 description: "某个长期方向的专属持久节点：累积上下文、独立记忆库。"
 
-# [必填] 声明为持久节点：dispatch 未显式指定 context_mode 时默认 accumulate。
+# 必填：委派时没写 context_mode 就按 accumulate，上下文长期累积，轮摘要、压缩、记忆提取都会接上
 persistent: true
 
-# [必填] 独立记忆命名空间（建议与 id 一致），记忆写入 data/memory/{memory_book}/。
+# 必填：独立的记忆命名空间，落在 data/memory/{memory_book}/，和别的节点、会话的记忆隔开（建议和 id 一致）
 memory_book: my_persistent_agent
 
-# 可选：该节点可继续委派的下游节点。
 delegate_targets: []
 
 tool_access:
