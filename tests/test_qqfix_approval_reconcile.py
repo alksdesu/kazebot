@@ -38,6 +38,7 @@ from clonoth_sdk.state import SessionState  # noqa: E402
 from clonoth_sdk.types import Event  # noqa: E402
 
 _TIMEOUT_COMMENT = "approval timed out after 300s with no decision; auto-denied"
+_ORPHANED_COMMENT = "task ended before a decision; auto-denied"
 
 
 class _Supervisor:
@@ -143,15 +144,30 @@ class TestClosingCards:
 
         assert cards.closed == [("a1", APPROVAL_DENIED, _TIMEOUT_COMMENT)]
 
-    @pytest.mark.parametrize("event_type,reason", [("task_cancelled", "任务已取消"), ("task_completed", "任务已结束")])
-    def test_ending_the_task_expires_only_its_own_cards(self, wired, event_type: str, reason: str) -> None:
+    def test_cancelling_the_task_expires_only_its_own_cards(self, wired) -> None:
         router, _, cards = wired
         _show(router, "a1", task_id="t1")
         _show(router, "a2", task_id="t2")
 
-        asyncio.run(router._dispatch(_event(event_type, {"task_id": "t1", "node_id": "worker", "status": "failed"})))
+        asyncio.run(router._dispatch(_event("task_cancelled", {"task_id": "t1", "node_id": "worker", "status": "cancelled"})))
 
-        assert cards.closed == [("a1", APPROVAL_EXPIRED, reason)]
+        assert cards.closed == [("a1", APPROVAL_EXPIRED, "任务已取消")]
+
+    @pytest.mark.parametrize("status", ["completed", "failed"])
+    def test_a_task_that_ends_leaves_its_cards_to_the_supervisor(self, wired, status: str) -> None:
+        # 转到后台的工具可能还在等这条审批：收不收由 supervisor 定，收了会随 approval_decided 过来
+        router, _, cards = wired
+        _show(router, "a1", task_id="t1")
+
+        asyncio.run(router._dispatch(_event("task_completed", {"task_id": "t1", "node_id": "worker", "status": status})))
+        assert cards.closed == []
+
+        asyncio.run(router._dispatch(_event("approval_decided", {
+            "approval_id": "a1", "decision": "deny", "status": "denied", "comment": _ORPHANED_COMMENT,
+            "expired_reason": "任务已结束，没有人再等这条审批",
+        })))
+
+        assert cards.closed == [("a1", APPROVAL_DENIED, _ORPHANED_COMMENT)]
 
     def test_approvals_this_adapter_never_showed_are_left_alone(self, wired) -> None:
         router, _, cards = wired
@@ -337,6 +353,22 @@ class TestQQBook:
 
         assert "a1" not in book.pending
         assert book.settled["a1"]["decision"] == decision
+
+    @pytest.mark.parametrize("status,comment,label", [
+        (APPROVAL_DENIED, _TIMEOUT_COMMENT, "已超时失效"),
+        (APPROVAL_DENIED, _ORPHANED_COMMENT, "已失效"),
+        (APPROVAL_EXPIRED, "任务已取消", "已失效"),
+        (APPROVAL_MISSING, "", "已失效"),
+    ])
+    def test_the_notice_tells_a_timeout_from_an_approval_whose_task_went_away(
+        self, runtime: Any, status: str, comment: str, label: str,
+    ) -> None:
+        book = runtime.state._adapter.approvals
+        book.pending["a1"] = {"operation": "run_command", "created_at": time.time()}
+
+        asyncio.run(runtime.callbacks.TangQiuCallbacks().close_approval_ui("a1", status=status, comment=comment))
+
+        assert runtime.approval._settled_approval_notice("a1") == f"该审批已被处理：a1（{label}）。"
 
     def test_a_local_decision_keeps_who_made_it(self, runtime: Any) -> None:
         book = runtime.state._adapter.approvals

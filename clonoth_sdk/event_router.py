@@ -1557,7 +1557,7 @@ class EventRouter:
         await self._close_approval(approval_id, status=status, comment=str(p.get("comment") or ""))
 
     async def _close_task_approvals(self, task_id: str, *, reason: str) -> None:
-        """任务结束后，它挂着没批的审批再批也不会生效。"""
+        """任务取消后，它挂着没批的审批再批也不会生效。"""
         if not task_id:
             return
         for approval_id in [aid for aid, item in self._open_approvals.items() if item.task_id == task_id]:
@@ -1644,10 +1644,9 @@ class EventRouter:
         p = event.payload
         node_id = p.get("node_id", "")
         src_seq = int(p.get("source_inbound_seq") or 0)
-        await self._close_task_approvals(
-            str(p.get("task_id") or ""),
-            reason="任务已取消" if event.type == "task_cancelled" else "任务已结束",
-        )
+        if event.type == "task_cancelled":
+            # 正常结束的任务，转到后台的工具可能还在等它的审批；没人等的那些由 supervisor 收掉，随 approval_decided 过来
+            await self._close_task_approvals(str(p.get("task_id") or ""), reason="任务已取消")
 
         # [Fork/Merge 2026-05-12] 入口节点取消只按 source_inbound_seq 清理 trigger。
         # Why: cancelling one branch must not consume another trigger on the same parent session.

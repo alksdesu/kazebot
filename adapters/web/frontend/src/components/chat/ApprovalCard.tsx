@@ -14,14 +14,17 @@ interface SettledDecision {
   id: string;
   /** 回执落下时外面传进来的状态。外面的状态变了就以外面为准。 */
   base: ApprovalInfo['status'];
-  status: 'allowed' | 'denied';
+  status: 'allowed' | 'denied' | 'expired';
+  expiredReason?: string;
 }
 
 export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
   const { decide, isBusy, messageOf } = useApprovalDecision();
   const [settled, setSettled] = useState<SettledDecision | null>(null);
   // 决定也会从 QQ、设置页或别的标签页落下，本地只叠加自己这一次的回执。
-  const status = settled && settled.id === approval.id && settled.base === approval.status ? settled.status : approval.status;
+  const ownReceipt = settled && settled.id === approval.id && settled.base === approval.status ? settled : null;
+  const status = ownReceipt ? ownReceipt.status : approval.status;
+  const expiredReason = ownReceipt ? ownReceipt.expiredReason : approval.expiredReason;
   const loading = isBusy(approval.id);
   const message = messageOf(approval.id);
 
@@ -29,7 +32,9 @@ export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
     if (loading || status !== 'pending') return;
     const base = approval.status;
     const outcome = await decide(approval.id, decision, `${decision} via web`);
-    if (outcome && (outcome.status === 'allowed' || outcome.status === 'denied')) {
+    if (outcome?.expiredReason) {
+      setSettled({ id: approval.id, base, status: 'expired', expiredReason: outcome.expiredReason });
+    } else if (outcome && (outcome.status === 'allowed' || outcome.status === 'denied')) {
       setSettled({ id: approval.id, base, status: outcome.status });
     }
   };
@@ -61,6 +66,11 @@ export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
             <Icon name="cancel" size={14} />
             <span>拒绝</span>
           </Button>
+        </div>
+      ) : status === 'expired' ? (
+        <div className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--duties-tertiary)]">
+          <Icon name="schedule" size={14} />
+          <span>{expiredReason ? `已失效：${expiredReason}` : '已失效'}</span>
         </div>
       ) : (
         <div className={`inline-flex items-center gap-1 text-xs font-semibold ${status === 'allowed' ? 'text-[var(--duties-success)]' : 'text-[var(--duties-danger)]'}`}>

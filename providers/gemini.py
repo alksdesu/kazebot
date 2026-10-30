@@ -291,16 +291,35 @@ class GeminiProvider(BaseProvider):
         - role=assistant → role="model", text + optional functionCall parts
         - role=tool     → role="function", functionResponse parts
                           (name is resolved from prior assistant tool_calls via
-                           a tool_call_id→name mapping built on the fly)
+                           a tool_call_id→name mapping built on the fly; one
+                           turn's results follow the prior functionCall order)
         """
         system_parts: list[str] = []
         contents: list[dict[str, Any]] = []
         # Map tool_call_id → function name so we can fill functionResponse.name
         # when processing role=tool messages (which only carry tool_call_id).
         tc_id_to_name: dict[str, str] = {}
+        # 上一条 model 消息里 functionCall 的 tool_call_id 顺序，和攒着还没交出去的这一轮工具结果
+        call_order: list[str] = []
+        pending_responses: list[tuple[str, dict[str, Any]]] = []
+
+        def flush_responses() -> None:
+            # Gemini requires all function responses for the same turn to be
+            # grouped in a single role="function" entry.  Merge into the
+            # previous entry if it's also a function response.
+            if not pending_responses:
+                return
+            parts = _ordered_function_responses(pending_responses, call_order)
+            pending_responses.clear()
+            if contents and contents[-1].get("role") == "function":
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": "function", "parts": parts})
 
         for msg in messages:
             role = msg.get("role", "")
+            if role not in ("tool", "system"):
+                flush_responses()
 
             if role == "system":
                 txt = _extract_text(msg)
@@ -314,6 +333,7 @@ class GeminiProvider(BaseProvider):
 
             if role == "assistant":
                 calls = [fields for fields in map(tool_call_fields, msg.get("tool_calls") or []) if fields]
+                positional_ids: list[str] = []
                 # Gemini 3 要求整条回复的 parts 原样回传：任何一块都可能带 thoughtSignature，不能合并或重建。
                 raw_parts = provider_metadata(msg, "gemini").get("raw_parts")
                 if raw_parts and isinstance(raw_parts, list):
@@ -324,6 +344,7 @@ class GeminiProvider(BaseProvider):
                         if isinstance(call, dict):
                             position += 1
                             tc_id_to_name[f"call_{position}"] = str(call.get("name") or "")
+                            positional_ids.append(f"call_{position}")
                     contents.append({"role": "model", "parts": raw_parts})
                 else:
                     # 旧消息或别家 provider 产生的历史：从 tool_calls 重建。
@@ -338,6 +359,7 @@ class GeminiProvider(BaseProvider):
                 for call_id, name, _arguments in calls:
                     if call_id:
                         tc_id_to_name[call_id] = name
+                call_order = [call_id for call_id, _name, _arguments in calls if call_id] or positional_ids
                 continue
 
             if role == "tool":
@@ -354,17 +376,7 @@ class GeminiProvider(BaseProvider):
                         resp_obj = {"result": resp_obj}
                 except (json.JSONDecodeError, TypeError):
                     resp_obj = {"result": raw_content}
-                # Gemini requires all function responses for the same turn to be
-                # grouped in a single role="function" entry.  Merge into the
-                # previous entry if it's also a function response.
-                _fr_part = {"functionResponse": {"name": name, "response": resp_obj}}
-                if contents and contents[-1].get("role") == "function":
-                    contents[-1]["parts"].append(_fr_part)
-                else:
-                    contents.append({
-                        "role": "function",
-                        "parts": [_fr_part],
-                    })
+                pending_responses.append((str(tc_id or ""), {"functionResponse": {"name": name, "response": resp_obj}}))
                 continue
 
             # 认不出的角色按用户消息发。
@@ -372,6 +384,7 @@ class GeminiProvider(BaseProvider):
             if txt:
                 contents.append({"role": "user", "parts": [{"text": txt}]})
 
+        flush_responses()
         system_text = "\n\n".join(system_parts) if system_parts else None
         return system_text, contents
 
@@ -620,6 +633,25 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
             else:
                 parts.append({"text": "[image could not be converted]"})
     return parts or [{"text": ""}]
+
+
+def _ordered_function_responses(
+    responses: list[tuple[str, dict[str, Any]]], call_order: list[str],
+) -> list[dict[str, Any]]:
+    """同一轮的 functionResponse 按上一条 model 消息里 functionCall 的顺序排，对不上的按原顺序跟在后面。
+
+    Gemini 只按名字和位置配对，不认 id：同一轮里同名调用的结果先后颠倒就会配错，所以按 tool_call_id 对回调用的位置。
+    """
+    position = {call_id: index for index, call_id in enumerate(call_order)}
+    matched: dict[int, dict[str, Any]] = {}
+    rest: list[dict[str, Any]] = []
+    for call_id, part in responses:
+        index = position.get(call_id) if call_id else None
+        if index is None or index in matched:
+            rest.append(part)
+        else:
+            matched[index] = part
+    return [matched[index] for index in sorted(matched)] + rest
 
 
 def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:

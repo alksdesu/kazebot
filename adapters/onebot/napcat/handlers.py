@@ -670,6 +670,7 @@ async def _finish_approval_decision(
         book.settle(
             approval_id, decision=approval._book_decision(result.status, result.comment),
             operation=str(info.get("operation") or ""),
+            timed_out=approval._timed_out(result.status, result.comment),
         )
         common.logger.info(
             "approval decision on QQ had no effect: id=%s decision=%s status=%s admin=%s",

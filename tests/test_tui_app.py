@@ -21,7 +21,13 @@ from textual.widgets import Static  # noqa: E402
 import config_layout  # noqa: E402
 import shell.tui.app as app_module  # noqa: E402
 from shell.tui.app import ClonothApp  # noqa: E402
-from shell.tui.models import NodeCompleted, NodeStarted, StreamThinking  # noqa: E402
+from shell.tui.models import (  # noqa: E402
+    ApprovalDecided,
+    ApprovalRequested,
+    NodeCompleted,
+    NodeStarted,
+    StreamThinking,
+)
 from shell.tui.services.event_poller import EventPoller  # noqa: E402
 from shell.tui.settings import TuiSettings  # noqa: E402
 from shell.tui.widgets.message_list import (  # noqa: E402
@@ -307,6 +313,50 @@ def test_node_started_still_carries_name_and_id() -> None:
 
     assert isinstance(message, NodeStarted)
     assert (message.name, message.node_id) == ("N", "n")
+
+
+@pytest.mark.parametrize("payload, settled", [
+    ({"decision": "allow", "status": "allowed"}, "已同意"),
+    ({"decision": "deny", "status": "denied", "comment": "不行"}, "已拒绝"),
+    ({
+        "decision": "deny", "status": "denied", "comment": "task ended before a decision; auto-denied",
+        "expired_reason": "任务已取消",
+    }, "已失效（任务已取消）"),
+    ({
+        "decision": "deny", "status": "denied", "comment": "approval timed out after 300s with no decision; auto-denied",
+    }, "已失效"),
+])
+def test_approval_decided_says_how_the_approval_was_settled(payload: dict[str, Any], settled: str) -> None:
+    message = _parse({"type": "approval_decided", "payload": {"approval_id": "a1", **payload}})
+
+    assert isinstance(message, ApprovalDecided)
+    assert (message.approval_id, message.settled) == ("a1", settled)
+
+
+def test_approval_decided_without_an_id_is_dropped() -> None:
+    assert _parse({"type": "approval_decided", "payload": {"decision": "deny"}}) is None
+
+
+@pytest.mark.asyncio
+async def test_an_approval_settled_elsewhere_closes_the_overlay(make_app) -> None:
+    app = make_app()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.post_message(ApprovalRequested("a1", "execute_command", {"command": "ls"}, "fp"))
+        await pilot.pause()
+        overlay = app.query_one("#approval-overlay")
+        assert overlay.has_class("visible") is True
+
+        app.post_message(ApprovalDecided("someone-else", "已同意"))
+        await pilot.pause()
+        assert overlay.has_class("visible") is True
+
+        app.post_message(ApprovalDecided("a1", "已失效（任务已取消）"))
+        await pilot.pause()
+
+        assert overlay.has_class("visible") is False
+        assert app._pending_approval is None
 
 
 @pytest.mark.parametrize("module_path", [

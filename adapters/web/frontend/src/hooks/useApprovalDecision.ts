@@ -20,9 +20,11 @@ const STATUS_AFTER: Readonly<Record<ApprovalDecision, string>> = {
 };
 
 export interface ApprovalReceipt {
-  /** false：这条审批在本次提交之前已被别处处理，status 是它现在的状态。 */
+  /** false：这条审批在本次提交之前已被别处处理或已失效，status 是它现在的状态。 */
   applied: boolean;
   status: string;
+  /** 没人定案、随任务失效被系统收掉时的原因；人批的没有这一项。 */
+  expiredReason?: string;
 }
 
 export interface ApprovalOutcome extends ApprovalReceipt {
@@ -33,10 +35,24 @@ export interface ApprovalOutcome extends ApprovalReceipt {
 
 export const approvalStatusLabel = (status: string): string => APPROVAL_STATUS_LABELS[status] || status || '未知';
 
-export const staleApprovalMessage = (status: string): string => `该审批已被处理，当前状态：${approvalStatusLabel(status)}`;
+export const staleApprovalMessage = (status: string, expiredReason = ''): string => (
+  expiredReason ? `该审批已失效：${expiredReason}` : `该审批已被处理，当前状态：${approvalStatusLabel(status)}`
+);
+
+interface ApprovalStanding {
+  status: string;
+  expiredReason?: string;
+}
 
 // 按审批 id 合并并发提交，共享的是服务端回的状态；各调用方再拿自己的决定去比。
-const inflight = new Map<string, Promise<string>>();
+const inflight = new Map<string, Promise<ApprovalStanding>>();
+
+function standingOf(approval: unknown): ApprovalStanding {
+  const record = approval && typeof approval === 'object' ? approval as Record<string, unknown> : {};
+  const status = typeof record.status === 'string' ? record.status : '';
+  const reason = typeof record.expired_reason === 'string' ? record.expired_reason.trim() : '';
+  return reason ? { status, expiredReason: reason } : { status };
+}
 
 export async function submitApprovalDecision(
   approvalId: string,
@@ -47,12 +63,14 @@ export async function submitApprovalDecision(
   let pending = inflight.get(approvalId);
   if (!pending) {
     pending = decideApproval(token, approvalId, decision, comment)
-      .then((approval) => (typeof approval?.status === 'string' ? approval.status : ''))
+      .then(standingOf)
       .finally(() => { inflight.delete(approvalId); });
     inflight.set(approvalId, pending);
   }
-  const status = await pending;
-  return { applied: status === STATUS_AFTER[decision], status };
+  const standing = await pending;
+  // 已失效的审批状态也是 denied：带着失效原因就说明不是这次的拒绝生效了
+  const applied = standing.status === STATUS_AFTER[decision] && !standing.expiredReason;
+  return standing.expiredReason ? { applied, ...standing } : { applied, status: standing.status };
 }
 
 export interface ApprovalDecisionControls {
@@ -83,7 +101,11 @@ export function useApprovalDecision(): ApprovalDecisionControls {
     let outcome: ApprovalOutcome;
     try {
       const receipt = await submitApprovalDecision(approvalId, decision, comment, token || undefined);
-      outcome = { ...receipt, failed: false, message: receipt.applied ? '' : staleApprovalMessage(receipt.status) };
+      outcome = {
+        ...receipt,
+        failed: false,
+        message: receipt.applied ? '' : staleApprovalMessage(receipt.status, receipt.expiredReason),
+      };
     } catch (failure) {
       outcome = { applied: false, status: '', failed: true, message: errorMessage(failure, '提交审批失败，请重试') };
     } finally {

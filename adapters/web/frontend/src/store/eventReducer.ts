@@ -39,6 +39,8 @@ const TERMINAL_TOOL_STATUSES = new Set<ToolStatus>(['async_started', 'success', 
 // retention behavior instead of growing for the lifetime of the tab.
 const MAX_EVENT_LOG = 3000;
 const MAX_PROCESSED_IDS = 5000;
+// 没人定案、由系统按拒绝收掉的审批（任务先结束、等审批超时）附言以它结尾；新事件另带给人看的原因 expired_reason
+const AUTO_DENIED_COMMENT_MARK = 'auto-denied';
 
 type EventPayload = Record<string, unknown>;
 
@@ -67,6 +69,7 @@ type ToolPatch = {
   // approval decision visible after the tool produces its result.
   approvalId?: string;
   approvalStatus?: ToolExecution['approvalStatus'];
+  approvalExpiredReason?: string;
   approvalDetails?: Record<string, unknown>;
 };
 
@@ -607,6 +610,7 @@ function applyApprovalRequested(state: ChatState, event: SupervisorEvent): ChatS
         status: 'awaiting_approval',
         approvalId,
         approvalStatus: 'pending',
+        approvalExpiredReason: undefined,
         approvalDetails: buildApprovalDetails(payload),
         updatedAt: event.ts,
         eventIds: appendUnique(tool.eventIds, getEventId(event)),
@@ -656,12 +660,13 @@ function applyApprovalDecided(state: ChatState, event: SupervisorEvent): ChatSta
       // the external tool_call_id and keep existing terminal tool results intact.
       // Purpose: replaying approval_decided updates the card instead of looking for
       // a standalone ApprovalBlock.
-      const approvalStatus = normalizeApprovalStatus(payload.status, payload.decision);
+      const verdict = readApprovalVerdict(payload);
       const updatedTool: ToolExecution = {
         ...tool,
-        status: getToolStatusAfterApproval(tool.status, approvalStatus),
+        status: getToolStatusAfterApproval(tool.status, verdict.status),
         approvalId,
-        approvalStatus,
+        approvalStatus: verdict.status,
+        approvalExpiredReason: verdict.expiredReason,
         approvalDetails: tool.approvalDetails || buildApprovalDetails(payload),
         updatedAt: event.ts,
         eventIds: appendUnique(tool.eventIds, getEventId(event)),
@@ -841,6 +846,7 @@ function upsertToolExecution(
     error: patch.error || current?.error,
     approvalId: patch.approvalId || current?.approvalId,
     approvalStatus: patch.approvalStatus || current?.approvalStatus,
+    approvalExpiredReason: patch.approvalExpiredReason || current?.approvalExpiredReason,
     approvalDetails: patch.approvalDetails || current?.approvalDetails,
     taskId: patch.taskId || current?.taskId || message.source.taskId,
     nodeId: patch.nodeId || current?.nodeId || message.source.nodeId,
@@ -1593,15 +1599,17 @@ function appendLegacyApprovalBlock(
   const turnKey = getTurnKey(state, event);
   let { state: nextState, message } = getOrCreateAssistantMessage(state, event, turnKey);
   const blockId = `${message.id}|approval:${approvalId}`;
+  const verdict = readApprovalVerdict(payload);
   const approvalBlock: ApprovalBlock = {
     id: blockId,
     kind: 'approval',
     approvalId,
     operation: getString(payload.operation),
     details: getRecord(payload.details) || {},
-    status: normalizeApprovalStatus(payload.status, payload.decision),
+    status: verdict.status,
     decision: getString(payload.decision) || undefined,
     comment: getString(payload.comment) || undefined,
+    expiredReason: verdict.expiredReason,
     createdAt: event.ts,
     updatedAt: event.ts,
     eventIds: [getEventId(event)],
@@ -1638,6 +1646,7 @@ function updateLegacyApprovalBlock(
   }
 
   const decision = getString(payload.decision);
+  const verdict = readApprovalVerdict(payload);
   const nextBlocks = message.blocks.map((block) => {
     if (block.kind !== 'approval' || block.id !== location.blockId) {
       return block;
@@ -1645,9 +1654,10 @@ function updateLegacyApprovalBlock(
 
     return {
       ...block,
-      status: normalizeApprovalStatus(payload.status, decision),
+      status: verdict.status,
       decision: decision || block.decision,
       comment: getString(payload.comment) || block.comment,
+      expiredReason: verdict.expiredReason,
       updatedAt: event.ts,
       eventIds: appendUnique(block.eventIds, getEventId(event)),
     } satisfies ApprovalBlock;
@@ -1744,6 +1754,21 @@ function normalizeApprovalStatus(status: unknown, decision: unknown): ApprovalBl
   return 'pending';
 }
 
+interface ApprovalVerdict {
+  status: ApprovalBlock['status'];
+  expiredReason?: string;
+}
+
+/** 定案事件的结论：拒绝里分出没人定案、被系统收掉的那种，记成已失效，带着原因。 */
+function readApprovalVerdict(payload: EventPayload): ApprovalVerdict {
+  const status = normalizeApprovalStatus(payload.status, payload.decision);
+  if (status !== 'denied') return { status };
+  const reason = getString(payload.expired_reason).trim();
+  if (reason) return { status: 'expired', expiredReason: reason };
+  if (getString(payload.comment).toLowerCase().includes(AUTO_DENIED_COMMENT_MARK)) return { status: 'expired' };
+  return { status };
+}
+
 export function findToolByCallId(state: ChatState, toolCallId: string): ToolExecution | undefined {
   // [AutoC 2026-05-31] Why: approval events carry the provider tool_call_id, not
   // the reducer's stable id. How: scan the normalized tool table for the external
@@ -1773,7 +1798,7 @@ function getToolStatusAfterApproval(
   // remains robust while the card reflects the decision immediately.
   if (TERMINAL_TOOL_STATUSES.has(currentStatus)) return currentStatus;
   if (approvalStatus === 'allowed') return 'running';
-  if (approvalStatus === 'denied') return 'error';
+  if (approvalStatus === 'denied' || approvalStatus === 'expired') return 'error';
   return 'awaiting_approval';
 }
 

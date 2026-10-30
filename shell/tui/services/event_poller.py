@@ -7,7 +7,9 @@ from typing import Any, TYPE_CHECKING
 
 from clonoth_runtime import strip_tool_trace_blocks
 
+from ...approvals import approval_settled_text
 from ..models import (
+    ApprovalDecided,
     ApprovalRequested,
     AssistantReply,
     ConfigUpdated,
@@ -194,6 +196,12 @@ class EventPoller:
                 details=payload.get("details") or {},
                 fingerprint=payload.get("fingerprint", ""),
             )
+
+        if et == "approval_decided":
+            approval_id = str(payload.get("approval_id") or "")
+            if not approval_id:
+                return None
+            return ApprovalDecided(approval_id=approval_id, settled=approval_settled_text(payload))
 
         if et == "cancel_acknowledged":
             return TaskCancelled()

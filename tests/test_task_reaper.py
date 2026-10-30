@@ -36,6 +36,7 @@ from supervisor.task_reaper import (  # noqa: E402
     HEARTBEAT_SILENCE_LIMIT,
     LEASE_GRACE,
     MISSING_LEASE_GRACE,
+    PENDING_QUEUE_LIMIT,
     reap_reason,
     reap_stuck_tasks_locked,
 )
@@ -112,9 +113,12 @@ def _task(
     )
 
 
-def _reason(task: Task, *, approval_pending: bool = False) -> str | None:
+def _reason(
+    task: Task, *, approval_pending: bool = False, worker_silence: timedelta = timedelta(0),
+) -> str | None:
     return reap_reason(
         task, now=_NOW, max_running_sec=_MAX_RUNNING, approval_pending=approval_pending,
+        worker_silence=worker_silence,
     )
 
 
@@ -174,16 +178,52 @@ def test_a_missing_lease_is_protected_by_a_pending_approval() -> None:
     assert _reason(task, approval_pending=True) is None
 
 
-def test_a_pending_task_is_reaped_after_queue_ttl() -> None:
+def test_a_pending_task_is_reaped_once_no_worker_has_shown_up_for_as_long_as_it_queued() -> None:
     task = _task(status=TaskStatus.pending, created_ago=timedelta(minutes=15, seconds=1))
 
-    reason = _reason(task)
+    reason = _reason(task, worker_silence=timedelta(minutes=16))
 
-    assert reason is not None and "排队过久" in reason
+    assert reason is not None
+    assert "排队 15 分钟无人接手" in reason and "16 分钟没有任何 engine worker" in reason
+
+
+def test_a_pending_task_behind_busy_workers_is_kept() -> None:
+    # worker 名额占满时不来领任务，只续租：排得再久也不是没人接手
+    task = _task(status=TaskStatus.pending, created_ago=timedelta(minutes=50))
+
+    assert _reason(task, worker_silence=timedelta(seconds=30)) is None
+    assert _reason(task, worker_silence=PENDING_QUEUE_LIMIT) is None
+
+
+def test_a_pending_task_behind_busy_workers_still_ends_at_its_lifetime_limit() -> None:
+    task = _task(status=TaskStatus.pending, created_ago=timedelta(hours=2))
+
+    def reason_at(now: datetime) -> str | None:
+        return reap_reason(
+            task, now=now, max_running_sec=_MAX_RUNNING, approval_pending=False,
+            worker_silence=timedelta(seconds=30), max_lifetime_sec=3 * 3600,
+        )
+
+    assert reason_at(_NOW) is None
+    reason = reason_at(_NOW + timedelta(hours=1, seconds=1))
+    assert reason is not None and "总上限 10800 秒" in reason
 
 
 def test_a_fresh_pending_task_is_kept() -> None:
-    assert _reason(_task(status=TaskStatus.pending, created_ago=timedelta(minutes=15))) is None
+    assert _reason(
+        _task(status=TaskStatus.pending, created_ago=timedelta(minutes=15)), worker_silence=timedelta(hours=1),
+    ) is None
+
+
+@pytest.mark.parametrize("status, silent_for", [
+    (TaskStatus.pending, timedelta(0)),
+    (TaskStatus.suspended, timedelta(minutes=20, seconds=1)),
+])
+def test_an_approval_no_longer_shields_a_task_that_is_not_running(status: TaskStatus, silent_for: timedelta) -> None:
+    # 排队和挂起的任务不会正在等审批：同一会话里挂着的审批是别的任务的
+    task = _task(status=status, created_ago=timedelta(minutes=16), silent_for=silent_for)
+
+    assert _reason(task, approval_pending=True, worker_silence=timedelta(minutes=16)) is not None
 
 
 def test_a_suspended_task_without_any_wait_target_is_reaped_after_silence() -> None:
@@ -200,7 +240,8 @@ def test_a_suspended_batch_caller_is_kept_while_its_batch_still_runs() -> None:
     task.waiting_for_batch_id = "batch-1"
 
     assert reap_reason(
-        task, now=_NOW, max_running_sec=_MAX_RUNNING, approval_pending=False, wait_target_live=True,
+        task, now=_NOW, max_running_sec=_MAX_RUNNING, approval_pending=False, worker_silence=timedelta(0),
+        wait_target_live=True,
     ) is None
 
 
@@ -213,6 +254,7 @@ def test_a_suspended_task_waiting_for_a_terminal_child_gets_a_grace_period() -> 
         now=_NOW,
         max_running_sec=_MAX_RUNNING,
         approval_pending=False,
+        worker_silence=timedelta(0),
         waiting_task_terminal=True,
     ) is None
     assert reap_reason(
@@ -220,6 +262,7 @@ def test_a_suspended_task_waiting_for_a_terminal_child_gets_a_grace_period() -> 
         now=_NOW + timedelta(minutes=5),
         max_running_sec=_MAX_RUNNING,
         approval_pending=False,
+        worker_silence=timedelta(0),
         waiting_task_terminal=True,
     ) is not None
 
@@ -233,6 +276,7 @@ def test_a_suspended_task_waiting_for_a_missing_child_is_reaped() -> None:
         now=_NOW,
         max_running_sec=_MAX_RUNNING,
         approval_pending=False,
+        worker_silence=timedelta(0),
         waiting_task_missing=True,
     )
 
@@ -250,7 +294,9 @@ def test_the_hard_limit_is_read_from_the_caller_not_the_env(monkeypatch: pytest.
     monkeypatch.setenv(_TIME_LIMIT_ENV, "99999")
     task = _task(created_ago=timedelta(seconds=400))
 
-    assert reap_reason(task, now=_NOW, max_running_sec=300.0, approval_pending=False) is not None
+    assert reap_reason(
+        task, now=_NOW, max_running_sec=300.0, approval_pending=False, worker_silence=timedelta(0),
+    ) is not None
 
 
 def _make_state(workspace: Path) -> SupervisorState:
@@ -463,6 +509,164 @@ def test_a_decided_approval_no_longer_protects(
 
     with state._lock:
         assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+
+
+def _add_task_approval(
+    state: SupervisorState, task: Task, *, requested_at: datetime = _NOW, approval_id: str = "a-task",
+) -> None:
+    state.approvals[approval_id] = Approval(
+        approval_id=approval_id,
+        session_id=task.session_id,
+        operation="execute_command",
+        status=ApprovalStatus.pending,
+        fingerprint=f"fp-{approval_id}",
+        requested_at=requested_at,
+        task_id=task.task_id,
+    )
+
+
+def test_an_approval_the_task_itself_asked_for_shields_its_expired_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _running(state, session_id, lease_in=-timedelta(minutes=5))
+    _add_task_approval(state, task)
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == []
+    assert task.status == TaskStatus.running
+
+
+def test_another_tasks_approval_in_the_same_session_shields_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    stuck = _running(state, session_id, lease_in=-timedelta(minutes=5))
+    asking = _running(state, session_id, lease_in=timedelta(minutes=2))
+    _add_task_approval(state, asking)
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [stuck.task_id]
+    assert asking.status == TaskStatus.running
+    assert state.approvals["a-task"].status == ApprovalStatus.pending
+
+
+def test_an_approval_left_from_an_earlier_claim_shields_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 重排之前那次领取提的审批已经没人在等，重新领取后的任务租约过期照样回收，回收时连那条审批一起收掉
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _running(state, session_id, lease_in=-timedelta(minutes=5))
+    task.claimed_at = _NOW - timedelta(minutes=2)
+    _add_task_approval(state, task, requested_at=_NOW - timedelta(minutes=10))
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+    approval = state.approvals["a-task"]
+    assert approval.status == ApprovalStatus.denied
+    assert approval.expired_reason == f"任务失败：{task.result['error']}"
+
+
+def test_reaping_a_silent_task_closes_the_approval_it_was_waiting_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _running(
+        state, session_id, lease_in=timedelta(minutes=2),
+        silent_for=HEARTBEAT_SILENCE_LIMIT + timedelta(minutes=1),
+    )
+    _add_task_approval(state, task)
+    state.note_approval_read("a-task")
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+    approval = state.approvals["a-task"]
+    assert approval.status == ApprovalStatus.denied
+    assert approval.expired_reason is not None and approval.expired_reason.startswith("任务失败：任务运行超时")
+
+
+def _pending(state: SupervisorState, session_id: str, *, queued_ago: timedelta) -> Task:
+    task = _running(
+        state, session_id, lease_in=None, status=TaskStatus.pending, created_ago=queued_ago, silent_for=queued_ago,
+    )
+    task.worker_id = None
+    task.queued_at = _NOW - queued_ago
+    return task
+
+
+def test_a_queued_task_is_kept_while_some_worker_keeps_showing_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _pending(state, session_id, queued_ago=timedelta(minutes=40))
+    state._engine_last_seen_at = _NOW - timedelta(minutes=1)
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == []
+    assert task.status == TaskStatus.pending
+
+    state._engine_last_seen_at = _NOW - timedelta(minutes=16)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+    assert "排队 40 分钟无人接手" in task.result["error"]
+    assert "16 分钟没有任何 engine worker" in task.result["error"]
+
+
+def test_with_no_worker_seen_yet_the_silence_counts_from_the_supervisor_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _pending(state, session_id, queued_ago=timedelta(minutes=40))
+    state.started_at = _NOW - timedelta(minutes=10)
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == []
+
+    state.started_at = _NOW - timedelta(minutes=20)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+
+
+def test_a_session_approval_does_not_shield_a_queued_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:reaper")
+    task = _pending(state, session_id, queued_ago=timedelta(minutes=40))
+    _add_pending_approval(state, session_id)
+    state._engine_last_seen_at = _NOW - timedelta(minutes=20)
+    monkeypatch.setattr(SupervisorState, "_route_completed_task_locked", lambda self, t: None)
+
+    with state._lock:
+        assert reap_stuck_tasks_locked(state, now=_NOW) == [task.task_id]
+
+
+def test_renewing_a_lease_or_registering_counts_as_a_worker_showing_up(tmp_path: Path) -> None:
+    state = _make_state(tmp_path)
+    assert state.engine_seen_snapshot() == (None, None)
+
+    state.renew_lease(task_id="no-such-task", worker_id="worker-busy")
+
+    seen_at, worker = state.engine_seen_snapshot()
+    assert seen_at is not None and worker == "worker-busy"
+
+    state.register_engine(worker_id="worker-new", generation_id="gen-1")
+
+    assert state.engine_seen_snapshot()[1] == "worker-new"
 
 
 def test_reaping_defaults_to_the_configured_hard_limit(

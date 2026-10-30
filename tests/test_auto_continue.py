@@ -512,10 +512,15 @@ class TestLifetimeAndNodes:
                 input={AUTO_CONTINUE_KEY: {"round": 2, "chain_started_at": started.isoformat()}},
             )
 
-        reason = reap_reason(_task(chain_start), now=now, max_running_sec=_MAX, approval_pending=False)
+        reason = reap_reason(
+            _task(chain_start), now=now, max_running_sec=_MAX, approval_pending=False, worker_silence=timedelta(0),
+        )
 
         assert reason is not None and "总上限" in reason
-        assert reap_reason(_task(now - timedelta(hours=1)), now=now, max_running_sec=_MAX, approval_pending=False) is None
+        assert reap_reason(
+            _task(now - timedelta(hours=1)), now=now, max_running_sec=_MAX, approval_pending=False,
+            worker_silence=timedelta(0),
+        ) is None
 
     def test_the_shipped_coder_runs_long_and_continues_on_its_own(self, tmp_path: Path) -> None:
         node = load_node(tmp_path, "bootstrap.coder")

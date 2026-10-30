@@ -49,14 +49,18 @@ export interface ToolBlock extends BlockBase {
   toolIds: string[];
 }
 
+/** expired：没人定案，随任务结束或等审批超时被系统收掉（服务端状态仍是 denied）。 */
+export type ApprovalStatus = 'pending' | 'allowed' | 'denied' | 'expired';
+
 export interface ApprovalBlock extends BlockBase {
   kind: 'approval';
   approvalId: string;
   operation: string;
   details: Record<string, unknown>;
-  status: 'pending' | 'allowed' | 'denied';
+  status: ApprovalStatus;
   decision?: 'allow' | 'deny' | string;
   comment?: string;
+  expiredReason?: string;
 }
 
 export interface NoticeBlock extends BlockBase {
@@ -106,7 +110,8 @@ export interface ToolExecution {
   // they belong to. How: store the approval metadata on ToolExecution itself.
   // Purpose: one tool card can show pending approval, buttons, and final decision.
   approvalId?: string;
-  approvalStatus?: 'pending' | 'allowed' | 'denied';
+  approvalStatus?: ApprovalStatus;
+  approvalExpiredReason?: string;
   approvalDetails?: Record<string, unknown>;
   taskId?: string;
   // [AutoC 2026-06-04] Why: a task can span several visible LLM request cards.

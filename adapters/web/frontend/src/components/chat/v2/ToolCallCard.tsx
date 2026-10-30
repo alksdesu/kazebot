@@ -745,6 +745,13 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
         </div>
       )}
 
+      {tool.approvalStatus === 'expired' && (
+        <div className="inline-flex items-center gap-1 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-xs font-semibold text-[var(--duties-tertiary)]">
+          <Icon name="schedule" size={14} />
+          <span>{tool.approvalExpiredReason ? `已失效：${tool.approvalExpiredReason}` : '已失效'}</span>
+        </div>
+      )}
+
       {expanded && canExpand && (
         <div className="space-y-2 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-[0.66rem] text-[var(--duties-secondary)]">
           {(tool.taskId || tool.nodeId || tool.nodeName) && (

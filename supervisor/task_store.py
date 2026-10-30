@@ -26,10 +26,11 @@ from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
-from . import child_retention, stopped_batch
+from . import child_retention, dispatch_fork, stopped_batch
 from ._helpers import _now
 from .auto_continue import chain_input
 from .context_calibration import calibrated_chars_per_token
+from .dispatch_limits import DISPATCH_DEPTH_KEY, DISPATCH_TREE_KEY, stamp_new_task_locked
 from .task_ending import TaskEnding, clear_stopping, mark_stopping, task_ending
 from .task_lanes import CLAIM_ORDER, LaneLimits, TaskLane, derive_lane, parse_lane
 from .task_traits import REQUEUE_MARK
@@ -61,6 +62,8 @@ _RESUME_REMOVABLE_INPUT_KEYS = (
 )
 # 异步委派结果回调入站带的子任务结局，只认这几种
 _INBOUND_CHILD_STATUSES = frozenset({"finish", "ask", "fail"})
+# 任务进入终态时发的事件：失败也发 task_completed
+_TASK_END_EVENT_TYPES = frozenset({"task_completed", "task_cancelled"})
 
 
 def _inbound_result_fields(source: dict[str, Any]) -> dict[str, Any]:
@@ -322,12 +325,16 @@ class TaskStoreMixin:
     def _event_task_snapshot(
         self, event_type: str, task: Task, *, component: str = "supervisor",
     ) -> dict[str, Any]:
-        return self.eventlog.append(
+        event = self.eventlog.append(
             session_id=task.session_id,
             component=component,
             type_=event_type,
             payload=self._event_payload_for_task(task, event_type=event_type),
         )
+        if event_type in _TASK_END_EVENT_TYPES:
+            # 每条终态路径都从这里发事件，任务名下没人再等的审批在这里一并收掉，各条路径不用各记一遍
+            self._close_ended_task_approvals_locked(task)
+        return event
 
     # [2026-07-16] 只在 task_created 快照保留完整 input；后续生命周期
     # 事件（started/completed/suspended/resumed 等）的 input 与 created 一致。
@@ -374,6 +381,7 @@ class TaskStoreMixin:
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
                     "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
                     "context_ref", STEPS_USED_KEY, REQUEUE_MARK, AWAITING_INPUT_KEY,
+                    DISPATCH_DEPTH_KEY, DISPATCH_TREE_KEY,
                     *WORKTREE_SNAPSHOT_INPUT_KEYS,
                 ):
                     if _k in raw_input:
@@ -499,8 +507,12 @@ class TaskStoreMixin:
         task_lane = parse_lane(lane) if lane is not None else None
         if task_lane is None:
             task_lane = derive_lane(task_input, inherited=self._origin_lane_locked(caller_task_id, task_input))
+        task_id = str(uuid.uuid4())
+        stamp_new_task_locked(
+            self, task_input, task_id=task_id, caller_task_id=caller_task_id, session_id=session_id,
+        )
         task = Task(
-            task_id=str(uuid.uuid4()),
+            task_id=task_id,
             session_id=session_id,
             session_generation=session_generation,
             kind=kind,
@@ -795,18 +807,9 @@ class TaskStoreMixin:
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
         self._cancelled_sessions.discard(session_id)
-        # dispatch 的 fork 模式下，将调用方历史复制到目标 session。
-
-        # 目的：fork 模式下目标节点启动时能看到调用方的对话上下文。
-        _fork_from = str(payload.get("dispatch_fork_from_session") or "").strip()
-        if _fork_from:
-            from engine.conversation_store import ConversationStore
-            _fork_store = ConversationStore(self.workspace_root / "data" / "conversations")
-            if _fork_store.message_count(session_id) == 0:
-                try:
-                    _fork_store.fork(_fork_from, session_id)
-                except Exception as _fork_err:
-                    logger.warning("dispatch fork from %s to %s failed: %s", _fork_from[:12], session_id[:12], _fork_err)
+        # fork 模式的子节点要看到调用方的对话：经 /v1/inbound 来的已在锁外复制好装进来，这里只补进程里直接建的
+        _fork_from = dispatch_fork.fork_source(payload)
+        _fork_error = dispatch_fork.copy_if_empty_locked(self, _fork_from, session_id) if _fork_from else ""
         # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
         branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
         branch_base_count = int(fork_meta.get("base_count") or 0)
@@ -960,6 +963,9 @@ class TaskStoreMixin:
         if _worktree_plan.refused:
             # repo 不能建副本、或要接着用的副本正被别的任务用着：任务照常建出来再判失败，结果按异步委派的路子交回派发方
             self._fail_task_locked(task, error=_worktree_plan.error)
+        elif _fork_error:
+            # 调用方的历史复制不了：同样建出来再判失败，不让它从空历史开始
+            self._fail_task_locked(task, error=_fork_error)
         else:
             _worktrees.register_child_locked(task, _worktree_plan)
         # Emit transient inbound_accepted so Bot can advance watermark
@@ -1366,6 +1372,9 @@ class TaskStoreMixin:
         wid = (worker_id or "").strip()
         claim = (claim_id or "").strip()
         with self._lock:
+            if wid:
+                # 名额占满的 worker 不来领任务，只续租：回收线程靠这一笔分清 worker 是忙着还是不在了
+                self.mark_engine_seen(worker_id=wid)
             task = self.tasks.get(tid) if tid else None
             if task is None:
                 return LeaseRenewal(False, "not_found")

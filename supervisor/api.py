@@ -28,7 +28,7 @@ from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 from real_paths import real_path
 
-from . import async_dispatches, continuation, provisioning, session_reuse, share_groups
+from . import async_dispatches, continuation, dispatch_fork, provisioning, session_reuse, share_groups
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
@@ -634,7 +634,7 @@ def create_app(
         )
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
-    async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
+    def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
         # platform_auth 是整套鉴权的源头，这里不校验就等于谁都能声明自己是管理员。
         # adapter、engine、cli、tui 四个调用方本来就都带令牌。
         verify_admin_token(request)
@@ -646,19 +646,38 @@ def create_app(
         # 目的：确保 dispatch_origin/dispatch_context_mode/dispatch_fork_from_session
         #   能通过 event payload 传递到 task 创建逻辑。
         payload = msg.model_dump()
-        # 判能不能收和建任务在同一把锁里：两个委派同时到，只有一个能落进同一个会话
-        with st._lock:
+
+        def refuse_if_needed_locked() -> None:
             refused = session_reuse.inbound_refusal_locked(st, payload)
             if refused is not None:
                 raise HTTPException(status_code=refused.status, detail=refused.message)
-            session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
-            evt = st.eventlog.append(
-                session_id=session_id,
-                component="shell",
-                type_="inbound_message",
-                payload=payload,
-            )
-            created = st.record_inbound_message_event(evt)
+
+        fork_from = dispatch_fork.fork_source(payload)
+        staged = None
+        try:
+            if fork_from:
+                # 整段历史在锁外复制：先在锁里看一眼收不收、来源在不在，拒收的委派不白复制
+                with st._lock:
+                    refuse_if_needed_locked()
+                    dispatch_fork.check_source_locked(st, fork_from)
+                staged = dispatch_fork.stage(st, fork_from)
+            # 判能不能收和建任务在同一把锁里：两个委派同时到，只有一个能落进同一个会话
+            with st._lock:
+                refuse_if_needed_locked()
+                session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
+                if staged is not None:
+                    dispatch_fork.install_locked(st, staged, session_id)
+                evt = st.eventlog.append(
+                    session_id=session_id,
+                    component="shell",
+                    type_="inbound_message",
+                    payload=payload,
+                )
+                created = st.record_inbound_message_event(evt)
+        except dispatch_fork.ForkCopyError as failure:
+            raise HTTPException(status_code=failure.status, detail=failure.refusal) from failure
+        finally:
+            dispatch_fork.discard(staged)
         inbound_seq = int(evt.get("seq", 0) or 0)
         return InboundMessageOut(
             session_id=session_id, inbound_seq=inbound_seq, accepted=True,
@@ -1691,6 +1710,8 @@ def create_app(
         st: SupervisorState = app.state.state
         if approval_id not in st.approvals:
             raise HTTPException(status_code=404, detail="approval not found")
+        # 等审批的工具就是这样一遍遍来读的：读过的审批算有人在等，任务结束时不会被当成没人要的收掉
+        st.note_approval_read(approval_id)
         return st.approvals[approval_id]
 
     @app.post("/v1/approvals/{approval_id}", response_model=Approval)

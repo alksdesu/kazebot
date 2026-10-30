@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from clonoth_runtime import get_int
+from clonoth_runtime import get_int, get_str
 
 from .attachments import is_allowed_attachment_path
 from .dispatch_handle import parse_handle
+
+log = logging.getLogger(__name__)
 
 MAX_DISPATCH_BATCH_ITEMS = 8
 MAX_ITEM_ATTACHMENTS = 32
@@ -46,7 +49,16 @@ DEFAULT_AWAIT_TIMEOUT_SEC = 600
 DEFAULT_MAX_TIMEOUT_SEC = 3600
 MAX_TIMEOUT_CEILING_SEC = 21600
 
+MAX_DEPTH_CONFIG_KEY = "engine.dispatch.max_depth"
+MAX_LIVE_CONFIG_KEY = "engine.dispatch.max_live_descendants"
+DEFAULT_MAX_DEPTH = 4
+DEFAULT_MAX_LIVE = 16
+MAX_DEPTH_CEILING = 32
+MAX_LIVE_CEILING = 256
+
 _ATTACHMENT_TYPES = frozenset({"image", "file"})
+# engine 每一步、supervisor 每个批次都现读上限，同一个写错的值只提醒一次
+_WARNED_LIMIT_VALUES: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -71,6 +83,48 @@ class DispatchTimeouts:
 
     def clamp(self, seconds: int) -> int:
         return max(MIN_TIMEOUT_SEC, min(int(seconds), self.maximum))
+
+
+def _limit_from_config(cfg: dict[str, Any], key: str, default: int, ceiling: int) -> int:
+    """一项委派上限：没写用默认值，超过上限按上限；不是非负整数的按写错，用默认值并提醒一次，不会变成不限。"""
+    raw = get_str(cfg, key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        marker = (key, raw)
+        if marker not in _WARNED_LIMIT_VALUES:
+            _WARNED_LIMIT_VALUES.add(marker)
+            log.warning("runtime 配置 %s 的值「%s」不是非负整数，按默认值 %d 算", key, raw, default)
+        return default
+    return min(value, ceiling)
+
+
+@dataclass(frozen=True)
+class DispatchLimits:
+    """委派的两个上限：从用户那一轮（第 0 层）往下最多几层，一次用户请求派生的委派里同时没结束的最多几个。0 表示不限。"""
+
+    max_depth: int = DEFAULT_MAX_DEPTH
+    max_live: int = DEFAULT_MAX_LIVE
+
+    @classmethod
+    def from_config(cls, runtime_cfg: Any) -> "DispatchLimits":
+        cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+        return cls(
+            max_depth=_limit_from_config(cfg, MAX_DEPTH_CONFIG_KEY, DEFAULT_MAX_DEPTH, MAX_DEPTH_CEILING),
+            max_live=_limit_from_config(cfg, MAX_LIVE_CONFIG_KEY, DEFAULT_MAX_LIVE, MAX_LIVE_CEILING),
+        )
+
+    def depth_exceeded(self, depth: int) -> bool:
+        """排在第 depth 层的新委派是否超出层数上限。"""
+        return self.max_depth > 0 and depth > self.max_depth
+
+    def live_full(self, live: int) -> bool:
+        """已有 live 个没结束的委派时，是否不能再派新的。"""
+        return self.max_live > 0 and live >= self.max_live
 
 
 @dataclass(frozen=True)

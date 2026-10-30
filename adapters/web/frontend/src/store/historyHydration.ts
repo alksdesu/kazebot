@@ -509,6 +509,7 @@ function carryApproval(tool: ToolExecution, previous: ToolExecution | undefined)
     status: finished ? tool.status : previous.status,
     approvalId: previous.approvalId,
     approvalStatus: previous.approvalStatus,
+    approvalExpiredReason: previous.approvalExpiredReason,
     approvalDetails: previous.approvalDetails,
   };
 }

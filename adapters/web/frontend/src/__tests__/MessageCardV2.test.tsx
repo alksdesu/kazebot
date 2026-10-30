@@ -263,6 +263,23 @@ describe('MessageCard v2', () => {
     expect(screen.getByText('REJECTED: finish must be called alone')).toBeInTheDocument();
   });
 
+  it('shows an approval nobody decided as expired with its reason, not as denied', () => {
+    render(
+      <ToolCallCard
+        tool={baseTool({
+          status: 'error',
+          approvalId: 'ap-expired',
+          approvalStatus: 'expired',
+          approvalExpiredReason: '任务已取消',
+        })}
+      />,
+    );
+
+    expect(screen.getByText('已失效：任务已取消')).toBeInTheDocument();
+    expect(screen.queryByText('已拒绝')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /允许/ })).not.toBeInTheDocument();
+  });
+
   it('previews oversized tool details and shows byte sizes', () => {
     const longArguments = 'a'.repeat(10020);
     const longResult = 'b'.repeat(10030);

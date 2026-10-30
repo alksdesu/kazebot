@@ -908,6 +908,8 @@ class SessionMixin:
                 if task.input.get("branch_session_id"):
                     task.input["_branch_finalized"] = True
                 if self._task_terminal(task) and task.route_status == RouteStatus.routed:
+                    # 早已结束的任务不会再发终态事件，它转到后台的工具这时也要停，名下的审批在这里收掉
+                    self._close_ended_task_approvals_locked(task)
                     continue
                 task.cancel_requested = True
                 task.status = TaskStatus.cancelled

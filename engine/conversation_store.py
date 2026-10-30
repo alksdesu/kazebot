@@ -136,6 +136,19 @@ class ConversationChangedError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class StagedFork:
+    """暂存好的一份 fork 副本：同目录下的临时文件（没有可复制的消息时为 None）和里面的消息条数。
+
+    source_found 为 False 表示来源会话还没有对话文件。
+    """
+
+    source_session_id: str
+    path: Path | None
+    count: int
+    source_found: bool
+
+
 _LOCK_DIR_NAME = ".locks"
 _LOCK_STRIPE_CHARS = 2
 
@@ -316,6 +329,83 @@ class ConversationStore:
         """返回 session 中的消息总数。"""
         return len(self.load(session_id))
 
+    @staticmethod
+    def _has_messages_unlocked(path: Path) -> bool:
+        """文件里至少有一条读得出来的消息，读到第一条就停。调用方已持有这个会话的文件锁。"""
+        try:
+            stream = path.open("r", encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        with stream:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    Message.from_dict(json.loads(line))
+                except Exception:
+                    continue
+                return True
+        return False
+
+    def has_messages(self, session_id: str) -> bool:
+        """会话里至少有一条读得出来的消息。不整份解析，也不进缓存。"""
+        with self._locked(session_id):
+            return self._has_messages_unlocked(self._data_dir / f"{session_id}.jsonl")
+
+    def stage_fork(self, source_session_id: str) -> StagedFork:
+        """把 source 的非 system 消息写进同目录的临时文件，留给 install_fork 装进新会话。读写出错照常抛出。
+
+        子节点有自己的 system prompt，不需要父节点的。
+        """
+        found = (self._data_dir / f"{source_session_id}.jsonl").exists()
+        messages = [m for m in self.load(source_session_id) if m.role != "system" and not m.ephemeral]
+        if not messages:
+            return StagedFork(source_session_id, None, 0, found)
+        temporary: Path | None = None
+        try:
+            # 换行固定写 \n：追加走字节写，Windows 上文本模式会写成 \r\n，同一个文件就混了两种换行
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=self._data_dir,
+                prefix=".fork.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                for message in messages:
+                    stream.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
+        return StagedFork(source_session_id, temporary, len(messages), found)
+
+    def install_fork(self, staged: StagedFork, target_session_id: str) -> int:
+        """把暂存的副本装进 target，返回装进去的消息条数；target 已有读得出来的消息就不装，返回 0。
+
+        target 还没有文件或是空文件时整份换上去；只剩读不出的残行时接在后面，不把它冲掉。
+        """
+        if staged.path is None:
+            return 0
+        path = self._data_dir / f"{target_session_id}.jsonl"
+        with self._locked(target_session_id):
+            if self._has_messages_unlocked(path):
+                return 0
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    _append_lines(path, staged.path.read_bytes())
+                else:
+                    os.replace(staged.path, path)
+            finally:
+                self.invalidate_cache(target_session_id)
+        return staged.count
+
+    @staticmethod
+    def discard_fork(staged: StagedFork) -> None:
+        """丢掉没装进去的暂存副本；已经装进去的临时文件不在了，这里什么也不做。"""
+        if staged.path is not None:
+            staged.path.unlink(missing_ok=True)
+
     def fork(self, source_session_id: str, target_session_id: str) -> int:
         """将 source session 的非 system 消息复制到 target session。
 
@@ -323,16 +413,13 @@ class ConversationStore:
         target session 必须是空的（新创建的），已有内容则跳过，防止重复复制。
         返回实际复制的消息数量。
         """
-        if self.message_count(target_session_id) > 0:
+        if self.has_messages(target_session_id):
             return 0  # target 已有内容，不重复复制
-        source_msgs = self.load(source_session_id)
-        if not source_msgs:
-            return 0
-        # 过滤 system 消息——子节点有自己的 system prompt，不需要父节点的
-        non_system = [m for m in source_msgs if m.role != "system"]
-        if non_system:
-            self.append_batch(target_session_id, non_system)
-        return len(non_system)
+        staged = self.stage_fork(source_session_id)
+        try:
+            return self.install_fork(staged, target_session_id)
+        finally:
+            self.discard_fork(staged)
 
     def invalidate_cache(self, session_id: str) -> None:
         """手动使缓存失效，下次 load 时强制从文件重新读取。"""

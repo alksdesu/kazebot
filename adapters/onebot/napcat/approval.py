@@ -28,6 +28,8 @@ from . import common, identity, message_text, permissions, routing, sending, sta
 
 # 没人定案、由系统按拒绝收掉的审批（toolbox 等待超时、任务先结束了）附言里的固定说法；结构化字段里没有这一项。
 _AUTO_DENIED_COMMENT_MARK = "auto-denied"
+# toolbox 等审批超时收掉时附言里的说法，和任务结束后被收掉的区分开
+_TIMED_OUT_COMMENT_MARK = "timed out"
 
 
 def _book_decision(status: str, comment: str = "") -> str:
@@ -37,6 +39,12 @@ def _book_decision(status: str, comment: str = "") -> str:
     if status == APPROVAL_DENIED and _AUTO_DENIED_COMMENT_MARK not in str(comment or "").lower():
         return approvals.DECISION_DENY
     return approvals.DECISION_EXPIRED
+
+
+def _timed_out(status: str, comment: str = "") -> bool:
+    """这次失效是不是因为等审批超时；任务先结束、被取消而收掉的不算。"""
+    text = str(comment or "").lower()
+    return status == APPROVAL_DENIED and _AUTO_DENIED_COMMENT_MARK in text and _TIMED_OUT_COMMENT_MARK in text
 
 
 _STATUS_LABELS: Mapping[str, str] = MappingProxyType({
@@ -112,7 +120,7 @@ def _settled_approval_notice(approval_id: str) -> str:
     label = {
         approvals.DECISION_ALLOW: "已同意",
         approvals.DECISION_DENY: "已拒绝",
-        approvals.DECISION_EXPIRED: "已超时失效",
+        approvals.DECISION_EXPIRED: "已超时失效" if info.get("timed_out") else "已失效",
     }.get(decision, "已处理")
     admin_id = info.get("admin_id")
     by = f"，由管理员 {admin_id}" if admin_id else ""

@@ -22,6 +22,7 @@ export const ApprovalBlockView = ({ block }: ApprovalBlockViewProps) => {
     operation: block.operation,
     details: normalizeDetails(block.details),
     status: block.status,
+    expiredReason: block.expiredReason,
   };
 
   return (

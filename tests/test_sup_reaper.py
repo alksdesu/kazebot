@@ -47,24 +47,28 @@ def _task(**fields) -> Task:
 
 
 def _reason(task: Task, **flags) -> str | None:
-    return reap_reason(task, now=_NOW, max_running_sec=_MAX, approval_pending=flags.pop("approval_pending", False), **flags)
+    return reap_reason(
+        task, now=_NOW, max_running_sec=_MAX, approval_pending=flags.pop("approval_pending", False),
+        worker_silence=flags.pop("worker_silence", timedelta(0)), **flags,
+    )
 
 
 class TestPerPhaseTiming:
     def test_a_resumed_task_is_timed_from_its_requeue(self) -> None:
         task = _task(status=TaskStatus.pending, created_at=_NOW - timedelta(hours=2), queued_at=_NOW - timedelta(minutes=1))
 
-        assert _reason(task) is None
+        assert _reason(task, worker_silence=timedelta(hours=1)) is None
 
-    def test_a_task_left_in_the_queue_is_still_reaped(self) -> None:
+    def test_a_task_left_in_the_queue_with_no_worker_around_is_still_reaped(self) -> None:
         task = _task(
             status=TaskStatus.pending, created_at=_NOW - timedelta(hours=2),
             queued_at=_NOW - PENDING_QUEUE_LIMIT - timedelta(seconds=1),
         )
 
-        reason = _reason(task)
+        assert _reason(task) is None
+        reason = _reason(task, worker_silence=PENDING_QUEUE_LIMIT + timedelta(seconds=1))
 
-        assert reason is not None and "排队过久" in reason
+        assert reason is not None and "排队 15 分钟无人接手" in reason
 
     def test_a_long_suspension_does_not_count_against_the_next_run(self) -> None:
         task = _task(

@@ -18,6 +18,7 @@ from clonoth_runtime import (
     strip_tool_trace_blocks,
     wait_supervisor,
 )
+from shell.approvals import approval_settled_text, decision_took_effect
 from workspace import resolve_workspace_root
 
 
@@ -27,6 +28,17 @@ def _print_outbound(text: str) -> None:
         print(f"assistant> {cleaned}", flush=True)
     else:
         print("assistant> （已生成回复，但包含内部调试信息已被隐藏）", flush=True)
+
+
+def _decision_report(response: httpx.Response, decision: str) -> str:
+    """提交审批决定之后的那一句：回执和这次决定对不上，就是在别处先定了或已经失效。"""
+    try:
+        receipt = response.json()
+    except ValueError:
+        receipt = None
+    if decision_took_effect(receipt, decision):
+        return f"[approval] decided: {decision}"
+    return f"[approval] 这次决定没有生效：这条审批{approval_settled_text(receipt)}"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +105,8 @@ class _PushPoller:
         self._lock = threading.Lock()
         self._global_seq: int = global_seq
         self._paused: bool = False
+        # 推送过、还没定案的审批：在别处定案或失效时补一句，免得还照着旧提示去批
+        self._announced_approvals: set[str] = set()
 
     def start(self) -> None:
         t = threading.Thread(target=self._loop, daemon=True, name="push-poller")
@@ -115,6 +129,11 @@ class _PushPoller:
         with self._lock:
             return self._global_seq
 
+    def forget_approval(self, approval_id: str) -> None:
+        """这条审批由用户在这里亲自定了，之后的定案事件不用再提示。"""
+        with self._lock:
+            self._announced_approvals.discard(approval_id)
+
     def _loop(self) -> None:
         while True:
             try:
@@ -132,7 +151,7 @@ class _PushPoller:
         try:
             r = self._client.get(
                 f"{self._base_url}/v1/events",
-                params={"after_seq": seq, "types": "outbound_message,approval_requested"},
+                params={"after_seq": seq, "types": "outbound_message,approval_requested,approval_decided"},
             )
             if r.status_code != 200:
                 return
@@ -160,11 +179,23 @@ class _PushPoller:
             elif et == "approval_requested":
                 aid = payload.get("approval_id", "")
                 op = payload.get("operation", "")
+                if aid:
+                    with self._lock:
+                        self._announced_approvals.add(str(aid))
                 sys.stdout.write(
                     f"\n[push] 有待审批的操作: {op} (id={aid})\n"
                     f"[push] 输入 /approve {aid} 或 /deny {aid} 处理\nyou> "
                 )
                 sys.stdout.flush()
+
+            elif et == "approval_decided":
+                aid = str(payload.get("approval_id") or "")
+                with self._lock:
+                    announced = aid in self._announced_approvals
+                    self._announced_approvals.discard(aid)
+                if announced:
+                    sys.stdout.write(f"\n[push] 审批 {aid} {approval_settled_text(payload)}，不用再处理\nyou> ")
+                    sys.stdout.flush()
 
         with self._lock:
             self._global_seq = new_seq
@@ -285,13 +316,14 @@ def main() -> None:
                 decision = "allow" if parts[0] == "/approve" else "deny"
                 aid = parts[1].strip() if len(parts) > 1 else ""
                 if aid:
+                    push.forget_approval(aid)
                     try:
                         dr = client.post(
                             f"{base_url}/v1/approvals/{aid}",
                             json={"decision": decision, "comment": "approved via shell cli"},
                         )
                         dr.raise_for_status()
-                        print(f"[approval] decided: {decision}", flush=True)
+                        print(_decision_report(dr, decision), flush=True)
                     except Exception as e:
                         print(f"[approval] failed: {e}", flush=True)
                 else:
@@ -409,12 +441,13 @@ def main() -> None:
 
                             ans = input("allow? (y/N)> ").strip().lower()
                             decision = "allow" if ans in {"y", "yes"} else "deny"
+                            push.forget_approval(str(approval_id or ""))
                             dr = client.post(
                                 f"{base_url}/v1/approvals/{approval_id}",
                                 json={"decision": decision, "comment": "approved via shell cli"},
                             )
                             dr.raise_for_status()
-                            print(f"[approval] decided: {decision}\n", flush=True)
+                            print(f"{_decision_report(dr, decision)}\n", flush=True)
 
                     if got_reply:
                         stream_renderer.on_stream_end()

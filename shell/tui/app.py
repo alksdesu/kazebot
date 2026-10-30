@@ -29,6 +29,7 @@ from .widgets.status_bar import StatusBar
 from .widgets.thinking import ThinkingIndicator
 from .widgets.search_bar import SearchBar
 from .models import (
+    ApprovalDecided,
     ApprovalRequested,
     AssistantReply,
     ConfigUpdated,
@@ -470,6 +471,20 @@ class ClonothApp(App):
             self.query_one("#approval-overlay").add_class("visible")
         except Exception:
             pass
+
+    async def on_approval_decided(self, event: ApprovalDecided) -> None:
+        """亮着的审批在别处定案或被系统收掉：收起审批框，免得还对着它点同意。"""
+        pending = self._pending_approval
+        if not self._chat_ready or not pending or pending.get("approval_id") != event.approval_id:
+            return
+        self._pending_approval = None
+        try:
+            self.query_one("#approval-overlay").remove_class("visible")
+        except Exception:
+            pass
+        await self.query_one(MessageList).add_system_message(
+            f"审批{event.settled}，不用再处理（{pending.get('operation', '')}）"
+        )
 
     async def on_task_cancelled(self, event: TaskCancelled) -> None:
         if not self._chat_ready:

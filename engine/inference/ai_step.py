@@ -67,7 +67,7 @@ from .pseudo_handlers import (
 )
 
 from ..context_store import load_context_snapshot
-from ..dispatch_batch import AWAIT_KEY, DispatchTimeouts
+from ..dispatch_batch import AWAIT_KEY, DispatchLimits, DispatchTimeouts
 from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
 from ..conversation_store import Message, MessageType
 from ..isolation_notice import task_isolation
@@ -2335,6 +2335,7 @@ async def run_ai_node(
         _dispatch_timeouts = DispatchTimeouts.from_config(runtime_cfg)
         openai_tools.extend(_dispatch_delegate_specs(
             delegate_targets, downstream_info, allow_wait=not _is_system_task, timeouts=_dispatch_timeouts,
+            limits=DispatchLimits.from_config(runtime_cfg),
             isolating=_isolating, can_merge=_delegation.can_merge, caller_id=node.id,
         ))
         openai_tools.extend(_dispatch_control_specs(allow_await=not _is_system_task, timeouts=_dispatch_timeouts))

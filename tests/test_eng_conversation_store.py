@@ -156,3 +156,91 @@ def test_a_preempt_message_is_on_disk_before_the_supervisor_is_told(tmp_path: Pa
     asyncio.run(_inject_preempt_message(SimpleNamespace(messages=loop.messages, step=1), loop))
 
     assert seen == [["new question"]]
+
+
+def _staged_files(directory: Path) -> list[Path]:
+    return sorted(directory.glob(".fork.*.tmp"))
+
+
+def _parent_history(store: ConversationStore) -> None:
+    store.append_batch("parent", [
+        Message(id="sys", role="system", content="persona"),
+        Message(id="ask", role="user", content="帮我查一下"),
+        Message(id="answer", role="assistant", content="好的"),
+    ])
+
+
+def test_a_staged_fork_installs_the_source_as_it_was_when_staged(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+
+    staged = store.stage_fork("parent")
+    store.append("parent", Message(id="later", role="user", content="派出去之后才写的"))
+
+    assert (staged.count, staged.source_found) == (2, True)
+    assert store.install_fork(staged, "child") == 2
+    assert [message.id for message in ConversationStore(tmp_path).load("child")] == ["ask", "answer"]
+    ConversationStore.discard_fork(staged)
+    assert _staged_files(tmp_path) == []
+
+
+def test_a_fork_never_lands_on_a_target_that_already_has_messages(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    store.append("child", Message(id="own", role="user", content="自己的"))
+
+    staged = store.stage_fork("parent")
+    try:
+        assert store.install_fork(staged, "child") == 0
+    finally:
+        ConversationStore.discard_fork(staged)
+
+    assert [message.id for message in ConversationStore(tmp_path).load("child")] == ["own"]
+    assert _staged_files(tmp_path) == []
+
+
+def test_a_fork_keeps_unreadable_leftovers_in_the_target_and_lands_after_them(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+    (tmp_path / "child.jsonl").write_bytes(b'{"id": "torn", "role": "us')
+
+    staged = store.stage_fork("parent")
+    assert store.install_fork(staged, "child") == 2
+    ConversationStore.discard_fork(staged)
+
+    assert (tmp_path / "child.jsonl").read_bytes().startswith(b'{"id": "torn", "role": "us\n')
+    assert [message.id for message in ConversationStore(tmp_path).load("child")] == ["ask", "answer"]
+    assert _staged_files(tmp_path) == []
+
+
+def test_staging_a_source_without_messages_writes_nothing(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append("only-system", Message(id="sys", role="system", content="persona"))
+
+    missing = store.stage_fork("nobody")
+    empty = store.stage_fork("only-system")
+
+    assert (missing.path, missing.count, missing.source_found) == (None, 0, False)
+    assert (empty.path, empty.count, empty.source_found) == (None, 0, True)
+    assert store.install_fork(missing, "child") == 0
+    assert not (tmp_path / "child.jsonl").exists()
+
+
+def test_has_messages_needs_one_readable_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    assert store.has_messages("session") is False
+    (tmp_path / "session.jsonl").write_text("\n   \nnot json\n", encoding="utf-8")
+    assert store.has_messages("session") is False
+    store.append("session", Message(id="m", role="user", content="x"))
+    assert store.has_messages("session") is True
+
+
+def test_fork_still_copies_everything_but_system_messages_once(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _parent_history(store)
+
+    assert store.fork("parent", "child") == 2
+    assert store.fork("parent", "child") == 0
+    assert [message.id for message in ConversationStore(tmp_path).load("child")] == ["ask", "answer"]
+    assert _staged_files(tmp_path) == []

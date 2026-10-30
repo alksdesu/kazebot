@@ -33,6 +33,7 @@ from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
 from . import branch_recovery, child_retention, stopped_batch
+from .async_tools import detached_cancelled_locked
 from .policy import ApprovalGrantSettings, PathScope, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
@@ -64,6 +65,8 @@ from .worktrees import service_of as worktree_service_of
 
 # 没人定案、由系统按拒绝收掉的审批附言以 auto-denied 结尾，toolbox 的审批超时也是；适配器据此显示成「已失效」。
 ORPHANED_APPROVAL_COMMENT = "task ended before a decision; auto-denied"
+# 等审批的工具每 0.5 秒来读一次审批；这么久没人读，就是已经没有人在等它
+APPROVAL_WAITER_SILENCE = timedelta(seconds=60)
 # 这几种操作带路径或命令，按任务所在的隔离副本判
 _PATH_SCOPED_OPS = frozenset({"read_file", "write_file", "execute_command"})
 
@@ -86,6 +89,23 @@ def _auth_is_admin(platform_auth: dict[str, Any]) -> bool:
     return bool(platform_auth.get("is_admin"))
 
 
+def _approval_expired_reason(task: Task | None) -> str:
+    """审批没人定案、被系统收掉时给人看的原因，按发起它的任务现在的状况说。"""
+    if task is None:
+        return "发起这条审批的任务已不在"
+    task_input = task.input if isinstance(task.input, dict) else {}
+    if task_input.get("_session_reset"):
+        return "会话已重置"
+    if task.status == TaskStatus.cancelled:
+        return "任务已取消"
+    if task.status == TaskStatus.failed:
+        error = str((task.result or {}).get("error") or "").strip() if isinstance(task.result, dict) else ""
+        return f"任务失败：{error[:200]}" if error else "任务失败"
+    if task.status == TaskStatus.completed:
+        return "任务已结束，没有人再等这条审批"
+    return "已经没有人在等这条审批"
+
+
 class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     """Supervisor 核心状态。管理会话、inbound 记录、task 队列与审批。"""
 
@@ -106,6 +126,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.approvals: dict[str, Approval] = {}
         self.approval_grants = ApprovalGrantBook()
         self._approval_grant_file = ApprovalGrantFile(workspace_root / "data" / "approval_grants.json")
+        # 待审批最近一次被等它的工具读到的时间：没人再读的就是没人在等，任务结束和巡检时据此决定收不收
+        self._approval_read_at: dict[str, datetime] = {}
 
         self.tasks: dict[str, Task] = {}
         self._task_order: list[str] = []
@@ -1628,6 +1650,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             a.approver = model_or_none(ApproverIdentity, payload.get("approver"))
             a.grant = grant
             a.grant_note = str(payload.get("grant_note") or "") or None
+            a.expired_reason = str(payload.get("expired_reason") or "") or None
         if grant is not None:
             self.approval_grants.store(grant, now=_now())
 
@@ -1727,7 +1750,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         grant_minutes: int | None = None,
         grant_permanent: bool = False,
         grant_settings: ApprovalGrantSettings | None = None,
+        expired_reason: str | None = None,
     ) -> None:
+        """定案一条审批并发出 approval_decided。expired_reason 只在系统替没人定案的审批收尾时给。"""
         now = _now()
         approver_identity = GrantIdentity.from_auth(approver)
         grant: ApprovalGrant | None = None
@@ -1761,6 +1786,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         a.approver = ApproverIdentity(**approver_identity.as_dict()) if approver_identity is not None else None
         a.grant = grant
         a.grant_note = grant_note
+        a.expired_reason = expired_reason or None
+        self._approval_read_at.pop(a.approval_id, None)
         self.eventlog.append(
             session_id=a.session_id,
             component="supervisor",
@@ -1777,6 +1804,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "approver": a.approver.model_dump(mode="json") if a.approver is not None else None,
                 "grant": grant.model_dump(mode="json") if grant is not None else None,
                 "grant_note": grant_note,
+                "expired_reason": a.expired_reason,
             },
         )
         # 事件落盘之后才生效：重启后按事件重建，没记下的授权不能先在内存里放行。
@@ -1840,20 +1868,72 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
         return revoked
 
-    def _close_orphaned_approvals_locked(self) -> list[str]:
-        """任务已经结束、或已不在内存里的待审批按拒绝收掉，返回收掉的 id。
+    def note_approval_read(self, approval_id: str) -> None:
+        """等审批的工具来读了一次待审批：记下时间，据此判断还有没有人在等它。"""
+        approval = self.approvals.get(approval_id)
+        if approval is not None and approval.status == ApprovalStatus.pending:
+            # 每条待审批每 0.5 秒读一次，不进全局锁：单次字典写入是原子的，读到旧值至多让收审批晚一轮巡检
+            self._approval_read_at[approval_id] = _now()
 
-        工具等审批时任务被取消或回收，等待循环直接退出，审批就一直挂着待审，适配器重连对账时会把它重新亮给管理员。
-        没有 task_id 的审批判断不了归属，不动。
+    def _approval_waited_on_locked(self, approval: Approval, now: datetime) -> bool:
+        """最近 APPROVAL_WAITER_SILENCE 里有工具来读过这条审批；刚建出来、还没来得及读的也算有人在等。"""
+        last_read = self._approval_read_at.get(approval.approval_id) or approval.requested_at
+        try:
+            return now - last_read <= APPROVAL_WAITER_SILENCE
+        except TypeError:
+            # 旧数据里不带时区的时间没法比，按还有人在等算
+            return True
+
+    def _close_task_approvals_locked(self, task: Task) -> list[str]:
+        """收掉任务名下没人再等的待审批，按拒绝定案并发出 approval_decided，返回收掉的 id。
+
+        任务取消、失败或会话重置时，它的工具连同转到后台的都会停下，全收；正常结束时转到后台的工具可能还在等，只收没人再读的。
         """
+        now = _now()
+        stopping = detached_cancelled_locked(self, task.task_id)
+        reason = _approval_expired_reason(task)
         closed: list[str] = []
         for approval in list(self.approvals.values()):
-            if approval.status != ApprovalStatus.pending or not approval.task_id:
+            if approval.status != ApprovalStatus.pending or str(approval.task_id or "").strip() != task.task_id:
                 continue
-            task = self.tasks.get(approval.task_id)
-            if task is not None and not self._task_terminal(task):
+            if not stopping and self._approval_waited_on_locked(approval, now):
                 continue
-            self._decide_approval_locked(approval, "deny", ORPHANED_APPROVAL_COMMENT)
+            self._decide_approval_locked(approval, "deny", ORPHANED_APPROVAL_COMMENT, expired_reason=reason)
+            closed.append(approval.approval_id)
+        return closed
+
+    def _close_ended_task_approvals_locked(self, task: Task) -> None:
+        """任务的终态事件发出之后收掉它名下的审批。派发那次的完成随后转成挂起，不算结束；出错只记日志，不打断任务收尾。"""
+        try:
+            if self._task_ending_locked(task).continues:
+                return
+            self._close_task_approvals_locked(task)
+        except Exception:
+            logger.exception("closing the approvals of task %s failed", task.task_id[:12])
+
+    def _close_orphaned_approvals_locked(self) -> list[str]:
+        """巡检：没人再等的待审批按拒绝收掉，返回收掉的 id。
+
+        发起任务已取消、失败或会话已重置的全收；其余（任务已结束、已不在内存，或还活着却早就没人来读，比如重排前那次领取留下的）
+        只收超过 APPROVAL_WAITER_SILENCE 没人读的，转到后台的工具还在等的照样留着。没有 task_id 的审批判断不了归属，不动。
+        """
+        now = _now()
+        for approval_id in list(self._approval_read_at):
+            approval = self.approvals.get(approval_id)
+            if approval is None or approval.status != ApprovalStatus.pending:
+                self._approval_read_at.pop(approval_id, None)
+        closed: list[str] = []
+        for approval in list(self.approvals.values()):
+            task_id = str(approval.task_id or "").strip()
+            if approval.status != ApprovalStatus.pending or not task_id:
+                continue
+            stopping = detached_cancelled_locked(self, task_id, approval.session_id)
+            if not stopping and self._approval_waited_on_locked(approval, now):
+                continue
+            self._decide_approval_locked(
+                approval, "deny", ORPHANED_APPROVAL_COMMENT,
+                expired_reason=_approval_expired_reason(self.tasks.get(task_id)),
+            )
             closed.append(approval.approval_id)
         return closed
 
@@ -2190,6 +2270,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         gid = (generation_id or "").strip()
         if not wid or not gid:
             return {"ok": False, "error": "worker_id and generation_id required"}
+        self.mark_engine_seen(worker_id=wid)
 
         with self._lock:
             old_gen = self._engine_generations.get(wid)

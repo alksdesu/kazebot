@@ -298,6 +298,8 @@ export interface AdminApproval {
   tool_call_id?: string | null;
   node_id?: string | null;
   task_id?: string | null;
+  /** 没人定案、随任务失效被系统收掉时给人看的原因。 */
+  expired_reason?: string | null;
 }
 
 export interface AdminState {

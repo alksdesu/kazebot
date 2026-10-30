@@ -310,8 +310,10 @@ class ApprovalBook:
             return set()
         return {card.admin_id for card in self.cards.values() if card.approval_id == approval_id}
 
-    def settle(self, approval_id: str, *, decision: str, admin_id: Any = "", operation: str = "") -> None:
-        """登记一条已决或已失效的审批。admin_id 留空表示不是人作的决定（超时、自动拒绝）。"""
+    def settle(
+        self, approval_id: str, *, decision: str, admin_id: Any = "", operation: str = "", timed_out: bool = False,
+    ) -> None:
+        """登记一条已决或已失效的审批。admin_id 留空表示不是人作的决定（超时、自动拒绝）；timed_out 标出失效是因为等审批超时。"""
         if not approval_id:
             return
         self.settled[approval_id] = {
@@ -319,25 +321,28 @@ class ApprovalBook:
             "admin_id": self._account(admin_id),
             "at": self._clock(),
             "operation": operation,
+            "timed_out": bool(timed_out),
         }
         self.settled.move_to_end(approval_id)
         while len(self.settled) > _SETTLED_LIMIT:
             self.settled.popitem(last=False)
 
-    def close(self, approval_id: str, *, decision: str, admin_id: Any = "") -> dict[str, Any] | None:
+    def close(
+        self, approval_id: str, *, decision: str, admin_id: Any = "", timed_out: bool = False,
+    ) -> dict[str, Any] | None:
         """摘掉一条待审批并登记定案，返回它挂起时的信息；本来就不在待审批里也照样登记。"""
         info = self.pending.pop(approval_id, None)
         self.settle(
             approval_id, decision=decision, admin_id=admin_id,
-            operation=str((info or {}).get("operation") or ""),
+            operation=str((info or {}).get("operation") or ""), timed_out=timed_out,
         )
         return info
 
-    def close_if_pending(self, approval_id: str, *, decision: str) -> bool:
+    def close_if_pending(self, approval_id: str, *, decision: str, timed_out: bool = False) -> bool:
         """在别处定案或作废的审批：还挂着才收起。本地已定案的保留原记录，那里记着是哪位管理员批的。"""
         if approval_id not in self.pending:
             return False
-        self.close(approval_id, decision=decision)
+        self.close(approval_id, decision=decision, timed_out=timed_out)
         return True
 
     def prune_expired(self) -> None:
@@ -350,7 +355,7 @@ class ApprovalBook:
             if now - (float(info.get("created_at") or 0) or now) > self._ttl_seconds
         ]
         for approval_id in expired:
-            self.close(approval_id, decision=DECISION_EXPIRED)
+            self.close(approval_id, decision=DECISION_EXPIRED, timed_out=True)
 
     async def claim(self, approval_id: str, admin_id: Any, decision: str) -> dict[str, Any] | None:
         """原子领取待审批：抢到才返回挂起时的信息，领取即登记定案。"""

@@ -309,6 +309,18 @@ class TestFinishDecision:
 
         assert text.startswith("该审批已被处理，当前状态：")
         assert wired.state._adapter.approvals.settled[AID]["decision"] == approvals.DECISION_EXPIRED
+        assert "（已超时失效）" in wired.approval._settled_approval_notice(AID)
+
+    def test_an_approval_closed_because_its_task_ended_is_not_called_timed_out(
+        self, wired: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        self._supervisor(monkeypatch, wired, "denied", note="task ended before a decision; auto-denied")
+
+        self._decide(wired, LISTED_QQ, AID, "allow")
+
+        assert wired.state._adapter.approvals.settled[AID]["decision"] == approvals.DECISION_EXPIRED
+        assert "（已失效）" in wired.approval._settled_approval_notice(AID)
 
     def test_an_approval_the_supervisor_no_longer_knows_is_reported(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}

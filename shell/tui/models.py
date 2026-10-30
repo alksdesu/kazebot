@@ -82,6 +82,14 @@ class ApprovalRequested(Message):
         self.fingerprint = fingerprint
 
 
+class ApprovalDecided(Message):
+    """审批在某处定案或被系统收掉。settled 是给人看的结论，如「已失效（任务已取消）」。"""
+    def __init__(self, approval_id: str, settled: str) -> None:
+        super().__init__()
+        self.approval_id = approval_id
+        self.settled = settled
+
+
 class TaskCancelled(Message):
     """任务已取消。"""
 

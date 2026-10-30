@@ -24,6 +24,7 @@ from ..dispatch_batch import (
     MIN_TIMEOUT_SEC,
     OWN_SESSION_MODES,
     REPO_KEY,
+    DispatchLimits,
     DispatchTimeouts,
 )
 from ..todo_list import MAX_TODO_CONTENT_CHARS, MAX_TODO_ITEMS, TODO_STATUSES, TODO_TOOL_NAME
@@ -230,12 +231,25 @@ def _dispatch_delegate_parameters(
     }
 
 
+def _dispatch_limits_note(limits: DispatchLimits) -> str | None:
+    """说明里讲委派上限的那一句，数字照配置；不限的那一项不提，两项都不限时没有这一句。"""
+    parts: list[str] = []
+    if limits.max_depth > 0:
+        parts.append(f"从用户那一轮往下最多 {limits.max_depth} 层")
+    if limits.max_live > 0:
+        parts.append(f"这次用户请求派生的委派里同时没结束的（含挂起等结果的）最多 {limits.max_live} 个")
+    if not parts:
+        return None
+    return f"委派有上限：{'，'.join(parts)}；超出的那一次不会派出，结果里会说明原因。"
+
+
 def _dispatch_delegate_spec(
     target_id: str,
     info: Mapping[str, Any] | None = None,
     *,
     allow_wait: bool = True,
     timeouts: DispatchTimeouts | None = None,
+    limits: DispatchLimits | None = None,
     isolation: bool = False,
     can_merge: bool = True,
     to_self: bool = False,
@@ -244,6 +258,7 @@ def _dispatch_delegate_spec(
 
     isolation=True 给可以隔离的目标：多 isolation、repo 两个参数，说明里多一段交回的副本怎么审、怎么合回。
     to_self=True 给调用方自己这个节点：派出去的是另一份它，不能沿用会话。
+    limits 不给时按默认上限写说明。
     """
     target = str(target_id or "").strip()
     node_name = str((info or {}).get("name") or target).strip() or target
@@ -278,6 +293,7 @@ def _dispatch_delegate_spec(
         ]
     if isolation:
         desc_parts.append(_isolation_review(can_merge=can_merge))
+    desc_parts.append(_dispatch_limits_note(limits or DispatchLimits()))
     desc_parts.append("需要并行委派时，可以在同一轮调用多个委派工具。")
     return {
         "type": "function",
@@ -305,6 +321,7 @@ def _dispatch_delegate_specs(
     *,
     allow_wait: bool = True,
     timeouts: DispatchTimeouts | None = None,
+    limits: DispatchLimits | None = None,
     isolating: Collection[str] = (),
     can_merge: bool = True,
     caller_id: str = "",
@@ -323,7 +340,7 @@ def _dispatch_delegate_specs(
             continue
         seen.add(target)
         result.append(_dispatch_delegate_spec(
-            target, info_by_id.get(target), allow_wait=allow_wait, timeouts=timeouts,
+            target, info_by_id.get(target), allow_wait=allow_wait, timeouts=timeouts, limits=limits,
             isolation=target in offered, can_merge=can_merge, to_self=bool(caller_id) and target == caller_id,
         ))
     return result

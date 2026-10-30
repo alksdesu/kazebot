@@ -36,6 +36,11 @@ describe('审批状态的说法', () => {
     expect(approvalStatusLabel('')).toBe('未知');
     expect(staleApprovalMessage('allowed')).toBe('该审批已被处理，当前状态：已允许');
   });
+
+  it('随任务失效被系统收掉的审批说出失效原因', () => {
+    expect(staleApprovalMessage('denied', '任务已取消')).toBe('该审批已失效：任务已取消');
+    expect(staleApprovalMessage('denied', '')).toBe('该审批已被处理，当前状态：已拒绝');
+  });
 });
 
 describe('submitApprovalDecision', () => {
@@ -59,6 +64,17 @@ describe('submitApprovalDecision', () => {
     await expect(deny).resolves.toEqual({ applied: true, status: 'denied' });
     expect(api.decideApproval).toHaveBeenCalledOnce();
     expect(api.decideApproval).toHaveBeenCalledWith('token-a', 'ap-1', 'allow', '');
+  });
+
+  it('已失效的审批状态也是 denied，带着失效原因就不算这次的拒绝生效', async () => {
+    vi.mocked(api.decideApproval)
+      .mockResolvedValueOnce({ approval_id: 'ap-1', status: 'denied', expired_reason: '任务已取消' } as api.AdminApproval)
+      .mockResolvedValueOnce({ approval_id: 'ap-1', status: 'denied', expired_reason: null } as api.AdminApproval);
+
+    await expect(submitApprovalDecision('ap-1', 'deny', '', 'token-a')).resolves.toEqual({
+      applied: false, status: 'denied', expiredReason: '任务已取消',
+    });
+    await expect(submitApprovalDecision('ap-1', 'deny', '', 'token-a')).resolves.toEqual({ applied: true, status: 'denied' });
   });
 
   it('上一次提交结束后可以再提交', async () => {
@@ -100,6 +116,25 @@ describe('useApprovalDecision', () => {
 
     expect(outcome).toEqual({ applied: false, status: 'denied', failed: false, message: '该审批已被处理，当前状态：已拒绝' });
     expect(result.current.messageOf('ap-1')).toBe('该审批已被处理，当前状态：已拒绝');
+  });
+
+  it('审批已失效时说出原因', async () => {
+    vi.mocked(api.decideApproval).mockResolvedValue(
+      { approval_id: 'ap-1', status: 'denied', expired_reason: '任务已结束，没有人再等这条审批' } as api.AdminApproval,
+    );
+    const { result } = renderHook(() => useApprovalDecision());
+
+    let outcome: unknown;
+    await act(async () => { outcome = await result.current.decide('ap-1', 'allow'); });
+
+    expect(outcome).toEqual({
+      applied: false,
+      status: 'denied',
+      expiredReason: '任务已结束，没有人再等这条审批',
+      failed: false,
+      message: '该审批已失效：任务已结束，没有人再等这条审批',
+    });
+    expect(result.current.messageOf('ap-1')).toBe('该审批已失效：任务已结束，没有人再等这条审批');
   });
 
   it('提交失败把原因留下，下次提交前清掉', async () => {

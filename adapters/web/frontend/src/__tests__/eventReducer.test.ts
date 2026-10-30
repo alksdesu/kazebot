@@ -374,6 +374,91 @@ describe('eventReducer', () => {
     });
   });
 
+  it('shows an approval nobody decided as expired, with the reason the supervisor gave', () => {
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-expired', text: 'run it' }),
+      event(2, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-expired',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-run',
+        tool_name: 'execute_command',
+        arguments: { command: 'ls' },
+      }),
+      event(3, 'approval_requested', {
+        source_inbound_seq: 1,
+        task_id: 'task-expired',
+        node_id: 'ereuna_main',
+        approval_id: 'ap-expired',
+        tool_call_id: 'call-run',
+        operation: 'execute_command',
+        details: { command: 'ls' },
+        status: 'pending',
+      }),
+      event(4, 'approval_decided', {
+        source_inbound_seq: 1,
+        task_id: 'task-expired',
+        node_id: 'ereuna_main',
+        approval_id: 'ap-expired',
+        tool_call_id: 'call-run',
+        decision: 'deny',
+        status: 'denied',
+        comment: 'task ended before a decision; auto-denied',
+        expired_reason: '任务已取消',
+      }),
+    ], createInitialChatState());
+
+    const toolBlock = selectMessages(state, 'conv-expired')[1].blocks[0];
+    const tools = toolBlock.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      status: 'error',
+      approvalId: 'ap-expired',
+      approvalStatus: 'expired',
+      approvalExpiredReason: '任务已取消',
+    });
+  });
+
+  it('reads an auto-denied comment without a reason as expired and a plain denial as denied', () => {
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-legacy-expired', text: 'write file' }),
+      event(2, 'approval_requested', {
+        source_inbound_seq: 1,
+        approval_id: 'ap-timeout',
+        operation: 'write_file',
+        details: { path: 'a.md' },
+        status: 'pending',
+      }),
+      event(3, 'approval_requested', {
+        source_inbound_seq: 1,
+        approval_id: 'ap-denied',
+        operation: 'write_file',
+        details: { path: 'b.md' },
+        status: 'pending',
+      }),
+      event(4, 'approval_decided', {
+        source_inbound_seq: 1,
+        approval_id: 'ap-timeout',
+        decision: 'deny',
+        comment: 'approval timed out after 300s with no decision; auto-denied',
+      }),
+      event(5, 'approval_decided', {
+        source_inbound_seq: 1,
+        approval_id: 'ap-denied',
+        decision: 'deny',
+        comment: 'not now',
+      }),
+    ], createInitialChatState());
+
+    const approvals = selectMessages(state, 'conv-legacy-expired')[1].blocks.filter((block) => block.kind === 'approval');
+
+    expect(approvals.map((block) => [block.approvalId, block.status, block.expiredReason])).toEqual([
+      ['ap-timeout', 'expired', undefined],
+      ['ap-denied', 'denied', undefined],
+    ]);
+  });
+
   it('merges approvals with tool_call_id into the matching tool execution', () => {
     // Why: approvals are now a ToolExecution state instead of a separate card when
     // the backend supplies tool_call_id. How: create a tool, request approval for

@@ -396,6 +396,8 @@ class Approval(BaseModel):
     # 同意了却没生成授权的原因：once / disabled / not_requester / no_requester / no_approver；
     # 要了永久却只给了限时的原因：permanent_not_admin / permanent_disabled。
     grant_note: str | None = None
+    # 没人定案、随任务失效而被系统收掉时给人看的原因；人批的、toolbox 等审批超时收的都没有这一项
+    expired_reason: str | None = None
 
 
 class OpRequestIn(BaseModel):

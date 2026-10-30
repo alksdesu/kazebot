@@ -117,6 +117,17 @@ class TestPendingAndSettled:
 
         assert list(book.pending) == [A2]
         assert book.settled[A1]["decision"] == approvals.DECISION_EXPIRED
+        assert book.settled[A1]["timed_out"] is True
+
+    def test_only_a_settlement_marked_as_a_timeout_says_so(self, book: ApprovalBook) -> None:
+        _open(book, A1)
+        _open(book, A2)
+
+        book.close(A1, decision=approvals.DECISION_EXPIRED)
+        assert book.close_if_pending(A2, decision=approvals.DECISION_EXPIRED, timed_out=True) is True
+
+        assert book.settled[A1]["timed_out"] is False
+        assert book.settled[A2]["timed_out"] is True
 
     def test_a_request_without_a_timestamp_never_expires(self, book: ApprovalBook, clock: _Clock) -> None:
         book.pending[AID] = {"operation": "read_file"}

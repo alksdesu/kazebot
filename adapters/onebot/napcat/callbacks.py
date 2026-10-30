@@ -334,6 +334,7 @@ class TangQiuCallbacks:
         """审批在别处定案或作废：收起本地待审批，之后引用卡片只会得到「已处理」而不是假回执。"""
         if state._adapter.approvals.close_if_pending(
             approval_id, decision=approval._book_decision(status, comment),
+            timed_out=approval._timed_out(status, comment),
         ):
             common.logger.info("approval closed on QQ by supervisor: id=%s status=%s", approval_id, status)
 

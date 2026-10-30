@@ -20,7 +20,15 @@ from typing import Any
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
-from . import async_dispatches, auto_continue, child_retention, continuation, session_reuse, stopped_batch
+from . import (
+    async_dispatches,
+    auto_continue,
+    child_retention,
+    continuation,
+    dispatch_limits,
+    session_reuse,
+    stopped_batch,
+)
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
@@ -1633,6 +1641,7 @@ class TaskRouterMixin:
             items_created_at = _now()
             # 这一批最晚等到这个时刻：本任务的总寿命（和派它的那一层给的封顶）减去收尾余量，嵌套一层早一层
             batch_wait_cap = async_dispatches.wait_cap(task)
+            item_budget = dispatch_limits.batch_budget_locked(self, task)
             for idx, item in enumerate(dispatch_batch):
                 if not isinstance(item, dict):
                     continue
@@ -1692,6 +1701,14 @@ class TaskRouterMixin:
                     )
                     worktrees.register_child_locked(child, _tool_plan)
                 else:
+                    _limit_refusal = item_budget.refusal(item_target)
+                    if _limit_refusal:
+                        refused = self._create_refused_batch_child_locked(
+                            task, item, target=item_target, batch_id=batch_id, index=idx,
+                            delivery_key=delivery_key, error=_limit_refusal,
+                        )
+                        created_child_ids.append(refused.task_id)
+                        continue
                     _continue_handle = parse_handle(batch_item_continue_from(item))
                     _continued: dict[str, Any] = {}
                     if _continue_handle is not None:
@@ -1802,6 +1819,7 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                     worktrees.register_child_locked(child, _plan)
+                    item_budget.admit()
                 created_child_ids.append(child.task_id)
                 async_dispatches.watch_item_locked(self, child)
             if not created_child_ids:

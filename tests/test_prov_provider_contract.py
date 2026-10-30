@@ -504,3 +504,107 @@ def test_gemini_history_maps_tool_results_back_by_the_stored_ids() -> None:
     _system, contents = GeminiProvider._convert_messages(messages)
     response = contents[-1]["parts"][0]["functionResponse"]
     assert response["name"] == "read_file"
+
+
+def _gemini_contents(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from providers.gemini import GeminiProvider
+
+    _system, contents = GeminiProvider._convert_messages(messages)
+    return contents
+
+
+def _results(entry: dict[str, Any]) -> list[tuple[str, Any]]:
+    assert entry["role"] == "function"
+    return [(part["functionResponse"]["name"], part["functionResponse"]["response"]) for part in entry["parts"]]
+
+
+def _call_record(call_id: str, name: str, **arguments: Any) -> dict[str, Any]:
+    return {"id": call_id, "name": name, "arguments": arguments}
+
+
+def test_gemini_puts_same_name_results_back_in_call_order() -> None:
+    # Gemini 只按名字和位置配对：同名的两个委派结果先后颠倒，模型就会把 b 的结果当成 a 的
+    contents = _gemini_contents([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _call_record("c-a", "dispatch_to_scout", instruction="a"),
+            _call_record("c-b", "dispatch_to_scout", instruction="b"),
+        ]},
+        {"role": "tool", "tool_call_id": "c-b", "content": "result b"},
+        {"role": "tool", "tool_call_id": "c-a", "content": "result a"},
+    ])
+
+    assert [entry["role"] for entry in contents] == ["user", "model", "function"]
+    assert _results(contents[-1]) == [
+        ("dispatch_to_scout", {"result": "result a"}), ("dispatch_to_scout", {"result": "result b"}),
+    ]
+    assert all("id" not in part["functionResponse"] for part in contents[-1]["parts"])
+
+
+def test_gemini_orders_a_mix_of_async_wait_and_tool_results_by_the_calls() -> None:
+    contents = _gemini_contents([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _call_record("c-async", "dispatch_to_scout", instruction="a", wait=False),
+            _call_record("c-wait", "dispatch_to_scout", instruction="b", wait=True),
+            _call_record("c-read", "read_file", path="a.txt"),
+        ]},
+        {"role": "tool", "tool_call_id": "c-read", "content": "file body"},
+        {"role": "tool", "tool_call_id": "c-async", "content": "handle h-1"},
+        {"role": "tool", "tool_call_id": "c-wait", "content": "{\"text\": \"waited\"}"},
+    ])
+
+    assert _results(contents[-1]) == [
+        ("dispatch_to_scout", {"result": "handle h-1"}),
+        ("dispatch_to_scout", {"text": "waited"}),
+        ("read_file", {"result": "file body"}),
+    ]
+
+
+def test_gemini_keeps_results_it_cannot_place_after_the_placed_ones_in_their_order() -> None:
+    contents = _gemini_contents([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _call_record("c-a", "read_file", path="a"), _call_record("c-b", "read_file", path="b"),
+        ]},
+        {"role": "tool", "tool_call_id": "c-stray", "name": "list_dir", "content": "stray"},
+        {"role": "tool", "tool_call_id": "c-b", "content": "b body"},
+        {"role": "tool", "tool_call_id": "c-b", "content": "b again"},
+        {"role": "tool", "tool_call_id": "c-a", "content": "a body"},
+    ])
+
+    assert [response for _name, response in _results(contents[-1])] == [
+        {"result": "a body"}, {"result": "b body"}, {"result": "stray"}, {"result": "b again"},
+    ]
+
+
+def test_gemini_orders_old_history_by_the_positional_ids() -> None:
+    raw_parts = [
+        {"functionCall": {"name": "read_file", "args": {"path": "a"}}},
+        {"functionCall": {"name": "read_file", "args": {"path": "b"}}},
+    ]
+    contents = _gemini_contents([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "_meta": {"metadata": {"gemini": {"raw_parts": raw_parts}}}},
+        {"role": "tool", "tool_call_id": "call_2", "content": "b body"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "a body"},
+    ])
+
+    assert contents[1] == {"role": "model", "parts": raw_parts}
+    assert _results(contents[-1]) == [("read_file", {"result": "a body"}), ("read_file", {"result": "b body"})]
+
+
+def test_gemini_does_not_move_results_across_a_message_between_them() -> None:
+    contents = _gemini_contents([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _call_record("c-a", "read_file", path="a"), _call_record("c-b", "read_file", path="b"),
+        ]},
+        {"role": "tool", "tool_call_id": "c-b", "content": "b body"},
+        {"role": "user", "content": "[attachment of b]"},
+        {"role": "tool", "tool_call_id": "c-a", "content": "a body"},
+    ])
+
+    assert [entry["role"] for entry in contents] == ["user", "model", "function", "user", "function"]
+    assert _results(contents[2]) == [("read_file", {"result": "b body"})]
+    assert _results(contents[4]) == [("read_file", {"result": "a body"})]

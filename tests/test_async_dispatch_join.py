@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -1695,3 +1696,132 @@ class TestEndpoints:
         assert cancelled.status_code == 200, cancelled.text
         assert cancelled.json()["status"] == "cancelled"
         assert child.status == TaskStatus.cancelled
+
+
+@pytest.mark.usefixtures("admin_token")
+class TestForkCopy:
+    """异步 fork 的历史在锁外复制、进锁再装；复制不了就拒收或判失败，不让子任务从空历史开始。"""
+
+    @staticmethod
+    def _payload(sid: str, caller: Task, source: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "channel": "qq", "conversation_key": f"agent:a.node:{CONV}:{uuid.uuid4()}", "text": "接着查",
+            "entry_node_id": "a.node", "platform_auth": AUTH, "dispatch_context_mode": "fork",
+            "dispatch_origin": _origin(sid, caller, mode="fork"), "dispatch_fork_from_session": source, **extra,
+        }
+
+    @staticmethod
+    def _staged(workspace: Path) -> list[Path]:
+        return sorted((workspace / "data" / "conversations").glob(".fork.*.tmp"))
+
+    @staticmethod
+    def _history(workspace: Path, session_id: str) -> list[str]:
+        return [message.id for message in ConversationStore(workspace / "data" / "conversations").load(session_id)]
+
+    def test_the_child_starts_from_the_callers_history(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        ConversationStore(tmp_path / "data" / "conversations").append_batch(caller.session_id, [
+            Message(id="persona", role="system", content="调用方的 system prompt"),
+            Message(id="ask", role="user", content="帮我查一下"),
+        ])
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json=self._payload(sid, caller, caller.session_id))
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert self._history(tmp_path, body["session_id"]) == ["ask"]
+        assert state.tasks[body["task_id"]].status == TaskStatus.pending
+        assert self._staged(tmp_path) == []
+
+    def test_an_unknown_source_is_refused_before_anything_is_created(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        tasks_before = set(state.tasks)
+        payload = self._payload(sid, caller, "no-such-session")
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json=payload)
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert detail.startswith("没有派出：") and "no-such-session" in detail
+        assert set(state.tasks) == tasks_before
+        assert payload["conversation_key"] not in state.conversation_map
+        assert self._staged(tmp_path) == []
+
+    def test_a_source_that_is_not_a_session_id_cannot_reach_outside_the_conversations(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        assert (tmp_path / "data" / "events.jsonl").is_file()
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json=self._payload(sid, caller, "../events"))
+
+        assert response.status_code == 422
+        assert self._staged(tmp_path) == []
+
+    def test_a_copy_that_fails_is_refused_with_only_the_error_type(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        ConversationStore(tmp_path / "data" / "conversations").append_batch(
+            caller.session_id, [Message(id="ask", role="user", content="帮我查一下")],
+        )
+        tasks_before = set(state.tasks)
+
+        def broken(self: ConversationStore, source_session_id: str) -> Any:
+            raise OSError("disk full at /secret/path")
+
+        monkeypatch.setattr(ConversationStore, "stage_fork", broken)
+
+        response = _call(_app(state, tmp_path), "POST", "/v1/inbound", json=self._payload(sid, caller, caller.session_id))
+
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert "OSError" in detail and "稍后重试" in detail and "/secret/path" not in detail
+        assert set(state.tasks) == tasks_before
+
+    def test_a_refused_dispatch_copies_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        staged_sources: list[str] = []
+        original = ConversationStore.stage_fork
+
+        def recording(self: ConversationStore, source_session_id: str) -> Any:
+            staged_sources.append(source_session_id)
+            return original(self, source_session_id)
+
+        monkeypatch.setattr(ConversationStore, "stage_fork", recording)
+
+        response = _call(
+            _app(state, tmp_path), "POST", "/v1/inbound",
+            json=self._payload(sid, caller, caller.session_id, dispatch_context_mode="sideways"),
+        )
+
+        assert response.status_code == 422
+        assert staged_sources == []
+
+    def test_a_fork_created_in_process_that_cannot_copy_fails_its_task(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        _finish(state, caller, "派出去了")
+        agent_sid = state.get_or_create_session(channel="qq", conversation_key=f"agent:a.node:{CONV}:{uuid.uuid4()}")
+
+        child = _inbound(
+            state, agent_sid, node="a.node", dispatch_context_mode="fork",
+            dispatch_origin=_origin(sid, caller, mode="fork"), dispatch_fork_from_session="no-such-session",
+        )
+
+        assert child.status == TaskStatus.failed
+        assert child.result["error"].startswith("没能开始：fork 的来源会话 no-such-session 不存在")
+        # 判失败后的路由要合并入口分支，在另起的线程里跑
+        deadline = time.monotonic() + 30
+        while not _callbacks(state) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert [task.input["inbound_child_status"] for task in _callbacks(state)] == ["fail"]

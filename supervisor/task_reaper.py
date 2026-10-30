@@ -25,7 +25,7 @@ LEASE_GRACE = timedelta(seconds=60)
 MISSING_LEASE_GRACE = timedelta(minutes=5)
 # 续租会顺带刷新 updated_at；十分钟没动静说明 worker 已经不在了，哪怕它还挂着审批
 HEARTBEAT_SILENCE_LIMIT = timedelta(minutes=10)
-# 队列长时间没有被 worker 接走时，避免 pending 任务永久占据会话。
+# 排队这么久、同样这么久也没有任何 engine worker 来领任务、续租或注册，才按没人接手回收；worker 只是都忙着时交给总寿命兜底。
 PENDING_QUEUE_LIMIT = timedelta(minutes=15)
 # 没有合法等待目标的 suspended 任务，超过这个时间按丢失的等待链收尾。
 SUSPENDED_SILENCE_LIMIT = timedelta(minutes=20)
@@ -47,6 +47,7 @@ def reap_reason(
     now: datetime,
     max_running_sec: float,
     approval_pending: bool,
+    worker_silence: timedelta,
     waiting_task_terminal: bool = False,
     waiting_task_missing: bool = False,
     wait_target_live: bool = False,
@@ -54,6 +55,8 @@ def reap_reason(
 ) -> str | None:
     """该回收时返回写进 task.result 的原因，不该回收返回 None。
 
+    approval_pending 只放宽 running 任务的租约类判定：排队和挂起的任务不会正在等审批。
+    worker_silence 是距离最近一次有 engine worker 领任务、续租或注册过了多久。
     waiting_* 描述挂起任务的等待目标（单个子任务或整个批次）：全部结束、找不到，或还有没结束的。
     总寿命从续跑链第一个任务创建时算，一条链上的续跑任务不各自重新起算。
     """
@@ -63,17 +66,16 @@ def reap_reason(
     if task.status == TaskStatus.pending:
         if lifetime_sec > lifetime_limit:
             return _lifetime_reason(lifetime_sec, lifetime_limit)
-        if approval_pending:
-            return None
         queued = now - _queued_since(task)
-        if queued > PENDING_QUEUE_LIMIT:
-            return f"任务排队过久（{_minutes(queued)} 分钟无 worker 接手），已自动终止"
+        if queued > PENDING_QUEUE_LIMIT and worker_silence > PENDING_QUEUE_LIMIT:
+            return (
+                f"任务排队 {_minutes(queued)} 分钟无人接手：已经 {_minutes(worker_silence)} 分钟"
+                "没有任何 engine worker 来领任务、续租或注册，已自动终止"
+            )
         return None
     if task.status == TaskStatus.suspended:
         if lifetime_sec > lifetime_limit:
             return _lifetime_reason(lifetime_sec, lifetime_limit)
-        if approval_pending:
-            return None
         if waiting_task_terminal and silence > SUSPENDED_CHILD_GRACE:
             return "等待的子任务已结束但入口未恢复，按僵尸任务回收"
         if waiting_task_missing and silence > SUSPENDED_CHILD_GRACE:
@@ -154,10 +156,14 @@ def reap_stuck_tasks_locked(
     if scope is None:
         # 到点的 await_dispatches 和 wait 委派单项超时平时由定时器处理，这里每轮兜底一次
         async_dispatches.expire_due_locked(state, now=now)
-    waiting_sessions = {
+    engine_seen_at = state.engine_seen_snapshot()[0]
+    worker_silence = now - (engine_seen_at or state.started_at)
+    awaiting_approval = state._tasks_awaiting_approval_locked()
+    # 不带 task_id 的旧审批认不出是谁的，只能按会话算
+    unattributed_sessions = {
         approval.session_id
         for approval in state.approvals.values()
-        if approval.status == ApprovalStatus.pending
+        if approval.status == ApprovalStatus.pending and not (approval.task_id or "").strip()
     }
     children: dict[str, list[Task]] = {}
     for candidate in state.tasks.values():
@@ -175,11 +181,16 @@ def reap_stuck_tasks_locked(
         # 分支上跑的任务，审批可能挂在父会话上
         route_session_id = state._route_session_id_for_task_locked(task)
         waiting_terminal, waiting_missing, waiting_live = _wait_target_state(state, task, children)
+        approval_pending = task.task_id in awaiting_approval or (
+            task.status == TaskStatus.running
+            and (task.session_id in unattributed_sessions or route_session_id in unattributed_sessions)
+        )
         reason = reap_reason(
             task,
             now=now,
             max_running_sec=max_running_sec,
-            approval_pending=task.session_id in waiting_sessions or route_session_id in waiting_sessions,
+            approval_pending=approval_pending,
+            worker_silence=worker_silence,
             waiting_task_terminal=waiting_terminal,
             waiting_task_missing=waiting_missing,
             wait_target_live=waiting_live,

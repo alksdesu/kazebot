@@ -86,7 +86,9 @@ export interface ApprovalInfo {
   id: string;
   operation: string;
   details: { path?: string; reason?: string; [key: string]: any };
-  status: 'pending' | 'allowed' | 'denied';
+  /** expired：没人定案，随任务结束或等审批超时被系统收掉。 */
+  status: 'pending' | 'allowed' | 'denied' | 'expired';
+  expiredReason?: string;
 }
 
 export interface StreamPreviewState {
