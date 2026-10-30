@@ -33,7 +33,7 @@ def test_feature_paths_accept_real_versioned_endpoints():
     validate_feature_path("/v1/materials/versions/v_123/preview/1")
     validate_feature_path("/v1/execution/plans/P123/resolve-step")
     validate_feature_path("/v1/operations/diagnostics", operations=True)
-    validate_feature_path("/v1/operations/instances", operations=True)
+    validate_feature_path("/v1/operations/status", operations=True)
     validate_feature_path("/v1/community/notifications/activity%3AA123%3Aconfirm/ack")
 
 

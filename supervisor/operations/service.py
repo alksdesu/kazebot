@@ -31,7 +31,7 @@ from platforms.protection import secret_env_names
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.execution.service import EXECUTION_SETTINGS
-from supervisor.instances import load_instances, url_prefix
+from supervisor.instances import url_prefix
 from supervisor.log_access import LogReader
 from supervisor.platform_api import platform_health
 from supervisor.reminders.service import REMINDER_SETTINGS
@@ -264,18 +264,6 @@ class OperationsService:
             return
         group = config_layout.config_share_group(self.root)
         add("配置布局", "passed", f"配置用的是共享组 {group}" if group else "配置都在 config/ 下")
-
-    def instances(self) -> list[dict[str, Any]]:
-        """清单读不懂就抛 InstanceDirectoryError：当成单实例交出去，看的人会以为别的实例都没了。"""
-        rows = load_instances(self.root, required=True)
-        prefix = url_prefix()
-        if not rows:
-            # 和读清单时一样：序号 0 占站点根，带前缀的推不出序号，标 -1。
-            rows = [{
-                "id": "current", "label": "当前实例", "path": prefix, "idx": 0 if not prefix else -1,
-                "platform": current_platform().id, "account": "",
-            }]
-        return [{**row, "current": row["path"] == prefix} for row in rows]
 
     async def diagnose(self, *, test_model: bool = False, include_logs: bool = False) -> dict[str, Any]:
         if self._probe_lock.locked():

@@ -20,7 +20,6 @@ from platforms.registry import platform_config_path
 from providers import registry
 from providers.base import ProviderResponse
 from supervisor.admin_api import create_admin_router
-from supervisor.instances import InstanceDirectoryError, save_instance
 from supervisor.operations.service import OperationsService
 
 
@@ -142,7 +141,7 @@ def test_retired_template_routes_cannot_write_explicit_instance_config(operation
     assert workspace_state(tmp_path) == before
 
 
-def test_operations_status_instances_and_diagnostics_remain_available(operations_api, tmp_path, monkeypatch):
+def test_operations_status_and_diagnostics_remain_available(operations_api, tmp_path, monkeypatch):
     client, _ = operations_api
     config = tmp_path / "config"
     config.mkdir()
@@ -161,15 +160,6 @@ def test_operations_status_instances_and_diagnostics_remain_available(operations
     assert status.status_code == 200
     assert status.json()["supervisor"] == "online"
     assert status.json()["instance_prefix"] == "/i/222"
-    rows = client.get("/v1/operations/instances", headers=headers)
-    assert rows.status_code == 200
-    assert rows.json()["instances"] == [
-        {"id": "rong", "label": "主实例", "path": "", "idx": 0, "platform": "qq", "account": "111", "current": False},
-        {
-            "id": "222", "label": "副实例", "path": "/i/222", "idx": 1,
-            "platform": "qq", "account": "222", "current": True,
-        },
-    ]
     assert workspace_state(tmp_path) == before
     diagnosed = client.post("/v1/operations/diagnostics", headers=headers, json={"test_model": False})
     assert diagnosed.status_code == 200
@@ -189,82 +179,6 @@ def service(root):
     state = SimpleNamespace(workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
         feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret, load_error=""))
     return OperationsService(state), secret
-
-
-@pytest.mark.parametrize("prefix,path,idx", [
-    (None, "", 0), ("", "", 0), ("  ", "", 0), ("/", "", 0),
-    ("/i/xiaoyu", "/i/xiaoyu", -1), ("i/koki/", "/i/koki", -1), (" /i/koki ", "/i/koki", -1),
-])
-def test_a_deployment_without_a_roster_still_names_the_instance_it_is(tmp_path, monkeypatch, prefix, path, idx):
-    # 兜底行要和读清单时一样推序号：根实例必然是 0，带前缀的推不出来标 -1，别算出一个正在跑的实例的端口。
-    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "missing.yaml"))
-    if prefix is None:
-        monkeypatch.delenv("CLONOTH_URL_PREFIX", raising=False)
-    else:
-        monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
-    operations, _ = service(tmp_path)
-    assert operations.instances() == [{
-        "id": "current", "label": "当前实例", "path": path, "idx": idx,
-        "platform": "qq", "account": "", "current": True,
-    }]
-
-
-@pytest.mark.parametrize("prefix", ["i/koki/", "/i/koki", " /i/koki "])
-def test_a_roster_leaves_no_room_for_the_fallback_row(tmp_path, monkeypatch, prefix):
-    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "instances.yaml"))
-    monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
-    save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
-    operations, _ = service(tmp_path)
-    assert operations.instances() == [
-        {"id": "rong", "label": "主号", "path": "", "idx": 0, "platform": "qq", "account": "", "current": False},
-        {
-            "id": "koki", "label": "小号", "path": "/i/koki", "idx": 1,
-            "platform": "qq", "account": "1000000002", "current": True,
-        },
-    ]
-
-
-def test_a_prefix_the_roster_never_heard_of_marks_nobody_current(tmp_path, monkeypatch):
-    # 清单是软状态，漏记了本实例也不能凭空补一行：那会在切换器里多出一个点不到的选项。
-    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "instances.yaml"))
-    monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/nobody")
-    save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1)
-    operations, _ = service(tmp_path)
-    rows = operations.instances()
-    assert [row["id"] for row in rows] == ["rong", "koki"]
-    assert not any(row["current"] for row in rows)
-
-
-BROKEN_ROSTER = "instances:\n  - id: koki\n    account: qq-SECRET-account: x\n"
-
-
-def test_an_unreadable_roster_is_not_listed_as_a_single_instance(tmp_path, monkeypatch):
-    # 当成单实例补一行「当前实例」，别的实例就从切换器里消失了，看着像只开了这一个。
-    roster = tmp_path / "instances.yaml"
-    roster.write_text(BROKEN_ROSTER, encoding="utf-8")
-    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(roster))
-    monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/koki")
-    operations, _ = service(tmp_path)
-
-    with pytest.raises(InstanceDirectoryError) as caught:
-        operations.instances()
-
-    assert caught.value.reason == f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here"
-
-
-def test_the_instance_endpoint_says_why_the_roster_cannot_be_listed(operations_api, tmp_path, monkeypatch):
-    client, _ = operations_api
-    roster = tmp_path / "instances.yaml"
-    roster.write_text(BROKEN_ROSTER, encoding="utf-8")
-    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(roster))
-
-    response = client.get("/v1/operations/instances", headers={"Authorization": "Bearer synthetic-operations-token"})
-
-    assert response.status_code == 503
-    assert response.json() == {"detail": f"实例清单 {roster} 读不懂：第 3 行第 31 列：mapping values are not allowed here"}
-    assert "qq-SECRET" not in response.text
 
 
 @pytest.mark.parametrize("age", [120, -3600])
