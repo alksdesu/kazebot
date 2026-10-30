@@ -735,8 +735,11 @@ async def _resolve_dispatch_request(
         # 接着的是那个子会话自己的历史：模式沿用它当初的，context_key 不再参与找会话
         ctx_mode = str(continuation.get("context_mode") or "").strip() or ctx_mode
         context_key = ""
+    named_paths, path_problem = _named_attachment_paths(args)
+    if path_problem:
+        return None, path_problem
     attachment_paths, refused_attachments = await screen_model_attachment_paths(
-        ls, pseudo_call, args.get("attachment_paths") or [], data_dir_only=True,
+        ls, pseudo_call, named_paths or [], data_dir_only=True,
     )
     # 接着一个隔离过的子 agent 时 supervisor 沿用它的副本、repo 指向别的仓库时另建，隔离字段照原样交过去由它定
     return DispatchRequest(

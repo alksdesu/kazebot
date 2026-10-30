@@ -125,12 +125,14 @@ def inbound_refusal_locked(state: "SupervisorState", payload: dict[str, Any]) ->
 
 
 def _inbound_checks() -> tuple[InboundCheck, ...]:
-    # continuation 在模块层引用本模块，只能在这里取
-    from . import continuation
+    # 这几个模块在模块层引用本模块，只能在这里取
+    from . import async_dispatches, continuation, dispatch_limits
 
     return (
         _context_mode_refusal,
+        async_dispatches.dispatcher_refusal_locked,
         continuation.inbound_refusal_locked,
+        dispatch_limits.inbound_refusal_locked,
         _reused_session_refusal_locked,
     )
 

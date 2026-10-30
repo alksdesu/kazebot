@@ -40,6 +40,13 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _continues_after(result: dict[str, Any], status: str) -> bool:
+    """这次完成之后任务还会接着做：交回 dispatch 后挂起（同步压缩、wait 委派），或者还没到终态。"""
+    if status not in {"completed", "failed", "cancelled"}:
+        return True
+    return status == "completed" and str(result.get("action") or "").strip() == "dispatch"
+
+
 class ExecutionService:
     def __init__(self, state: Any):
         self.state = state
@@ -492,7 +499,10 @@ class ExecutionService:
         plan_id, step_id = task.input.get("execution_plan_id"), task.input.get("execution_step_id")
         if not plan_id or not step_id:
             return
-        self._task_result(str(plan_id), str(step_id), str(task.task_id), dict(task.result or {}), str(getattr(task.status, "value", task.status)))
+        status = str(getattr(task.status, "value", task.status))
+        if _continues_after(dict(task.result or {}), status):
+            return
+        self._task_result(str(plan_id), str(step_id), str(task.task_id), dict(task.result or {}), status)
 
     def actor_for_task(self, task: Any) -> FeatureActor | None:
         plan_id, step_id = task.input.get("execution_plan_id"), task.input.get("execution_step_id")
@@ -550,8 +560,9 @@ class ExecutionService:
         task_id = step["task_id"]
         if task_id:
             snapshots = [event.get("payload") for event in self.state.eventlog.iter_persisted_events() if event.get("type") in {"task_completed", "task_cancelled"} and (event.get("payload") or {}).get("task_id") == task_id]
-            if snapshots:
-                snapshot = snapshots[-1]
+            snapshot = snapshots[-1] if snapshots else None
+            # 最后一笔是交回 dispatch 的那次完成：它挂起后就没了下文，按执行进程中断收尾
+            if snapshot is not None and not _continues_after(snapshot.get("result") or {}, str(snapshot.get("status") or "")):
                 self._task_result(plan["id"], step["id"], task_id, snapshot.get("result") or {}, snapshot.get("status", ""))
                 return
         if step.get("lease_until") and datetime.fromisoformat(step["lease_until"]) > datetime.now(timezone.utc):

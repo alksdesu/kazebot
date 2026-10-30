@@ -1327,6 +1327,22 @@ class TestCancelReach:
         assert dispatched.status == TaskStatus.cancelled
         assert bystander.status == TaskStatus.pending
 
+    def test_cancelling_a_node_reaches_its_rounds_started_under_an_old_id(self, tmp_path: Path) -> None:
+        # 会话记的入口、定时任务和还没回来的回调可能还用着改名前的 id
+        nodes = tmp_path / "config" / "nodes"
+        nodes.mkdir(parents=True, exist_ok=True)
+        (nodes / "chat.orchestrator.yaml").write_text("id: test.orchestrator\ntype: ai\n", encoding="utf-8")
+        state = _state(tmp_path)
+        sid = _session(state)
+        renamed = _inbound(state, sid)
+        bystander = _inbound(state, sid, node="d.node")
+
+        state.cancel_active_tasks(sid, node_id="chat.orchestrator")
+
+        assert renamed.node_id == "test.orchestrator"
+        assert renamed.status == TaskStatus.cancelled
+        assert bystander.status == TaskStatus.pending
+
     def test_cancelling_from_inside_an_async_dispatch_spares_the_tasks_above_it(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         sid = _session(state)

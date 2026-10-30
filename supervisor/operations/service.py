@@ -294,6 +294,15 @@ class OperationsService:
             policy_error = getattr(getattr(self.state, "policy", None), "load_error", "")
             if policy_error:
                 add("策略文件", "warning", policy_error, f"在原文编辑器里修好 {config_layout.POLICY_FILE}")
+            session_store = getattr(self.state, "_session_store", None)
+            registry_error = str(getattr(session_store, "load_error", "") or "")
+            if registry_error:
+                add(
+                    "会话登记", "warning", registry_error,
+                    "修好 data/sessions.json 后重启 supervisor：这次运行不写它，新开的会话重启后接不上"
+                    if getattr(session_store, "read_only", False) else
+                    "坏的那份已改名留存，旧的会话映射要从留存的文件里手工找回",
+                )
             runtime_error = runtime_config_error(self.root)
             if runtime_error:
                 add("运行参数文件", "warning", runtime_error, f"在原文编辑器里修好 {config_layout.RUNTIME_FILE}")

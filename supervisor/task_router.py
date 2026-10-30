@@ -2051,6 +2051,11 @@ class TaskRouterMixin:
         child_retention.reparent_locked(self, child_session_id, caller.session_id, flush=False)
         child_retention.release_locked(self, child_session_id)
         self._session_store.update_last_active(child_session_id)
+        entry = self._session_store.get_entry(child_session_id) or {}
+        if str(entry.get("context_mode") or "").strip() == "accumulate":
+            # 重启时登记表按最近活跃的一行重建 accumulate 映射，接走的这一行刚刷新过，运行时照样挂上
+            key = (caller.session_id, str(entry.get("node_id") or ""), str(entry.get("context_key") or ""))
+            self.child_session_map[key] = child_session_id
 
     def _existing_dispatch_children_locked(self, task: Task, delivery_key: str) -> dict[int, Task]:
         """同一次完成已经派出的子任务，按批次序号索引（单节点委派记 -1）。

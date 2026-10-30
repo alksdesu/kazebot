@@ -241,3 +241,32 @@ def test_a_key_on_the_broken_line_of_models_yaml_is_hidden_in_the_export(tmp_pat
 
     assert "input_value=" in report["logs"]["supervisor.log"]
     assert "relay-SECRET-value" not in json.dumps(report, ensure_ascii=False)
+
+
+def test_a_session_registry_that_could_not_be_read_says_it_is_not_written(tmp_path: Path) -> None:
+    # 启动时读不出来就从空表开始、这次运行不写：不报出来的话，人只会看到旧对话都另开了新会话
+    operations = service(tmp_path)
+    reason = "data/sessions.json 读不出来（PermissionError），这次运行不写它，会话登记从空表开始；修好后重启"
+    operations.state._session_store = SimpleNamespace(load_error=reason, read_only=True)
+
+    item = check(asyncio.run(operations.diagnose()), "会话登记")
+
+    assert item["status"] == "warning" and item["detail"] == reason
+    assert "重启" in item["action"] and "不写" in item["action"]
+
+
+def test_a_session_registry_set_aside_points_at_the_kept_copy(tmp_path: Path) -> None:
+    operations = service(tmp_path)
+    reason = "data/sessions.json 格式不对，已改名为 sessions.json.corrupt-1 留存，会话登记从空表开始"
+    operations.state._session_store = SimpleNamespace(load_error=reason, read_only=False)
+
+    item = check(asyncio.run(operations.diagnose()), "会话登记")
+
+    assert item["detail"] == reason and "改名留存" in item["action"]
+
+
+def test_a_readable_session_registry_adds_no_check(tmp_path: Path) -> None:
+    operations = service(tmp_path)
+    operations.state._session_store = SimpleNamespace(load_error="", read_only=False)
+
+    assert "会话登记" not in _names(asyncio.run(operations.diagnose()))

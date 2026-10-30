@@ -831,6 +831,27 @@ class TestContinueInABatch:
 
         assert state._session_store.get_entry(child_sid) is None
 
+    def test_an_adopted_accumulate_session_is_the_one_the_new_round_keeps_using(self, tmp_path: Path) -> None:
+        # 重启后按登记表也是这样挂的：接走以后同一个节点的 accumulate 接着写这一个，不另开
+        state = _state(tmp_path)
+        sid = _session(state)
+        first = _inbound(state, sid)
+        [child] = _dispatch(state, first, _item(call_id="w1", context_mode="accumulate"))
+        child_sid = child.input["child_session_id"]
+        _fail(state, child)
+        _finish(state, first, "这一轮先到这")
+        assert state._session_store.get_entry(child_sid)["parent_session_id"] == sid
+
+        second = _inbound(state, sid)
+        handle = format_handle(child.task_id, child_sid)
+        [again] = _dispatch(state, second, _item(call_id="w2", continue_from=handle))
+        assert again.input["child_session_id"] == child_sid
+        _finish(state, again, "接着做完了")
+
+        [later] = _dispatch(state, second, _item(call_id="w3", context_mode="accumulate"))
+
+        assert later.input["child_session_id"] == child_sid
+
 
 class TestGracePeriod:
     def test_the_grace_period_starts_when_the_caller_ends(self, tmp_path: Path) -> None:

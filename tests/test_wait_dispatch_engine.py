@@ -423,6 +423,29 @@ class TestAttachments:
         assert payload["success"] is True
         assert [item["path"] for item in payload["refused_attachments"]] == ["notes/secret.txt"]
 
+    def test_a_single_path_written_as_a_string_rides_along(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        image = tmp_path / "data" / "attachments" / "a.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ls, _registry = _loop(tmp_path, monkeypatch)
+        ls.collected_attachments.append({"type": "image", "path": "data/attachments/a.png"})
+
+        action = _run(ls, _wait("scout", call_id="w1", attachment_paths="data/attachments/a.png"))
+
+        assert [item["path"] for item in action.dispatch_batch[0]["attachments"]] == ["data/attachments/a.png"]
+
+    def test_attachment_paths_it_cannot_read_refuse_the_item_instead_of_dropping_them(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ls, _registry = _loop(tmp_path, monkeypatch)
+
+        _run(ls, _wait("scout", call_id="w1", attachment_paths={"path": "data/attachments/a.png"}))
+
+        payload = _payload(ls, "w1")
+        assert payload["success"] is False and "attachment_paths 要写成文件路径的列表" in payload["error"]
+
     def test_without_attachments_the_item_has_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ls, _registry = _loop(tmp_path, monkeypatch)
 

@@ -20,6 +20,7 @@ from engine.dispatch_results import (
     INBOUND_RESULTS_KEY,
     RESULT_FALLBACK_KEY,
 )
+from engine.node import known_node_ids
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.project_root import INBOUND_CHILD_WORKTREE_KEY
 from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
@@ -1150,6 +1151,8 @@ class TaskStoreMixin:
         if not sid:
             return {"ok": False}
         _filter_node = (node_id or "").strip() or None
+        # 用旧 id 建的任务（会话存的入口、定时任务、还没回来的回调）也算这个节点的
+        _filter_ids = frozenset(known_node_ids(self.workspace_root, _filter_node)) if _filter_node else frozenset()
         with self._lock:
             keep_ids: set[str] = set()
             tid = (exclude_task_id or "").strip()
@@ -1172,7 +1175,7 @@ class TaskStoreMixin:
                 if task.session_id not in session_ids or task.task_id in keep_ids:
                     continue
                 # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
-                if _filter_node and task.node_id != _filter_node:
+                if _filter_node and task.node_id not in _filter_ids:
                     continue
                 targets = [task]
                 if _filter_node and self._task_ending_locked(task).continues:

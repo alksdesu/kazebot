@@ -499,3 +499,21 @@ def test_link_without_path_preserves_query_and_still_blocks_private_redirect(mon
     with pytest.raises(ValueError, match="公网"):
         inputs.fetch_url("http://example.test/redirect", 100)
     assert seen[-1] == "/redirect"
+
+
+def test_a_dispatch_the_step_suspends_on_is_not_its_outcome(state, actor):
+    # 处理步骤中途同步压缩时交回的是 dispatch，挂起后还会接着做，不能先记成失败
+    plan = state.execution.create(actor, PlanDraft(goal="summarize"))
+    state.execution.confirm(actor, plan["id"], 1)
+    state.execution.tick(); state.execution.tick()
+    task_id = state.execution.get(actor, plan["id"])["steps"][1]["task_id"]
+    task = state.tasks[task_id]
+    task.status = TaskStatus.suspended
+    task.result = {"action": "dispatch", "target_node": "system.compactor"}
+
+    state.execution.on_task_completed(task)
+
+    assert state.execution.get(actor, plan["id"])["steps"][1]["status"] in {"queued", "running"}
+    finish(state, task_id)
+    state.execution.tick()
+    assert state.execution.get(actor, plan["id"])["steps"][1]["status"] == "succeeded"

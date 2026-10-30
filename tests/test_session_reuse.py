@@ -1195,3 +1195,55 @@ class TestAsyncContinuationRecheck:
 
         assert response.status_code == INBOUND_CONFLICT_STATUS
         assert response.json()["detail"] == continuation.refusal("lineage_unknown")["message"]
+
+
+@pytest.mark.usefixtures("admin_token")
+class TestInboundChecksInOrder:
+    """异步委派入站的几道核对按顺序走：写错的值先报，再看发起任务、续接的句柄、委派上限和要落进的会话。"""
+
+    def test_a_dispatch_from_a_round_that_already_ended_is_refused(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        _finish(state, top)
+        payload = _dispatch_payload(state, top, "scout.node", mode="fresh")
+        events = _inbound_events(state)
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+        assert "发起这次委派的任务已经结束" in response.json()["detail"]
+        assert payload["conversation_key"] not in state.conversation_map
+        assert _inbound_events(state) == events
+
+    def test_a_bad_mode_is_reported_before_the_ended_dispatcher(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        _finish(state, top)
+        payload = _dispatch_payload(state, top, "scout.node", mode="fresh")
+        payload["dispatch_context_mode"] = "Fresh"
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_BAD_MODE_STATUS
+        assert response.json()["detail"] == context_mode_refusal("Fresh")
+
+    def test_a_dispatch_past_the_depth_limit_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "runtime.yaml").write_text(
+            "engine:\n  dispatch:\n    max_depth: 1\n", encoding="utf-8",
+        )
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        agent = _accepted(state, _post(app, _dispatch_payload(state, top, "y.node")))
+        payload = _dispatch_payload(state, agent, "helper.node", mode="fresh")
+        events = _inbound_events(state)
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+        assert "超过了上限 1 层" in response.json()["detail"]
+        assert payload["conversation_key"] not in state.conversation_map
+        assert _inbound_events(state) == events
