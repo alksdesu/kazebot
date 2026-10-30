@@ -107,7 +107,7 @@ if __name__ == "__main__":
     if channel.error:
         fail(channel.error)
     if not api_key:
-        fail("No API key found in config/models.yaml / env / .env file")
+        fail("No API key found in config/models.yaml, .env or config/secrets.env")
 
     # 密钥放请求头、不进 URL：中转站的访问日志和各种报错里都会带上完整 URL。官方域名和中转站的鉴权头与 provider 同一套。
     url = endpoint(WIRE_GEMINI, base_url, model)

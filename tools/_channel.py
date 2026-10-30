@@ -576,7 +576,7 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
         )
     if not api_key:
         # 与同目录其它工具同一句：排障时按这句话搜得到所有缺 key 的场景。
-        return VisionChannel(error="No API key found in config/models.yaml / env / .env file")
+        return VisionChannel(error="No API key found in config/models.yaml, .env or config/secrets.env")
 
     wire = wire_mod.wire_for(provider)
     if not base_url:

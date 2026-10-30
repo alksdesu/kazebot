@@ -138,7 +138,7 @@ if __name__ == "__main__":
     if channel.error:
         fail(channel.error)
     if not api_key:
-        fail('No API key found in config/models.yaml / env / .env file')
+        fail('No API key found in config/models.yaml, .env or config/secrets.env')
     if not base_url:
         fail('No base_url configured (system_models.image_gpt / OPENAI_BASE_URL)')
 
