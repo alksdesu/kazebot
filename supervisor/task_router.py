@@ -43,10 +43,17 @@ from engine.dispatch_batch import (
     parse_context_mode,
 )
 from engine.dispatch_handle import parse_handle
+from engine.dispatch_results import (
+    CONTINUES_TASK_PAYLOAD_KEY,
+    DELIVERY_NOTE_PAYLOAD_KEY,
+    DISPATCH_RESULTS_PAYLOAD_KEY,
+    RESULT_FALLBACK_KEY,
+)
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.run_budget import STEPS_USED_KEY, reported_step_count, steps_used
 from engine.tool_outputs import mentioned_refs
 
+from .task_traits import is_ambient_task, is_internal_task
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 from .worktrees import NO_ISOLATION, service_of as worktree_service_of
 from .worktrees.keys import (
@@ -63,15 +70,27 @@ log = logging.getLogger(__name__)
 _TASK_END_ACTIONS = frozenset({"finish", "ask", "fail", "cancelled", "preempted"})
 # 和 engine/inference/pseudo_tools.py 的 NO_REPLY_MARKER 一致；在这里导入 engine.inference 会把整个推理循环拉进来
 OUTBOUND_NO_REPLY = "no_reply"
-# 异步工具结果沿派发链往上找落点最多走几层，防着坏数据里的环
+# 异步结果沿派发链往上找落点最多走几层，防着坏数据里的环
 _ASYNC_RESULT_MAX_HOPS = 16
 _WITHDRAWN_REASON = "这一批没有派完，已撤回"
 _UNSENT_DISPATCH_ERROR = "它交回了委派请求，但那些子任务没有派出去（路由失败，或迟迟没处理完），它没有做完。"
+RESULT_OF_TOOL = "tool"
+RESULT_OF_DISPATCH = "dispatch"
+_NOTE_SUBJECTS = {RESULT_OF_TOOL: "This tool call", RESULT_OF_DISPATCH: "This async dispatch"}
+# 合并交回时逐条带的字段；会话、入口节点、派发记录、输出说明、隔离副本来源由落点决定，取第一条的
+_DISPATCH_RESULT_ITEM_KEYS = (
+    "text", "summary", "caller_node_id", "child_node_id", "child_task_id", "child_session_id", "child_status",
+    "child_handle", "child_continuable", "child_wrapup", CHILD_WORKTREE_PAYLOAD_KEY, "attachments",
+    "attachments_outbound_sent", DELIVERY_NOTE_PAYLOAD_KEY, CONTINUES_TASK_PAYLOAD_KEY,
+)
 
 
 @dataclass(frozen=True)
 class AsyncResultHome:
-    """异步工具结果的落点：交到哪个会话、由哪个节点接；回到 agent 会话时带着派发记录，接着做完还能交回发起方。"""
+    """异步结果的落点：交到哪个会话、由哪个节点接；回到 agent 会话时带着派发记录，接着做完还能交回发起方。
+
+    guide_task_id 是接着做的那一轮（同步链最上面的任务，或 accumulate 的中间层）；worktree 只在回落时给，平时按 guide 任务算。
+    """
 
     session_id: str
     node_id: str = ""
@@ -79,6 +98,17 @@ class AsyncResultHome:
     context_mode: str = ""
     guide_task_id: str = ""
     note: str = ""
+    worktree: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AsyncResultFallback:
+    """发起任务的记录已被清理时结果交到哪：入站时记下的链顶，或投递时给的会话，连同那时的节点、会话代次和隔离副本。"""
+
+    session_id: str
+    node_id: str = ""
+    generation: Any = None
+    worktree: dict[str, Any] | None = None
 
 
 class BranchFinalizeDeferred(RuntimeError):
@@ -1884,6 +1914,7 @@ class TaskRouterMixin:
         task.waiting_for_task_id = waiting_task_id
         task.updated_at = _now()
         self._event_task_snapshot("task_suspended", task)
+        async_dispatches.release_round_holds_locked(self, task)
 
     def _call_off_dispatch_locked(self, task: Task) -> bool:
         """交回了 dispatch、路由进锁前就被叫停的。
@@ -2468,106 +2499,225 @@ class TaskRouterMixin:
     def _inject_dispatch_result_via_origin_locked(
         self, task: Task, fallback_result: dict[str, Any],
     ) -> None:
-        """异步委派的子任务完成：有 await_dispatches 在等、或者结果留给了等过它的任务时交给那边，否则作为新消息交回。
+        """异步委派的子任务完成：有 await_dispatches 在等、或者结果留给了等过它的任务时交给那边；
+        落点节点在落点会话里还有一轮没做完就先留给那一轮，否则作为新消息交回落点。
 
         此方法在 self._lock 内调用。
         """
         if async_dispatches.settle_locked(self, task, fallback_result=fallback_result):
             return
-        if self._deliver_dispatch_result_inbound_locked(task, fallback_result):
-            async_dispatches.mark_delivered_locked(self, task)
-
-    def _deliver_dispatch_result_inbound_locked(
-        self, task: Task, fallback_result: dict[str, Any],
-    ) -> bool:
-        """把异步委派的结果作为新 inbound 注入 dispatch_origin 记的发起方会话，返回这条消息现在在不在。
-
-        回调目标是 dispatch_origin.parent_session_id，不是子任务自己的 route session。
-        此方法在 self._lock 内调用。
-        """
-        origin = task.input.get("_dispatch_origin") or {}
-        target_session_id = str(origin.get("parent_session_id") or "").strip()
-        caller_node = str(origin.get("caller_node_id") or "").strip()
-        child_session_id = str(task.input.get("child_session_id") or "").strip()
-
-        if not target_session_id:
+        home = self._dispatch_result_home_locked(task)
+        if home is None:
             log.warning(
-                "dispatch_origin callback skipped: no parent_session_id in task %s",
+                "result of async dispatch %s dropped: no session along its dispatch chain can take it",
                 task.task_id[:12],
             )
-            return False
+            return
+        holder = self._unfinished_round_locked(home)
+        if holder is not None and async_dispatches.hold_for_round_locked(self, task, holder):
+            return
+        delivery = self._deliver_dispatch_results_locked([(home, task, fallback_result)])
+        async_dispatches.mark_delivered_locked(self, task, delivery)
 
-        session_info = self.sessions.get(target_session_id)
-        if not session_info:
-            log.warning(
-                "dispatch_origin callback skipped: session %s not found for task %s",
-                target_session_id[:12], task.task_id[:12],
+    def _dispatch_result_home_locked(self, task: Task) -> "AsyncResultHome | None":
+        """异步委派的结果交给谁：从派它出去的任务起，和异步工具结果走同一条派发链。"""
+        origin = task.input.get("_dispatch_origin")
+        dispatcher_id = str(origin.get("caller_task_id") or "").strip() if isinstance(origin, dict) else ""
+        return self._async_result_home_locked(
+            self._result_fallback_of(task),
+            self.tasks.get(dispatcher_id) if dispatcher_id else None,
+            kind=RESULT_OF_DISPATCH,
+            produced_by=task,
+        )
+
+    def _dispatch_result_reader_session_locked(self, task: Task) -> str:
+        """谁会读到这条异步委派结果：有活着的 await 在等它就是那个任务的归档会话，否则是结果的落点会话。"""
+        waiter = async_dispatches.reserved_waiter_locked(self, task)
+        if waiter is not None:
+            return child_retention.archive_session(waiter)
+        home = self._dispatch_result_home_locked(task)
+        return home.session_id if home is not None else ""
+
+    def _dispatch_result_fallback_locked(self, dispatch_origin: dict[str, Any]) -> dict[str, Any] | None:
+        """异步委派入站时记下的回落落点，和 dispatch_origin 记的会话、节点一样时不记。
+
+        派发方的记录日后没了时结果照它交：沿派发链找第一个由节点在会话里正常接收的任务，accumulate 的 agent
+        会话也越过去（回落时没有派发记录可带，在那里接着做的那一轮交不回上层）。
+        """
+        dispatcher = self.tasks.get(str(dispatch_origin.get("caller_task_id") or "").strip())
+        if dispatcher is None:
+            return None
+        home = self._async_result_home_locked(
+            AsyncResultFallback(""), dispatcher, kind=RESULT_OF_DISPATCH, stop_at_accumulate=False,
+        )
+        if home is None:
+            return None
+        if (
+            home.session_id == str(dispatch_origin.get("parent_session_id") or "").strip()
+            and home.node_id == str(dispatch_origin.get("caller_node_id") or "").strip()
+        ):
+            return None
+        recorded: dict[str, Any] = {
+            "session_id": home.session_id,
+            "node_id": home.node_id,
+            "generation": self._current_session_generation_locked(home.session_id) or None,
+        }
+        worktree = worktree_service_of(self).caller_record_locked(self.tasks.get(home.guide_task_id)) or home.worktree
+        if worktree is not None:
+            recorded["worktree"] = dict(worktree)
+        return recorded
+
+    def _result_fallback_of(self, task: Task) -> AsyncResultFallback:
+        """异步任务的发起任务记录没了时结果回落到哪：入站时记下的链顶；旧任务按 dispatch_origin 记的会话和节点。"""
+        recorded = task.input.get(RESULT_FALLBACK_KEY)
+        if isinstance(recorded, dict) and str(recorded.get("session_id") or "").strip():
+            worktree = recorded.get("worktree")
+            return AsyncResultFallback(
+                str(recorded.get("session_id") or "").strip(),
+                node_id=str(recorded.get("node_id") or "").strip(),
+                generation=recorded.get("generation"),
+                worktree=dict(worktree) if isinstance(worktree, dict) and worktree.get("worktree") else None,
             )
-            return False
+        origin = task.input.get("_dispatch_origin")
+        origin = origin if isinstance(origin, dict) else {}
+        worktree = task.input.get(CALLER_WORKTREE_KEY)
+        generation = self._to_positive_int(origin.get("parent_session_generation"))
+        return AsyncResultFallback(
+            str(origin.get("parent_session_id") or "").strip(),
+            node_id=str(origin.get("caller_node_id") or "").strip(),
+            # 没记父会话代次的旧任务照旧拿它自己的代次核对，宁可不交也不交错代
+            generation=generation if generation is not None else task.session_generation,
+            worktree=dict(worktree) if isinstance(worktree, dict) and worktree.get("worktree") else None,
+        )
 
-        # 旧任务没有父代次快照，继续沿用原来的保守校验。
-        parent_generation = self._to_positive_int(origin.get("parent_session_generation"))
-        if parent_generation is None:
-            parent_generation = task.session_generation
-        current_gen = self._current_session_generation_locked(target_session_id)
-        if parent_generation and current_gen and parent_generation != current_gen:
+    def _round_of_home_locked(self, task: Task, session_id: str, node_id: str) -> bool:
+        """task 是不是落点节点在落点会话里自己的一轮：没有 caller、不是内部流程，也不是群里自己插话的那一轮。"""
+        return (
+            task.kind == TaskKind.node
+            and str(task.node_id or "") == node_id
+            and not (task.caller_task_id or "").strip()
+            and not is_internal_task(task)
+            # 插话轮被引擎重启时静默取消，留给它的结果会跟着丢，而那些结果是别的请求的
+            and not is_ambient_task(task)
+            and self._route_session_id_for_task_locked(task) == session_id
+        )
+
+    def _unfinished_round_locked(self, home: "AsyncResultHome") -> Task | None:
+        """落点节点在落点会话里还没做完的那一轮：在跑、为压缩挂起或刚交回还没路由完的优先，其次最早排队的。
+
+        没有落点节点（交给会话自己定）时不留。
+        """
+        node_id = str(home.node_id or "").strip()
+        if not node_id:
+            return None
+        now = _now()
+        queued: Task | None = None
+        for task in self.tasks.values():
+            if not self._round_of_home_locked(task, home.session_id, node_id):
+                continue
+            if not async_dispatches.round_open_locked(self, task, now):
+                continue
+            if task.status != TaskStatus.pending:
+                return task
+            if queued is None or task.created_at < queued.created_at:
+                queued = task
+        return queued
+
+    def _result_group_key_locked(self, home: "AsyncResultHome") -> tuple[str, str, str, str]:
+        """几条结果能不能合成一轮：同一落点会话和节点；回到 agent 会话接着做的还要是同一轮；接手时的隔离副本也要相同。"""
+        worktree = (
+            worktree_service_of(self).caller_record_locked(self.tasks.get(home.guide_task_id)) or home.worktree or {}
+        )
+        continued = home.guide_task_id if home.dispatch_origin is not None else ""
+        return home.session_id, home.node_id, continued, str(worktree.get("worktree") or "")
+
+    def _deliver_dispatch_results_locked(
+        self, results: list[tuple["AsyncResultHome", Task, dict[str, Any]]],
+    ) -> async_dispatches.DispatchDelivery:
+        """把同一落点的几条异步委派结果作为新入站交回：每条一个 inbound_message 事件（和单条交回同一格式），合起来只建一个任务。
+
+        早先已经交回过的（按 delivery_id 认）不再交，算作已交回。此方法在 self._lock 内调用。
+        """
+        if not results:
+            return async_dispatches.DispatchDelivery(None, ())
+        home = results[0][0]
+        session_info = self.sessions.get(home.session_id)
+        if session_info is None:
             log.warning(
-                "dispatch_origin callback skipped: session %s generation %s != %s for task %s",
-                target_session_id[:12], parent_generation, current_gen, task.task_id[:12],
+                "async dispatch results skipped: session %s not found for %s",
+                home.session_id[:12], [task.task_id[:12] for _home, task, _result in results],
             )
-            return False
-        if target_session_id in self._cancelled_sessions:
-            log.warning(
-                "dispatch_origin callback skipped: session %s cancelled for task %s",
-                target_session_id[:12], task.task_id[:12],
+            return async_dispatches.DispatchDelivery(None, ())
+        delivered: list[str] = []
+        fresh: list[tuple[int, dict[str, Any]]] = []
+        for item_home, task, fallback_result in results:
+            payload = self._dispatch_result_payload_locked(item_home, session_info, task, fallback_result)
+            delivery_id = str(payload.get("delivery_id") or "")
+            if delivery_id and self.eventlog.find_delivery_event(delivery_id, event_type="inbound_message"):
+                delivered.append(task.task_id)
+                continue
+            event = self.eventlog.append(
+                session_id=home.session_id,
+                component="supervisor",
+                type_="inbound_message",
+                payload=payload,
             )
-            return False
+            seq = int(event.get("seq", 0))
+            self._apply_inbound_message(seq=seq, session_id=home.session_id, payload=payload)
+            fresh.append((seq, payload))
+            delivered.append(task.task_id)
+        if not fresh:
+            return async_dispatches.DispatchDelivery(None, tuple(delivered))
+        task_payload = fresh[0][1] if len(fresh) == 1 else self._merged_dispatch_payload(
+            [payload for _seq, payload in fresh],
+        )
+        callback = self._create_entry_task_for_inbound_locked(
+            inbound_seq=fresh[-1][0], session_id=home.session_id, payload=task_payload,
+        )
+        if len(fresh) > 1:
+            log.info(
+                "%d async dispatch results delivered together to session %s as task %s",
+                len(fresh), home.session_id[:12], callback.task_id[:12] if callback is not None else "-",
+            )
+        return async_dispatches.DispatchDelivery(callback, tuple(delivered))
 
-        result_text = str(fallback_result.get("text") or "").strip()
-        result_summary = str(fallback_result.get("summary") or "").strip()
-
+    def _dispatch_result_payload_locked(
+        self, home: "AsyncResultHome", session_info: Any, task: Task, fallback_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """一条异步委派结果的入站：子任务原始的结果和结局、句柄、隔离副本，加上落点决定的那几项。附件在这里先发给用户。"""
+        origin = task.input.get("_dispatch_origin")
+        origin = origin if isinstance(origin, dict) else {}
         result_atts = (
             fallback_result.get("attachments")
             if isinstance(fallback_result.get("attachments"), list)
             else None
         )
-
-        # 构造 inbound payload 并注入目标 session
-        conv_key = session_info.conversation_key
-        channel = session_info.channel
-        msg_id = f"dispatch_origin:{task.task_id}"
         attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
-            session_id=target_session_id,
-            conversation_key=conv_key,
+            session_id=home.session_id,
+            conversation_key=session_info.conversation_key,
             task=task,
             attachments=result_atts,
         ) if result_atts else False
-
         payload: dict[str, Any] = {
-            "channel": channel,
-            "conversation_key": conv_key,
-            "message_id": msg_id,
-            "text": result_text,
-            "summary": result_summary,
+            "channel": session_info.channel,
+            "conversation_key": session_info.conversation_key,
+            "message_id": f"dispatch_origin:{task.task_id}",
+            "text": str(fallback_result.get("text") or "").strip(),
+            "summary": str(fallback_result.get("summary") or "").strip(),
             "message_type": "dispatch_result",
-            "caller_node_id": caller_node,
+            "caller_node_id": str(origin.get("caller_node_id") or "").strip(),
             "child_node_id": task.node_id,
             "child_task_id": task.task_id,
-            "child_session_id": child_session_id,
+            "child_session_id": str(task.input.get("child_session_id") or "").strip(),
             # 前缀照它写成功、要补充信息还是失败，失败不能说成完成
             "child_status": self._task_outcome_action(task),
         }
-        # [2026-07-15] Why: 异步 dispatch 结果回调以新 inbound 注入时，若不指定
-        # entry_node_id，_create_entry_task_for_inbound_locked 会回退到 session 最后绑定
-        # 的入口节点（如上一次被 dispatch 目标写入的 chat.web_search），导致回调被错误
-        # 路由到不具备推送能力的节点，异步结果无法发出。How: 回调明确指定
-        # entry_node_id 为发起 dispatch 的 caller 节点（orchestrator）。Purpose: 异步
-        # 结果回到原编排节点，由它决定如何向用户推送。
-        if caller_node:
-            payload["entry_node_id"] = caller_node
-        output_guide = self._inherited_output_guide_locked(origin.get("caller_task_id"))
-        if output_guide:
-            payload[OUTPUT_GUIDE_KEY] = output_guide
+        payload.update(self._home_payload_fields_locked(
+            home, guide_fallback_id=str(origin.get("caller_task_id") or "").strip(),
+        ))
+        note = home.note.strip()
+        if note:
+            payload[DELIVERY_NOTE_PAYLOAD_KEY] = note
         if attachments_outbound_sent:
             payload["attachments_outbound_sent"] = True
         elif result_atts:
@@ -2581,33 +2731,64 @@ class TaskRouterMixin:
         child_worktree = worktree_service_of(self).result_fields_locked(task).get("worktree")
         if child_worktree:
             payload[CHILD_WORKTREE_PAYLOAD_KEY] = child_worktree
-        # 派它出去的任务在隔离副本里：结果回到那个会话，接手的这一轮接着在那个副本里做
-        caller_worktree = task.input.get(CALLER_WORKTREE_KEY)
-        if isinstance(caller_worktree, dict) and caller_worktree.get("worktree"):
-            payload[WORKTREE_FROM_KEY] = dict(caller_worktree)
+        if task.delivery_id:
+            payload["delivery_id"] = f"{task.delivery_id}:caller-resume"
+        return payload
 
-        callback_delivery_id = (
-            f"{task.delivery_id}:caller-resume" if task.delivery_id else ""
-        )
-        if callback_delivery_id:
-            payload["delivery_id"] = callback_delivery_id
-            if self.eventlog.find_delivery_event(
-                callback_delivery_id, event_type="inbound_message",
-            ):
-                return True
+    @staticmethod
+    def _merged_dispatch_payload(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+        """几条结果合成一轮时建任务用的入站：顶层照第一条（委派深度、任务树按它算），每条结果放进 dispatch_results。
 
-        evt = self.eventlog.append(
-            session_id=target_session_id,
-            component="supervisor",
-            type_="inbound_message",
-            payload=payload,
+        附件取几条里没外发的并集；有一条已经外发过，这一轮就不再替模型发它点名的附件。
+        """
+        merged = {
+            key: value for key, value in payloads[0].items()
+            if key not in ("delivery_id", "attachments", "attachments_outbound_sent")
+        }
+        merged["message_id"] = str(payloads[-1].get("message_id") or merged.get("message_id") or "")
+        merged[DISPATCH_RESULTS_PAYLOAD_KEY] = [
+            {key: payload[key] for key in _DISPATCH_RESULT_ITEM_KEYS if key in payload} for payload in payloads
+        ]
+        unsent = [
+            attachment
+            for payload in payloads
+            if isinstance(payload.get("attachments"), list)
+            for attachment in payload["attachments"]
+        ]
+        if unsent:
+            merged["attachments"] = unsent
+        if any(payload.get("attachments_outbound_sent") for payload in payloads):
+            merged["attachments_outbound_sent"] = True
+        return merged
+
+    def _home_payload_fields_locked(self, home: "AsyncResultHome", *, guide_fallback_id: str = "") -> dict[str, Any]:
+        """落点决定的那几项：由哪个节点接、钉不钉、接着做的是哪一轮、带不带派发记录、沿用谁的输出说明和隔离副本。"""
+        fields: dict[str, Any] = {}
+        if home.node_id:
+            fields["entry_node_id"] = home.node_id
+            # 会话被 switch_node 改过入口也照样交给落点的节点
+            if home.dispatch_origin is None:
+                fields["entry_node_pinned"] = True
+        if home.dispatch_origin is not None:
+            fields["dispatch_origin"] = dict(home.dispatch_origin)
+            if home.context_mode:
+                fields["dispatch_context_mode"] = home.context_mode
+        if home.guide_task_id:
+            fields[CONTINUES_TASK_PAYLOAD_KEY] = home.guide_task_id
+        output_guide = self._inherited_output_guide_locked(home.guide_task_id or guide_fallback_id)
+        if output_guide:
+            fields[OUTPUT_GUIDE_KEY] = output_guide
+        # 落点的节点在隔离副本里时，接手的这一轮接着在同一个副本里做
+        home_worktree = (
+            worktree_service_of(self).caller_record_locked(self.tasks.get(home.guide_task_id)) or home.worktree
         )
-        seq = int(evt.get("seq", 0))
-        self._apply_inbound_message(seq=seq, session_id=target_session_id, payload=payload)
-        self._create_entry_task_for_inbound_locked(
-            inbound_seq=seq, session_id=target_session_id, payload=payload,
-        )
-        return True
+        if home_worktree is not None:
+            fields[WORKTREE_FROM_KEY] = dict(home_worktree)
+        return fields
+
+    def _async_result_chains_needed_locked(self) -> set[str]:
+        """留着还没交出去的异步委派结果，交回时还要沿派发链找落点：链上的任务不能被清出内存。"""
+        return async_dispatches.chains_to_keep_locked(self)
 
     def _async_result_origin_guard_locked(
         self, session_id: str, task_id: str, *, cancelled: bool = False,
@@ -2688,26 +2869,38 @@ class TaskRouterMixin:
         if guard_result is not None:
             return guard_result, None
         origin = self.tasks.get(task_id) if task_id else None
-        home = self._async_result_home_locked(session_id, origin)
+        home = self._async_result_home_locked(AsyncResultFallback(session_id), origin)
         if home is not None:
             return {}, home
         if origin is None:
             return {"ok": False, "error": "session not found"}, None
         return {"ok": True, "strategy": "dropped", "reason": "home_gone"}, None
 
-    def _async_result_home_locked(self, session_id: str, origin: Task | None) -> "AsyncResultHome | None":
-        """异步工具结果交给谁。发起它的节点自己还收得到消息就交给它，收不到就往上交给派它出来的一方。
+    def _async_result_home_locked(
+        self,
+        fallback: AsyncResultFallback,
+        start: Task | None,
+        *,
+        kind: str = RESULT_OF_TOOL,
+        produced_by: Task | None = None,
+        stop_at_accumulate: bool = True,
+    ) -> "AsyncResultHome | None":
+        """异步结果交给谁。发起它的节点自己还收得到消息就交给它，收不到就往上交给派它出来的一方。
 
         - 入口任务：它面向用户的会话，指定由它自己的节点接；
         - 同步委派的子节点没有收消息的会话：沿 caller 交给这条同步链最上面的任务；
         - 异步委派的子节点：accumulate 的 agent 会话一直留着，在那里由它接着做，带上派发记录，做完照常交回发起方；
           其余的（fresh、fork 用完即删）交给派它出来的任务；
-        - 发起任务的记录已被清理：交给投递时给的会话，节点由会话自己定。
+        - 发起任务的记录已被清理：交给回落落点（入站时记下的链顶，或投递时给的会话）。
+
+        start 是发起的那个任务：异步工具结果是调用工具的任务，异步委派结果是派发方；produced_by 是交回结果的子任务。
         """
-        if origin is None:
-            return AsyncResultHome(session_id) if session_id in self.sessions else None
+        if start is None:
+            if not self._async_result_session_usable_locked(fallback.session_id, fallback.generation):
+                return None
+            return AsyncResultHome(fallback.session_id, node_id=fallback.node_id, worktree=fallback.worktree)
         hops: list[Task] = []
-        current = origin
+        current = start
         seen: set[str] = set()
         for _ in range(_ASYNC_RESULT_MAX_HOPS):
             if current.task_id in seen:
@@ -2720,7 +2913,9 @@ class TaskRouterMixin:
                     route = self._route_session_id_for_task_locked(current) or current.session_id
                     if not self._async_result_session_usable_locked(route, current.session_generation):
                         return None
-                    return AsyncResultHome(route, note=self._async_result_note_locked(origin, [*hops, current]))
+                    return AsyncResultHome(route, note=self._async_result_note_locked(
+                        start, [*hops, current], kind=kind, produced_by=produced_by,
+                    ))
                 hops.append(current)
                 current = caller
                 continue
@@ -2734,10 +2929,14 @@ class TaskRouterMixin:
                     route,
                     node_id=str(current.node_id or "") if regular else "",
                     guide_task_id=current.task_id,
-                    note=self._async_result_note_locked(origin, hops),
+                    note=self._async_result_note_locked(start, hops, kind=kind, produced_by=produced_by),
                 )
             mode = str(dispatch.get("context_mode") or current.input.get("dispatch_context_mode") or "").strip()
-            if mode == "accumulate" and self._async_result_session_usable_locked(route, current.session_generation):
+            if (
+                stop_at_accumulate
+                and mode == "accumulate"
+                and self._async_result_session_usable_locked(route, current.session_generation)
+            ):
                 return AsyncResultHome(
                     route,
                     node_id=str(current.node_id or ""),
@@ -2748,22 +2947,23 @@ class TaskRouterMixin:
                     },
                     context_mode=mode,
                     guide_task_id=current.task_id,
-                    note=self._async_result_note_locked(origin, hops),
+                    note=self._async_result_note_locked(start, hops, kind=kind, produced_by=produced_by),
                 )
             hops.append(current)
             dispatcher = self.tasks.get(str(dispatch.get("caller_task_id") or "").strip())
             if dispatcher is not None:
                 current = dispatcher
                 continue
-            parent = str(dispatch.get("parent_session_id") or "").strip()
-            if not self._async_result_session_usable_locked(parent, dispatch.get("parent_session_generation")):
+            hop_fallback = self._result_fallback_of(current)
+            if not self._async_result_session_usable_locked(hop_fallback.session_id, hop_fallback.generation):
                 return None
             return AsyncResultHome(
-                parent,
-                node_id=str(dispatch.get("caller_node_id") or "").strip(),
-                note=self._async_result_note_locked(origin, hops),
+                hop_fallback.session_id,
+                node_id=hop_fallback.node_id,
+                worktree=hop_fallback.worktree,
+                note=self._async_result_note_locked(start, hops, kind=kind, produced_by=produced_by),
             )
-        log.warning("async tool result of task %s: dispatch chain too deep or cyclic", origin.task_id[:12])
+        log.warning("async result started by task %s: dispatch chain too deep or cyclic", start.task_id[:12])
         return None
 
     def _async_result_session_usable_locked(self, session_id: str, generation: Any) -> bool:
@@ -2773,20 +2973,31 @@ class TaskRouterMixin:
         current = self._current_session_generation_locked(session_id)
         return not (expected and current and expected != current)
 
-    def _async_result_note_locked(self, origin: Task, hops: list[Task]) -> str:
-        """结果没交给发起它的节点时，在末尾说明是谁发起的；接在末尾，开头的状态行照旧给 finish_guard 认。"""
+    def _async_result_note_locked(
+        self,
+        start: Task,
+        hops: list[Task],
+        *,
+        kind: str = RESULT_OF_TOOL,
+        produced_by: Task | None = None,
+    ) -> str:
+        """结果没交给发起它的节点时，在末尾说明是谁发起的、经过了哪几层；接在末尾，开头的状态行照旧给 finish_guard 认。"""
         if not hops:
             return ""
-        ended = self._task_terminal(origin)
+        ended = self._task_terminal(start)
         note = (
-            f'\n\n[Note] This tool call was made by sub-agent "{origin.node_id or "?"}" (task {origin.task_id[:8]}), '
-            f"which {'has already finished' if ended else 'is still running'}. It cannot receive new messages, "
-            "so the result is delivered to you."
+            f'\n\n[Note] {_NOTE_SUBJECTS[kind]} was made by sub-agent "{start.node_id or "?"}" '
+            f"(task {start.task_id[:8]}), which {'has already finished' if ended else 'is still running'}. "
+            "It cannot receive new messages, so the result is delivered to you."
         )
         if ended:
-            fields = child_retention.continue_fields_locked(self, origin)
+            fields = child_retention.continue_fields_locked(self, start)
             if fields.get("continuable") and fields.get("handle"):
                 note += f' To hand the result back to it, dispatch to it again with continue_from="{fields["handle"]}".'
+        links = [*reversed(hops), *([produced_by] if produced_by is not None else [])]
+        if len(links) > 1:
+            chain = " -> ".join(f'"{task.node_id or "?"}" (task {task.task_id[:8]})' for task in links)
+            note += f"\nChain from you to where the result came from: you -> {chain}."
         return note
 
     def _adopt_async_result_refs(self, source_session_id: str, target_session_id: str, text: str) -> int:
@@ -2875,22 +3086,7 @@ class TaskRouterMixin:
                 "async_tool_name": tool_name,
                 "async_tool_error": str(error)[:1000] if error else "",
             }
-        if home.node_id:
-            payload["entry_node_id"] = home.node_id
-            # 会话被 switch_node 改过入口也照样交给发起的节点
-            if home.dispatch_origin is None:
-                payload["entry_node_pinned"] = True
-        if home.dispatch_origin is not None:
-            payload["dispatch_origin"] = dict(home.dispatch_origin)
-            if home.context_mode:
-                payload["dispatch_context_mode"] = home.context_mode
-        output_guide = self._inherited_output_guide_locked(home.guide_task_id or task_id)
-        if output_guide:
-            payload[OUTPUT_GUIDE_KEY] = output_guide
-        # 落点的节点在隔离副本里时，接手的这一轮接着在同一个副本里做
-        home_worktree = worktree_service_of(self).caller_record_locked(self.tasks.get(home.guide_task_id))
-        if home_worktree is not None:
-            payload[WORKTREE_FROM_KEY] = home_worktree
+        payload.update(self._home_payload_fields_locked(home, guide_fallback_id=task_id))
 
         evt = self.eventlog.append(
             session_id=target_session_id,

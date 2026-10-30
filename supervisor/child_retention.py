@@ -1,7 +1,7 @@
 """失败或到点收尾的子 agent 会话：留到发起它的任务结束后再过一段宽限期，期间父节点能用句柄接着派。
 
 保留记录写在 sessions.json 那一行的 retain 字段，engine 的 data_cleanup 也按它判。
-子任务的结果交回去之前，结果里引用到的超长输出先复制到父节点那份会话名下，子会话删了也读得到。
+子任务的结果交回去之前，结果里引用到的超长输出先复制到读结果的那一方的会话名下，子会话删了也读得到。
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ class ChildStorage:
 
 @dataclass(frozen=True)
 class RefAdoption:
-    """子会话名下要复制到父节点会话名下的超长输出。"""
+    """子会话名下要复制到读结果的那一方会话名下的超长输出。"""
 
     source_session_id: str
     target_session_id: str
@@ -222,7 +222,7 @@ def session_busy_locked(state: "SupervisorState", session_id: str) -> bool:
 
 def _parent_live_locked(state: "SupervisorState", hold: dict[str, Any]) -> bool:
     parent = state.tasks.get(str(hold.get("parent_task_id") or "").strip())
-    return parent is not None and not state._task_terminal(parent)
+    return parent is not None and state._task_ending_locked(parent).continues
 
 
 def sweep_hold_locked(
@@ -246,37 +246,45 @@ def sweep_hold_locked(
     return until <= now, False
 
 
-def adoption_locked(state: "SupervisorState", task: Task) -> RefAdoption | None:
-    """子任务结果里引用到的超长输出该从哪个会话复制到哪个会话；用不着复制给 None。"""
-    if _outcome(task) not in ("finish", "fail") or storage_locked(state, task) is None:
-        return None
-    source = str(
+def archive_session(task: Task) -> str:
+    """任务的对话和超长输出记在哪个会话名下，和 engine 读 ref 的取法一致：子会话，其次它运行的那个会话。"""
+    return str(
         task.input.get("child_session_id") or task.input.get("parent_session_id") or task.session_id or ""
     ).strip()
-    target = ""
-    # 异步委派的发起任务也按它自己的键算：它若是同步子任务，输出存在它的子会话名下，不在 dispatch_origin 记的会话
-    caller = state.tasks.get(parent_task_id(task))
-    if caller is not None:
-        target = str(
-            caller.input.get("child_session_id") or caller.input.get("parent_session_id") or caller.session_id or ""
-        ).strip()
+
+
+def result_refs(task: Task) -> tuple[str, ...]:
+    """任务交回的结果里引用到的超长输出。"""
+    inner = _inner_result(task)
+    return tuple(mentioned_refs(
+        inner.get("text"), inner.get("summary"), (task.result or {}).get("summary"), (task.result or {}).get("error"),
+    ))
+
+
+def adoption_locked(state: "SupervisorState", task: Task) -> RefAdoption | None:
+    """子任务结果里引用到的超长输出该从哪个会话复制到哪个会话；用不着复制给 None。
+
+    同步委派复制到 caller 名下；异步委派复制到真正读它的一方：在等它的 await 的那个任务名下，否则是结果的落点会话。
+    """
+    if _outcome(task) not in ("finish", "fail") or storage_locked(state, task) is None:
+        return None
+    source = archive_session(task)
+    origin = task.input.get("_dispatch_origin")
+    if not (task.caller_task_id or "").strip() and isinstance(origin, dict) and origin:
+        target = state._dispatch_result_reader_session_locked(task)
     else:
-        origin = task.input.get("_dispatch_origin")
-        if isinstance(origin, dict):
-            target = str(origin.get("parent_session_id") or "").strip()
+        caller = state.tasks.get(parent_task_id(task))
+        target = archive_session(caller) if caller is not None else ""
     if not source or not target or source == target:
         return None
-    inner = _inner_result(task)
-    refs = mentioned_refs(
-        inner.get("text"), inner.get("summary"), (task.result or {}).get("summary"), (task.result or {}).get("error"),
-    )
+    refs = result_refs(task)
     if not refs:
         return None
-    return RefAdoption(source_session_id=source, target_session_id=target, refs=tuple(refs))
+    return RefAdoption(source_session_id=source, target_session_id=target, refs=refs)
 
 
 def adopt(workspace_root: Path | str, adoption: RefAdoption | None) -> int:
-    """把引用到的超长输出复制到父节点会话名下，返回父节点现在能读到几份。有磁盘读写，尽量在锁外调用。"""
+    """把引用到的超长输出复制到读结果的那一方会话名下，返回那边现在能读到几份。有磁盘读写，尽量在锁外调用。"""
     if adoption is None:
         return 0
     store = ToolOutputStore(Path(workspace_root))

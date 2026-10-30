@@ -744,12 +744,19 @@ class TestAsyncInbound:
         agent = _accepted(state, _post(app, _dispatch_payload(state, top, "y.node")))
         helper = _accepted(state, _post(app, _dispatch_payload(state, agent, "helper.node", mode="fresh")))
 
-        _finish(state, helper, "查到了")
+        def callbacks() -> list[Task]:
+            return [
+                task for task in state.tasks.values()
+                if task.input.get("inbound_message_type") == "dispatch_result"
+                and task.input.get("inbound_child_task_id") == helper.task_id
+            ]
 
-        [callback] = [
-            task for task in state.tasks.values()
-            if task.input.get("inbound_message_type") == "dispatch_result"
-            and task.input.get("inbound_child_task_id") == helper.task_id
-        ]
+        _finish(state, helper, "查到了")
+        # 派它出来的那一轮还没做完，结果先留给它
+        assert callbacks() == []
+
+        [sub] = _dispatch(state, agent, _item("a.node", mode="fresh"))
+
+        [callback] = callbacks()
         assert _agent_session(callback) == _agent_session(agent)
-        assert agent.status == TaskStatus.pending
+        assert agent.status == TaskStatus.suspended and sub.status == TaskStatus.pending

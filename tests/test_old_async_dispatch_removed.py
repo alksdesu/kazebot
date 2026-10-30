@@ -166,6 +166,7 @@ class TestCompletionRoutingIsUnchanged:
     def test_a_delegated_child_still_reports_back_to_the_caller(self, state: SupervisorState) -> None:
         session_id, entry = _conversation(state)
         bob = _delegate(state, entry, "bob")
+        _finish(state, entry, "交给 bob 了")
 
         _finish(state, bob, "found it")
 

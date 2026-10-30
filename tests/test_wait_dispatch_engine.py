@@ -170,7 +170,7 @@ class TestMixedRounds:
         assert [item["target"] for item in action.dispatch_batch] == ["scout"]
         # 应答里没有 task_id（旧 supervisor）时拼不出句柄，照样算派出了
         assert _payload(ls, "a1") == {
-            "success": True, "session_id": "s-async", "message": "已异步委派给 helper，结果稍后会作为一条新消息送达。",
+            "success": True, "session_id": "s-async", "message": "已异步委派给 helper，结果等你这一轮结束后作为消息交回。",
         }
         assert _payload(ls, "w1")["status"] == "waiting"
         assert answered_once(ls.messages)

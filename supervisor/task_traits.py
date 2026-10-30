@@ -1,18 +1,21 @@
-"""续跑、重排、子会话保留都要问的两件事：任务是不是系统内部流程，节点有没有声明 auto_continue。"""
+"""续跑、重排、子会话保留、结果留给哪一轮都要问的几件事：任务是不是系统内部流程、是不是群里自己插话的那一轮，节点有没有声明 auto_continue。"""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 
 from clonoth_runtime import parse_bool
+from engine.conversation_routing import routing_meta
 
 from .types import Task
 
 log = logging.getLogger(__name__)
 
 AUTO_CONTINUE_FIELD = "auto_continue"
-# engine 中途退出后重排过的任务记一笔：同一个任务只重排一次，再中断就照旧取消
+# engine 中途退出后重排过的任务记一笔：同一个任务只重排一次，再中断就按失败收尾
 REQUEUE_MARK = "_crash_requeued"
+# 适配层给群里没人叫 bot、它自己插话的那一轮写的 delivery_purpose
+AMBIENT_PURPOSE = "ambient"
 
 
 def is_internal_task(task: Task) -> bool:
@@ -26,6 +29,13 @@ def is_internal_task(task: Task) -> bool:
         or task_input.get("_session_reset")
         or (isinstance(context, dict) and context.get("is_system_task"))
     )
+
+
+def is_ambient_task(task: Task) -> bool:
+    """群里没人叫 bot、它自己插话的那一轮。"""
+    task_input = task.input if isinstance(task.input, dict) else {}
+    context = task_input.get("task_context")
+    return routing_meta(context if isinstance(context, dict) else {}).get("delivery_purpose") == AMBIENT_PURPOSE
 
 
 def node_auto_continues(workspace_root: Path | str, node_id: str) -> bool:

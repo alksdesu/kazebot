@@ -176,9 +176,11 @@ class TestWhereResultsGo:
         assert payload["text"] == "✅ done" and "dispatch_origin" not in payload
         assert payload["entry_node_id"] == "bootstrap.coder" and payload["entry_node_pinned"] is True
         assert payload["route_hints"]["async_tool_success"] is True
+        assert payload["continues_task_id"] == launcher.task_id
         [relay] = _created_since(state, before)
         assert relay.node_id == "bootstrap.coder" and relay.input["parent_session_id"] == sid
         assert relay.input["inbound_child_task_id"] == launcher.task_id
+        assert relay.input["inbound_continues_task_id"] == launcher.task_id
 
     def test_a_wait_child_hands_its_result_to_the_caller_with_a_note(self, state: SupervisorState) -> None:
         sid = _session(state)
@@ -195,6 +197,7 @@ class TestWhereResultsGo:
         assert payload["entry_node_id"] == "test.orchestrator" and payload["entry_node_pinned"] is True
         assert payload["text"].startswith(f'✅ built\n\n{_NOTE} "a.node" (task {child.task_id[:8]}), which is still running.')
         assert "continue_from" not in payload["text"]
+        assert payload["continues_task_id"] == caller.task_id
         [relay] = _created_since(state, before)
         assert relay.node_id == "test.orchestrator"
 
@@ -252,6 +255,7 @@ class TestWhereResultsGo:
         origin = payload["dispatch_origin"]
         assert origin["caller_task_id"] == caller.task_id and origin["parent_session_id"] == sid
         assert CONTINUE_FROM_KEY not in origin
+        assert payload["continues_task_id"] == child.task_id
         [relay] = _created_since(state, before)
         assert relay.node_id == "a.node" and relay.input["parent_session_id"] == agent_sid
         assert relay.input["_dispatch_origin"]["caller_task_id"] == caller.task_id
@@ -297,6 +301,7 @@ class TestWhereResultsGo:
         [payload] = _relays(state, sid)
         assert payload["entry_node_id"] == "test.orchestrator" and payload["entry_node_pinned"] is True
         assert "is still running" in payload["text"]
+        assert "continues_task_id" not in payload
 
     def test_a_result_whose_task_record_is_gone_lands_in_the_posted_conversation(self, state: SupervisorState) -> None:
         sid = _session(state)

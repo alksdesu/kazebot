@@ -39,6 +39,7 @@ from .session_store import SessionStore, session_registry_path
 from .task_requeue import (
     ENGINE_CRASH,
     Orphan,
+    OrphanSettlement,
     collect_orphans_locked,
     release_stale_claims_locked,
     settle_orphans_locked,
@@ -216,9 +217,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._restore_branch_finalize_claims_from_events()
         self._restore_memory_extract_intents_from_events()
         self._restore_approval_grants()
+        # 补路由会新开分支（交回的结果、自动续跑），孤儿只认补路由之前就在的
+        restart_branches = frozenset(
+            sid for sid in self._session_store.keys_snapshot() if str(sid).startswith("branch_")
+        )
         self._restore_recoverable_routes_from_events()
-        self.recover_pending_completion_routes()
-        self._reconcile_after_restart()
+        self.recover_pending_completion_routes(orphan_branches=restart_branches)
+        self._reconcile_after_restart(restart_branches=restart_branches)
         self._recover_memory_extract_intents()
         self._defer_post_work_enqueue = False
         self.recover_pending_post_completion_work()
@@ -648,8 +653,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         )
         return restored
 
-    def recover_pending_completion_routes(self) -> int:
-        """Retry restored versioned terminal routes without replaying legacy tasks."""
+    def recover_pending_completion_routes(self, *, orphan_branches: frozenset[str] = frozenset()) -> int:
+        """Retry restored versioned terminal routes without replaying legacy tasks.
+
+        orphan_branches 上交回 dispatch 的任务不再路由：它的分支随后会被当孤儿合并，派出的子任务会被白白取消。
+        """
         recovered = 0
         with self._lock:
             candidates = [
@@ -659,6 +667,16 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 and bool(str(task.delivery_id or "").strip())
                 and task.route_status != RouteStatus.routed
             ]
+            abandoned = {
+                task.task_id for task in candidates
+                if task.session_id in orphan_branches
+                and task.status == TaskStatus.completed
+                and str((task.result or {}).get("action") or "").strip() == "dispatch"
+            }
+            for task in candidates:
+                if task.task_id in abandoned:
+                    self._abandon_restored_dispatch_locked(task)
+            candidates = [task for task in candidates if task.task_id not in abandoned]
         for task in candidates:
             try:
                 self._route_completed_task(task)
@@ -675,6 +693,33 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 extra={"event": "task_route_recovered", "recovered_count": recovered},
             )
         return recovered
+
+    def _abandon_restored_dispatch_locked(self, task: Task) -> None:
+        """上一进程交回 dispatch 却没路由完、所在分支马上要被当孤儿合并的任务：不派子任务，按取消收尾并记成已路由。
+
+        记成已路由，下次重启才不会再把它恢复出来；分支由孤儿协调合并，用户收到的重启说明照旧。
+        """
+        now = _now()
+        task.cancel_requested = True
+        task.status = TaskStatus.cancelled
+        task.updated_at = now
+        task.lease_expires_at = None
+        task.waiting_for_task_id = None
+        task.waiting_for_batch_id = None
+        task.result = {
+            "action": "cancelled",
+            "node_id": task.node_id or task.tool_name or "",
+            "error": branch_recovery.RESTART_ABANDONED_DISPATCH,
+        }
+        task.route_status = RouteStatus.routed
+        task.routed_at = now
+        task.route_error = ""
+        self._event_task_snapshot("task_cancelled", task, component="supervisor")
+        self._settle_cancelled_task_locked(task, finalize_branch=False)
+        logger.info(
+            "startup: dispatch of task %s on interrupted branch %s not routed",
+            task.task_id[:12], task.session_id[:12],
+        )
 
     def _build_supervisor_hook_ctx(self, **extra: Any) -> dict[str, Any]:
         """Build the callback-only context passed to built-in supervisor hooks."""
@@ -843,13 +888,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         parts.reverse()
         return "\n\n---\n\n".join(parts)
 
-    def _reconcile_after_restart(self) -> None:
+    def _reconcile_after_restart(self, restart_branches: frozenset[str] | None = None) -> None:
         """启动期状态协调：清理上一进程遗留的运行期状态。
 
         [AutoC 2026-05-30] Why: 移除 EventLog 启动回放后，需要独立的
         启动清理逻辑替代原有的 cancel_orphaned_tasks 等依赖回放重建的机制。
         How: 从 sessions.json 扫描并清理 orphan branch、过期 child session。
         Purpose: 确保重启后内存状态干净，不留上一进程的运行期残余。
+
+        给了 restart_branches 时孤儿分支只认这份名单里还在的：补路由时新开的分支不是上一进程留下的。
         """
         cleaned = 0
         stale_sids: list[str] = []
@@ -876,6 +923,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         for sid in self._session_store.keys_snapshot():
             if not str(sid).startswith("branch_") or sid in seen_stale:
                 continue
+            if restart_branches is not None and sid not in restart_branches:
+                continue
             if branch_recovery.recover_orphan_branch(self, sid):
                 recovered += 1
                 continue
@@ -891,7 +940,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         grace = child_retention.grace_period(self)
         holds_changed = False
         for sid, entry in self._session_store.items_snapshot():
-            if sid in seen_stale or not isinstance(entry, dict):
+            # 入口分支在上一步都处理过了：补路由时新开的分支行也没写 context_mode，不能当成历史遗留的子会话清掉
+            if sid in seen_stale or str(sid).startswith("branch_") or not isinstance(entry, dict):
                 continue
             hold = retention_hold(entry)
             if hold is not None:
@@ -2133,8 +2183,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         """登记 engine worker 这一次启动的代次。
 
         代次变了（或本进程第一次见到这个 worker），说明原来那个进程已经不在：它名下还在 running 的任务，
-        节点声明了 auto_continue 且已经有进展的重排一次，其余连同后代取消；排队和挂起的任务只清掉作废的领取信息，
-        留着接着办。查进展要读对话文件，放在锁外。
+        节点声明了 auto_continue 且已经有进展的重排一次，其余判失败（内部流程和群里的插话照旧取消），同步后代连带取消；
+        排队和挂起的任务只清掉作废的领取信息，留着接着办。查进展要读对话文件，放在锁外。
         """
         wid = (worker_id or "").strip()
         gid = (generation_id or "").strip()
@@ -2151,9 +2201,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         progress = stored_steps(self.workspace_root, orphans) if orphans else {}
 
         with self._lock:
-            requeued = cancelled = 0
+            outcome = OrphanSettlement()
             if orphans:
-                requeued, cancelled = settle_orphans_locked(
+                outcome = settle_orphans_locked(
                     self, orphans, progress,
                     reason=ENGINE_CRASH,
                     cancel_reason=f"engine worker {wid} restarted (generation mismatch)",
@@ -2167,8 +2217,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "worker_id": wid,
                     "generation_id": gid,
                     "previous_generation_id": old_gen or "",
-                    "orphans_cancelled": cancelled,
-                    "orphans_requeued": requeued,
+                    "orphans_cancelled": outcome.cancelled,
+                    "orphans_failed": outcome.failed,
+                    "orphans_requeued": outcome.requeued,
                     "ts": _now().isoformat(),
                 },
             )
@@ -2195,8 +2246,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
             return {
                 "ok": True,
-                "orphans_cancelled": cancelled,
-                "orphans_requeued": requeued,
+                "orphans_cancelled": outcome.cancelled,
+                "orphans_failed": outcome.failed,
+                "orphans_requeued": outcome.requeued,
                 "generation_id": gid,
             }
 

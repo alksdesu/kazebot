@@ -1,4 +1,6 @@
-"""supervisor 重启时还没收束的入口分支：补上缺结果的调用和一句说明，合并回父会话再删，告诉用户说「继续」接着做；认不出合并起点的照旧整个丢掉。"""
+"""supervisor 重启时还没收束的入口分支：补上缺结果的调用和一句说明，合并回父会话再删，告诉用户说「继续」接着做；认不出合并起点的照旧整个丢掉。
+这样的分支上交回 dispatch、还没路由的任务不再派出子任务；补路由时新开的分支不算上一进程留下的。
+"""
 from __future__ import annotations
 
 import sys
@@ -15,6 +17,7 @@ if str(_ROOT) not in sys.path:
 from engine.conversation_store import ConversationStore, Message  # noqa: E402
 from engine.interrupted_calls import INTERRUPTED_MARK_KEY, INTERRUPTED_RESULT_TEXT  # noqa: E402
 from supervisor.branch_recovery import (  # noqa: E402
+    RESTART_ABANDONED_DISPATCH,
     RESTART_HISTORY_NOTICE,
     RESTART_MARK_KEY,
     RESTART_USER_NOTICE,
@@ -23,7 +26,7 @@ from supervisor.branch_recovery import (  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
-from supervisor.types import Task  # noqa: E402
+from supervisor.types import RouteStatus, Task, TaskStatus  # noqa: E402
 
 CONV = "qq_private:9"
 
@@ -188,6 +191,75 @@ class TestRecovery:
         assert restarted._session_store.get_entry(branch) is None
         with restarted._lock:
             assert restarted._session_family_root_locked(child_sid) == sid
+
+
+def _reported_unrouted(state: SupervisorState, task: Task, result: dict[str, Any]) -> None:
+    """上一进程收下了完成回报、还没来得及路由就退出：完成快照写进了事件日志，路由没跑。"""
+    with state._lock:
+        task.status = TaskStatus.completed
+        task.result = dict(result)
+        state._reset_task_route_state_locked(task)
+        state._event_task_snapshot("task_completed", task, component="engine")
+
+
+def _finish(state: SupervisorState, task: Task, text: str) -> None:
+    task.status = TaskStatus.running
+    task.worker_id = "worker-1"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    state.complete_task(task_id=task.task_id, worker_id="worker-1", result={"action": "finish", "result": {"text": text}})
+
+
+class TestRoutesLeftByTheLastProcess:
+    def test_a_dispatch_from_an_interrupted_branch_is_not_sent_out(self, tmp_path: Path) -> None:
+        first = _state(tmp_path, "run-a")
+        sid = first.get_or_create_session(channel="qq_private", conversation_key=CONV)
+        task = _inbound(first, sid)
+        _store(tmp_path).append_batch(task.session_id, _interrupted_round(task))
+        _reported_unrouted(first, task, {
+            "action": "dispatch",
+            "dispatch_batch": [{"kind": "node", "target": "helper.node", "instruction": "查一下", "context_mode": "fresh"}],
+        })
+
+        restarted = _state(tmp_path, "run-b")
+
+        abandoned = restarted.tasks[task.task_id]
+        assert abandoned.status == TaskStatus.cancelled and abandoned.route_status == RouteStatus.routed
+        assert abandoned.result["error"] == RESTART_ABANDONED_DISPATCH
+        assert [other for other in restarted.tasks.values() if other.caller_task_id == task.task_id] == []
+        assert "a1" in [message.id for message in _store(tmp_path).load(sid)]
+        assert _outbound_texts(restarted).count(RESTART_USER_NOTICE) == 1
+
+        third = _state(tmp_path, "run-c")
+
+        assert task.task_id not in third.tasks
+
+    def test_a_result_handed_back_while_recovering_keeps_its_new_branch(self, tmp_path: Path) -> None:
+        first = _state(tmp_path, "run-a")
+        sid = first.get_or_create_session(channel="qq_private", conversation_key=CONV)
+        caller = _inbound(first, sid)
+        _finish(first, caller, "交给 helper 了")
+        agent_sid = first.get_or_create_session(channel="qq_private", conversation_key=f"agent:helper.node:{CONV}:x2")
+        payload = {
+            "channel": "qq_private", "conversation_key": first.sessions[agent_sid].conversation_key,
+            "text": "查一下", "entry_node_id": "helper.node", "dispatch_context_mode": "fresh",
+            "dispatch_origin": {
+                "parent_session_id": sid, "caller_node_id": caller.node_id, "parent_conversation_key": CONV,
+                "context_mode": "fresh", "caller_task_id": caller.task_id,
+            },
+        }
+        event = first.eventlog.append(session_id=agent_sid, component="shell", type_="inbound_message", payload=payload)
+        child = first.record_inbound_message_event(event)
+        assert child is not None
+        _reported_unrouted(first, child, {"action": "finish", "result": {"text": "查到了"}})
+
+        restarted = _state(tmp_path, "run-b")
+
+        [callback] = [
+            task for task in restarted.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"
+        ]
+        assert callback.status == TaskStatus.pending and callback.node_id == caller.node_id
+        assert callback.input["inbound_child_task_id"] == child.task_id
+        assert restarted._session_store.get_entry(callback.session_id) is not None
 
 
 def _messages(*ids: str) -> list[Message]:

@@ -556,6 +556,6 @@ class AdapterCallbacks(Protocol):
         Args:
             payload: engine_registered event payload containing:
                 worker_id, generation_id, previous_generation_id,
-                orphans_cancelled, ts.
+                orphans_cancelled, orphans_failed, orphans_requeued, ts.
         """
         ...

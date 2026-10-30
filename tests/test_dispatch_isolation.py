@@ -574,7 +574,7 @@ class TestHandling:
         assert dispatch_isolation(origin) == ISOLATION_WORKTREE and dispatch_repo(origin) == REPO
         payload = _payload(ls, "a1")
         assert payload["success"] is True and payload["handle"] == "child-1@agent-session-1"
-        assert payload["message"].startswith(f"已异步委派给 {CODER}（在隔离副本里执行，仓库 {REPO}），结果稍后")
+        assert payload["message"].startswith(f"已异步委派给 {CODER}（在隔离副本里执行，仓库 {REPO}）。结果回来时")
         assert payload[ISOLATION_KEY] == ISOLATION_WORKTREE and payload[REPO_KEY] == REPO
 
     @pytest.mark.parametrize("extra", [

@@ -28,6 +28,7 @@ RESTART_HISTORY_NOTICE = (
     "用户要接着做时，先核对实际状态（重新读相关文件、查看命令的产物），再继续没做完的部分。"
 )
 RESTART_USER_NOTICE = "服务重启打断了刚才的任务，已经做的部分都保留着，说「继续」就接着做。"
+RESTART_ABANDONED_DISPATCH = "服务重启打断了这一轮，交回的委派没有派出。"
 
 
 def _as_int(value: Any) -> int | None:

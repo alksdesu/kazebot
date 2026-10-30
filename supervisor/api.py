@@ -1972,7 +1972,7 @@ def create_app(
                     return
                 # ---- 清理旧 engine 遗留的孤儿 task ----
                 try:
-                    _orphan_count = st.cancel_orphaned_tasks(claimed_before=stopped_at)
+                    _orphan_count = st.settle_orphaned_tasks(claimed_before=stopped_at)
                 except Exception:
                     # engine 已经起来了，清理出错不算重启失败：记进日志，照常报完成。
                     log.exception("engine 重启后清理孤儿 task 失败")

@@ -213,7 +213,7 @@ def _break_orphan_sweep(state: SupervisorState) -> None:
     def _boom(**_kwargs: Any) -> int:
         raise RuntimeError("孤儿清理炸了")
 
-    state.cancel_orphaned_tasks = _boom
+    state.settle_orphaned_tasks = _boom
 
 
 def _break_announcement(state: SupervisorState) -> None:

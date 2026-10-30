@@ -1,4 +1,5 @@
-"""异步委派的结果台账和 await_dispatches 汇合，list_dispatches / cancel_dispatch，以及 wait 委派单项超时的到点处理。
+"""异步委派的结果台账和 await_dispatches 汇合，结果留给某一轮、合成一轮交回，list_dispatches / cancel_dispatch，
+以及 wait 委派单项超时的到点处理。
 
 都只在内存里：supervisor 重启后任务本身也不在了。带 _locked 的函数要求调用方持有 state._lock。
 """
@@ -15,8 +16,15 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from clonoth_runtime import load_runtime_config, task_max_running_seconds
-from engine.dispatch_batch import AWAIT_ANY, AWAITING_INPUT_KEY, AwaitRequest, DispatchTimeouts
+from engine.dispatch_batch import (
+    AWAIT_ANY,
+    AWAITING_INPUT_KEY,
+    INBOUND_CONFLICT_STATUS,
+    AwaitRequest,
+    DispatchTimeouts,
+)
 from engine.dispatch_handle import format_handle, parse_handle
+from engine.dispatch_results import INBOUND_RESULTS_KEY
 from engine.run_budget import lifetime_limit_seconds, lifetime_origin, parse_timestamp
 
 from . import child_retention
@@ -26,6 +34,7 @@ from .task_store import CancelEffect
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
 if TYPE_CHECKING:
+    from .session_reuse import InboundRefusal
     from .state import SupervisorState
 
 log = logging.getLogger(__name__)
@@ -46,6 +55,13 @@ DELIVERED_DROPPED = "dropped"
 _DELIVERED_PLACES = frozenset({DELIVERED_INBOUND, DELIVERED_JOIN})
 STATUS_RUNNING = "running"
 STATUS_UNAVAILABLE = "unavailable"
+# 结果为什么留着：await 过它的任务还活着，或者落点节点那一轮还没做完
+HOLD_AWAIT = "await"
+HOLD_ROUND = "round"
+# 和 task_router 里压缩 dispatch 挂起时写的标记是同一个键
+COMPACT_PENDING_KEY = "_compact_dispatch_pending"
+# 结果被 await 收走后撤掉的那一轮：它不是一次委派，不进台账，也不在 list_dispatches 里出现
+_WITHDRAWN_KEY = "_result_withdrawn"
 
 LEDGER_LIMIT = 512
 LEDGER_TTL = timedelta(hours=24)
@@ -57,7 +73,7 @@ _LIFETIME_MARGIN = timedelta(minutes=10)
 # 定时器早醒一点就会错过刚好到点的那一项
 _TIMER_SLACK_SEC = 0.05
 
-_NOT_FOUND = "找不到这个委派：句柄不对、不属于这段对话，或者它结束得太早、记录已经清掉了（那样的话结果早先已作为单独的消息交回过）。"
+_NOT_FOUND = "找不到这个委派：句柄不对、不属于这段对话，或者它结束得太早、记录已经清掉了（那样的话结果早先已经作为消息交回过）。"
 _INVALID_HANDLE = "句柄格式不对：要照抄委派结果里给的句柄（task_id@session_id）。"
 _SYNC_HANDLE = "这是 wait=true 同步委派的句柄，它的结果已经随那一批结果交回，不用再等。"
 _SYNC_HANDLE_RUNNING = "这是 wait=true 同步委派的句柄：它的结果只交给挂起等这一批的那个任务，await_dispatches 收不到。"
@@ -84,7 +100,11 @@ _VANISHED = "这个委派的任务记录已经不在了，拿不到它的结果�
 
 @dataclass
 class SettledDispatch:
-    """一个已经结束的异步委派。delivered 是结果第一次交到了哪里；held_for 非空时结果先留给那个任务，还没交出去。"""
+    """一个已经结束的异步委派。delivered 是结果第一次交到了哪里；held_for 非空时结果先留给那个任务，还没交出去，
+    hold 说明为什么留（await 过它，或落点节点那一轮还没做完）。
+
+    callback_task_id 是作为新消息交回时接它的那一轮；refs_session 是它引用的超长输出眼下复制到了哪个会话。
+    """
 
     task: Task
     status: str
@@ -93,6 +113,17 @@ class SettledDispatch:
     fallback_result: dict[str, Any] | None = None
     delivered: str = ""
     held_for: str = ""
+    hold: str = ""
+    callback_task_id: str = ""
+    refs_session: str = ""
+
+
+@dataclass(frozen=True)
+class DispatchDelivery:
+    """一次作为新消息交回：建出的那一轮（全部早先已经交回过时为 None），和这次算作已交回的子任务。"""
+
+    callback: Task | None
+    delivered: tuple[str, ...]
 
 
 @dataclass
@@ -249,10 +280,12 @@ def _settled_without_hook_locked(
 def settle_locked(
     state: "SupervisorState", task: Task, *, fallback_result: dict[str, Any] | None = None,
 ) -> bool:
-    """异步委派到了终点：记进台账；有汇合在等就交给汇合，留给某个还活着的任务就先留着。
+    """异步委派到了终点：记进台账；有汇合在等就交给汇合，留给某个还活着的、await 过它的任务就先留着。
 
     返回 True 表示结果已经有了去处，调用方不要再把它作为新消息交回。
     """
+    if task.input.get(_WITHDRAWN_KEY):
+        return True
     if not is_async_dispatch(task):
         return False
     registry = registry_locked(state)
@@ -261,6 +294,9 @@ def settle_locked(
     if record.delivered or record.held_for:
         # 同一次完成的路由重推：第一次已经交出去或留下了
         return True
+    if not record.refs_session:
+        # 完成路由在这之前已经按同一个读者复制过它引用的超长输出
+        record.refs_session = state._dispatch_result_reader_session_locked(task)
     waiter_id = registry.reserved.get(task.task_id, "")
     waiter = state.tasks.get(waiter_id) if waiter_id else None
     if waiter is None or not _alive(state, waiter, now):
@@ -268,7 +304,7 @@ def settle_locked(
         return False
     join = registry.joins.get(waiter_id)
     if join is not None and task.task_id in join.pending:
-        _claim_settled(registry, join, record)
+        _claim_settled(state, registry, join, record)
         log.info(
             "async dispatch %s settled into the join of task %s (status=%s)",
             task.task_id[:12], waiter_id[:12], record.status,
@@ -277,36 +313,115 @@ def settle_locked(
             _resume_join_locked(state, registry, join, timed_out=False)
         return True
     record.held_for = waiter_id
+    record.hold = HOLD_AWAIT
     log.info("async dispatch %s settled while task %s holds it; result kept for it", task.task_id[:12], waiter_id[:12])
     return True
 
 
-def mark_delivered_locked(state: "SupervisorState", task: Task) -> None:
-    """结果已经作为新消息交回发起方会话。"""
+def hold_for_round_locked(state: "SupervisorState", task: Task, holder: Task) -> bool:
+    """落点节点那一轮还没做完：结果先留给它，它能用 await_dispatches 收走，没收的等它结束或挂起等待时合成一轮交回。
+
+    结果不在台账里（不是异步委派）、已经交出去或留下了时返回 False，由调用方照常交回。
+    """
     registry = _existing_registry(state)
     record = registry.ledger.get(task.task_id) if registry is not None else None
-    if record is not None and not record.delivered:
-        record.delivered = DELIVERED_INBOUND
+    if record is None or record.delivered or record.held_for:
+        return False
+    record.held_for = holder.task_id
+    record.hold = HOLD_ROUND
+    log.info(
+        "result of async dispatch %s held for round %s (node=%s) until it ends",
+        task.task_id[:12], holder.task_id[:12], holder.node_id,
+    )
+    return True
 
 
-def _deliver_held_locked(state: "SupervisorState", record: SettledDispatch, *, drop: bool = False) -> None:
-    """留着的结果没人收了：照没有汇合时那样作为新消息交回。取消、打断的异步委派本来就不交回。
+def round_open_locked(state: "SupervisorState", task: Task, now: datetime | None = None) -> bool:
+    """这一轮还算没做完、新回来的结果该留给它：排队、在跑、为压缩挂起，或刚交回 dispatch 还没路由完。
 
-    drop 为真时收它的任务是被取消的，结果不再交回，免得任务停下之后又开出新任务。
+    wait、await 挂起的不算，免得结果被一个长时间挂起的任务压住；已被要求停下的也不算。
     """
-    record.held_for = ""
-    if drop:
-        record.delivered = DELIVERED_DROPPED
-        log.info("result of async dispatch %s dropped: the task holding it was cancelled", record.task.task_id[:12])
+    if state._task_cancel_pending_locked(task):
+        return False
+    if task.status == TaskStatus.suspended:
+        return bool(task.input.get(COMPACT_PENDING_KEY))
+    return _alive(state, task, now or _now())
+
+
+def release_round_holds_locked(state: "SupervisorState", task: Task) -> None:
+    """一轮挂起等子任务或 await_dispatches：留给它的结果不再压着，合成一轮交回；为压缩挂起的照旧留着。不会抛异常。"""
+    if task.input.get(COMPACT_PENDING_KEY):
         return
-    if record.fallback_result is None:
+    registry = _existing_registry(state)
+    if registry is None:
         return
-    if state._deliver_dispatch_result_inbound_locked(record.task, record.fallback_result):
+    try:
+        held = [
+            record for record in registry.ledger.values()
+            if record.held_for == task.task_id and record.hold == HOLD_ROUND
+        ]
+        if held:
+            _hand_back_locked(state, held, drop=False)
+    except Exception:
+        log.exception("handing back the results held for round %s failed", getattr(task, "task_id", "?"))
+
+
+def mark_delivered_locked(state: "SupervisorState", task: Task, delivery: DispatchDelivery) -> None:
+    """结果已经作为新消息交回落点会话：记下接它的是哪一轮，await 收走时还能从那一轮撤下。"""
+    registry = _existing_registry(state)
+    record = registry.ledger.get(task.task_id) if registry is not None else None
+    if record is not None:
+        _mark_inbound(record, delivery)
+
+
+def _mark_inbound(record: SettledDispatch, delivery: DispatchDelivery) -> None:
+    if record.task.task_id not in delivery.delivered:
+        return
+    if not record.delivered:
         record.delivered = DELIVERED_INBOUND
+    record.callback_task_id = delivery.callback.task_id if delivery.callback is not None else ""
+
+
+def _hand_back_locked(state: "SupervisorState", records: list[SettledDispatch], *, drop: bool) -> None:
+    """留着或收进汇合却没交出去的结果作为新消息交回：按落点分组，同一落点的合成一轮。取消、打断的异步委派本来就不交回。
+
+    drop 为真时持有它们的任务是被取消的，结果不再交回，免得任务停下之后又开出新任务；台账里还在，
+    list_dispatches 看得到，await_dispatches 还能收。
+    """
+    for record in records:
+        record.held_for = ""
+        record.hold = ""
+    if drop:
+        for record in records:
+            record.delivered = DELIVERED_DROPPED
+            log.info("result of async dispatch %s dropped: the task holding it was cancelled", record.task.task_id[:12])
+        return
+    groups: dict[tuple[str, str, str, str], list[tuple[SettledDispatch, Any]]] = {}
+    for record in sorted(records, key=lambda item: item.settled_at):
+        if record.fallback_result is None:
+            continue
+        home = state._dispatch_result_home_locked(record.task)
+        if home is None:
+            log.warning(
+                "result of async dispatch %s dropped: no session along its dispatch chain can take it",
+                record.task.task_id[:12],
+            )
+            continue
+        groups.setdefault(state._result_group_key_locked(home), []).append((record, home))
+    for members in groups.values():
+        for record, home in members:
+            _ensure_refs_locked(state, record, home.session_id)
+        delivery = state._deliver_dispatch_results_locked(
+            [(home, record.task, record.fallback_result or {}) for record, home in members],
+        )
+        for record, _home in members:
+            _mark_inbound(record, delivery)
 
 
 def release_if_ended_locked(state: "SupervisorState", task: Task) -> None:
-    """任务结束了：它的汇合作废，留给它的句柄放开，留着没收的结果作为新消息交回（任务是被取消的就丢掉）。不会抛异常。"""
+    """任务结束了：它的汇合作废，留给它的句柄放开，收进汇合没交出去的和留给它的结果合成新消息交回
+    （任务是被取消的就丢掉）。不会抛异常。
+    """
     registry = _existing_registry(state)
     if registry is None:
         return
@@ -326,27 +441,150 @@ def _release_waiter_locked(
     join = registry.joins.pop(waiter_id, None) or join
     waiter = state.tasks.get(waiter_id)
     drop = waiter is not None and waiter.status == TaskStatus.cancelled
+    returned: list[SettledDispatch] = []
     if join is not None:
         log.info("join of task %s dropped: the task ended or can no longer resume", waiter_id[:12])
-        _return_join_results_locked(state, registry, join, drop=drop)
+        returned.extend(_unreturned_join_results(registry, join))
     for child_id, holder in list(registry.reserved.items()):
         if holder == waiter_id:
             registry.reserved.pop(child_id, None)
-    for record in list(registry.ledger.values()):
-        if record.held_for == waiter_id:
-            _deliver_held_locked(state, record, drop=drop)
+    returned.extend(record for record in registry.ledger.values() if record.held_for == waiter_id)
+    if returned:
+        _hand_back_locked(state, returned, drop=drop)
 
 
-def _return_join_results_locked(
-    state: "SupervisorState", registry: AsyncDispatchRegistry, join: Join, *, drop: bool,
-) -> None:
-    """汇合没能交到调用方手里：收进汇合的结果照没有汇合时那样作为新消息交回，早先已经交回过的不再交。"""
+def _unreturned_join_results(registry: AsyncDispatchRegistry, join: Join) -> list[SettledDispatch]:
+    """汇合没能交到调用方手里时收进它的结果；早先已经交回过的不再交。"""
+    returned: list[SettledDispatch] = []
     for child_id in join.settled:
         record = registry.ledger.get(child_id)
         if child_id in join.earlier or record is None or record.delivered != DELIVERED_JOIN:
             continue
         record.delivered = ""
-        _deliver_held_locked(state, record, drop=drop)
+        returned.append(record)
+    return returned
+
+
+def reserved_waiter_locked(state: "SupervisorState", task: Task) -> Task | None:
+    """await 过这个委派、还活着的任务：结果交给它，它就是读结果的一方。"""
+    registry = _existing_registry(state)
+    waiter_id = registry.reserved.get(task.task_id, "") if registry is not None else ""
+    waiter = state.tasks.get(waiter_id) if waiter_id else None
+    return waiter if waiter is not None and _alive(state, waiter, _now()) else None
+
+
+def chains_to_keep_locked(state: "SupervisorState") -> set[str]:
+    """留着、或收进汇合还没交出去的结果，交回时要沿派发链重新找落点：这些链上的任务不能被清出内存。"""
+    registry = _existing_registry(state)
+    if registry is None:
+        return set()
+    in_joins = {child_id for join in registry.joins.values() for child_id in join.settled}
+    keep: set[str] = set()
+    for child_id, record in registry.ledger.items():
+        if record.held_for or child_id in in_joins:
+            keep |= _dispatch_chain_ids(state, record.task)
+    return keep
+
+
+def _ensure_refs_locked(state: "SupervisorState", record: SettledDispatch, target_session_id: str) -> None:
+    """结果引用的超长输出要在读它的一方的会话名下：读者变了在锁里补一次复制，这种情况很少。"""
+    if not target_session_id or target_session_id == record.refs_session:
+        return
+    refs = child_retention.result_refs(record.task)
+    source = record.refs_session or child_retention.archive_session(record.task)
+    if refs and source and source != target_session_id:
+        child_retention.adopt(
+            state.workspace_root, child_retention.RefAdoption(source, target_session_id, refs),
+        )
+    record.refs_session = target_session_id
+
+
+def _withdraw_from_callback_locked(state: "SupervisorState", record: SettledDispatch) -> bool:
+    """结果已作为新消息交回、接它的那一轮还没被领走：从那一轮撤下这条结果，改由收走它的 await 交出。
+
+    那一轮只有这一条结果就整轮撤掉；那一轮已经领走过、开跑过的撤不了，返回 False。
+    """
+    callback = state.tasks.get(record.callback_task_id) if record.callback_task_id else None
+    if (
+        callback is None
+        or callback.status != TaskStatus.pending
+        or callback.claim_id
+        or state._task_cancel_pending_locked(callback)
+    ):
+        return False
+    child_id = record.task.task_id
+    items = callback.input.get(INBOUND_RESULTS_KEY)
+    if isinstance(items, list) and len(items) > 1:
+        kept = [
+            item for item in items
+            if isinstance(item, dict) and str(item.get("inbound_child_task_id") or "") != child_id
+        ]
+        if not kept or len(kept) == len(items):
+            return False
+        _keep_callback_results(callback, kept)
+        log.info("result of async dispatch %s taken out of round %s", child_id[:12], callback.task_id[:12])
+        return True
+    if str(callback.input.get("inbound_child_task_id") or "") != child_id:
+        return False
+    callback.input[_WITHDRAWN_KEY] = True
+    # 撤掉不是用户取消：它排队时留给它的结果照常交回，不能随取消丢掉
+    registry = registry_locked(state)
+    held = [entry for entry in registry.ledger.values() if entry.held_for == callback.task_id]
+    for entry in held:
+        entry.held_for = ""
+        entry.hold = ""
+    state._cancel_task_locked(callback, _now(), reason="这条结果已被 await_dispatches 收走，这一轮不再需要")
+    log.info("round %s withdrawn: its only result %s was collected by an await", callback.task_id[:12], child_id[:12])
+    if held:
+        _hand_back_locked(state, held, drop=False)
+    return True
+
+
+def _keep_callback_results(callback: Task, kept: list[dict[str, Any]]) -> None:
+    """合并的那一轮撤下几条以后重写它的输入：顶层 inbound_* 照剩下的第一条，附件是剩下几条没外发的并集；只剩一条时退回单条格式。"""
+    for key in [key for key in callback.input if key.startswith("inbound_") and key != "inbound_message_type"]:
+        callback.input.pop(key, None)
+    first = kept[0]
+    callback.input.update({key: value for key, value in first.items() if key.startswith("inbound_")})
+    callback.input["instruction"] = str(first.get("text") or "")
+    callback.input["attachments"] = [
+        attachment
+        for item in kept
+        if isinstance(item.get("attachments"), list)
+        for attachment in item["attachments"]
+    ]
+    if any(item.get("inbound_attachments_outbound_sent") for item in kept):
+        callback.input["inbound_attachments_outbound_sent"] = True
+    else:
+        callback.input.pop("inbound_attachments_outbound_sent", None)
+    if len(kept) > 1:
+        callback.input[INBOUND_RESULTS_KEY] = kept
+
+
+def dispatcher_refusal_locked(state: "SupervisorState", payload: dict[str, Any]) -> "InboundRefusal | None":
+    """异步委派的入站：派出它的任务已经结束、或已被要求停下时拒收；派发方的记录不在内存里（旧回调链、已清理）照收。"""
+    origin = payload.get("dispatch_origin")
+    if not isinstance(origin, dict) or not origin:
+        return None
+    dispatcher_id = str(origin.get("caller_task_id") or "").strip()
+    dispatcher = state.tasks.get(dispatcher_id) if dispatcher_id else None
+    if dispatcher is None:
+        return None
+    # session_reuse 要在模块级引用这里的检查，反过来只能用到时再导入
+    from .session_reuse import InboundRefusal
+
+    if not _alive(state, dispatcher, _now()):
+        outcome = state._task_outcome_action(dispatcher) or dispatcher.status.value
+        return InboundRefusal(
+            INBOUND_CONFLICT_STATUS,
+            f"没有派出：发起这次委派的任务已经结束（{outcome}），不再派出新的异步委派。",
+        )
+    if state._task_cancel_pending_locked(dispatcher):
+        return InboundRefusal(
+            INBOUND_CONFLICT_STATUS,
+            "没有派出：发起这次委派的任务已被要求停下，不再派出新的异步委派。",
+        )
+    return None
 
 
 def _lifetime_end(task: Task) -> datetime:
@@ -484,7 +722,7 @@ def _admit_locked(
         holder = _record_holder(registry, join, record)
         if holder and _holder_alive_locked(state, holder, now):
             return f"另一个任务（{_short_id(holder)}）还在等这个结果，结果会交给它。"
-        _claim_settled(registry, join, record)
+        _claim_settled(state, registry, join, record)
         return ""
     holder = registry.reserved.get(child_id, "")
     if holder and holder != join.waiter_id and _holder_alive_locked(state, holder, now):
@@ -495,8 +733,8 @@ def _admit_locked(
 
 
 def _record_holder(registry: AsyncDispatchRegistry, join: Join, record: SettledDispatch) -> str:
-    """结果留给了别的任务，或者已经收进别的任务还没交出去的汇合：那个任务的 id。"""
-    if record.held_for and record.held_for != join.waiter_id:
+    """结果留给了别的任务的 await，或者已经收进别的任务还没交出去的汇合：那个任务的 id。留给某一轮的谁都能收。"""
+    if record.held_for and record.held_for != join.waiter_id and record.hold != HOLD_ROUND:
         return record.held_for
     child_id = record.task.task_id
     return next(
@@ -505,17 +743,29 @@ def _record_holder(registry: AsyncDispatchRegistry, join: Join, record: SettledD
     )
 
 
-def _claim_settled(registry: AsyncDispatchRegistry, join: Join, record: SettledDispatch) -> None:
-    """已经结束的委派算进汇合；结果早先交到过别处的，记下是哪里，交回时注明。"""
+def _claim_settled(
+    state: "SupervisorState", registry: AsyncDispatchRegistry, join: Join, record: SettledDispatch,
+) -> None:
+    """已经结束的委派算进汇合；结果早先交到过别处的，记下是哪里，交回时注明。
+
+    作为新消息交回、接它的那一轮还没被领走的，从那一轮撤下，算作这次才收到。
+    """
     child_id = record.task.task_id
     join.pending.discard(child_id)
     join.settled.add(child_id)
     registry.reserved.pop(child_id, None)
+    if record.delivered == DELIVERED_INBOUND and _withdraw_from_callback_locked(state, record):
+        record.delivered = ""
+        record.callback_task_id = ""
     if record.delivered in _DELIVERED_PLACES:
         join.earlier[child_id] = record.delivered
     else:
         record.delivered = DELIVERED_JOIN
     record.held_for = ""
+    record.hold = ""
+    waiter = state.tasks.get(join.waiter_id)
+    if waiter is not None:
+        _ensure_refs_locked(state, record, child_retention.archive_session(waiter))
 
 
 def _entry_locked(
@@ -608,7 +858,7 @@ def _catch_up_join_locked(state: "SupervisorState", registry: AsyncDispatchRegis
         record = registry.ledger.get(child_id) or _settled_without_hook_locked(state, registry, task, now)
         if record is None:
             continue
-        _claim_settled(registry, join, record)
+        _claim_settled(state, registry, join, record)
 
 
 def wait_cap(caller: Task) -> datetime:
@@ -859,7 +1109,16 @@ def _finished_item_locked(
         summary = _preview(inner.get("summary") or (task.result or {}).get("summary") or inner.get("text"))
         if summary:
             item["summary"] = summary
-    if record.held_for:
+    if record.held_for and record.hold == HOLD_ROUND:
+        mine = record.held_for == caller.task_id
+        item["delivered"] = "held_for_your_round" if mine else "held_for_round"
+        item["held_note"] = (
+            "结果先留着：你这一轮还没做完，可以用 await_dispatches 收走；没收的等这一轮结束后，和其他留着的结果合成一条消息交回。"
+            if mine else
+            f"结果先留着，等任务 {_short_id(record.held_for)} 那一轮做完后，和其他留着的结果合成一条消息交回；"
+            "也可以用 await_dispatches 收走。"
+        )
+    elif record.held_for:
         item["delivered"] = "held_for_you" if record.held_for == caller.task_id else "held"
     else:
         item["delivered"] = record.delivered or "not_delivered"
@@ -882,6 +1141,7 @@ def list_locked(state: "SupervisorState", caller_task_id: str) -> dict[str, Any]
     active = [
         task for task in state.tasks.values()
         if is_async_dispatch(task)
+        and not task.input.get(_WITHDRAWN_KEY)
         and task.task_id not in registry.ledger
         and not (state._task_terminal(task) and task.route_status == RouteStatus.routed)
         and state._task_family_root_locked(task) == root

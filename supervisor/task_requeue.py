@@ -1,4 +1,5 @@
-"""engine 中途退出时正在跑的任务：声明了 auto_continue 的节点任务有进展就重排一次，其余照旧取消。
+"""engine 中途退出时正在跑的任务：声明了 auto_continue 的节点任务有进展就重排一次，其余按失败收尾，
+原因写明是引擎重启打断的；系统内部流程和群里没人叫 bot 的插话照旧静默取消。
 
 进展看三处：挂起时记下的步数、engine 优雅退出时报的步数、对话存储里这个任务写过的 assistant 消息。
 """
@@ -16,8 +17,7 @@ from engine.interrupted_calls import INTERRUPTED_RESUME_TYPE
 from engine.run_budget import STEPS_USED_KEY, reported_step_count, steps_used
 
 from ._helpers import _now
-from .task_store import CancelEffect
-from .task_traits import REQUEUE_MARK, is_internal_task, node_auto_continues
+from .task_traits import REQUEUE_MARK, is_ambient_task, is_internal_task, node_auto_continues
 from .types import Task, TaskKind, TaskStatus
 
 if TYPE_CHECKING:
@@ -29,10 +29,29 @@ ENGINE_SHUTDOWN = "engine_shutdown"
 ENGINE_CRASH = "engine_crash"
 ENGINE_RESTART = "engine_restart"
 
+USER_INTERRUPTED_ERROR = "引擎重启，这一轮被打断了，说「继续」接着做。"
+# 委派出去的任务失败是交给上级节点看的：句柄和怎么 continue_from 由结果那边照保留的规矩给
+DELEGATE_INTERRUPTED_ERROR = "引擎重启打断了这个任务，没有做完。"
+INTERRUPTED_CANCEL_REASON = "引擎重启，任务已终止"
+DESCENDANT_CANCEL_REASON = "上级任务已失败"
+
+
+@dataclass(frozen=True)
+class OrphanSettlement:
+    """一次收拾孤儿的结果：重排、判失败、取消各几个。"""
+
+    requeued: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.requeued + self.failed + self.cancelled
+
 
 @dataclass(frozen=True)
 class Orphan:
-    """领取已经作废的 running 任务。重排还是取消，锁外查完进展再定。"""
+    """领取已经作废的 running 任务。重排还是收尾，锁外查完进展再定。"""
 
     task_id: str
     claim_id: str
@@ -128,6 +147,42 @@ def requeue_locked(state: "SupervisorState", task: Task, *, reason: str, steps: 
     state._event_task_snapshot("task_requeued", task)
 
 
+def interrupted_error(task: Task) -> str:
+    """被引擎重启打断的任务判失败时写的原因：用户那一轮告诉用户说「继续」，委派出去的告诉上级节点它没做完。"""
+    origin = task.input.get("_dispatch_origin")
+    delegated = bool((task.caller_task_id or "").strip()) or (isinstance(origin, dict) and bool(origin))
+    return DELEGATE_INTERRUPTED_ERROR if delegated else USER_INTERRUPTED_ERROR
+
+
+def silent_on_interrupt(task: Task) -> bool:
+    """被打断时照旧静默取消、不判失败的：系统内部流程（免得记一次压缩熔断），和群里没人叫 bot、它自己插话的那一轮。"""
+    return is_internal_task(task) or is_ambient_task(task)
+
+
+def fail_interrupted_locked(
+    state: "SupervisorState", task: Task, *, cancel_reason: str, now: datetime,
+) -> bool:
+    """被引擎重启打断、不重排的任务收尾：判失败并写明原因，返回 True；静默的那几类照旧强制取消，返回 False。"""
+    if silent_on_interrupt(task):
+        state._cancel_task_locked(task, now, force=True, reason=cancel_reason)
+        return False
+    state._fail_task_locked(task, error=interrupted_error(task), now=now, worker_gone=True)
+    return True
+
+
+def shutdown_failure(task: Task, result: Any) -> dict[str, Any] | None:
+    """engine 优雅退出时报回来的取消、又没能重排：改成失败结局，保留它报的步数和打断原因；静默的那几类和其余回报给 None。"""
+    if not isinstance(result, dict) or str(result.get("interrupted") or "") != ENGINE_SHUTDOWN:
+        return None
+    if str(result.get("action") or "").strip() != "cancelled" or silent_on_interrupt(task):
+        return None
+    failure = {key: value for key, value in result.items() if key != "action"}
+    failure["action"] = "fail"
+    failure["node_id"] = str(result.get("node_id") or task.node_id or task.tool_name or "")
+    failure["error"] = interrupted_error(task)
+    return failure
+
+
 def settle_orphans_locked(
     state: "SupervisorState",
     orphans: list[Orphan],
@@ -136,10 +191,14 @@ def settle_orphans_locked(
     reason: str,
     cancel_reason: str,
     now: datetime | None = None,
-) -> tuple[int, int]:
-    """重排或取消，返回 (重排几个, 取消几个)。锁外那段时间里状态或领取变了的任务不动。"""
+) -> OrphanSettlement:
+    """重排或收尾，返回各几个。锁外那段时间里状态或领取变了的任务不动。
+
+    不重排的判失败（静默的那几类照旧取消）；它派出去的同步后代连带取消，异步后代不连带。取消的个数含连带的后代。
+    """
     moment = now or _now()
-    requeued = cancelled = 0
+    orphan_ids = {orphan.task_id for orphan in orphans}
+    requeued = failed = cancelled = 0
     for orphan in orphans:
         task = state.tasks.get(orphan.task_id)
         if task is None or task.status != TaskStatus.running or str(task.claim_id or "") != orphan.claim_id:
@@ -149,11 +208,20 @@ def settle_orphans_locked(
             requeue_locked(state, task, reason=reason, steps=steps, now=moment)
             requeued += 1
             continue
-        # 父在子前：子任务结算时父已是终态，不会被先唤醒再取消
-        for target in (task, *state._live_descendants_locked(task.task_id)):
-            if state._cancel_task_locked(target, moment, force=True, reason=cancel_reason) is not CancelEffect.none:
-                cancelled += 1
-    return requeued, cancelled
+        # 父在子前：子任务结算时父已是终态，不会被先唤醒再收尾
+        descendants = state._live_descendants_locked(task.task_id)
+        if fail_interrupted_locked(state, task, cancel_reason=cancel_reason, now=moment):
+            failed += 1
+            # 判失败只请求在跑的后代停下，领着它们的 engine 已经不在，直接取消，免得之后又被单独判失败
+            for descendant in descendants:
+                if descendant.task_id in orphan_ids:
+                    state._cancel_task_locked(descendant, moment, force=True, reason=DESCENDANT_CANCEL_REASON)
+        else:
+            cancelled += 1
+            for descendant in descendants:
+                state._cancel_task_locked(descendant, moment, force=True, reason=cancel_reason)
+        cancelled += sum(1 for descendant in descendants if descendant.status == TaskStatus.cancelled)
+    return OrphanSettlement(requeued=requeued, failed=failed, cancelled=cancelled)
 
 
 def release_stale_claims_locked(state: "SupervisorState", worker_id: str) -> None:

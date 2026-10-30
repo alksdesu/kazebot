@@ -1,4 +1,4 @@
-"""engine 一侧的异步委派：派出后拿到句柄，await_dispatches 本轮最后挂起，list / cancel 转给 supervisor，wait 委派的单项超时，异步 fork 从调用方自己写对话的会话复制，恢复后的结果和异步结果前缀怎么写给模型。"""
+"""engine 一侧的异步委派：派出后拿到句柄，await_dispatches 本轮最后挂起，list / cancel 转给 supervisor，wait 委派的单项超时，异步 fork 从调用方自己写对话的会话复制，恢复后的结果和异步结果前缀怎么写给模型，一轮交回几条结果时怎么写、怎么落盘。"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -43,9 +44,13 @@ from engine.inference import pseudo_handlers  # noqa: E402
 from engine.inference.ai_step import _FINAL_STEP_REJECT_MESSAGE, _handle_tool_calls  # noqa: E402
 from engine.inference.pseudo_tools import _dispatch_control_specs, _dispatch_delegate_spec  # noqa: E402
 from engine.inference.resume_builder import DISPATCH_RESULT_TYPE, _build_resume_messages  # noqa: E402
+from engine import runner  # noqa: E402
+from engine.dispatch_results import INBOUND_DELIVERY_NOTE_KEY, INBOUND_RESULTS_KEY  # noqa: E402
 from engine.node import Node, ToolAccess  # noqa: E402
-from engine.protocol import ACTION_CANCELLED, ACTION_DISPATCH  # noqa: E402
-from engine.runner import _dispatch_result_headline  # noqa: E402
+from engine.protocol import ACTION_CANCELLED, ACTION_DISPATCH, TaskAction  # noqa: E402
+from engine.runner import _dispatch_handle_lines, _dispatch_result_headline  # noqa: E402
+from engine.tool_outputs import ToolOutputStore, mentioned_refs  # noqa: E402
+from toolbox.registry import ToolRegistry  # noqa: E402
 from toolbox.tool_names import PSEUDO_TOOL_NAMES, is_pseudo_tool_name  # noqa: E402
 
 TARGETS = ("scout", "helper")
@@ -654,7 +659,7 @@ class TestResumeRendering:
 
         assert message["content"] == (
             "子节点 scout（指令：crawl the docs）还在运行。\n"
-            "它的结果会留给你：之后再调用 await_dispatches 收取；本任务结束时还没收取的，会作为单独的消息交回。\n"
+            "它的结果会留给你：之后再调用 await_dispatches 收取；本任务结束时还没收取的，会和其他留着的结果合成一条消息交回。\n"
             f"句柄：{H1}"
         )
         assert message["_meta"] == {
@@ -717,3 +722,136 @@ class TestAsyncResultPrefix:
         headline, _label = _dispatch_result_headline({"inbound_child_status": "fail"}, "")
 
         assert headline.startswith("[Async task failed] Node unknown failed")
+
+    def test_a_question_whose_session_is_kept_says_how_to_answer_it(self) -> None:
+        fields = {"inbound_child_status": "ask", "inbound_child_continuable": True, "inbound_child_handle": H1}
+
+        headline, label = _dispatch_result_headline(fields, "scout")
+
+        assert headline.startswith(
+            "[Async task needs input] Node scout stopped to ask for more information; its session is kept."
+        )
+        assert "continue_from" in headline and label == "Question"
+        assert _dispatch_handle_lines(fields, H1, "scout") == [f"Handle: {H1}"]
+
+
+def _run_callback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_input: dict[str, Any]) -> AsyncMock:
+    """照 engine 收到一轮回调那样跑 _run_node_task，模型那一步换成桩；返回桩，看它收到的 instruction。"""
+    lead = Node(id="lead", type="ai", prompt="Work.", tool_mode="native")
+    load_real = runner.load_node
+    monkeypatch.setattr(runner, "load_node", lambda root, node_id: lead if node_id == "lead" else load_real(root, node_id))
+    monkeypatch.setattr(runner, "_fetch_session_provider_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_create_provider_from_registry", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(runner, "install_event_bridge", lambda *args, **kwargs: None)
+    run_ai_node = AsyncMock(return_value=TaskAction(action="finish", node_id="lead", result={"text": "done"}))
+    monkeypatch.setattr(runner, "run_ai_node", run_ai_node)
+    task = {"task_id": "callback-1", "node_id": "lead", "input": {"task_context": {}, **task_input}}
+
+    async def run_task() -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+        async with httpx.AsyncClient(transport=transport) as http:
+            await runner._run_node_task(
+                http=http, llm_http=http, sup_url="http://local", ws_root=tmp_path,
+                registry=ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools"),
+                task=task, worker_id="worker", session_id="callback-session", session_generation=1,
+                api_key="test", base_url="http://model.invalid", default_model="test",
+            )
+
+    asyncio.run(run_task())
+    return run_ai_node
+
+
+def _shown(run_ai_node: AsyncMock) -> str:
+    return str(run_ai_node.await_args.kwargs["instruction"])
+
+
+class TestCallbackRound:
+    def test_a_single_result_reads_and_is_stored_as_before(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_ai_node = _run_callback(tmp_path, monkeypatch, {
+            "instruction": "two pages", "inbound_message_type": "dispatch_result", "inbound_summary": "crawled",
+            "inbound_child_node_id": "scout", "inbound_child_task_id": "child-1", "inbound_child_status": "finish",
+            "inbound_child_handle": H1,
+        })
+
+        assert _shown(run_ai_node) == "\n".join([
+            "[Async task completed] Node scout finished.", f"Handle: {H1}", "Summary: crawled", "Result:\ntwo pages",
+        ])
+        [message] = stored(tmp_path, "callback-session")
+        assert message.content == "two pages" and message.message_type == DISPATCH_RESULT_TYPE
+        assert message.meta["child_task_id"] == "child-1" and message.meta["summary"] == "crawled"
+
+    def test_results_delivered_together_are_numbered_and_stored_one_by_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        note = '[Note] This async dispatch was made by sub-agent "b.node" (task b1), which has already finished.'
+        results = [
+            {
+                "inbound_child_node_id": "scout", "inbound_child_task_id": "child-1", "inbound_child_status": "finish",
+                "inbound_continues_task_id": "top-1", "text": "two pages", "attachments": [],
+            },
+            {
+                "inbound_child_node_id": "helper", "inbound_child_task_id": "child-2", "inbound_child_status": "fail",
+                INBOUND_DELIVERY_NOTE_KEY: note, "text": "[错误] disk full", "attachments": [],
+            },
+        ]
+
+        run_ai_node = _run_callback(tmp_path, monkeypatch, {
+            "instruction": "two pages", "inbound_message_type": "dispatch_result", "switched_from": "chat.entry",
+            **{key: value for key, value in results[0].items() if key.startswith("inbound_")},
+            INBOUND_RESULTS_KEY: results,
+        })
+
+        shown = _shown(run_ai_node)
+        assert shown.startswith("[系统提示：你当前是通过节点切换接管此会话的。")
+        assert "[2 async results] These dispatches came back while you were still busy" in shown
+        assert "(1/2) [Async task completed] Node scout finished.\nResult:\ntwo pages" in shown
+        assert (
+            "(2/2) [Async task failed] Node helper failed and returned no result. Do not guess its output.\n" + note
+        ) in shown
+        assert shown.endswith("Error:\n[错误] disk full")
+        messages = stored(tmp_path, "callback-session")
+        assert [message.content for message in messages] == ["two pages", "[错误] disk full"]
+        assert [message.meta["child_task_id"] for message in messages] == ["child-1", "child-2"]
+        assert {message.message_type for message in messages} == {DISPATCH_RESULT_TYPE}
+
+    def test_a_result_too_long_for_the_context_is_stored_and_shown_as_a_preview(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        long_text = "\n".join(f"line {index}: crawled page body" for index in range(4000))
+
+        run_ai_node = _run_callback(tmp_path, monkeypatch, {
+            "instruction": long_text, "inbound_message_type": "dispatch_result",
+            "inbound_child_node_id": "scout", "inbound_child_task_id": "child-1", "inbound_child_status": "finish",
+        })
+
+        [message] = stored(tmp_path, "callback-session")
+        assert len(message.content) < len(long_text)
+        [ref] = mentioned_refs(message.content)
+        assert ToolOutputStore(tmp_path).load("callback-session", ref) == long_text
+        assert _shown(run_ai_node).endswith(f"Result:\n{message.content}")
+
+    def test_a_result_with_nothing_in_it_says_so_and_is_still_stored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_ai_node = _run_callback(tmp_path, monkeypatch, {
+            "instruction": "", "inbound_message_type": "dispatch_result",
+            "inbound_child_node_id": "scout", "inbound_child_task_id": "child-1", "inbound_child_status": "finish",
+        })
+
+        assert _shown(run_ai_node) == (
+            "[Async task completed] Node scout finished.\nResult: (none: it ended without returning any content)"
+        )
+        [message] = stored(tmp_path, "callback-session")
+        assert message.content == "" and message.meta["child_task_id"] == "child-1"
+
+    def test_a_resumed_callback_round_is_not_shown_its_results_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_ai_node = _run_callback(tmp_path, monkeypatch, {
+            "instruction": "two pages", "inbound_message_type": "dispatch_result",
+            "inbound_child_node_id": "scout", "inbound_child_task_id": "child-1", "inbound_child_status": "finish",
+            "resume_data": {"type": "batch_results", "entries": []},
+        })
+
+        assert _shown(run_ai_node) == ""
+        assert stored(tmp_path, "callback-session") == []

@@ -47,10 +47,10 @@ RESUME_RESULT_TYPES = frozenset({"tool_results", "batch_results"})
 AWAIT_RUNNING = "running"
 AWAIT_UNAVAILABLE = "unavailable"
 _RUNNING_KEPT_NOTE = (
-    "它的结果会留给你：之后再调用 await_dispatches 收取；本任务结束时还没收取的，会作为单独的消息交回。"
+    "它的结果会留给你：之后再调用 await_dispatches 收取；本任务结束时还没收取的，会和其他留着的结果合成一条消息交回。"
 )
 _DELIVERED_EARLIER_NOTES = {
-    "inbound": "这个结果之前已经作为一条单独的消息交回过，那一轮可能已经处理或汇报过它，不要重复汇报。",
+    "inbound": "这个结果之前已经作为消息交回过，那一轮可能已经处理或汇报过它，不要重复汇报。",
     "join": "这个结果之前已经由另一次 await_dispatches 收到过。",
 }
 

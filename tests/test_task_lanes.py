@@ -366,6 +366,7 @@ class TestLaneAtCreation:
         child = _async_child(state, sid, user, suffix="cb")
         claimed_child = _claim(state)
         assert claimed_child is not None and claimed_child["task_id"] == child.task_id
+        _finish(state, claimed)
         _finish(state, claimed_child)
         [callback] = [
             task for task in state.tasks.values()

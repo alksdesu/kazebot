@@ -122,6 +122,22 @@ def _continuations(state: SupervisorState) -> list[Task]:
     ]
 
 
+def _callbacks(state: SupervisorState) -> list[Task]:
+    return [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
+
+
+def _async_child(state: SupervisorState, sid: str, caller: Task, *, caller_node: str, key: str) -> Task:
+    agent_sid = state.get_or_create_session(channel="qq_private", conversation_key=f"agent:{WORKER}:{CONV}:{key}")
+    return _inbound(
+        state, agent_sid, node=WORKER, text="重写导出",
+        dispatch_context_mode="fresh",
+        dispatch_origin={
+            "parent_session_id": sid, "caller_node_id": caller_node, "parent_conversation_key": CONV,
+            "context_mode": "fresh", "caller_task_id": caller.task_id,
+        },
+    )
+
+
 def _outbound_texts(state: SupervisorState) -> list[str]:
     return [
         str((event.get("payload") or {}).get("text") or "")
@@ -364,24 +380,37 @@ class TestDelegatedChildren:
         state = _state(workspace)
         sid = _session(state)
         caller = _inbound(state, sid, node=CHAT)
-        agent_sid = state.get_or_create_session(channel="qq_private", conversation_key=f"agent:{WORKER}:{CONV}:x1")
-        child = _inbound(
-            state, agent_sid, node=WORKER, text="重写导出",
-            dispatch_context_mode="fresh",
-            dispatch_origin={
-                "parent_session_id": sid, "caller_node_id": CHAT, "parent_conversation_key": CONV,
-                "context_mode": "fresh", "caller_task_id": caller.task_id,
-            },
-        )
+        child = _async_child(state, sid, caller, caller_node=CHAT, key="x1")
+        _report(state, caller, {"action": "finish", "result": {"text": "交给 worker 了"}})
 
         _report(state, child, _wrapup(reason="time"))
 
         assert _continuations(state) == []
-        [callback] = [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
+        [callback] = _callbacks(state)
         assert callback.node_id == CHAT
-        assert callback.input["inbound_child_handle"] == f"{child.task_id}@{agent_sid}"
+        assert callback.input["inbound_child_handle"] == f"{child.task_id}@{child.input['parent_session_id']}"
         assert callback.input["inbound_child_continuable"] is True
         assert callback.input["inbound_child_wrapup"] == "time"
+
+    def test_a_result_arriving_during_the_next_round_waits_for_it_but_not_for_the_one_after(
+        self, workspace: Path,
+    ) -> None:
+        state = _state(workspace)
+        sid = _session(state)
+        first = _inbound(state, sid)
+        child = _async_child(state, sid, first, caller_node=WORKER, key="x2")
+        _report(state, first, _wrapup(todos=PLAN))
+        [second] = _continuations(state)
+
+        _report(state, child, {"action": "finish", "result": {"text": "导出的测试补好了"}})
+
+        assert _callbacks(state) == []
+        _report(state, second, _wrapup(todos=PLAN))
+
+        assert len(_continuations(state)) == 2
+        [callback] = _callbacks(state)
+        assert callback.node_id == WORKER and callback.input["inbound_child_task_id"] == child.task_id
+        assert callback.input["inbound_continues_task_id"] == first.task_id
 
 
 class TestChainRecord:

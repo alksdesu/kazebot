@@ -1,4 +1,6 @@
-"""supervisor 一侧的异步委派：句柄和结局、await_dispatches 汇合、list / cancel 只认会话家族、取消顺着派发链往下走、wait 批次的单项超时、异步 fork 从分支复制。"""
+"""supervisor 一侧的异步委派：句柄和结局、结果交给谁、落点那一轮没做完时先留给它再合成一轮交回、await_dispatches 汇合、
+list / cancel 只认会话家族、取消顺着派发链往下走、派发方结束后不再收新委派、wait 批次的单项超时、异步 fork 从分支复制。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +22,9 @@ if str(_ROOT) not in sys.path:
 from engine.conversation_store import ConversationStore, Message  # noqa: E402
 from engine.dispatch_batch import AWAIT_KEY, AWAITING_INPUT_KEY  # noqa: E402
 from engine.dispatch_handle import format_handle  # noqa: E402
+from engine.dispatch_results import RESULT_FALLBACK_KEY  # noqa: E402
 from engine.run_budget import AUTO_CONTINUE_KEY, CHAIN_STARTED_AT_KEY  # noqa: E402
+from engine.tool_outputs import ToolOutputStore  # noqa: E402
 from supervisor import admin_api, async_dispatches  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -28,6 +32,7 @@ from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.task_reaper import reap_stuck_tasks_locked  # noqa: E402
+from supervisor.task_router import PostCompletionWork  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
 
 CONV = "qq_group:1001"
@@ -95,13 +100,13 @@ def _origin(session_id: str, caller: Task, *, mode: str = "fresh", caller_node: 
 
 def _async_child(
     state: SupervisorState, session_id: str, caller: Task, *, node: str = "a.node", text: str = "",
-    caller_node: str = "test.orchestrator",
+    caller_node: str = "test.orchestrator", mode: str = "fresh",
 ) -> Task:
     """照 engine 异步委派那样投一条带 dispatch_origin 的入站，子节点在自己的 agent: 会话里跑。"""
     agent_sid = state.get_or_create_session(channel="qq", conversation_key=f"agent:{node}:{CONV}:{uuid.uuid4()}")
     return _inbound(
         state, agent_sid, node=node, text=text,
-        dispatch_context_mode="fresh", dispatch_origin=_origin(session_id, caller, caller_node=caller_node),
+        dispatch_context_mode=mode, dispatch_origin=_origin(session_id, caller, mode=mode, caller_node=caller_node),
     )
 
 
@@ -162,6 +167,37 @@ def _callback_children(state: SupervisorState) -> list[str]:
     return [task.input["inbound_child_task_id"] for task in _callbacks(state)]
 
 
+def _callback_for(state: SupervisorState, child: Task) -> Task:
+    return next(task for task in _callbacks(state) if task.input.get("inbound_child_task_id") == child.task_id)
+
+
+def _result_inbounds(state: SupervisorState) -> list[dict[str, Any]]:
+    """异步委派结果交回时写下的入站事件：每条结果一条，合成一轮交回的也一样。"""
+    return [
+        event["payload"] for event in state.eventlog.events
+        if event["type"] == "inbound_message" and event["payload"].get("message_type") == "dispatch_result"
+    ]
+
+
+def _outbound_texts(state: SupervisorState) -> list[str]:
+    return [
+        str((event.get("payload") or {}).get("text") or "")
+        for event in state.eventlog.iter_persisted_events()
+        if event.get("type") == "outbound_message"
+    ]
+
+
+def _post_cleanup(state: SupervisorState, task: Task) -> None:
+    """跑一遍完成后的会话拆除那一步，和后台 post-work 里的是同一个函数。"""
+    with state._lock:
+        work = PostCompletionWork(
+            task=task.model_copy(deep=True),
+            route_session_id=state._route_session_id_for_task_locked(task),
+            session_generation=task.session_generation,
+        )
+    state._execute_post_cleanup(work, {"phase_id": f"test:{task.task_id}:cleanup", "kind": "cleanup"})
+
+
 def _expire(state: SupervisorState, *, after: timedelta) -> None:
     with state._lock:
         async_dispatches.expire_due_locked(state, now=datetime.now(timezone.utc) + after)
@@ -186,6 +222,7 @@ class TestOutcomes:
         sid = _session(state)
         caller = _inbound(state, sid)
         child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
 
         _report(state, child, result)
 
@@ -193,6 +230,7 @@ class TestOutcomes:
         assert callback.input["inbound_child_status"] == status
         assert callback.input["inbound_child_task_id"] == child.task_id
         assert callback.input["inbound_child_handle"] == _handle(child)
+        assert callback.input["inbound_continues_task_id"] == caller.task_id
 
     def test_an_outcome_it_does_not_know_is_left_out(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -246,7 +284,7 @@ class TestAwaitAll:
         early = _async_child(state, sid, caller)
         late = _async_child(state, sid, caller)
         _finish(state, early, "early result")
-        assert _callback_children(state) == [early.task_id]
+        assert _callbacks(state) == []
 
         _await(state, caller, _handle(early), _handle(late))
 
@@ -254,9 +292,28 @@ class TestAwaitAll:
         _finish(state, late, "late result")
         first, second = _entries(caller)
         assert first["status"] == "finish" and first["text"] == "early result"
-        assert first["delivered_earlier"] == "inbound"
+        assert "delivered_earlier" not in first
         assert second["text"] == "late result" and "delivered_earlier" not in second
-        assert _callback_children(state) == [early.task_id]
+        assert _callbacks(state) == []
+
+    def test_a_result_whose_round_has_already_started_is_marked_as_delivered_earlier(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        _finish(state, child, "result")
+        [callback] = _callbacks(state)
+        callback.status = TaskStatus.running
+        callback.claim_id = "claim-1"
+        waiter = _inbound(state, sid, node="d.node")
+
+        _await(state, waiter, _handle(child))
+
+        [entry] = _entries(waiter)
+        assert entry["text"] == "result" and entry["delivered_earlier"] == "inbound"
+        assert callback.status == TaskStatus.running
+        assert callback.input["inbound_child_task_id"] == child.task_id
 
     def test_an_await_on_dispatches_that_all_ended_resumes_at_once(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -270,8 +327,9 @@ class TestAwaitAll:
         assert caller.status == TaskStatus.pending
         [entry] = _entries(caller)
         assert entry["status"] == "fail" and entry["error"] == "boom"
-        assert entry["delivered_earlier"] == "inbound"
+        assert "delivered_earlier" not in entry
         assert caller.input["resume_data"]["await"]["timed_out"] is False
+        assert _callbacks(state) == []
 
 
 class TestAwaitAny:
@@ -490,6 +548,7 @@ class TestAwaitRefusals:
         assert stranger.status == TaskStatus.pending
         [entry] = _entries(stranger)
         assert entry["status"] == "unavailable" and "找不到这个委派" in entry["error"]
+        _finish(state, owner, "派出去了")
         _finish(state, child, "for the owner")
         [callback] = _callbacks(state)
         assert callback.input["inbound_child_task_id"] == child.task_id
@@ -629,8 +688,25 @@ class TestListAndCancel:
         assert active["dispatched_by"] == "you"
         [finished] = listed["finished"]
         assert finished["handle"] == _handle(done) and finished["status"] == "finish"
-        assert finished["summary"] == "summary text" and finished["delivered"] == "inbound"
+        assert finished["summary"] == "summary text" and finished["delivered"] == "held_for_your_round"
+        assert "await_dispatches" in finished["held_note"]
         assert listed["active_total"] == 1 and listed["finished_total"] == 1
+
+    def test_another_task_of_the_family_sees_whose_round_a_result_waits_for(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        done = _async_child(state, sid, caller)
+        _finish(state, done, "summary text")
+        other = _inbound(state, sid, node="d.node")
+
+        [finished] = async_dispatches.list_dispatches(state, other.task_id)["finished"]
+
+        assert finished["delivered"] == "held_for_round"
+        assert caller.task_id[:8] in finished["held_note"]
+        _finish(state, caller, "这一轮做完了")
+        [finished] = async_dispatches.list_dispatches(state, other.task_id)["finished"]
+        assert finished["delivered"] == "inbound" and "held_note" not in finished
 
     def test_another_conversation_sees_none_of_them(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -659,6 +735,7 @@ class TestListAndCancel:
         }
         assert target.status == TaskStatus.cancelled
         assert other.status == TaskStatus.pending
+        _finish(state, caller, "取消了一个")
         _finish(state, other, "still here")
         assert _callback_children(state) == [other.task_id]
 
@@ -770,9 +847,11 @@ class TestEndingTheWaiter:
     def test_a_cancelled_waiter_drops_what_it_collected(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         sid = _session(state)
+        dispatcher = _inbound(state, sid, node="d.node")
+        done = _async_child(state, sid, dispatcher, caller_node="d.node")
+        slow = _async_child(state, sid, dispatcher, caller_node="d.node")
+        _finish(state, dispatcher, "派出去了")
         caller = _inbound(state, sid)
-        done = _async_child(state, sid, caller)
-        slow = _async_child(state, sid, caller)
         _await(state, caller, _handle(done), _handle(slow))
         _finish(state, done, "collected")
 
@@ -810,6 +889,10 @@ class TestEndingTheWaiter:
         assert caller.status == TaskStatus.failed
         assert _callback_children(state) == [done.task_id]
         _finish(state, slow, "after the caller")
+        # 交回 done 的那一轮还没做完，slow 的结果先留给它
+        assert _callback_children(state) == [done.task_id]
+        [first] = _callbacks(state)
+        _finish(state, first, "看过了")
         assert _callback_children(state) == [done.task_id, slow.task_id]
 
     def test_cancelling_the_session_reaches_its_async_dispatches(self, tmp_path: Path) -> None:
@@ -850,6 +933,464 @@ class TestEndingTheWaiter:
         assert result == {"ok": True, "cancelled_count": 2}
         assert child.status == TaskStatus.cancelled
         assert unrelated.status == TaskStatus.pending
+
+
+class TestResultHomes:
+    def test_a_sync_middle_layer_hands_the_result_to_the_top_of_its_chain(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        [middle] = _wait_batch(state, top, _item("b.node"))
+        leaf = _async_child(state, sid, middle, node="c.node", caller_node="b.node")
+
+        _finish(state, leaf, "leaf result")
+
+        [callback] = _callbacks(state)
+        assert callback.node_id == "test.orchestrator"
+        assert callback.input["inbound_child_task_id"] == leaf.task_id
+        assert callback.input["inbound_continues_task_id"] == top.task_id
+        note = callback.input["inbound_delivery_note"]
+        assert '"b.node"' in note and '"c.node"' in note and "you ->" in note
+        [payload] = _result_inbounds(state)
+        assert payload["entry_node_id"] == "test.orchestrator" and payload["entry_node_pinned"] is True
+        assert payload["continues_task_id"] == top.task_id
+
+    def test_with_the_chain_records_gone_the_result_still_goes_to_the_top_node(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        [middle] = _wait_batch(state, top, _item("b.node"))
+        leaf = _async_child(state, sid, middle, node="c.node", caller_node="b.node")
+        assert leaf.input[RESULT_FALLBACK_KEY]["session_id"] == sid
+        assert leaf.input[RESULT_FALLBACK_KEY]["node_id"] == "test.orchestrator"
+        with state._lock:
+            state.tasks.pop(middle.task_id)
+            state.tasks.pop(top.task_id)
+
+        _finish(state, leaf, "leaf result")
+
+        [callback] = _callbacks(state)
+        assert callback.node_id == "test.orchestrator"
+        assert "inbound_continues_task_id" not in callback.input
+
+    def test_outputs_the_result_quotes_are_copied_to_the_conversation_that_reads_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        [middle] = _wait_batch(state, top, _item("b.node"))
+        leaf = _async_child(state, sid, middle, node="c.node", caller_node="b.node")
+        outputs = ToolOutputStore(tmp_path)
+        saved = outputs.save(leaf.input["parent_session_id"], "长输出\n" * 100)
+
+        _finish(state, leaf, f"全文见 ref={saved.ref}")
+
+        assert outputs.load(sid, saved.ref) == "长输出\n" * 100
+
+    def test_a_dispatch_from_the_node_that_receives_its_result_records_no_fallback(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+
+        child = _async_child(state, sid, caller)
+
+        assert RESULT_FALLBACK_KEY not in child.input
+
+    def test_a_fresh_middle_layer_that_ended_passes_the_result_up(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        middle = _async_child(state, sid, top, node="b.node")
+        middle_sid = middle.input["parent_session_id"]
+        leaf = _async_child(state, middle_sid, middle, node="c.node", caller_node="b.node")
+        _finish(state, top, "交给 b 了")
+        _finish(state, middle, "交给 c 了")
+        _post_cleanup(state, middle)
+        assert middle_sid not in state.sessions
+        [first] = _callbacks(state)
+        assert first.input["inbound_child_task_id"] == middle.task_id
+
+        _finish(state, leaf, "leaf result")
+
+        assert _callback_children(state) == [middle.task_id]
+        _finish(state, first, "收到")
+        second = _callback_for(state, leaf)
+        assert second.node_id == "test.orchestrator"
+        assert second.input["parent_session_id"] == sid
+        assert second.input["inbound_continues_task_id"] == top.task_id
+        assert '"b.node"' in second.input["inbound_delivery_note"]
+
+    def test_an_accumulate_middle_layer_continues_in_its_own_session(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        middle = _async_child(state, sid, top, node="b.node", mode="accumulate")
+        middle_sid = middle.input["parent_session_id"]
+        leaf = _async_child(state, middle_sid, middle, node="c.node", caller_node="b.node")
+        _finish(state, top, "交给 b 了")
+        _finish(state, middle, "交给 c 了")
+        _finish(state, _callback_for(state, middle), "收到")
+
+        _finish(state, leaf, "leaf result")
+
+        resumed = _callback_for(state, leaf)
+        assert resumed.node_id == "b.node"
+        assert resumed.input["parent_session_id"] == middle_sid
+        assert resumed.input["_dispatch_origin"]["caller_task_id"] == top.task_id
+        assert resumed.input["inbound_continues_task_id"] == middle.task_id
+        assert "inbound_delivery_note" not in resumed.input
+
+        _finish(state, resumed, "b 接着做完了")
+
+        assert "b 接着做完了" not in _outbound_texts(state)
+        relayed = _callback_for(state, resumed)
+        assert relayed.node_id == "test.orchestrator" and relayed.input["parent_session_id"] == sid
+        assert relayed.input["inbound_continues_task_id"] == top.task_id
+
+    def test_a_switched_conversation_still_hands_the_result_to_the_dispatching_node(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        state.session_entry_overrides[sid] = "other.node"
+
+        _finish(state, child, "result")
+
+        [callback] = _callbacks(state)
+        assert callback.node_id == "test.orchestrator"
+        [payload] = _result_inbounds(state)
+        assert payload["entry_node_pinned"] is True
+
+    def test_a_system_dispatcher_leaves_the_node_to_the_conversation_and_holds_nothing(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid, _system_task=True)
+        child = _async_child(state, sid, caller)
+
+        _finish(state, child, "result")
+
+        [payload] = _result_inbounds(state)
+        assert "entry_node_id" not in payload and "entry_node_pinned" not in payload
+        [callback] = _callbacks(state)
+        assert callback.input["inbound_continues_task_id"] == caller.task_id
+
+    def test_a_dispatch_that_returned_nothing_still_opens_a_round(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+
+        _finish(state, child, "")
+
+        [callback] = _callbacks(state)
+        assert callback.input["instruction"] == ""
+        assert callback.input["inbound_child_status"] == "finish"
+
+
+class TestHeldForTheRound:
+    def test_results_wait_for_the_round_and_come_back_together(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        first = _async_child(state, sid, caller, text="job 1")
+        second = _async_child(state, sid, caller, text="job 2")
+        caller.status = TaskStatus.running
+
+        _finish(state, first, "first result")
+        _fail(state, second, "second broke")
+
+        assert _callbacks(state) == []
+        _finish(state, caller, "这一轮先到这")
+
+        [callback] = _callbacks(state)
+        assert callback.node_id == "test.orchestrator"
+        assert callback.input["inbound_child_task_id"] == first.task_id
+        assert callback.input["inbound_continues_task_id"] == caller.task_id
+        results = callback.input["inbound_results"]
+        assert [item["inbound_child_task_id"] for item in results] == [first.task_id, second.task_id]
+        assert [item["inbound_child_status"] for item in results] == ["finish", "fail"]
+        assert results[0]["text"] == "first result" and results[1]["text"] == "[错误] second broke"
+        assert [payload["child_task_id"] for payload in _result_inbounds(state)] == [first.task_id, second.task_id]
+
+    def test_a_group_interjection_round_holds_nothing(self, tmp_path: Path) -> None:
+        """群里自己插话的那一轮不留结果：它被引擎重启时静默取消，留给它的结果会跟着丢，而那些结果是别的请求的。"""
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        interjection = _inbound(state, sid, route_hints={"delivery_purpose": "ambient"})
+        interjection.status = TaskStatus.running
+
+        _finish(state, child, "result")
+
+        [callback] = _callbacks(state)
+        assert callback.input["inbound_child_task_id"] == child.task_id
+
+    def test_the_round_can_collect_held_results_itself(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, child, "result")
+
+        _await(state, caller, _handle(child))
+
+        [entry] = _entries(caller)
+        assert entry["text"] == "result" and "delivered_earlier" not in entry
+        _finish(state, caller, "收到了")
+        assert _callbacks(state) == []
+
+    def test_a_round_that_suspends_to_wait_hands_its_held_results_back(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, child, "result")
+        assert _callbacks(state) == []
+
+        _wait_batch(state, caller, _item("b.node"))
+
+        assert caller.status == TaskStatus.suspended
+        assert _callback_children(state) == [child.task_id]
+
+    def test_a_round_suspended_for_compaction_keeps_them(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        with state._lock:
+            caller.input[async_dispatches.COMPACT_PENDING_KEY] = True
+            state._suspend_caller_locked(caller, waiting_task_id="compaction")
+
+        _finish(state, child, "result")
+
+        assert _callbacks(state) == []
+        with state._lock:
+            state._resume_compact_parent_locked(caller, "")
+        assert _callbacks(state) == []
+        _finish(state, caller, "压缩完接着做完了")
+        assert _callback_children(state) == [child.task_id]
+
+    def test_a_round_that_fails_hands_its_held_results_back(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, child, "result")
+        assert _callbacks(state) == []
+
+        _fail(state, caller, "模型出错")
+
+        assert _callback_children(state) == [child.task_id]
+
+    def test_a_cancelled_round_drops_them_but_they_can_still_be_collected(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, child, "result")
+
+        state.cancel_single_task(caller.task_id)
+
+        assert caller.status == TaskStatus.cancelled
+        assert _callbacks(state) == []
+        newcomer = _inbound(state, sid)
+        [finished] = async_dispatches.list_dispatches(state, newcomer.task_id)["finished"]
+        assert finished["delivered"] == "dropped"
+        _await(state, newcomer, _handle(child))
+        [entry] = _entries(newcomer)
+        assert entry["text"] == "result" and "delivered_earlier" not in entry
+
+    def test_a_queued_round_holds_them_and_hands_them_on_without_passing_them_to_the_next(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        queued = _inbound(state, sid, text="下一句")
+        later = _inbound(state, sid, text="再下一句")
+
+        _finish(state, child, "result")
+
+        assert _callbacks(state) == []
+        [finished] = async_dispatches.list_dispatches(state, queued.task_id)["finished"]
+        assert finished["delivered"] == "held_for_your_round"
+        _finish(state, queued, "回了下一句")
+        assert later.status == TaskStatus.pending
+        assert _callback_children(state) == [child.task_id]
+
+    def test_only_rounds_of_the_receiving_node_in_its_conversation_hold_results(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        _inbound(state, sid, node="d.node")
+        _inbound(state, _session(state, OTHER_CONV))
+
+        _finish(state, child, "result")
+
+        assert _callback_children(state) == [child.task_id]
+
+
+class TestCollectingWhatWasHandedBack:
+    def test_an_await_takes_the_result_back_from_a_round_that_has_not_started(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        _finish(state, child, "result")
+        [callback] = _callbacks(state)
+        waiter = _inbound(state, sid, node="d.node")
+
+        _await(state, waiter, _handle(child))
+
+        [entry] = _entries(waiter)
+        assert entry["text"] == "result" and "delivered_earlier" not in entry
+        assert callback.status == TaskStatus.cancelled
+
+    def test_an_await_takes_one_result_out_of_a_merged_round(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        first = _async_child(state, sid, caller)
+        second = _async_child(state, sid, caller)
+        _finish(state, first, "first result")
+        _finish(state, second, "second result")
+        _finish(state, caller, "这一轮先到这")
+        [callback] = _callbacks(state)
+        assert len(callback.input["inbound_results"]) == 2
+        waiter = _inbound(state, sid, node="d.node")
+
+        _await(state, waiter, _handle(first))
+
+        [entry] = _entries(waiter)
+        assert entry["text"] == "first result" and "delivered_earlier" not in entry
+        assert callback.status == TaskStatus.pending
+        assert "inbound_results" not in callback.input
+        assert callback.input["inbound_child_task_id"] == second.task_id
+        assert callback.input["instruction"] == "second result"
+
+    def test_a_withdrawn_round_still_hands_back_what_was_held_for_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        first = _async_child(state, sid, caller)
+        second = _async_child(state, sid, caller)
+        _finish(state, caller, "派出去了")
+        _finish(state, first, "first result")
+        [callback] = _callbacks(state)
+        _finish(state, second, "second result")
+        assert _callback_children(state) == [first.task_id]
+        waiter = _inbound(state, sid, node="d.node")
+
+        _await(state, waiter, _handle(first))
+
+        assert callback.status == TaskStatus.cancelled
+        assert _callback_for(state, second).status == TaskStatus.pending
+
+
+class TestCancelReach:
+    def test_cancelling_a_finished_dispatch_reaches_the_round_that_continues_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _inbound(state, sid)
+        middle = _async_child(state, sid, top, node="b.node", mode="accumulate")
+        leaf = _async_child(state, middle.input["parent_session_id"], middle, node="c.node", caller_node="b.node")
+        _finish(state, top, "交给 b 了")
+        _finish(state, middle, "交给 c 了")
+        _finish(state, leaf, "leaf result")
+        resumed = _callback_for(state, leaf)
+        canceller = _inbound(state, sid, node="d.node")
+
+        result = async_dispatches.cancel_dispatch(state, canceller.task_id, _handle(middle))
+
+        assert result["ok"] is True and result["already_finished"] is True
+        assert resumed.status == TaskStatus.cancelled
+
+    def test_cancelling_a_node_takes_down_what_its_rounds_dispatched(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        dispatched = _async_child(state, sid, caller)
+        [helper] = _wait_batch(state, caller, _item("b.node"))
+        bystander = _inbound(state, sid, node="d.node")
+
+        state.cancel_active_tasks(sid, node_id="test.orchestrator")
+
+        assert caller.status == TaskStatus.cancelled
+        assert helper.status == TaskStatus.cancelled
+        assert dispatched.status == TaskStatus.cancelled
+        assert bystander.status == TaskStatus.pending
+
+    def test_cancelling_from_inside_an_async_dispatch_spares_the_tasks_above_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        child = _async_child(state, sid, caller)
+        _await(state, caller, _handle(child))
+        other = _inbound(state, sid)
+
+        result = state.cancel_active_tasks(sid, exclude_task_id=child.task_id)
+
+        assert result == {"ok": True, "cancelled_count": 1}
+        assert caller.status == TaskStatus.suspended
+        assert child.status == TaskStatus.pending
+        assert other.status == TaskStatus.cancelled
+
+
+class TestDispatcherRefusal:
+    @staticmethod
+    def _refusal(state: SupervisorState, sid: str, dispatcher_id: str) -> Any:
+        payload = {"dispatch_origin": {
+            "parent_session_id": sid, "caller_node_id": "test.orchestrator", "parent_conversation_key": CONV,
+            "context_mode": "fresh", "caller_task_id": dispatcher_id,
+        }}
+        with state._lock:
+            return async_dispatches.dispatcher_refusal_locked(state, payload)
+
+    def test_a_dispatcher_still_at_work_may_dispatch(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+
+        assert self._refusal(state, sid, caller.task_id) is None
+
+    def test_a_dispatcher_that_ended_may_not(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        _finish(state, caller, "做完了")
+
+        refusal = self._refusal(state, sid, caller.task_id)
+
+        assert refusal is not None and refusal.status == 409
+        assert "已经结束" in refusal.message and "finish" in refusal.message
+
+    def test_a_dispatcher_asked_to_stop_may_not(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        caller.status = TaskStatus.running
+        caller.worker_id = "worker-1"
+        caller.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+        state.cancel_single_task(caller.task_id)
+        assert caller.status == TaskStatus.running
+
+        refusal = self._refusal(state, sid, caller.task_id)
+
+        assert refusal is not None and refusal.status == 409 and "要求停下" in refusal.message
+
+    def test_a_dispatcher_no_longer_in_memory_and_ordinary_messages_are_not_judged(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+
+        assert self._refusal(state, sid, "gone-task") is None
+        with state._lock:
+            assert async_dispatches.dispatcher_refusal_locked(state, {"text": "你好"}) is None
 
 
 class TestWaitItemTimeout:

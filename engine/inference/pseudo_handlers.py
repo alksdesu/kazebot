@@ -757,7 +757,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     """处理 dispatch:{target_id} 动态伪工具（异步委派）。始终返回 None（非终止）。
 
     委派是一条带 dispatch_origin 回调信息的 inbound（POST /v1/inbound）：子节点在自己的 agent: 会话里跑，
-    和用户消息共用会话、入口分支和对话存储；做完后结果作为新消息注入回发起方会话。
+    和用户消息共用会话、入口分支和对话存储；做完后结果交回发起方会话：发起方那一轮还没做完时先留给它，结束后作为新消息交回。
     """
     # wait 写了认不出的值也会走到这里：按异步派出去的话，想等结果的调用方拿到的只是一个句柄
     if _wait_flag(args) is None:
@@ -903,12 +903,12 @@ def _async_dispatch_result(target: str, body: Any, *, isolation: dict[str, str] 
         result["handle"] = handle
         result["status"] = "dispatched"
         result["message"] = (
-            f"已异步委派给 {target}{where}，结果稍后会作为一条新消息送达。要在本任务里等它，"
-            f"用 {AWAIT_DISPATCHES_TOOL_NAME} 带上这个 handle；用 {LIST_DISPATCHES_TOOL_NAME} 查看进度，"
-            f"用 {CANCEL_DISPATCH_TOOL_NAME} 取消。"
+            f"已异步委派给 {target}{where}。结果回来时你这一轮还没做完，就先留给这一轮：要在本任务里拿结果，"
+            f"用 {AWAIT_DISPATCHES_TOOL_NAME} 带上这个 handle；没收取的等这一轮结束后，和其他回来的结果合成一条消息交回。"
+            f"用 {LIST_DISPATCHES_TOOL_NAME} 查看进度，用 {CANCEL_DISPATCH_TOOL_NAME} 取消。"
         )
     else:
-        result["message"] = f"已异步委派给 {target}{where}，结果稍后会作为一条新消息送达。"
+        result["message"] = f"已异步委派给 {target}{where}，结果等你这一轮结束后作为消息交回。"
     result.update(isolated)
     return result
 

@@ -7,6 +7,7 @@ import os
 import signal
 import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,16 +43,24 @@ from .model import (
 )
 from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
-from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
+from .inference.loop_state import (
+    attach_node_scope,
+    context_archive_session_id,
+    conversation_writer,
+    flush_conversation_writes,
+)
 from .inference.message_model import apply_reasoning_content
 from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allowed
+from .inference.resume_builder import bound_dispatch_text
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, entry_node_problem, load_node, missing_node_reason, node_file, node_files
 from .tool_reload import ToolReloadFollower, fetch_reload_seqs
+from .tool_outputs import tool_output_limits
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
+from .dispatch_results import INBOUND_DELIVERY_NOTE_KEY, INBOUND_RESULTS_KEY
 from .interrupted_calls import INTERRUPTED_RESUME_TYPE, append_interrupted_results
 from .isolation_notice import task_isolation
 from .project_root import INBOUND_CHILD_WORKTREE_KEY, isolation_error, task_project_origin, task_project_root
@@ -579,9 +588,14 @@ async def _register_engine(
         )
         if r.status_code == 200:
             data = r.json()
-            orphans = data.get("orphans_cancelled", 0)
-            if orphans:
-                print(f"[engine] registered generation {generation_id[:8]}, cancelled {orphans} orphan(s)", flush=True)
+            failed = data.get("orphans_failed", 0)
+            cancelled = data.get("orphans_cancelled", 0)
+            if failed or cancelled:
+                print(
+                    f"[engine] registered generation {generation_id[:8]}, "
+                    f"failed {failed} and cancelled {cancelled} orphan(s)",
+                    flush=True,
+                )
             else:
                 print(f"[engine] registered generation {generation_id[:8]}", flush=True)
             return data
@@ -1005,23 +1019,40 @@ _ASYNC_RESULT_HEADLINES = {
     ),
     "fail": "[Async task failed] Node {node} failed and returned no result. Do not guess its output.",
 }
+# 问问题结束、子会话留着可以接着做的：补齐信息后带句柄接着派，它从停下的地方往下做
+_ASK_CONTINUABLE_HEADLINE = (
+    "[Async task needs input] Node {node} stopped to ask for more information; its session is kept. "
+    "Once you have the missing details, dispatch to it again with continue_from set to the handle below "
+    "and include them, and it picks up where it stopped."
+)
 _ASYNC_RESULT_LABELS = {"finish": "Result", "ask": "Question", "fail": "Error"}
+_EMPTY_RESULT_BODY = "(none: it ended without returning any content)"
 
 
-def _dispatch_result_headline(input_data: dict[str, Any], node_id: str) -> tuple[str, str]:
+def _dispatch_result_headline(input_data: Mapping[str, Any], node_id: str) -> tuple[str, str]:
     """异步委派结果前缀的第一行和正文的标签；没带结局的旧入站按完成写。"""
     status = str(input_data.get("inbound_child_status") or "").strip()
     if status not in _ASYNC_RESULT_HEADLINES:
         status = "finish"
+    if status == "ask" and _ask_can_continue(input_data):
+        return _ASK_CONTINUABLE_HEADLINE.format(node=node_id or "unknown"), _ASYNC_RESULT_LABELS[status]
     return _ASYNC_RESULT_HEADLINES[status].format(node=node_id or "unknown"), _ASYNC_RESULT_LABELS[status]
 
 
-def _dispatch_handle_lines(input_data: dict[str, Any], handle: str, node_id: str) -> list[str]:
-    """异步委派结果前缀里的句柄；子会话为接着做留着时，再说明怎么用 continue_from。"""
+def _ask_can_continue(input_data: Mapping[str, Any]) -> bool:
+    return bool(input_data.get("inbound_child_continuable")) and bool(
+        str(input_data.get("inbound_child_handle") or "").strip()
+    )
+
+
+def _dispatch_handle_lines(input_data: Mapping[str, Any], handle: str, node_id: str) -> list[str]:
+    """异步委派结果前缀里的句柄；子会话为接着做留着时，再说明怎么用 continue_from（问问题的第一行已经说了）。"""
     if not handle:
         return []
     lines = [f"Handle: {handle}"]
     if not bool(input_data.get("inbound_child_continuable")):
+        return lines
+    if str(input_data.get("inbound_child_status") or "").strip() == "ask":
         return lines
     target = node_id or "the same node"
     wrapup = str(input_data.get("inbound_child_wrapup") or "").strip()
@@ -1036,6 +1067,129 @@ def _dispatch_handle_lines(input_data: dict[str, Any], handle: str, node_id: str
             f"To let it pick up where it stopped, dispatch to {target} again with continue_from set to this handle."
         )
     return lines
+
+
+def _inbound_message_meta(fields: Mapping[str, Any], route_meta: Mapping[str, Any], tool_status: str) -> dict[str, Any]:
+    """入站那条用户消息落盘时的 meta：路由标记，派发回调的 child_* 和摘要单独放，正文只存子节点的原始结果。"""
+    meta: dict[str, Any] = dict(route_meta)
+    summary = str(fields.get("inbound_summary") or "").strip()
+    if summary:
+        meta["summary"] = summary
+    child_session_id = str(fields.get("inbound_child_session_id") or "").strip()
+    if child_session_id:
+        meta["child_session_id"] = child_session_id
+    child_task_id = str(fields.get("inbound_child_task_id") or fields.get("inbound_task_id") or "").strip()
+    if child_task_id:
+        meta["child_task_id"] = child_task_id
+    child_node_id = str(fields.get("inbound_child_node_id") or fields.get("inbound_node_id") or "").strip()
+    if child_node_id:
+        meta["child_node_id"] = child_node_id
+    caller_node_id = str(fields.get("inbound_caller_node_id") or "").strip()
+    if caller_node_id:
+        meta["caller_node_id"] = caller_node_id
+    child_handle = str(fields.get("inbound_child_handle") or "").strip()
+    if child_handle:
+        meta["child_handle"] = child_handle
+    child_status = str(fields.get("inbound_child_status") or "").strip()
+    if child_status:
+        meta["child_status"] = child_status
+    child_worktree = worktree_brief(fields.get(INBOUND_CHILD_WORKTREE_KEY))
+    if child_worktree:
+        meta["child_worktree"] = child_worktree
+    if tool_status:
+        meta["tool_status"] = tool_status
+    return meta
+
+
+def _dispatch_result_items(
+    input_data: Mapping[str, Any], instruction: str, attachments: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """这一轮交回的异步委派结果，一条一项：合并交回的读 inbound_results，单条的就是这一轮自己的输入。"""
+    raw = input_data.get(INBOUND_RESULTS_KEY)
+    items = [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    if len(items) > 1:
+        return items
+    single = {key: value for key, value in input_data.items() if key.startswith("inbound_") and key != INBOUND_RESULTS_KEY}
+    single["text"] = instruction
+    single["attachments"] = list(attachments or [])
+    return [single]
+
+
+async def _bounded_dispatch_items(
+    rctx: Any, runtime_cfg: dict[str, Any], items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """超长的子任务正文落盘换成带 ref 的预览，落进历史和给模型的都是它，和同步委派的结果一个做法。"""
+    limits = tool_output_limits(runtime_cfg)
+    archive_session = context_archive_session_id(rctx)
+    bounded: list[dict[str, Any]] = []
+    for item in items:
+        text = str(item.get("text") or "")
+        node_id = str(item.get("inbound_child_node_id") or item.get("inbound_node_id") or "").strip()
+        shown = await asyncio.to_thread(
+            bound_dispatch_text, rctx.workspace_root, archive_session, node_id, text, limits,
+        )
+        bounded.append({**item, "text": shown} if shown != text else item)
+    return bounded
+
+
+def _dispatch_result_message(
+    item: Mapping[str, Any],
+    *,
+    route_meta: Mapping[str, Any],
+    tool_status: str,
+    ws_root: Path,
+    node_id: str,
+    task_id: str,
+) -> Message:
+    """一条异步委派结果落盘的样子：正文是子节点的原始结果，带附件时存发给模型的同一份多模态内容。"""
+    text = str(item.get("text") or "")
+    attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else None
+    content: Any = build_multimodal_content(text, attachments, workspace_root=ws_root) if attachments else text
+    return Message(
+        id=str(uuid.uuid4()),
+        role="user",
+        content=content,
+        message_type="dispatch_result",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        meta=_inbound_message_meta(item, route_meta, tool_status),
+        source_node_id=node_id,
+        source_task_id=task_id,
+    )
+
+
+def _dispatch_result_block(item: Mapping[str, Any], worktree_notes: Any) -> str:
+    """给模型看的一条异步委派结果：结局、句柄和怎么接着派、摘要、隔离副本、交回说明，最后是原始结果。"""
+    node_id = str(item.get("inbound_child_node_id") or item.get("inbound_node_id") or "").strip()
+    handle = str(item.get("inbound_child_handle") or "").strip()
+    headline, label = _dispatch_result_headline(item, node_id)
+    parts = [headline, *_dispatch_handle_lines(item, handle, node_id)]
+    summary = str(item.get("inbound_summary") or "").strip()
+    if summary:
+        parts.append(f"Summary: {summary}")
+    child_worktree = item.get(INBOUND_CHILD_WORKTREE_KEY)
+    if child_worktree:
+        parts.extend(worktree_notes(child_worktree))
+    note = str(item.get(INBOUND_DELIVERY_NOTE_KEY) or "").strip()
+    if note:
+        parts.append(note)
+    body = str(item.get("text") or "")
+    if body.strip() or summary:
+        parts.append(f"{label}:\n{body}")
+    else:
+        parts.append(f"{label}: {_EMPTY_RESULT_BODY}")
+    return "\n".join(parts)
+
+
+def _dispatch_results_instruction(blocks: list[str]) -> str:
+    """一轮交回几条结果时给模型的输入：先说有几条，再逐条编号；只有一条时就是那一条。"""
+    if len(blocks) == 1:
+        return blocks[0]
+    total = len(blocks)
+    header = (
+        f"[{total} async results] These dispatches came back while you were still busy and are delivered "
+        "together. Go through every one of them."
+    )
+    return "\n\n".join([header, *(f"({index}/{total}) {block}" for index, block in enumerate(blocks, 1))])
 
 
 async def _build_node_provider(
@@ -1279,8 +1433,10 @@ async def _run_node_task(
     # 如果是被 switch 过来的节点，在 instruction 前注入提示
     instruction = str(input_data.get("instruction") or "").strip()
     switched_from = str(input_data.get("switched_from") or "").strip()
+    _switched_note = ""
     if switched_from:
-        instruction = f"[系统提示：你当前是通过节点切换接管此会话的。会话的默认入口节点是 {switched_from}。用户可以要求切回默认节点，你可以使用 switch_node 工具（target 传空字符串）恢复默认。]\n\n{instruction}"
+        _switched_note = f"[系统提示：你当前是通过节点切换接管此会话的。会话的默认入口节点是 {switched_from}。用户可以要求切回默认节点，你可以使用 switch_node 工具（target 传空字符串）恢复默认。]"
+        instruction = f"{_switched_note}\n\n{instruction}"
 
     # Step 2（2026-04-16）：主节点 ConversationStore 模式下的 resume 去重保护。
     # resume 时（compact_done / child_result / child_preempted 等），JSONL 已包含原
@@ -1288,95 +1444,68 @@ async def _run_node_task(
     # 会破坏对话顺序并复发图片附件。旧 snapshot 路径下此 case 通过 snapshot.messages
     # 直接回放解决，新路径下需要在这里把 instruction 和 attachments 清空。
     # message_assembly.py 同步改为 instruction 为空且无 attachments 时不追加末尾消息。
-    if (_main_conv_enabled or child_session_id) and is_resume:
+    _turn_input_cleared = bool((_main_conv_enabled or child_session_id) and is_resume)
+    if _turn_input_cleared:
         instruction = ""
         input_attachments = None
 
     # 本轮用户输入写进运行 session（子节点写 child session），分支合并前历史才完整；
     # resume 时 instruction 还是原先那条，首次进入时已经写过，不再写
     _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
-    _inbound_summary = str(input_data.get("inbound_summary") or "").strip()
-    _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
-    _inbound_child_task_id = str(
-        input_data.get("inbound_child_task_id")
-        or input_data.get("inbound_task_id")
-        or ""
-    ).strip()
-    _inbound_node_id = str(
-        input_data.get("inbound_child_node_id")
-        or input_data.get("inbound_node_id")
-        or ""
-    ).strip()
-    _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
-    _inbound_child_handle = str(input_data.get("inbound_child_handle") or "").strip()
-    # dispatch_result 只带摘要、没有正文时也要留一条回调记录
-    _should_write_user_input = bool(
-        instruction
-        or input_attachments
-        or (_inbound_message_type == "dispatch_result" and _inbound_summary)
+    _async_tool_status = async_result_tool_status(rctx.task_context)
+    # 异步委派结果一条一项：合并交回的几条各落一条回调记录，正文和摘要都空的也留一条
+    _dispatch_items = (
+        _dispatch_result_items(input_data, instruction, input_attachments)
+        if _inbound_message_type == "dispatch_result" else []
     )
-    if _should_write_user_input and _conv_store and not is_resume:
-        from datetime import datetime, timezone
+    if _dispatch_items and not _turn_input_cleared:
+        _dispatch_items = await _bounded_dispatch_items(rctx, runtime_cfg, _dispatch_items)
+    if _conv_store and not is_resume and (_dispatch_items or instruction or input_attachments):
         _target_sid = child_session_id or session_id
-        # 带附件时落盘发给模型的同一份多模态内容，本任务后续步骤重载历史还看得到图
-        if input_attachments:
-            _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
-        else:
-            _user_content = instruction
-        # 派发回调的 child_* 和摘要单独进 meta，正文只存子节点的原始结果
-        _inbound_meta: dict[str, Any] = dict(_route_meta)
-        if _inbound_summary:
-            _inbound_meta["summary"] = _inbound_summary
-        if _inbound_child_session_id:
-            _inbound_meta["child_session_id"] = _inbound_child_session_id
-        if _inbound_child_task_id:
-            _inbound_meta["child_task_id"] = _inbound_child_task_id
-        if _inbound_node_id:
-            _inbound_meta["child_node_id"] = _inbound_node_id
-        if _inbound_caller_node_id:
-            _inbound_meta["caller_node_id"] = _inbound_caller_node_id
-        if _inbound_child_handle:
-            _inbound_meta["child_handle"] = _inbound_child_handle
-        _inbound_child_status = str(input_data.get("inbound_child_status") or "").strip()
-        if _inbound_child_status:
-            _inbound_meta["child_status"] = _inbound_child_status
-        _inbound_worktree = worktree_brief(input_data.get(INBOUND_CHILD_WORKTREE_KEY))
-        if _inbound_worktree:
-            _inbound_meta["child_worktree"] = _inbound_worktree
-        _async_tool_status = async_result_tool_status(rctx.task_context)
-        if _async_tool_status:
-            _inbound_meta["tool_status"] = _async_tool_status
-        _user_msg = Message(
+        _input_messages = [
+            _dispatch_result_message(
+                _item, route_meta=_route_meta, tool_status=_async_tool_status,
+                ws_root=ws_root, node_id=node.id, task_id=task_id,
+            )
+            for _item in _dispatch_items
+        ] or [Message(
             id=str(uuid.uuid4()),
             role="user",
-            content=_user_content,
+            # 带附件时落盘发给模型的同一份多模态内容，本任务后续步骤重载历史还看得到图
+            content=(
+                build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
+                if input_attachments else instruction
+            ),
             message_type=_inbound_message_type or MessageType.USER_INPUT,
             created_at=datetime.now(timezone.utc).isoformat(),
-            meta=_inbound_meta,
+            meta=_inbound_message_meta(input_data, _route_meta, _async_tool_status),
             source_node_id=node.id,
             source_task_id=task_id,
-        )
-        conversation_writer(rctx).submit(_target_sid, _user_msg)
+        )]
+        for _input_message in _input_messages:
+            conversation_writer(rctx).submit(_target_sid, _input_message)
 
-    if _inbound_message_type == "dispatch_result":
+    if _dispatch_items and not _turn_input_cleared:
         # [AutoC 2026-06-04] Why: the model still needs context that this inbound came
         # from an async child task, but that presentation must not be persisted in
         # ConversationStore. How: prepend an English, LLM-only wrapper after the raw
         # callback row has been stored. Purpose: storage remains pure while the caller
         # node receives an actionable instruction.
-        _headline, _body_label = _dispatch_result_headline(input_data, _inbound_node_id)
-        _prefix_parts = [_headline]
-        _prefix_parts.extend(_dispatch_handle_lines(input_data, _inbound_child_handle, _inbound_node_id))
-        if _inbound_summary:
-            _prefix_parts.append(f"Summary: {_inbound_summary}")
-        _child_worktree = input_data.get(INBOUND_CHILD_WORKTREE_KEY)
-        if _child_worktree:
-            _delegation = plan_delegation(
-                node, ws_root, ds_info, registry.list_specs(), in_isolation=bool(task_isolation(rctx.task_context)),
-            )
-            _prefix_parts.extend(worktree_lines(_child_worktree, can_merge=_delegation.can_merge))
-        _prefix_parts.append(f"{_body_label}:\n{instruction}")
-        instruction = "\n".join(_prefix_parts)
+        _worktree_notes_cache: list[Any] = []
+
+        def _worktree_notes(child_worktree: Any) -> list[str]:
+            if not _worktree_notes_cache:
+                _worktree_notes_cache.append(plan_delegation(
+                    node, ws_root, ds_info, registry.list_specs(),
+                    in_isolation=bool(task_isolation(rctx.task_context)),
+                ))
+            return worktree_lines(child_worktree, can_merge=_worktree_notes_cache[0].can_merge)
+
+        instruction = _dispatch_results_instruction(
+            [_dispatch_result_block(_item, _worktree_notes) for _item in _dispatch_items],
+        )
+        if len(_dispatch_items) > 1 and _switched_note:
+            instruction = f"{_switched_note}\n\n{instruction}"
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。
     # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。

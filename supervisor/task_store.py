@@ -11,6 +11,15 @@ from typing import Any
 from clonoth_runtime import default_entry_node_id, load_runtime_config, main_session_enabled, parse_bool
 from engine.dispatch_batch import AWAITING_INPUT_KEY, CONTINUE_FROM_KEY
 from engine.dispatch_handle import parse_handle
+from engine.dispatch_results import (
+    CONTINUES_TASK_PAYLOAD_KEY,
+    DELIVERY_NOTE_PAYLOAD_KEY,
+    DISPATCH_RESULTS_PAYLOAD_KEY,
+    INBOUND_CONTINUES_TASK_KEY,
+    INBOUND_DELIVERY_NOTE_KEY,
+    INBOUND_RESULTS_KEY,
+    RESULT_FALLBACK_KEY,
+)
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.project_root import INBOUND_CHILD_WORKTREE_KEY
 from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
@@ -52,6 +61,67 @@ _RESUME_REMOVABLE_INPUT_KEYS = (
 )
 # 异步委派结果回调入站带的子任务结局，只认这几种
 _INBOUND_CHILD_STATUSES = frozenset({"finish", "ask", "fail"})
+
+
+def _inbound_result_fields(source: dict[str, Any]) -> dict[str, Any]:
+    """入站里一条结果的字段换成任务 input 的 inbound_* 键：单条交回读入站顶层，合并交回逐条读。"""
+    fields: dict[str, Any] = {}
+    summary = str(source.get("summary") or "").strip()
+    if summary:
+        fields["inbound_summary"] = summary
+    child_session_id = str(source.get("child_session_id") or "").strip()
+    if child_session_id:
+        fields["inbound_child_session_id"] = child_session_id
+    child_task_id = str(source.get("child_task_id") or source.get("task_id") or "").strip()
+    if child_task_id:
+        fields["inbound_child_task_id"] = child_task_id
+    child_node_id = str(source.get("child_node_id") or source.get("node_id") or "").strip()
+    if child_node_id:
+        fields["inbound_child_node_id"] = child_node_id
+    caller_node_id = str(source.get("caller_node_id") or "").strip()
+    if caller_node_id:
+        fields["inbound_caller_node_id"] = caller_node_id
+    if bool(source.get("attachments_outbound_sent")):
+        fields["inbound_attachments_outbound_sent"] = True
+    child_status = str(source.get("child_status") or "").strip()
+    if child_status in _INBOUND_CHILD_STATUSES:
+        fields["inbound_child_status"] = child_status
+    child_handle = str(source.get("child_handle") or "").strip()
+    if child_handle:
+        fields["inbound_child_handle"] = child_handle
+        if source.get("child_continuable") is True:
+            fields["inbound_child_continuable"] = True
+        child_wrapup = str(source.get("child_wrapup") or "").strip()
+        if child_wrapup:
+            fields["inbound_child_wrapup"] = child_wrapup
+    child_worktree = source.get(CHILD_WORKTREE_PAYLOAD_KEY)
+    if isinstance(child_worktree, dict) and child_worktree.get("id"):
+        fields[INBOUND_CHILD_WORKTREE_KEY] = dict(child_worktree)
+    continues_task_id = str(source.get(CONTINUES_TASK_PAYLOAD_KEY) or "").strip()
+    if continues_task_id:
+        fields[INBOUND_CONTINUES_TASK_KEY] = continues_task_id
+    delivery_note = str(source.get(DELIVERY_NOTE_PAYLOAD_KEY) or "").strip()
+    if delivery_note:
+        fields[INBOUND_DELIVERY_NOTE_KEY] = delivery_note
+    return fields
+
+
+def _inbound_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """合并交回的几条结果，每条带上自己的正文和没外发的附件；不是合并交回给空列表。"""
+    raw = payload.get(DISPATCH_RESULTS_PAYLOAD_KEY)
+    if not isinstance(raw, list):
+        return []
+    results: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        attachments = item.get("attachments")
+        results.append({
+            **_inbound_result_fields(item),
+            "text": str(item.get("text") or "").strip(),
+            "attachments": list(attachments) if isinstance(attachments, list) else [],
+        })
+    return results if len(results) > 1 else []
 
 
 class CompletionOutcome(str, Enum):
@@ -523,11 +593,11 @@ class TaskStoreMixin:
             stopped_batch.drop_locked(task)
 
     def _live_descendants_locked(self, root_task_id: str) -> list[Task]:
-        """root 派出去、还没到终态的全部后代，父在子前。"""
+        """root 同步派出去、还会接着跑的全部后代（交回的委派还在路由的也算），父在子前。"""
         children: dict[str, list[Task]] = {}
         for candidate in self.tasks.values():
             caller_id = (candidate.caller_task_id or "").strip()
-            if caller_id and not self._task_terminal(candidate):
+            if caller_id and self._task_ending_locked(candidate).continues:
                 children.setdefault(caller_id, []).append(candidate)
         found: list[Task] = []
         seen = {root_task_id}
@@ -541,14 +611,18 @@ class TaskStoreMixin:
         return found
 
     def _dispatched_descendants_locked(self, root_task_id: str) -> list[Task]:
-        """root 派出去的全部后代里还没到终态的，同步派的（caller）和异步派的（dispatch_origin 记的发起任务）都算，父在子前。
+        """root 派出去的全部后代里还会接着跑的（交回的委派还在路由的也算），同步派的（caller）、异步派的（dispatch_origin 记的发起任务）、
+        结果回调接着它做的那一轮（inbound_continues_task_id）都算，父在子前。
 
-        异步委派派完就结束的中间任务也要穿过去：它结束了，它派出去的还可能在跑。
+        异步委派派完就结束的中间任务也要穿过去：它结束了，它派出去的、接着它做的还可能在跑。
         """
         children: dict[str, list[Task]] = {}
         for candidate in self.tasks.values():
-            parent_id = child_retention.parent_task_id(candidate)
-            if parent_id:
+            parent_ids = {
+                child_retention.parent_task_id(candidate),
+                str(candidate.input.get(INBOUND_CONTINUES_TASK_KEY) or "").strip(),
+            }
+            for parent_id in parent_ids - {"", candidate.task_id}:
                 children.setdefault(parent_id, []).append(candidate)
         found: list[Task] = []
         seen = {root_task_id}
@@ -559,7 +633,7 @@ class TaskStoreMixin:
                     continue
                 seen.add(child.task_id)
                 queue.append(child.task_id)
-                if not self._task_terminal(child):
+                if self._task_ending_locked(child).continues:
                     found.append(child)
         return found
 
@@ -674,16 +748,9 @@ class TaskStoreMixin:
     def _create_entry_task_for_inbound_locked(self, *, inbound_seq: int, session_id: str, payload: dict[str, Any]) -> Task | None:
         text = str(payload.get("text") or "").strip()
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
-        # [AutoC 2026-06-04] Why: dispatch_result.text is now the raw child result and
-        # can legitimately be empty when a child only returns summary. How: treat a
-        # dispatch_result summary as sufficient inbound content for task creation.
-        # Purpose: runner can still deliver the summary to the LLM through the new
-        # LLM-only English prefix while ConversationStore keeps text empty.
-        has_dispatch_summary = (
-            str(payload.get("message_type") or "").strip() == "dispatch_result"
-            and bool(str(payload.get("summary") or "").strip())
-        )
-        if not text and not has_attachments and not has_dispatch_summary:
+        # 委派结果正文和摘要都空也要建：派发方得知道它做完了，只是没交回内容
+        is_dispatch_result = str(payload.get("message_type") or "").strip() == "dispatch_result"
+        if not text and not has_attachments and not is_dispatch_result:
             return None
         # 优先级: session 覆盖（AI switch） > 前端指定 > session 记录的 > 全局默认
         default_node = self._default_entry_node()
@@ -781,41 +848,15 @@ class TaskStoreMixin:
         _inbound_message_type = str(payload.get("message_type") or "").strip()
         if _inbound_message_type:
             inbound_metadata["inbound_message_type"] = _inbound_message_type
-        _inbound_summary = str(payload.get("summary") or "").strip()
-        if _inbound_summary:
-
-            inbound_metadata["inbound_summary"] = _inbound_summary
-        _inbound_child_session_id = str(payload.get("child_session_id") or "").strip()
-        if _inbound_child_session_id:
-            inbound_metadata["inbound_child_session_id"] = _inbound_child_session_id
-        _inbound_child_task_id = str(payload.get("child_task_id") or payload.get("task_id") or "").strip()
-        if _inbound_child_task_id:
-
-            inbound_metadata["inbound_child_task_id"] = _inbound_child_task_id
-        _inbound_child_node_id = str(payload.get("child_node_id") or payload.get("node_id") or "").strip()
-        if _inbound_child_node_id:
-
-            inbound_metadata["inbound_child_node_id"] = _inbound_child_node_id
-        _inbound_caller_node_id = str(payload.get("caller_node_id") or "").strip()
-        if _inbound_caller_node_id:
-            inbound_metadata["inbound_caller_node_id"] = _inbound_caller_node_id
-        if bool(payload.get("attachments_outbound_sent")):
-
-            inbound_metadata["inbound_attachments_outbound_sent"] = True
-        _inbound_child_status = str(payload.get("child_status") or "").strip()
-        if _inbound_child_status in _INBOUND_CHILD_STATUSES:
-            inbound_metadata["inbound_child_status"] = _inbound_child_status
-        _inbound_child_handle = str(payload.get("child_handle") or "").strip()
-        if _inbound_child_handle:
-            inbound_metadata["inbound_child_handle"] = _inbound_child_handle
-            if payload.get("child_continuable") is True:
-                inbound_metadata["inbound_child_continuable"] = True
-            _inbound_child_wrapup = str(payload.get("child_wrapup") or "").strip()
-            if _inbound_child_wrapup:
-                inbound_metadata["inbound_child_wrapup"] = _inbound_child_wrapup
-        _inbound_child_worktree = payload.get(CHILD_WORKTREE_PAYLOAD_KEY)
-        if isinstance(_inbound_child_worktree, dict) and _inbound_child_worktree.get("id"):
-            inbound_metadata[INBOUND_CHILD_WORKTREE_KEY] = dict(_inbound_child_worktree)
+        # 合并交回时顶层照第一条：委派深度、任务树都按第一条结果的子任务和它接着做的那一轮算
+        inbound_metadata.update(_inbound_result_fields(payload))
+        _merged_results = _inbound_results(payload)
+        if _merged_results:
+            inbound_metadata[INBOUND_RESULTS_KEY] = _merged_results
+        if _dispatch_origin:
+            _result_fallback = self._dispatch_result_fallback_locked(_dispatch_origin)
+            if _result_fallback is not None:
+                inbound_metadata[RESULT_FALLBACK_KEY] = _result_fallback
         # 自动续跑的那一轮带着续跑链：第几轮、链从哪一刻起算寿命、上一段留下的待办
         _auto_continue = chain_input(payload.get("auto_continue"))
         _worktrees = worktree_service_of(self)
@@ -1063,6 +1104,7 @@ class TaskStoreMixin:
         for task in self.tasks.values():
             if task.batch_id and task.caller_task_id in live:
                 needed.add(task.task_id)
+        needed |= self._async_result_chains_needed_locked()
         return needed
 
     def _active_tasks_summary_locked(self, session_id: str) -> list[dict[str, Any]]:
@@ -1104,12 +1146,13 @@ class TaskStoreMixin:
         with self._lock:
             keep_ids: set[str] = set()
             tid = (exclude_task_id or "").strip()
-            while tid:
+            while tid and tid not in keep_ids:
                 keep_ids.add(tid)
                 t = self.tasks.get(tid)
                 if t is None:
                     break
-                tid = (t.caller_task_id or "").strip()
+                # 沿整条派发链往上：从异步委派里调用时，派它出来、正等着它的任务也不能取消
+                tid = child_retention.parent_task_id(t)
 
             now = _now()
             count = 0
@@ -1124,8 +1167,16 @@ class TaskStoreMixin:
                 # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
                 if _filter_node and task.node_id != _filter_node:
                     continue
-                if self._cancel_task_locked(task, now) is not CancelEffect.none:
-                    count += 1
+                targets = [task]
+                if _filter_node and self._task_ending_locked(task).continues:
+                    # 只取消某个节点时，它派出去的后代（节点不同）一并取消，和 cancel_single_task 一致
+                    targets.extend(
+                        descendant for descendant in self._dispatched_descendants_locked(task.task_id)
+                        if descendant.task_id not in keep_ids
+                    )
+                for target in targets:
+                    if self._cancel_task_locked(target, now) is not CancelEffect.none:
+                        count += 1
             return {"ok": True, "cancelled_count": count}
 
     def cancel_single_task(self, task_id: str) -> dict[str, Any]:
@@ -1137,7 +1188,8 @@ class TaskStoreMixin:
             task = self.tasks.get(tid)
             if task is None:
                 return {"ok": False, "error": "task not found"}
-            if self._task_terminal(task):
+            # 交回的委派还在路由的不算结束：取消会把那次派发叫停
+            if not self._task_ending_locked(task).continues:
                 return {"ok": True, "cancelled_count": 0, "already_terminal": True}
             now = _now()
             count = 0
@@ -1149,13 +1201,20 @@ class TaskStoreMixin:
 
     # ---- orphaned task cleanup ----
 
-    def cancel_orphaned_tasks(self, *, claimed_before: datetime | None = None) -> int:
-        """engine 整个重启之后收拾旧进程手里的任务，返回重排和取消的个数之和。
+    def settle_orphaned_tasks(self, *, claimed_before: datetime | None = None) -> int:
+        """engine 整个重启之后收拾旧进程手里的任务，返回重排、判失败和取消的个数之和。
 
         只动 claimed_before 之前领走、还在 running 的：排队的和挂起等子任务的留给新进程接着办，新进程已经领走的不碰。
-        声明了 auto_continue、已经有进展的节点任务重排一次，其余连同后代取消。
+        声明了 auto_continue、已经有进展的节点任务重排一次；其余判失败（内部流程和群里的插话照旧取消），
+        同步后代连带取消。
         """
-        from .task_requeue import ENGINE_RESTART, collect_orphans_locked, settle_orphans_locked, stored_steps
+        from .task_requeue import (
+            ENGINE_RESTART,
+            INTERRUPTED_CANCEL_REASON,
+            collect_orphans_locked,
+            settle_orphans_locked,
+            stored_steps,
+        )
 
         with self._lock:
             orphans = collect_orphans_locked(self, claimed_before=claimed_before)
@@ -1164,14 +1223,15 @@ class TaskStoreMixin:
         # 查进展要读对话文件，放在锁外；回到锁里时状态变了的任务不动
         progress = stored_steps(self.workspace_root, orphans)
         with self._lock:
-            requeued, cancelled = settle_orphans_locked(
-                self, orphans, progress, reason=ENGINE_RESTART, cancel_reason="引擎重启，任务已终止",
+            outcome = settle_orphans_locked(
+                self, orphans, progress, reason=ENGINE_RESTART, cancel_reason=INTERRUPTED_CANCEL_REASON,
             )
-        if requeued or cancelled:
+        if outcome.total:
             logger.warning(
-                "engine restart: requeued %d and cancelled %d task(s) left by the old engine", requeued, cancelled,
+                "engine restart: requeued %d, failed %d and cancelled %d task(s) left by the old engine",
+                outcome.requeued, outcome.failed, outcome.cancelled,
             )
-        return requeued + cancelled
+        return outcome.total
 
     # ---- preempt ----
 
@@ -1476,7 +1536,7 @@ class TaskStoreMixin:
         claim = (claim_id or "").strip()
         if not tid or not wid:
             return None
-        from .task_requeue import requeue_after_shutdown_locked
+        from .task_requeue import requeue_after_shutdown_locked, shutdown_failure
 
         should_route = False
         cancelled_while_running = False
@@ -1509,6 +1569,9 @@ class TaskStoreMixin:
                 elif requeue_after_shutdown_locked(self, task, task.result):
                     requeued = True
                 else:
+                    failure = shutdown_failure(task, task.result)
+                    if failure is not None:
+                        task.result = failure
                     act = str(task.result.get("action") or "").strip()
                     if act == "cancelled":
                         task.status = TaskStatus.cancelled

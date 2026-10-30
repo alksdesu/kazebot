@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from engine.project_root import (  # noqa: E402
     WORKTREE_KEY,
     task_project_root,
 )
+from supervisor.task_requeue import DELEGATE_INTERRUPTED_ERROR  # noqa: E402
 from supervisor.types import TaskStatus  # noqa: E402
 from supervisor.worktrees import service as service_module  # noqa: E402
 from supervisor.worktrees.keys import (  # noqa: E402
@@ -367,6 +369,9 @@ class TestOutcome:
 
         env.finish(child)
 
+        # 派它出来的那一轮还没做完，结果先留给它，它结束后才交回
+        assert env.callbacks() == []
+        env.finish(caller)
         [callback] = env.callbacks()
         carried = callback.input["inbound_child_worktree"]
         assert carried["id"] == child.task_id
@@ -688,6 +693,27 @@ class TestRestart:
         env.service.housekeeping()
 
         assert env.entry(child)["state"] == "ready"
+        assert env.worktree_of(child).is_dir()
+
+    def test_a_child_failed_by_an_engine_restart_hands_back_its_diff_and_keeps_its_worktree(self, env: Env) -> None:
+        env.state.register_engine("engine-0", "gen-1")
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        claimed = env.state.assign_next_task(worker_id="engine-0")
+        assert claimed is not None and claimed["task_id"] == child.task_id
+        write(env.worktree_of(child) / "app" / "new.py", "NEW = 1\n")
+
+        result = env.state.register_engine("engine-0", "gen-2")
+
+        assert result["orphans_failed"] == 1 and child.status == TaskStatus.failed
+        # 算 diff 在路由另起的线程里
+        deadline = time.monotonic() + 60
+        while caller.status != TaskStatus.pending and time.monotonic() < deadline:
+            time.sleep(0.05)
+        [entry] = entries(caller)
+        assert entry["status"] == "fail" and entry["error"] == DELEGATE_INTERRUPTED_ERROR
+        assert [item["path"] for item in entry["worktree"]["files"]] == ["app/new.py"]
+        assert env.entry(child)["state"] == "finished"
         assert env.worktree_of(child).is_dir()
 
     def test_a_corrupt_registry_is_set_aside(self, env: Env) -> None:

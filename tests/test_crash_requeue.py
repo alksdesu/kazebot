@@ -1,10 +1,15 @@
-"""engine 中途退出时手里的任务：排队和挂起的留着，声明了 auto_continue、已有进展的重排一次并从存储接着跑，其余照旧取消。"""
+"""engine 中途退出时手里的任务：排队和挂起的留着，声明了 auto_continue、已有进展的重排一次并从存储接着跑，
+其余按失败收尾并写明是引擎重启打断的，系统内部流程和群里没人叫 bot 的插话照旧静默取消。"""
 from __future__ import annotations
 
 import sys
+import time
+import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -16,7 +21,14 @@ from engine.conversation_store import ConversationStore, Message  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
-from supervisor.task_requeue import collect_orphans_locked, settle_orphans_locked, storage_session  # noqa: E402
+from supervisor.task_requeue import (  # noqa: E402
+    DELEGATE_INTERRUPTED_ERROR,
+    USER_INTERRUPTED_ERROR,
+    OrphanSettlement,
+    collect_orphans_locked,
+    settle_orphans_locked,
+    storage_session,
+)
 from supervisor.task_store import CompletionOutcome  # noqa: E402
 from supervisor.task_traits import REQUEUE_MARK  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
@@ -50,12 +62,13 @@ def _session(state: SupervisorState) -> str:
     return state.get_or_create_session(channel="qq_private", conversation_key=CONV)
 
 
-def _inbound(state: SupervisorState, session_id: str, *, node: str = WORKER) -> Task:
+def _inbound(state: SupervisorState, session_id: str, *, node: str = WORKER, **extra: Any) -> Task:
     payload = {
         "channel": "qq_private",
         "conversation_key": state.sessions[session_id].conversation_key,
         "text": "整理一下日志模块",
         "entry_node_id": node,
+        **extra,
     }
     event = state.eventlog.append(session_id=session_id, component="shell", type_="inbound_message", payload=payload)
     state.record_inbound_message_event(event)
@@ -103,6 +116,41 @@ def _outbound_texts(state: SupervisorState) -> list[str]:
     ]
 
 
+def _async_child(state: SupervisorState, session_id: str, caller: Task) -> Task:
+    """caller 异步派出去的子任务：一条带 dispatch_origin 的入站，在自己的 agent: 会话里跑。"""
+    agent_sid = state.get_or_create_session(channel="qq_private", conversation_key=f"agent:{CHAT}:{CONV}:{uuid.uuid4()}")
+    return _inbound(
+        state, agent_sid, node=CHAT, dispatch_context_mode="fresh",
+        dispatch_origin={
+            "parent_session_id": session_id, "caller_node_id": str(caller.node_id or ""), "parent_conversation_key": CONV,
+            "context_mode": "fresh", "caller_task_id": caller.task_id,
+        },
+    )
+
+
+def _callbacks(state: SupervisorState) -> list[Task]:
+    # 后台路由线程可能正在往任务表里加任务
+    with state._lock:
+        return [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
+
+
+def _finish_on(state: SupervisorState, task: Task, worker: str, text: str = "done") -> None:
+    task.status = TaskStatus.running
+    task.worker_id = worker
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    state.complete_task(task_id=task.task_id, worker_id=worker, result={"action": "finish", "result": {"text": text}})
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """入口分支上的任务被判失败后，路由在后台线程里跑完。"""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 class TestWorkerRestart:
     def test_queued_and_suspended_tasks_survive(self, workspace: Path) -> None:
         state = _state(workspace)
@@ -121,7 +169,7 @@ class TestWorkerRestart:
         result = state.register_engine("engine-0", "gen-2")
 
         assert result["ok"] is True
-        assert result["orphans_cancelled"] == 0 and result["orphans_requeued"] == 0
+        assert result["orphans_cancelled"] == 0 and result["orphans_requeued"] == 0 and result["orphans_failed"] == 0
         assert caller.status == TaskStatus.suspended
         assert child.status == TaskStatus.pending
 
@@ -148,7 +196,7 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-2")
 
-        assert result["orphans_requeued"] == 1 and result["orphans_cancelled"] == 0
+        assert result["orphans_requeued"] == 1 and result["orphans_cancelled"] == 0 and result["orphans_failed"] == 0
         assert task.status == TaskStatus.pending
         assert task.worker_id is None and task.lease_expires_at is None
         assert task.result == {}
@@ -174,10 +222,11 @@ class TestWorkerRestart:
 
         again = state.register_engine("engine-0", "gen-3")
 
-        assert again["orphans_requeued"] == 0 and again["orphans_cancelled"] == 1
-        assert task.status == TaskStatus.cancelled
+        assert again["orphans_requeued"] == 0 and again["orphans_failed"] == 1 and again["orphans_cancelled"] == 0
+        assert task.status == TaskStatus.failed
+        assert task.result["error"] == USER_INTERRUPTED_ERROR
 
-    def test_a_task_without_progress_is_cancelled(self, workspace: Path) -> None:
+    def test_a_task_without_progress_fails_with_the_restart_as_its_reason(self, workspace: Path) -> None:
         state = _state(workspace)
         state.register_engine("engine-0", "gen-1")
         task = _inbound(state, _session(state))
@@ -188,10 +237,11 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-2")
 
-        assert result["orphans_requeued"] == 0 and result["orphans_cancelled"] == 1
-        assert task.status == TaskStatus.cancelled
+        assert result["orphans_requeued"] == 0 and result["orphans_failed"] == 1 and result["orphans_cancelled"] == 0
+        assert task.status == TaskStatus.failed
+        assert task.result["error"] == USER_INTERRUPTED_ERROR
 
-    def test_a_node_without_auto_continue_is_cancelled_with_its_descendants(self, workspace: Path) -> None:
+    def test_a_node_without_auto_continue_fails_and_its_descendants_are_cancelled(self, workspace: Path) -> None:
         state = _state(workspace)
         state.register_engine("engine-0", "gen-1")
         sid = _session(state)
@@ -205,8 +255,9 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-2")
 
-        assert result["orphans_requeued"] == 0 and result["orphans_cancelled"] == 2
-        assert task.status == TaskStatus.cancelled and child.status == TaskStatus.cancelled
+        assert result["orphans_requeued"] == 0 and result["orphans_failed"] == 1 and result["orphans_cancelled"] == 1
+        assert task.status == TaskStatus.failed and child.status == TaskStatus.cancelled
+        assert f"[错误] {USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
 
     def test_without_the_conversation_store_nothing_is_requeued(self, workspace: Path) -> None:
         # 旧快照模式下中断前做的事没落盘，从存储接着跑会丢掉它们
@@ -220,10 +271,10 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-2")
 
-        assert result["orphans_cancelled"] == 1
-        assert task.status == TaskStatus.cancelled
+        assert result["orphans_failed"] == 1
+        assert task.status == TaskStatus.failed
 
-    def test_system_tasks_are_never_requeued(self, workspace: Path) -> None:
+    def test_system_tasks_are_never_requeued_and_are_cancelled_quietly(self, workspace: Path) -> None:
         state = _state(workspace)
         state.register_engine("engine-0", "gen-1")
         task = _running(state, _session(state), WORKER, claim="c-1")
@@ -232,8 +283,78 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-2")
 
-        assert result["orphans_cancelled"] == 1
+        assert result["orphans_cancelled"] == 1 and result["orphans_failed"] == 0
         assert task.status == TaskStatus.cancelled
+        assert _outbound_texts(state) == []
+
+    def test_an_interjection_nobody_asked_for_is_cancelled_quietly(self, workspace: Path) -> None:
+        state = _state(workspace)
+        state.register_engine("engine-0", "gen-1")
+        task = _inbound(state, _session(state), node=CHAT, route_hints={"delivery_purpose": "ambient"})
+        _claim(state, task)
+
+        result = state.register_engine("engine-0", "gen-2")
+
+        assert result["orphans_cancelled"] == 1 and result["orphans_failed"] == 0
+        assert task.status == TaskStatus.cancelled
+
+    def test_an_interrupted_wait_child_comes_back_to_its_caller_as_a_failure_it_can_continue(
+        self, workspace: Path,
+    ) -> None:
+        state = _state(workspace)
+        state.register_engine("engine-0", "gen-1")
+        caller = _inbound(state, _session(state), node=CHAT)
+        claim = _claim(state, caller)
+        state.complete_task(task_id=caller.task_id, worker_id="engine-0", claim_id=claim, result={
+            "action": "dispatch",
+            "dispatch_batch": [{"kind": "node", "target": CHAT, "instruction": "查一下", "context_mode": "fresh", "call_id": "w1"}],
+        })
+        [child] = [task for task in state.tasks.values() if task.caller_task_id == caller.task_id]
+        _claim(state, child)
+
+        result = state.register_engine("engine-0", "gen-2")
+
+        assert result["orphans_failed"] == 1 and result["orphans_cancelled"] == 0
+        assert child.status == TaskStatus.failed
+        assert caller.status == TaskStatus.pending
+        [entry] = caller.input["resume_data"]["entries"]
+        assert entry["status"] == "fail" and entry["error"] == DELEGATE_INTERRUPTED_ERROR
+        assert entry["continuable"] is True and entry["call_id"] == "w1"
+
+    def test_an_interrupted_async_dispatch_tells_its_dispatcher_it_failed(self, workspace: Path) -> None:
+        state = _state(workspace)
+        state.register_engine("engine-0", "gen-1")
+        sid = _session(state)
+        caller = _inbound(state, sid, node=CHAT)
+        _finish_on(state, caller, "engine-0", "交出去了")
+        child = _async_child(state, sid, caller)
+        _claim(state, child)
+
+        result = state.register_engine("engine-0", "gen-2")
+
+        assert result["orphans_failed"] == 1
+        assert child.status == TaskStatus.failed
+        assert _wait_until(lambda: bool(_callbacks(state)))
+        [callback] = _callbacks(state)
+        assert callback.node_id == CHAT
+        assert callback.input["inbound_child_status"] == "fail"
+        assert DELEGATE_INTERRUPTED_ERROR in callback.input["instruction"]
+        assert USER_INTERRUPTED_ERROR not in "\n".join(_outbound_texts(state))
+
+    def test_results_held_for_an_interrupted_round_are_handed_back(self, workspace: Path) -> None:
+        state = _state(workspace)
+        state.register_engine("engine-0", "gen-1")
+        sid = _session(state)
+        round_task = _running(state, sid, CHAT, claim="c-1")
+        child = _async_child(state, sid, round_task)
+        _finish_on(state, child, "engine-1", "查到了")
+        assert _callbacks(state) == []
+
+        result = state.register_engine("engine-0", "gen-2")
+
+        assert result["orphans_failed"] == 1 and round_task.status == TaskStatus.failed
+        [callback] = _callbacks(state)
+        assert callback.node_id == CHAT and callback.input["inbound_child_task_id"] == child.task_id
 
     def test_the_same_generation_registering_again_changes_nothing(self, workspace: Path) -> None:
         state = _state(workspace)
@@ -242,7 +363,7 @@ class TestWorkerRestart:
 
         result = state.register_engine("engine-0", "gen-1")
 
-        assert result["orphans_cancelled"] == 0 and result["orphans_requeued"] == 0
+        assert result["orphans_cancelled"] == 0 and result["orphans_requeued"] == 0 and result["orphans_failed"] == 0
         assert task.status == TaskStatus.running
 
     def test_tasks_that_changed_while_progress_was_read_are_left_alone(self, workspace: Path) -> None:
@@ -255,7 +376,7 @@ class TestWorkerRestart:
         with state._lock:
             outcome = settle_orphans_locked(state, orphans, {}, reason="engine_crash", cancel_reason="gone")
 
-        assert outcome == (0, 0)
+        assert outcome == OrphanSettlement()
         assert task.status == TaskStatus.running
 
 
@@ -290,7 +411,7 @@ class TestGracefulShutdown:
         assert completed == []
 
     @pytest.mark.parametrize("node,steps", [(CHAT, 7), (WORKER, 0)])
-    def test_anything_else_is_cancelled_as_before(
+    def test_anything_else_fails_with_the_restart_as_its_reason(
         self, workspace: Path, monkeypatch: pytest.MonkeyPatch, node: str, steps: int,
     ) -> None:
         state = _state(workspace)
@@ -303,11 +424,25 @@ class TestGracefulShutdown:
             result={**SHUTDOWN, "node_id": node, "_step_count": steps},
         )
 
-        assert task.status == TaskStatus.cancelled
+        assert task.status == TaskStatus.failed
+        assert task.result["error"] == USER_INTERRUPTED_ERROR and task.result["interrupted"] == "engine_shutdown"
         assert REQUEUE_MARK not in task.input
         assert completed == [task.task_id]
+        assert f"[错误] {USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
 
-    def test_a_task_requeued_before_is_cancelled_the_second_time(self, workspace: Path) -> None:
+    def test_an_interjection_nobody_asked_for_is_still_cancelled_quietly(
+        self, workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(workspace)
+        task = _inbound(state, _session(state), node=CHAT, route_hints={"delivery_purpose": "ambient"})
+        claim = _claim(state, task)
+
+        state.complete_task(task_id=task.task_id, worker_id="engine-0", claim_id=claim, result={**SHUTDOWN, "node_id": CHAT})
+
+        assert task.status == TaskStatus.cancelled
+        assert _outbound_texts(state) == []
+
+    def test_a_task_requeued_before_fails_the_second_time(self, workspace: Path) -> None:
         state = _state(workspace)
         task = _inbound(state, _session(state))
         claim = _claim(state, task)
@@ -316,7 +451,7 @@ class TestGracefulShutdown:
 
         state.complete_task(task_id=task.task_id, worker_id="engine-0", claim_id=claim, result={**SHUTDOWN, "_step_count": 5})
 
-        assert task.status == TaskStatus.cancelled
+        assert task.status == TaskStatus.failed
 
     def test_steps_recorded_at_a_suspend_count_as_progress(self, workspace: Path) -> None:
         state = _state(workspace)
@@ -347,12 +482,13 @@ class TestManualEngineRestart:
         _progress(workspace, old_worker, 4)
         newer = _running(state, sid, CHAT, claim="c-new", claimed_at=cutoff + timedelta(seconds=1))
 
-        settled = state.cancel_orphaned_tasks(claimed_before=cutoff)
+        settled = state.settle_orphaned_tasks(claimed_before=cutoff)
 
         assert settled == 2
         assert queued.status == TaskStatus.pending
         assert waiting.status == TaskStatus.suspended
-        assert old_chat.status == TaskStatus.cancelled
+        assert old_chat.status == TaskStatus.failed
+        assert old_chat.result["error"] == USER_INTERRUPTED_ERROR
         assert old_worker.status == TaskStatus.pending
         assert old_worker.input[REQUEUE_MARK]["reason"] == "engine_restart"
         assert old_worker.input["_steps_used"] == 4
@@ -364,10 +500,10 @@ class TestManualEngineRestart:
         first = _running(state, sid, CHAT, claim="c-1")
         second = _running(state, sid, CHAT, claim="c-2", claimed_at=datetime.now(timezone.utc) + timedelta(hours=1))
 
-        assert state.cancel_orphaned_tasks() == 2
-        assert first.status == TaskStatus.cancelled and second.status == TaskStatus.cancelled
+        assert state.settle_orphaned_tasks() == 2
+        assert first.status == TaskStatus.failed and second.status == TaskStatus.failed
 
     def test_nothing_running_means_nothing_to_do(self, workspace: Path) -> None:
         state = _state(workspace)
 
-        assert state.cancel_orphaned_tasks(claimed_before=datetime.now(timezone.utc)) == 0
+        assert state.settle_orphaned_tasks(claimed_before=datetime.now(timezone.utc)) == 0
