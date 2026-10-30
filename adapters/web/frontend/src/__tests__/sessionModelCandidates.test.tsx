@@ -7,6 +7,7 @@ import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore } from '../store/chatStore';
 import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 import type { NodeDef } from '../types';
+import { fallbackEntry, providerBlock, providerTable } from './fixtures/providerTable';
 
 const activeNode: NodeDef = {
   id: 'ereuna_main',
@@ -15,24 +16,20 @@ const activeNode: NodeDef = {
   model: '$ENV{QQ_MAIN_MODEL}',
 };
 
-const block = (model: string, raw = model) =>
-  ({ base_url: '', base_url_raw: '', model, model_raw: raw, api_key_present: false, api_key_redacted: '' });
-
-const PROVIDERS = {
-  active_provider: 'openai',
+const PROVIDERS = providerTable({
   providers: {
-    openai: block('gpt-4o-mini'),
-    deepseek: block('deepseek-v4-pro'),
+    openai: providerBlock({ model: 'gpt-4o-mini', model_raw: 'gpt-4o-mini' }),
+    deepseek: providerBlock({ model: 'deepseek-v4-pro', model_raw: 'deepseek-v4-pro', type: 'deepseek' }),
   },
   // 展开不出来的引用后端会给空 model，但真送到前端的形状不一定干净 —— 混两条
   // 未展开的进来，确认它们进不了候选。
   fallbacks: [
-    { ...block('claude-sonnet-4-6'), provider: 'openai' },
-    { ...block('$ENV{BACKUP_MODEL}'), provider: 'backup' },
-    { ...block('${SHELL_MODEL}'), provider: 'shell' },
+    fallbackEntry({ provider: 'openai', model: 'claude-sonnet-4-6', model_raw: 'claude-sonnet-4-6' }),
+    fallbackEntry({ provider: 'backup', model: '$ENV{BACKUP_MODEL}', model_raw: '$ENV{BACKUP_MODEL}' }),
+    fallbackEntry({ provider: 'shell', model: '${SHELL_MODEL}', model_raw: '${SHELL_MODEL}' }),
   ],
   registered: ['openai', 'deepseek'],
-};
+});
 
 function responseJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });

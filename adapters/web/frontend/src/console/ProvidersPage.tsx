@@ -12,6 +12,7 @@ import {
   getNodes,
   getProviders,
   getProviderProfiles,
+  receipted,
   setActiveProvider,
   upsertProvider,
   type ProviderConfigPublic,
@@ -20,6 +21,7 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromProviders } from '../utils/modelChoices';
+import { appendSentence, rereadFailed } from '../utils/sentence';
 import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Button, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, SaveBar, Select } from './components';
 import { SystemSlots } from './SystemSlots';
@@ -301,7 +303,6 @@ const ProvidersEditor = () => {
     void (async () => {
       try {
         const list = await getNodes(token);
-        if (!Array.isArray(list)) throw new Error('节点表回来的不是列表');
         if (!request.isCurrent()) return;
         setOverrides(
           list
@@ -359,12 +360,31 @@ const ProvidersEditor = () => {
     setNote(done);
   };
 
+  // 写回执读不懂时已经存上了：重读渠道表顶替回执；重读也没成就留着手上这份，说清得先刷新再改。
+  const settle = async (
+    auth: string, next: ProvidersResponse | null, receiptProblem: string, done: string, preserveDrafts: boolean,
+  ) => {
+    if (next) {
+      absorb(next, done, preserveDrafts);
+      setError(receiptProblem);
+      return;
+    }
+    try {
+      absorb(await getProviders(auth), done, preserveDrafts);
+      setError(receiptProblem);
+    } catch (caught) {
+      setNote(done);
+      setError(rereadFailed(receiptProblem, errorMessage(caught), '刷新页面读入最新内容'));
+    }
+  };
+
   const run = async (action: (auth: string) => Promise<ProvidersResponse>, done: string) => {
     if (!token || busy) return;
     setBusy(true);
     setError('');
     try {
-      absorb(await action(token), done, true);
+      const { result, receiptProblem } = await receipted(action(token));
+      await settle(token, result, receiptProblem, done, true);
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -376,13 +396,16 @@ const ProvidersEditor = () => {
     setBusy(true);
     setError('');
     try {
-      let latest = data;
+      let latest: ProvidersResponse | null = data;
+      let receiptProblem = '';
       for (const draft of drafts) {
         const stored = storedBy.get(draft.name);
         if (!changed(draft, stored)) continue;
-        latest = await upsertProvider(token, draft.name, providerPatch(draft, stored));
+        const written = await receipted(upsertProvider(token, draft.name, providerPatch(draft, stored)));
+        latest = written.result;
+        receiptProblem = appendSentence(receiptProblem, written.receiptProblem);
       }
-      if (latest) absorb(latest, '已保存。engine 每个任务重新取一次密钥，下一条消息就用新的。');
+      await settle(token, latest, receiptProblem, '已保存。engine 每个任务重新取一次密钥，下一条消息就用新的。', false);
     } catch (caught) {
       setError(errorMessage(caught));
     }

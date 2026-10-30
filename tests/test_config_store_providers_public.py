@@ -180,3 +180,32 @@ def test_provider_options_are_not_published_to_the_browser(tmp_path):
     public = ConfigStore(path=path).get_providers_public()
 
     assert "internal-tenant-42" not in str(public)
+
+
+def test_a_blank_active_provider_is_reported_the_way_the_engine_falls_back(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("version: 1\nprovider:\nopenai:\n  model: gpt-4o-mini\n", encoding="utf-8")
+
+    public = ConfigStore(path=path).get_providers_public()
+
+    assert public["active_provider"] == "openai"
+
+
+def test_a_fallback_written_as_a_bare_name_gets_every_field_and_keeps_its_place(tmp_path):
+    """engine 跳过这种条目；编辑器却按完整形状回填，缺字段就在 trim 上崩。位置不变，_origin 才对得上。"""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "version: 1\nprovider: openai\n"
+        "openai:\n  model: gpt-4o-mini\n"
+        "deepseek:\n  model: deepseek-v4-pro\n"
+        "fallbacks:\n  - DeepSeek\n  - provider: deepseek\n",
+        encoding="utf-8",
+    )
+
+    bare, listed = ConfigStore(path=path).get_providers_public()["fallbacks"]
+
+    assert set(bare) == set(listed)
+    assert bare["provider"] == "deepseek"
+    assert bare["model_raw"] == "" and bare["base_url_raw"] == ""
+    assert bare["supports_vision"] is False
+    assert bare["options"] == {}

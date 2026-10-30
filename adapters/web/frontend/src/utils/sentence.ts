@@ -20,3 +20,8 @@ export function savedMessage(done: string, note = '', warnings: readonly string[
 export function reloadBeforeEditing(receiptProblem: string, reload = '重新载入'): string {
   return appendSentence(receiptProblem, `${reload}再改，不然再存会被当成冲突拒掉`);
 }
+
+/** 存上了、回执没读懂，重读现状也没成时交代的那句：手上这份还是存之前的，得先读入最新内容再改。用于不带指纹的写。 */
+export function rereadFailed(receiptProblem: string, problem: string, reload: string): string {
+  return [`${reload}再改`, `刚才重新读取也没成：${problem}`].reduce(appendSentence, receiptProblem);
+}

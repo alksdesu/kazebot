@@ -208,3 +208,21 @@ def test_creating_a_node_under_a_free_id_still_works(client, workspace: Path) ->
 
     assert resp.status_code == 200
     assert (workspace / "config" / "nodes" / "chat.helper.yaml").read_text(encoding="utf-8") == "type: ai\n"
+
+
+def test_hand_written_fields_come_back_the_way_the_engine_reads_them(client, workspace: Path) -> None:
+    """留空的 model 原样给出去是 null，写成一个名字的 delegate_targets 会被拆成单个字母；engine 读的是规整后的值。"""
+    (workspace / "config" / "nodes" / "sloppy.yaml").write_text(
+        "type: ai\nname: 123\nmodel:\ndescription:\ndelegate_targets: helper\n", encoding="utf-8",
+    )
+    (workspace / "config" / "nodes" / "listed.yaml").write_text(
+        "type: ai\ndelegate_targets:\n  - \" helper \"\n  - 1\n  - helper\n  - \"\"\n", encoding="utf-8",
+    )
+
+    rows = _nodes(client)
+
+    assert rows["sloppy"]["name"] == "123"
+    assert rows["sloppy"]["model"] == ""
+    assert rows["sloppy"]["description"] == ""
+    assert rows["sloppy"]["delegate_targets"] == []
+    assert rows["listed"]["delegate_targets"] == ["helper"]

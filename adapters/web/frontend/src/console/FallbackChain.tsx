@@ -7,6 +7,8 @@ import { useMemo, useState } from 'react';
 import {
   channelChoices,
   clearNodeFallbacks,
+  getProviders,
+  receipted,
   updateFallbacks,
   updateNodeFallbacks,
   type ChannelChoice,
@@ -21,6 +23,7 @@ import { ChannelOptions, wireOf } from './channelFields';
 import { Block, Button, Check, Desc, Empty, ErrorText, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 import { errorMessage } from '../api/request';
+import { rereadFailed } from '../utils/sentence';
 
 /** 编辑态。api_key 单独存：空串表示不改，不是清空。 */
 interface Draft extends FallbackEntryPublic {
@@ -226,10 +229,11 @@ export const FallbackChain = ({
   const token = useSettingsStore((state) => state.adminToken);
   const [busy, setBusy] = useState(false);
   // 提示记着是写给哪条链的：换了节点就不显示，保存后数据重读也冲不掉。
-  const [note, setNote] = useState({ scope, text: '', failed: false });
+  // text 是做成的那句，problem 是没做成的那半：存上了、回执没读懂时两句都有。
+  const [note, setNote] = useState({ scope, text: '', problem: '' });
   const shown = note.scope === scope ? note : null;
-  const noteText = shown && !shown.failed ? shown.text : '';
-  const noteError = shown?.failed ? shown.text : '';
+  const noteText = shown?.text ?? '';
+  const noteError = shown?.problem ?? '';
 
   const { channels, wires } = useMemo(() => channelChoices(data), [data]);
   // 新建的一条默认指向第一个已配渠道 —— 那才是马上能用的，裸线格式还得再填地址密钥。
@@ -263,10 +267,20 @@ export const FallbackChain = ({
     if (!token || busy) return;
     setBusy(true);
     try {
-      onSaved(await action(token));
-      setNote({ scope, text: done, failed: false });
+      const { result, receiptProblem } = await receipted(action(token));
+      // 回执读不懂时已经存上了：重读渠道表顶替回执；重读也没成就留着手上这份，说清得先刷新再改。
+      let problem = receiptProblem;
+      if (result) onSaved(result);
+      else {
+        try {
+          onSaved(await getProviders(token));
+        } catch (caught) {
+          problem = rereadFailed(receiptProblem, errorMessage(caught), '刷新页面读入最新内容');
+        }
+      }
+      setNote({ scope, text: done, problem });
     } catch (caught) {
-      setNote({ scope, text: errorMessage(caught), failed: true });
+      setNote({ scope, text: '', problem: errorMessage(caught) });
     }
     setBusy(false);
   };

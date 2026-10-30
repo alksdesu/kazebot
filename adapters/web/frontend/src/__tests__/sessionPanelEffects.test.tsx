@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore } from '../store/chatStore';
 import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
+import { providerBlock, providerTable } from './fixtures/providerTable';
 
 const NODES = [{ id: 'ereuna_main', type: 'ai', name: 'EreunaMain', model: 'node-model' }];
 
@@ -20,19 +21,17 @@ function responseJson(body: unknown): Response {
 function defaultBody(url: string): unknown {
   if (url.endsWith('/admin/config/nodes')) return NODES;
   if (url.endsWith('/config/providers')) {
-    return {
-      active_provider: 'openai',
+    return providerTable({
       // 全局渠道配了 key —— 面板不该拿它冒充某个会话的专属密钥。
       providers: {
-        openai: {
+        openai: providerBlock({
           model: 'global-model', model_raw: 'global-model',
           base_url: 'https://global.example/v1', base_url_raw: 'https://global.example/v1',
           api_key_present: true, api_key_redacted: '****cdef',
-        },
+        }),
       },
-      fallbacks: [],
       registered: ['openai'],
-    };
+    });
   }
   if (url.endsWith('/active_node')) {
     return { node_id: 'ereuna_main', is_override: false, default_node_id: 'ereuna_main' };

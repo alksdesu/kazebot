@@ -280,7 +280,7 @@ def read_node_definition(path: Path) -> tuple[dict[str, Any] | None, str]:
     return data, _definition_problem(data)
 
 
-def _listed_targets(raw: Any) -> list[str]:
+def listed_targets(raw: Any) -> list[str]:
     """delegate_targets 里写的名字：去掉空项和重复，顺序不变。"""
     if not isinstance(raw, list):
         return []
@@ -290,7 +290,7 @@ def _listed_targets(raw: Any) -> list[str]:
 def _delegate_targets(workspace_root: Path, node_path: Path, raw: Any) -> list[str]:
     """统一换成现在的 id，派发工具名、白名单、子会话键都按它算；模板和示例剔掉，还不存在的节点照留。"""
     targets: list[str] = []
-    for name in _listed_targets(raw):
+    for name in listed_targets(raw):
         if template_node_name(name):
             _warn_template_target(node_path, name)
         else:
@@ -313,7 +313,7 @@ def template_reference_warnings(data: dict[str, Any]) -> list[str]:
     """节点定义里点名模板或示例的地方，控制台保存时随结果提醒：委派清单里的会被剔掉，旧 id 不会生效。"""
     warnings = [
         f"delegate_targets 里的 {name} 是模板或示例，不会派发过去"
-        for name in _listed_targets(data.get("delegate_targets"))
+        for name in listed_targets(data.get("delegate_targets"))
         if template_node_name(name)
     ]
     warnings.extend(

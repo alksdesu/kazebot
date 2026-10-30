@@ -10,6 +10,7 @@ import {
   getProviderProfiles,
   getProviders,
   getRuntimeRaw,
+  ReceiptUnreadable,
   updateFallbacks,
   updateNodeFallbacks,
 } from '../api/supervisorClient';
@@ -284,6 +285,36 @@ describe('保存之后的那一句', () => {
     saveChain();
 
     expect(await screen.findByText('写配置失败：磁盘只读')).toBeInTheDocument();
+  });
+
+  it('存上了、回执读不懂时重读渠道表顶上，回执的事单独交代', async () => {
+    const saved = structuredClone(PROVIDERS);
+    saved.fallbacks[1].model = 'backup-v2';
+    saved.fallbacks[1].model_raw = 'backup-v2';
+    vi.mocked(updateFallbacks).mockRejectedValue(new ReceiptUnreadable('全局备选链已经存上，可回执格式不对：缺 node_fallbacks'));
+    vi.mocked(getProviders).mockResolvedValueOnce(structuredClone(PROVIDERS) as any).mockResolvedValueOnce(saved as any);
+    render(<ModelsPage />);
+    await ready();
+    fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
+    saveChain();
+
+    expect(await screen.findByText('全局备选链已经存上，可回执格式不对：缺 node_fallbacks')).toBeInTheDocument();
+    expect(screen.getByText(SAVED)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存备选链' })).toBeDisabled();
+  });
+
+  it('重读也没成时说清先刷新再改', async () => {
+    vi.mocked(updateFallbacks).mockRejectedValue(new ReceiptUnreadable('全局备选链已经存上，可回执不是 JSON'));
+    vi.mocked(getProviders).mockResolvedValueOnce(structuredClone(PROVIDERS) as any).mockRejectedValueOnce(new Error('offline'));
+    render(<ModelsPage />);
+    await ready();
+    fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
+    saveChain();
+
+    expect(await screen.findByText(
+      '全局备选链已经存上，可回执不是 JSON。刷新页面读入最新内容再改。刚才重新读取也没成：offline',
+    )).toBeInTheDocument();
+    expect(screen.getByText(SAVED)).toBeInTheDocument();
   });
 
   it('换一条链就不再显示上一条链的提示', async () => {

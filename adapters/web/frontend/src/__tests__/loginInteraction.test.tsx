@@ -376,15 +376,4 @@ describe('入口节点加载归属', () => {
     // 没读成的原因记进 store，顶栏拿它说话
     expect(mocks.failNodeList).toHaveBeenCalledWith('offline');
   });
-
-  it('回来的不是列表也算没读成，不当成一个节点都没有', async () => {
-    const module = await vi.importActual<typeof import('../components/auth/loadEntryNodes')>('../components/auth/loadEntryNodes');
-    mocks.state.adminToken = 'fixture-token';
-    mocks.state.entryNodeId = 'kept.node';
-    mocks.getNodes.mockResolvedValueOnce({ detail: 'not a list' });
-    await module.loadEntryNodes('fixture-token');
-    expect(mocks.setNodeList).not.toHaveBeenCalled();
-    expect(mocks.setEntryNodeId).not.toHaveBeenCalled();
-    expect(mocks.failNodeList).toHaveBeenCalledWith('节点表回来的不是列表');
-  });
 });

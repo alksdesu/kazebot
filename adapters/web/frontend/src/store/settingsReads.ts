@@ -89,8 +89,6 @@ export async function readNodeList(token: string, request: RequestTicket): Promi
   let nodes: AdminNode[];
   try {
     nodes = await getNodes(token);
-    // 回来的不是列表也算没读成：当成一个节点都没有，下拉和继承链就都在说假话
-    if (!Array.isArray(nodes)) throw new Error('节点表回来的不是列表');
   } catch (caught) {
     if (request.isCurrent()) useSettingsStore.getState().failNodeList(errorMessage(caught));
     return null;
@@ -105,7 +103,6 @@ export async function readProviderTable(token: string, request: RequestTicket): 
   let table: ProvidersResponse;
   try {
     table = await getProviders(token);
-    if (!table || typeof table.providers !== 'object' || table.providers === null) throw new Error('渠道表回来的格式不对');
   } catch (caught) {
     if (request.isCurrent()) useSettingsStore.getState().failProviderTable(errorMessage(caught));
     return;

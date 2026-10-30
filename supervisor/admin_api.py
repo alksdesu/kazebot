@@ -24,6 +24,7 @@ from engine.node import (
     example_base_name,
     example_node_name,
     known_node_ids,
+    listed_targets,
     node_file,
     read_node_definition,
     template_node_name,
@@ -368,18 +369,19 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "declared_id": declared if declared and declared != nid else "",
                     # engine 实际认的旧 id：被同名文件或排在前面的节点占掉的不算，模板和示例没有。
                     "aliases": list(known_node_ids(workspace_root, nid)[1:]),
-                    "name": data.get("name", ""),
+                    # 名字、模型、描述、委派名单按 engine 的读法规整：yaml 里留空的 model 原样给出去是 null。
+                    "name": str(data.get("name") or "").strip(),
                     # 实际按哪种节点跑：没写 type 的是 ai，和 engine 判入口用的是同一个值。
                     "type": effective_node_type(data) if definition is not None else "",
-                    "model": data.get("model", ""),
+                    "model": str(data.get("model") or "").strip(),
                     # 节点文件里写的渠道，没写是空串（跟随全局活跃渠道）。
                     "provider": str(data.get("provider") or "").strip(),
                     # 节点文件里写的地址，没写是空串。
                     "base_url": str(data.get("base_url") or "").strip(),
                     "tool_access": ta_raw,
                     "skills": data.get("skills", {}),
-                    "description": data.get("description", ""),
-                    "delegate_targets": list(data.get("delegate_targets") or []),
+                    "description": str(data.get("description") or "").strip(),
+                    "delegate_targets": listed_targets(data.get("delegate_targets")),
                     "source": source,
                     "same_as_default": source == "override" and _same_as_default(f),
                     # 不空时 engine 加载它只会落空。只有位置和问题，不带原文。

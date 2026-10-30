@@ -9,6 +9,7 @@ import {
   getProviderProfiles,
   getProviders,
   getRuntimeFile,
+  ReceiptUnreadable,
   setActiveProvider,
   upsertProvider,
 } from '../api/supervisorClient';
@@ -327,13 +328,6 @@ describe('切换活跃渠道', () => {
     expect(getProviders).toHaveBeenCalledTimes(1);
   });
 
-  it('节点表回来的不是列表也算没读成', async () => {
-    vi.mocked(getNodes).mockResolvedValue({ detail: 'oops' } as any);
-    render(<ProvidersPage />);
-    await ready();
-    expect((await screen.findByRole('alert')).textContent).toContain('节点表回来的不是列表');
-  });
-
   it('重试提示时不冲掉没保存的草稿', async () => {
     vi.mocked(getNodes).mockRejectedValueOnce(new Error('boom'));
     render(<ProvidersPage />);
@@ -453,5 +447,37 @@ describe('地址填成别家的', () => {
 
     expect(screen.queryByText(/这个地址是/)).toBeNull();
     expect((await screen.findByRole('alert')).textContent).toContain('核对不了地址');
+  });
+});
+
+describe('写回执读不懂', () => {
+  it('存上了、回执读不懂时重读渠道表顶上，回执的事单独交代', async () => {
+    const saved = structuredClone(PROVIDERS);
+    saved.providers.openai.model_raw = 'gpt-5.5';
+    vi.mocked(upsertProvider).mockRejectedValueOnce(new ReceiptUnreadable('渠道 openai 已经存上，可回执格式不对：缺 registered'));
+    vi.mocked(getProviders).mockResolvedValueOnce(structuredClone(PROVIDERS) as any).mockResolvedValueOnce(saved as any);
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.change(within(rowFor('openai')).getByLabelText('openai 模型'), { target: { value: 'gpt-5.5' } });
+    saveChain();
+
+    expect(await screen.findByText('渠道 openai 已经存上，可回执格式不对：缺 registered')).toBeInTheDocument();
+    expect(screen.getByText(/已保存。engine 每个任务重新取一次密钥/)).toBeInTheDocument();
+    // 重读回来的那份就是存上的：没有未保存修改了。
+    expect(within(rowFor('openai')).getByLabelText('openai 模型')).toHaveValue('gpt-5.5');
+    expect(screen.getByRole('button', { name: '保存渠道' })).toBeDisabled();
+  });
+
+  it('重读也没成时说清先刷新再改', async () => {
+    vi.mocked(setActiveProvider).mockRejectedValueOnce(new ReceiptUnreadable('已经切到渠道 anthropic，可回执格式不对：缺 registered'));
+    vi.mocked(getProviders).mockResolvedValueOnce(structuredClone(PROVIDERS) as any).mockRejectedValueOnce(new Error('offline'));
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.click(within(rowFor('anthropic')).getByRole('button', { name: '设为活跃' }));
+
+    expect(await screen.findByText(
+      '已经切到渠道 anthropic，可回执格式不对：缺 registered。刷新页面读入最新内容再改。刚才重新读取也没成：offline',
+    )).toBeInTheDocument();
+    expect(screen.getByText('已切到 anthropic。')).toBeInTheDocument();
   });
 });

@@ -9,7 +9,7 @@ import type { AdminNode, ProvidersResponse } from '../api/supervisorClient';
 import { Header } from '../components/layout';
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
 import { useChatStore } from '../store/chatStore';
-import { readActiveNode, readGlobalConfig, readNodeList, readProviderTable, readSessionOverride } from '../store/settingsReads';
+import { readActiveNode, readGlobalConfig, readNodeList, readSessionOverride } from '../store/settingsReads';
 import { LOADED, UNREAD, useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
@@ -384,19 +384,16 @@ describe('会话面板', () => {
 describe('共用读取', () => {
   it('回来的格式不对也算没读成，不当成空的写进 store', async () => {
     vi.mocked(api.getAppConfig).mockResolvedValue({} as never);
-    vi.mocked(api.getProviders).mockResolvedValue({ active_provider: 'openai' } as never);
     vi.mocked(api.getActiveNode).mockResolvedValue({} as never);
     vi.mocked(api.getSessionProviderOverride).mockResolvedValue([] as never);
     const scope = new RequestScope();
 
     await readGlobalConfig(scope.begin('config'));
-    await readProviderTable('test-token', scope.begin('providers'));
     const node = await readActiveNode('session-1', scope.begin('node'));
     const override = await readSessionOverride('session-1', 'test-token', scope.begin('override'));
 
     const state = useSettingsStore.getState();
     expect(state.globalConfigRead).toEqual({ loaded: false, error: '全局配置回来的格式不对' });
-    expect(state.providerTableRead).toEqual({ loaded: false, error: '渠道表回来的格式不对' });
     expect(node).toEqual({ ok: false, error: '节点状态回来的格式不对' });
     expect(override).toEqual({ ok: false, error: '会话覆盖回来的格式不对' });
     expect(state.activeNodeSessionId).toBe('');

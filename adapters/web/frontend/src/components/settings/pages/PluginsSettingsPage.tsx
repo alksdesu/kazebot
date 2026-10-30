@@ -108,11 +108,10 @@ function BrowserStatus({ plugin }: { plugin: AdminPlugin }) {
   </Block>;
 }
 
-/** 作用范围的候选项。读回来的不是节点列表、不是渠道表也算没读成：当成空的，下拉看着像一个候选都没有。 */
+/** 作用范围的候选项。哪张表没读成要说出来：当成空的，下拉看着像一个候选都没有。 */
 function selectorChoices(nodes: PromiseSettledResult<AdminNode[]>, providers: PromiseSettledResult<ProvidersResponse>): { choices: Choices; complete: boolean } {
-  const nodeIds = nodes.status === 'fulfilled' && Array.isArray(nodes.value) ? nodes.value.map((node) => node.id) : null;
-  const table = providers.status === 'fulfilled' && typeof providers.value?.providers === 'object' && providers.value.providers !== null
-    && Array.isArray(providers.value.registered) ? providers.value : null;
+  const nodeIds = nodes.status === 'fulfilled' ? nodes.value.map((node) => node.id) : null;
+  const table = providers.status === 'fulfilled' ? providers.value : null;
   return {
     choices: { nodes: nodeIds ?? [], channels: table ? Object.keys(table.providers) : [], providers: table ? table.registered : [], purposes: PURPOSES },
     complete: nodeIds !== null && table !== null,

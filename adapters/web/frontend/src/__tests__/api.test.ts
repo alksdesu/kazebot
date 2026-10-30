@@ -1,9 +1,10 @@
 // Supervisor API client: endpoint shapes, which requests carry the admin token, and how server errors read.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getConversations, getDrawtoolsBundle, getInstanceDirectory, getInstanceProgress, getInstances, getMemoryEntries, getMemoryOverview, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, getProviderProfiles, getSessionChildren, getSessionRunningTasks, listLogFiles, listUpstreamModels, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import { ApiError, clearNodeFallbacks, deleteProvider, getNodes, getProviders, ReceiptUnreadable, setActiveProvider, updateFallbacks, updateNodeFallbacks, upsertProvider, postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getConversations, getDrawtoolsBundle, getInstanceDirectory, getInstanceProgress, getInstances, getMemoryEntries, getMemoryOverview, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, getProviderProfiles, getSessionChildren, getSessionRunningTasks, listLogFiles, listUpstreamModels, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
 import { MOUNT } from '../instances/paths';
 import { useSettingsStore } from '../store/settingsStore';
+import { fallbackEntry, providerBlock, providerTable } from './fixtures/providerTable';
 
 function stubFetch(body: unknown = {}) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
@@ -787,5 +788,62 @@ describe('Provider profiles client', () => {
     stubFetch({ ...body, [key]: value });
 
     await expect(getProviderProfiles('secret-token')).rejects.toThrow(`渠道参数清单格式不对：${key} 不是 JSON 对象`);
+  });
+});
+
+describe('Node and provider table client', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads the node table and refuses one that is not a list of nodes', async () => {
+    stubFetch([{ id: 'main', type: 'ai', model: '' }]);
+    await expect(getNodes('secret-token')).resolves.toEqual([{ id: 'main', type: 'ai', model: '' }]);
+
+    stubFetch({ detail: 'not a list' });
+    await expect(getNodes('secret-token')).rejects.toThrow('节点表格式不对：返回的不是数组');
+    stubFetch([{ type: 'ai' }]);
+    await expect(getNodes('secret-token')).rejects.toThrow('节点表格式不对：缺 [0].id');
+    stubFetch([{ id: 'main', type: 'ai', model: null }]);
+    await expect(getNodes('secret-token')).rejects.toThrow('节点表格式不对：[0].model 不是字符串');
+  });
+
+  it('refuses a provider table with a missing or mistyped part instead of filling it with nothing', async () => {
+    const complete = providerTable({
+      providers: { openai: providerBlock({ model: 'gpt-5.4', model_raw: 'gpt-5.4' }) },
+      fallbacks: [fallbackEntry({ provider: 'deepseek' })],
+      node_fallbacks: { main: [fallbackEntry()] },
+      registered: ['openai', 'deepseek'],
+    });
+    stubFetch(complete);
+    await expect(getProviders('secret-token')).resolves.toEqual(complete);
+
+    const { registered: _registered, ...unregistered } = complete;
+    stubFetch(unregistered);
+    await expect(getProviders('secret-token')).rejects.toThrow('渠道表格式不对：缺 registered');
+    const { model_raw: _modelRaw, ...partial } = complete.providers.openai;
+    stubFetch({ ...complete, providers: { openai: partial } });
+    await expect(getProviders('secret-token')).rejects.toThrow('渠道表格式不对：缺 providers.openai.model_raw');
+    stubFetch({ ...complete, fallbacks: { deepseek: {} } });
+    await expect(getProviders('secret-token')).rejects.toThrow('渠道表格式不对：fallbacks 不是数组');
+    const { options: _options, ...bare } = fallbackEntry();
+    stubFetch({ ...complete, node_fallbacks: { main: [bare] } });
+    await expect(getProviders('secret-token')).rejects.toThrow('渠道表格式不对：缺 node_fallbacks.main[0].options');
+  });
+
+  it('treats a provider write whose receipt it cannot read as done, saying what was done first', async () => {
+    stubFetch({ ok: true });
+    const writes: Array<[Promise<unknown>, string]> = [
+      [upsertProvider('secret-token', 'openai', { model: 'gpt-5.5' }), '渠道 openai 已经存上，可回执'],
+      [deleteProvider('secret-token', 'openai'), '渠道 openai 已经删掉，可回执'],
+      [setActiveProvider('secret-token', 'openai'), '已经切到渠道 openai，可回执'],
+      [updateFallbacks('secret-token', []), '全局备选链已经存上，可回执'],
+      [updateNodeFallbacks('secret-token', 'main', []), '节点 main 的备选链已经存上，可回执'],
+      [clearNodeFallbacks('secret-token', 'main'), '节点 main 已经改回跟随全局链，可回执'],
+    ];
+    for (const [write, receipt] of writes) {
+      await expect(write).rejects.toBeInstanceOf(ReceiptUnreadable);
+      await expect(write).rejects.toThrow(`${receipt}格式不对：缺 active_provider`);
+    }
   });
 });

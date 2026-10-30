@@ -9,6 +9,7 @@ import {
 import { PluginsSettingsPage } from '../components/settings/pages/PluginsSettingsPage';
 import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { useSettingsStore } from '../store/settingsStore';
+import { providerBlock, providerTable } from './fixtures/providerTable';
 
 function plugin(overrides: Partial<AdminPlugin> = {}): AdminPlugin {
   return {
@@ -48,8 +49,8 @@ function stubApi(data = catalog(), intercept?: (url: string, init?: RequestInit)
     if (custom) return custom;
     if (url === '/v1/admin/plugins' && !init?.method) return response(data);
     if (url.endsWith('/source')) return response({ content: 'PLUGIN_META = {}\n', hash: 'source-1' });
-    if (url.endsWith('/nodes')) return response([{ id: 'main', name: '主节点' }]);
-    if (url.endsWith('/config/providers')) return response({ providers: { my_channel: { type: 'openai' } }, registered: ['openai', 'anthropic'] });
+    if (url.endsWith('/nodes')) return response([{ id: 'main', type: 'ai', name: '主节点' }]);
+    if (url.endsWith('/config/providers')) return response(providerTable({ providers: { my_channel: providerBlock() }, registered: ['openai', 'anthropic'] }));
     return response({});
   });
   vi.stubGlobal('fetch', fetcher);

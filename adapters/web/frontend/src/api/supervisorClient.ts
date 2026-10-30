@@ -531,9 +531,27 @@ export async function checkAdminAuth(token: string): Promise<boolean> {
 
 // ── Nodes ──
 
+const NODE_ROW = {
+  id: NON_EMPTY_TEXT,
+  type: TEXT,
+  name: optional(TEXT),
+  description: optional(TEXT),
+  model: optional(TEXT),
+  base_url: optional(TEXT),
+  provider: optional(TEXT),
+  delegate_targets: optional(TEXT_LIST),
+  aliases: optional(TEXT_LIST),
+  active: optional(BOOLEAN),
+  internal: optional(BOOLEAN),
+  declared_id: optional(TEXT),
+  source: optional(oneOf('default', 'override', 'custom', 'system')),
+  same_as_default: optional(BOOLEAN),
+  problem: optional(TEXT),
+};
+
 export async function getNodes(token: string): Promise<AdminNode[]> {
   const resp = await apiFetch('/admin/config/nodes', { token });
-  return resp.json();
+  return shapedRows('节点表', await resp.json(), NODE_ROW) as unknown as AdminNode[];
 }
 
 export function getConfigRaw(token: string): Promise<RawText> {
@@ -631,9 +649,54 @@ export function activeProviderConfig(
   return cfg ? { model: cfg.model, base_url: cfg.base_url, api_key_present: cfg.api_key_present } : null;
 }
 
+const PROVIDER_BLOCK = {
+  base_url: TEXT,
+  model: TEXT,
+  base_url_raw: TEXT,
+  model_raw: TEXT,
+  api_key_present: BOOLEAN,
+  api_key_redacted: TEXT,
+  supports_vision: nullable(BOOLEAN),
+  type: TEXT,
+  type_explicit: BOOLEAN,
+  label: TEXT,
+};
+const FALLBACK_ENTRY = {
+  provider: TEXT,
+  base_url: TEXT,
+  model: TEXT,
+  base_url_raw: TEXT,
+  model_raw: TEXT,
+  api_key_present: BOOLEAN,
+  api_key_redacted: TEXT,
+  supports_vision: BOOLEAN,
+  options: OBJECT,
+};
+const PROVIDERS_TABLE = {
+  active_provider: TEXT,
+  providers: OBJECT,
+  node_fallbacks: OBJECT,
+  registered: TEXT_LIST,
+  reserved_names: TEXT_LIST,
+};
+
+/** 渠道表。读和写回的是同一张：缺了哪块，渠道下拉、模型继承、备选链编辑器就拿空的顶上，说成一个都没有。 */
+function providersTable(what: string, value: unknown): ProvidersResponse {
+  const table = shaped(what, value, PROVIDERS_TABLE);
+  for (const [name, block] of Object.entries(table.providers)) shaped(what, block, PROVIDER_BLOCK, at('providers', name));
+  shapedRows(what, table.fallbacks, FALLBACK_ENTRY, 'fallbacks');
+  for (const [node, chain] of Object.entries(table.node_fallbacks)) shapedRows(what, chain, FALLBACK_ENTRY, at('node_fallbacks', node));
+  return table as unknown as ProvidersResponse;
+}
+
+/** 写渠道表的回执。receipt 打头说清已经做完；读不懂抛 ReceiptUnreadable。 */
+function providersReceipt(receipt: string, resp: Response): Promise<ProvidersResponse> {
+  return receiptOf(receipt, resp, (body) => providersTable(receipt, body));
+}
+
 export async function getProviders(token: string): Promise<ProvidersResponse> {
   const resp = await apiFetch('/config/providers', { token });
-  return resp.json();
+  return providersTable('渠道表', await resp.json());
 }
 
 export interface ProviderOptionChoice {
@@ -717,7 +780,7 @@ export async function upsertProvider(
     token,
     json: data,
   });
-  return resp.json();
+  return providersReceipt(savedReceipt(`渠道 ${name}`), resp);
 }
 
 export async function deleteProvider(token: string, name: string): Promise<ProvidersResponse> {
@@ -725,7 +788,7 @@ export async function deleteProvider(token: string, name: string): Promise<Provi
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return providersReceipt(nameWith(`渠道 ${name}`, '已经删掉，可回执'), resp);
 }
 
 export interface SystemModelSlot {
@@ -1225,7 +1288,7 @@ export async function setActiveProvider(token: string, provider: string): Promis
     token,
     json: { provider },
   });
-  return resp.json();
+  return providersReceipt(`已经切到渠道 ${provider}，可回执`, resp);
 }
 
 export async function updateFallbacks(
@@ -1237,7 +1300,7 @@ export async function updateFallbacks(
     token,
     json: { fallbacks },
   });
-  return resp.json();
+  return providersReceipt(savedReceipt('全局备选链'), resp);
 }
 
 export async function updateNodeFallbacks(
@@ -1250,7 +1313,7 @@ export async function updateNodeFallbacks(
     token,
     json: { fallbacks },
   });
-  return resp.json();
+  return providersReceipt(savedReceipt(`节点 ${nodeId} 的备选链`), resp);
 }
 
 // 删掉专属链 = 这个节点回退到全局链。提交空数组是「禁用」，两者不同。
@@ -1262,7 +1325,7 @@ export async function clearNodeFallbacks(
     method: 'DELETE',
     token,
   });
-  return resp.json();
+  return providersReceipt(`节点 ${nodeId} 已经改回跟随全局链，可回执`, resp);
 }
 
 export function getRuntimeRaw(token: string): Promise<RawText> {

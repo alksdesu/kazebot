@@ -398,7 +398,8 @@ class ConfigStore:
         读到的键都没有暴露的理由。
         """
         if not isinstance(entry, dict):
-            return {"provider": str(entry or "")}
+            # 写成一个渠道名的条目 engine 跳过不用，照样给齐字段：编辑器按完整形状回填，缺一项就崩。
+            entry = {"provider": entry}
         provider_name = str(entry.get("provider", "") or "").strip().lower()
         public = self._public_block(entry, provider_name)
         # 备选条目用 provider 指渠道，没有自己的 type/label；漏出去编辑器会原样回写。
@@ -421,7 +422,8 @@ class ConfigStore:
         """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
         with self._current():
             data = self._load_raw()
-            active = data.get("provider", "openai")
+            # 和 _active_name 一样：留空的 provider 按 openai 算，原样给出去是 null。
+            active = str(data.get("provider") or "").strip() or "openai"
             fallbacks = data.get("fallbacks", []) or []
 
             providers: dict[str, dict[str, Any]] = {}
