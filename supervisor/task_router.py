@@ -22,6 +22,7 @@ from file_lock import exclusive_lock
 
 from . import (
     async_dispatches,
+    async_tools,
     auto_continue,
     child_retention,
     continuation,
@@ -2855,18 +2856,28 @@ class TaskRouterMixin:
         success: bool | None = None,
         error: str = "",
         cancelled: bool = False,
+        delivery_id: str = "",
     ) -> dict[str, Any]:
         """把异步工具结果交回发起它的节点所在的会话，在那里新建一个入口任务；成功的媒体结果直接发出去。
 
         session_id 是 engine 投递时给的会话，结果里的超长输出存在它名下；落点在哪见 _async_result_home_locked。
         落点换了会话时，先在锁外把引用到的超长输出复制过去，那边的任务才读得回来。
+        delivery_id 交过的照当时的交法回、不再交：engine 没收到应答时会带着同一个 id 重投。
         """
         event_task_id = str(task_id or "").strip()
+        key = async_tools.delivery_key(delivery_id)
         with self._lock:
+            repeat = self._repeated_async_result_locked(key, event_task_id)
+            if repeat is not None:
+                return repeat
             _outcome, planned = self._plan_async_result_locked(session_id, event_task_id, cancelled=cancelled)
         if planned is not None and planned.session_id != session_id:
             self._adopt_async_result_refs(session_id, planned.session_id, text)
         with self._lock:
+            # 两次持锁之间，同一份结果的另一次重投可能已经交下去了
+            repeat = self._repeated_async_result_locked(key, event_task_id)
+            if repeat is not None:
+                return repeat
             outcome, home = self._plan_async_result_locked(session_id, event_task_id, cancelled=cancelled)
             if home is None:
                 if outcome.get("strategy") == "dropped":
@@ -2881,7 +2892,15 @@ class TaskRouterMixin:
             return self._deliver_async_result_locked(
                 home, text=text, attachments=attachments, node_id=str(node_id or "").strip(),
                 task_id=event_task_id, tool_name=str(tool_name or "").strip(), success=success, error=error,
+                delivery_key=key,
             )
+
+    def _repeated_async_result_locked(self, key: str, task_id: str) -> dict[str, Any] | None:
+        """这份结果交过就回当时的交法；没交过回 None。"""
+        repeat = self._async_tool_deliveries.repeat(key)
+        if repeat is not None:
+            log.info("async tool result %s from task %s was already delivered; not delivering it again", key, task_id[:12])
+        return repeat
 
     def _plan_async_result_locked(
         self, session_id: str, task_id: str, *, cancelled: bool,
@@ -3042,7 +3061,9 @@ class TaskRouterMixin:
         tool_name: str,
         success: bool | None,
         error: str,
+        delivery_key: str = "",
     ) -> dict[str, Any]:
+        """交下去的事件带着 delivery_key，交过就记下：之后的重投、重启后的补投都按它认出来。"""
         target_session_id = home.session_id
         session_info = self.sessions.get(target_session_id)
         if not session_info:
@@ -3073,12 +3094,15 @@ class TaskRouterMixin:
             conv_key = session_info.conversation_key
             if conv_key:
                 payload["conversation_key"] = conv_key
+            if delivery_key:
+                payload["delivery_id"] = delivery_key
             evt = self.eventlog.append(
                 session_id=target_session_id,
                 component="supervisor",
                 type_="outbound_message",
                 payload=payload,
             )
+            self._async_tool_deliveries.remember(delivery_key, "outbound_attachment")
             try:
                 self._apply_outbound_message(
                     seq=int(evt.get("seq", 0) or 0),
@@ -3109,6 +3133,8 @@ class TaskRouterMixin:
                 "async_tool_error": str(error)[:1000] if error else "",
             }
         payload.update(self._home_payload_fields_locked(home, guide_fallback_id=task_id))
+        if delivery_key:
+            payload["delivery_id"] = delivery_key
 
         evt = self.eventlog.append(
             session_id=target_session_id,
@@ -3116,6 +3142,7 @@ class TaskRouterMixin:
             type_="inbound_message",
             payload=payload,
         )
+        self._async_tool_deliveries.remember(delivery_key, "inbound")
         seq = int(evt.get("seq", 0))
         self._apply_inbound_message(seq=seq, session_id=target_session_id, payload=payload)
         self._create_entry_task_for_inbound_locked(

@@ -42,13 +42,17 @@ def build_async_result_payload(
     attachments: list[str] | None = None,
     cancelled: bool = False,
 ) -> dict[str, Any]:
-    """所有异步路径共用的结果请求体。cancelled：工具是因为发起任务被取消才停的，supervisor 不再转交。"""
+    """所有异步路径共用的结果请求体。cancelled：工具是因为发起任务被取消才停的，supervisor 不再转交。
+
+    delivery_id 认的是这一份结果：重试和落盘补投都带着同一个，supervisor 交过的不再交第二次。
+    """
     payload: dict[str, Any] = {
         "message": str(message or ""),
         "tool_name": str(tool_name or ""),
         "task_id": str(task_id or ""),
         "node_id": str(node_id or ""),
         "success": not bool(failure_error),
+        "delivery_id": uuid.uuid4().hex,
     }
     if failure_error:
         payload["error"] = str(failure_error)

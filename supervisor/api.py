@@ -837,6 +837,7 @@ def create_app(
             tool_name=str(body.get("tool_name") or ""),
             success=body.get("success") if isinstance(body.get("success"), bool) else None,
             error=str(body.get("error") or ""),
+            delivery_id=str(body.get("delivery_id") or ""),
         )
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error", "unknown"))

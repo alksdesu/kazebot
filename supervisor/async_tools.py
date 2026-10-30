@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,6 +15,57 @@ from starlette.concurrency import run_in_threadpool
 from .types import TaskStatus
 
 log = logging.getLogger(__name__)
+
+# engine 给的投递 id 加上这个前缀再写进事件，和别处 inbound、outbound 的 delivery_id 分开
+_DELIVERY_PREFIX = "async-tool:"
+# engine 落盘的结果最晚一天后补投，按一天里交得完的异步结果留足
+_DELIVERED_LIMIT = 8192
+_STRATEGY_OF_EVENT = {"inbound_message": "inbound", "outbound_message": "outbound_attachment"}
+
+
+def delivery_key(delivery_id: Any) -> str:
+    raw = str(delivery_id or "").strip()
+    return f"{_DELIVERY_PREFIX}{raw}" if raw else ""
+
+
+class DeliveredResults:
+    """交过的异步工具结果，按投递 id 记着当时怎么交的。engine 没收到应答会重投，同一份结果只交一次。
+
+    只在 supervisor 的全局锁里读写。
+    """
+
+    def __init__(self, limit: int = _DELIVERED_LIMIT) -> None:
+        self._limit = limit
+        self._strategies: OrderedDict[str, str] = OrderedDict()
+
+    @classmethod
+    def from_events(cls, events: Iterable[dict[str, Any]]) -> "DeliveredResults":
+        """从事件日志认回交过的：交下去之后、应答之前 supervisor 重启了，engine 补投时照样认得出。"""
+        delivered = cls()
+        for event in events:
+            strategy = _STRATEGY_OF_EVENT.get(str(event.get("type") or ""))
+            payload = event.get("payload")
+            if strategy is None or not isinstance(payload, dict):
+                continue
+            key = str(payload.get("delivery_id") or "")
+            if key.startswith(_DELIVERY_PREFIX):
+                delivered.remember(key, strategy)
+        return delivered
+
+    def repeat(self, key: str) -> dict[str, Any] | None:
+        """key 交过就回当时的交法，标明这次是重投；没交过回 None。"""
+        strategy = self._strategies.get(key) if key else None
+        if strategy is None:
+            return None
+        return {"ok": True, "strategy": strategy, "deduped": True}
+
+    def remember(self, key: str, strategy: str) -> None:
+        if not key:
+            return
+        self._strategies[key] = strategy
+        self._strategies.move_to_end(key)
+        while len(self._strategies) > self._limit:
+            self._strategies.popitem(last=False)
 
 
 def detached_cancelled_locked(state: Any, task_id: str, session_id: str = "") -> bool:
@@ -78,6 +131,7 @@ def create_router(state: Any) -> APIRouter:
             success=success if isinstance(success, bool) else None,
             error=str(body.get("error") or ""),
             cancelled=body.get("cancelled") is True,
+            delivery_id=str(body.get("delivery_id") or ""),
         )
         if result.get("ok"):
             return result

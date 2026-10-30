@@ -215,6 +215,7 @@ def test_async_result_payload_carries_structured_failure_metadata() -> None:
         failure_error="API HTTP 500",
         attachments=["data/attachments/a.png"],
     )
+    assert payload.pop("delivery_id")
     assert payload == {
         "message": "failed",
         "tool_name": "read_image",

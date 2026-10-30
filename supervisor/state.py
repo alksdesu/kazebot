@@ -33,7 +33,7 @@ from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
 from . import branch_recovery, child_retention, stopped_batch
-from .async_tools import detached_cancelled_locked
+from .async_tools import DeliveredResults, detached_cancelled_locked
 from .policy import ApprovalGrantSettings, PathScope, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
@@ -158,6 +158,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             and isinstance(event.get("payload"), dict)
             and str((event.get("payload") or {}).get("delivery_id") or "").strip()
         }
+        self._async_tool_deliveries = DeliveredResults.from_events(eventlog.events)
 
         self._cancelled_sessions: set[str] = set()
         self._tools_reload_seq: int = 0

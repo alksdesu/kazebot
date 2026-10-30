@@ -1,4 +1,6 @@
-"""异步工具结果送不到 supervisor 时不能悄悄丢：瞬时错误重试，重试完落盘，worker 之后补投。"""
+"""异步工具结果送不到 supervisor 时不能悄悄丢：瞬时错误重试，重试完落盘，worker 之后补投。
+重试和补投都带着这份结果第一次发出时的投递 id，supervisor 据此认出重投。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -49,25 +51,48 @@ def _queued(root: Path) -> list[Path]:
 
 def test_transient_failures_are_retried_until_delivered(tmp_path: Path) -> None:
     http = _Http(503, OSError("reset"), 200)
+    payload = _payload()
 
-    assert asyncio.run(deliver_async_result(http, "http://sup", "session", _payload(), workspace_root=tmp_path)) is True
+    assert asyncio.run(deliver_async_result(http, "http://sup", "session", payload, workspace_root=tmp_path)) is True
 
     assert len(http.calls) == 3
     assert http.calls[0][0] == "http://sup/v1/async_tools/results"
-    assert http.calls[0][1] == {**_payload(), "session_id": "session"}
+    assert http.calls[0][1] == {**payload, "session_id": "session"}
     assert _queued(tmp_path) == []
+
+
+def test_every_result_has_its_own_delivery_id_and_every_retry_repeats_it(tmp_path: Path) -> None:
+    http = _Http(503, OSError("reset"), 200)
+    payload = _payload()
+
+    asyncio.run(deliver_async_result(http, "http://sup", "session", payload, workspace_root=tmp_path))
+
+    assert payload["delivery_id"] and payload["delivery_id"] != _payload()["delivery_id"]
+    assert {body["delivery_id"] for _url, body in http.calls} == {payload["delivery_id"]}
+
+
+def test_a_queued_result_is_redelivered_with_the_delivery_id_it_was_first_sent_with(tmp_path: Path) -> None:
+    first = _Http(503, 503, 503, 503)
+    payload = _payload("kept")
+    asyncio.run(deliver_async_result(first, "http://sup", "session", payload, workspace_root=tmp_path))
+    later = _Http(200)
+
+    assert asyncio.run(flush_async_result_outbox(later, "http://sup", tmp_path)) == 1
+
+    assert {body["delivery_id"] for _url, body in [*first.calls, *later.calls]} == {payload["delivery_id"]}
 
 
 @pytest.mark.parametrize("missing", [404, 405])
 def test_a_supervisor_without_the_task_route_gets_it_by_session(tmp_path: Path, missing: int) -> None:
     http = _Http(missing, 200)
+    payload = _payload()
 
-    assert asyncio.run(deliver_async_result(http, "http://sup", "session", _payload(), workspace_root=tmp_path)) is True
+    assert asyncio.run(deliver_async_result(http, "http://sup", "session", payload, workspace_root=tmp_path)) is True
 
     assert [url for url, _body in http.calls] == [
         "http://sup/v1/async_tools/results", "http://sup/v1/sessions/session/async_tool_result",
     ]
-    assert http.calls[1][1] == _payload()
+    assert http.calls[1][1] == payload
 
 
 def test_an_old_supervisor_that_no_longer_knows_the_session_rejects_it(tmp_path: Path) -> None:

@@ -402,6 +402,100 @@ class TestDroppedResults:
         assert outcome == {"ok": True, "strategy": "dropped", "reason": "route_mismatch"}
 
 
+def _attachments_sent(state: SupervisorState) -> list[dict[str, Any]]:
+    return [
+        event for event in state.eventlog.events
+        if event["type"] == "outbound_message" and event["payload"].get("message_type") == "async_tool_attachment"
+    ]
+
+
+class TestRedelivery:
+    """engine 没收到应答会带着同一个投递 id 重投：交过的照当时的交法回，不再交第二次。"""
+
+    def test_a_repeated_result_is_answered_but_not_delivered_again(self, state: SupervisorState) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        _finish(state, launcher)
+        before = set(state.tasks)
+
+        first = state.inject_async_result(sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1")
+        again = state.inject_async_result(sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1")
+
+        assert first == {"ok": True, "strategy": "inbound"}
+        assert again == {"ok": True, "strategy": "inbound", "deduped": True}
+        [payload] = _relays(state, sid)
+        assert payload["delivery_id"] == "async-tool:d-1"
+        assert len(_created_since(state, before)) == 1
+
+    def test_a_repeated_media_result_is_sent_once(self, state: SupervisorState) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+
+        for _ in range(2):
+            state.inject_async_result(
+                sid, "", ["data/attachments/cat.png"], task_id=launcher.task_id, tool_name="draw", success=True,
+                delivery_id="d-1",
+            )
+
+        [sent] = _attachments_sent(state)
+        assert sent["payload"]["delivery_id"] == "async-tool:d-1"
+        assert state.inject_async_result(
+            sid, "", ["data/attachments/cat.png"], task_id=launcher.task_id, success=True, delivery_id="d-1",
+        ) == {"ok": True, "strategy": "outbound_attachment", "deduped": True}
+
+    def test_other_results_and_results_without_an_id_are_all_delivered(self, state: SupervisorState) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        _finish(state, launcher)
+
+        for delivery_id in ("d-1", "d-2", "", ""):
+            state.inject_async_result(sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id=delivery_id)
+
+        assert len(_relays(state, sid)) == 4
+
+    def test_a_repeat_landing_between_planning_and_delivery_is_not_delivered_twice(
+        self, state: SupervisorState, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sid = _session(state)
+        caller = _caller(state, sid)
+        agent_sid, child = _async_child(state, sid, caller)
+        adopt = state._adopt_async_result_refs
+        raced: list[dict[str, Any]] = []
+
+        def adopt_while_a_repeat_lands(source: str, target: str, text: str) -> int:
+            # 第一次复制超长输出的空当里，同一份结果的另一次重投抢先交下去
+            if not raced:
+                raced.append({})
+                raced[0] = state.inject_async_result(
+                    agent_sid, "✅ built", task_id=child.task_id, success=True, delivery_id="d-1",
+                )
+            return adopt(source, target, text)
+
+        monkeypatch.setattr(state, "_adopt_async_result_refs", adopt_while_a_repeat_lands)
+
+        outcome = state.inject_async_result(agent_sid, "✅ built", task_id=child.task_id, success=True, delivery_id="d-1")
+
+        assert raced == [{"ok": True, "strategy": "inbound"}]
+        assert outcome == {"ok": True, "strategy": "inbound", "deduped": True}
+        assert len(_relays(state, sid)) == 1
+
+    def test_a_restarted_supervisor_still_knows_what_it_delivered(self, state: SupervisorState, tmp_path: Path) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        _finish(state, launcher)
+        state.inject_async_result(sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1")
+
+        restarted = SupervisorState(
+            workspace_root=tmp_path,
+            eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="async-tool-routing-restarted"),
+            policy=PolicyEngine(workspace_root=tmp_path),
+        )
+
+        assert restarted.inject_async_result(
+            sid, "✅ done", task_id=launcher.task_id, success=True, delivery_id="d-1",
+        ) == {"ok": True, "strategy": "inbound", "deduped": True}
+
+
 def _cancelled(state: SupervisorState, task_id: str, session_id: str = "") -> bool:
     with state._lock:
         return detached_cancelled_locked(state, task_id, session_id)
@@ -477,6 +571,22 @@ class TestEndpoints:
         assert response.status_code == 200 and response.json() == {"ok": True, "strategy": "inbound"}
         [payload] = _relays(state, sid)
         assert payload["entry_node_id"] == "test.orchestrator" and payload["route_hints"]["async_tool_success"] is True
+
+    def test_a_result_posted_again_to_either_route_is_delivered_once(
+        self, client: TestClient, state: SupervisorState,
+    ) -> None:
+        sid = _session(state)
+        launcher = _inbound(state, sid)
+        _finish(state, launcher)
+        body = {"message": "✅ built", "task_id": launcher.task_id, "success": True, "delivery_id": "d-1"}
+
+        first = client.post("/v1/async_tools/results", json={**body, "session_id": sid})
+        again = client.post("/v1/async_tools/results", json={**body, "session_id": sid})
+        by_session = client.post(f"/v1/sessions/{sid}/async_tool_result", json=body)
+
+        assert first.json() == {"ok": True, "strategy": "inbound"}
+        assert again.json() == by_session.json() == {"ok": True, "strategy": "inbound", "deduped": True}
+        assert len(_relays(state, sid)) == 1
 
     def test_a_cancelled_result_is_acknowledged_and_dropped(self, client: TestClient, state: SupervisorState) -> None:
         sid = _session(state)
