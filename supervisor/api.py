@@ -1479,13 +1479,13 @@ def create_app(
     ) -> dict[str, Any]:
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        from engine.conversation_store import ConversationStore
+        from engine.conversation_store import ConversationStore, public_fields
 
         store = ConversationStore(st.workspace_root / "data" / "conversations")
         messages = store.load(session_id)
         return {
             "total": len(messages),
-            "messages": [message.to_dict() for message in messages[-limit:]],
+            "messages": [{**message.to_dict(), **public_fields(message)} for message in messages[-limit:]],
         }
 
     @app.post("/v1/admin/conversations/{session_id}/reset")

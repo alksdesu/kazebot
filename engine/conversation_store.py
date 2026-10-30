@@ -26,6 +26,7 @@ from typing import Any, BinaryIO, Iterator
 import config_layout
 from engine.eventlog_rotation import append_lines
 from file_lock import exclusive_lock
+from providers.base import content_parts
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,17 @@ class Message:
             tool_call_id=str(data.get("tool_call_id") or ""),
             name=str(data.get("name") or ""),
         )
+
+
+_PUBLIC_TEXT_FIELDS = ("id", "role", "message_type", "created_at", "source_node_id", "source_task_id")
+
+
+def public_fields(message: Message) -> dict[str, Any]:
+    """接口给出去的文本字段和 content。from_dict 不核类型：手改或导入的行在这里照 provider 的读法折好，一行写坏不挡住整份历史。"""
+    fields: dict[str, Any] = {name: str(getattr(message, name) or "") for name in _PUBLIC_TEXT_FIELDS}
+    content = message.content
+    fields["content"] = content if isinstance(content, str) else content_parts(content)
+    return fields
 
 
 # ---------------------------------------------------------------------------

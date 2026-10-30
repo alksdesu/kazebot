@@ -23,7 +23,7 @@ from supervisor.admin_api import create_admin_router  # noqa: E402
 from supervisor.config_store import check_models_text  # noqa: E402
 from supervisor.policy import check_policy_text  # noqa: E402
 from supervisor.scheduler import schedules_path  # noqa: E402
-from toolbox.mcp_runtime import McpConfigError, check_mcp_text  # noqa: E402
+from toolbox.mcp_runtime import McpConfigError, check_mcp_text, get_client_spec  # noqa: E402
 
 _TOKEN = "rt-raw-editor-token"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
@@ -246,6 +246,16 @@ class TestTheMcpClientList:
         # 没写 transport 的按 stdio 起，url 用不上，和运行期一样
         assert (listed["web"]["transport"], listed["web"]["command"]) == ("stdio", "")
         assert "url" not in listed["web"]
+
+    def test_ids_in_a_mapping_are_read_like_the_list_form(self, admin, ws: Path) -> None:
+        # 空 id 那项注册表从来不连；带空白的 id 注册表按去掉空白的去找，原样收的话页面上有、却永远连不上
+        _write(config_layout.mcp_path(ws), "clients:\n  '':\n    command: npx\n  ' fs ':\n    command: npx\n")
+
+        response = admin("GET", "/mcp-clients")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == [_STDIO_FS]
+        assert get_client_spec(ws, "fs") == _STDIO_FS
 
     def test_clients_written_as_a_list_are_listed_too(self, admin, ws: Path) -> None:
         # 运行期认这种写法，控制台不能把它显示成没有客户端。

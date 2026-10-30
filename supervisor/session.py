@@ -974,7 +974,8 @@ class SessionMixin:
         keeps only records with a smaller cursor, so older pages can be fetched.
         """
         from pathlib import Path
-        from engine.conversation_store import ConversationStore
+        from engine.conversation_store import ConversationStore, public_fields
+        from engine.tool_history import tool_calls_of
 
         store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
         messages = list(store.load(session_id))
@@ -988,18 +989,19 @@ class SessionMixin:
         with self._lock:
             branch_ids = self._entry_branch_ids_for_parent_locked(session_id)
         if branch_ids:
-            parent_msg_ids = {m.id for m in messages}
+            # 比较、排序都按 public_fields 的读法：手改的行 id 是列表、时间是数字，整份历史会跟着报错
+            parent_msg_ids = {str(m.id or "") for m in messages}
             for bid in branch_ids:
                 branch_msgs = store.load(bid)
                 for bm in branch_msgs:
-                    if bm.id not in parent_msg_ids:
+                    if str(bm.id or "") not in parent_msg_ids:
                         messages.append(bm)
             # Re-sort by created_at to maintain chronological order
-            messages.sort(key=lambda m: m.created_at or "")
+            messages.sort(key=lambda m: str(m.created_at or ""))
 
         indexed = list(enumerate(messages))
         if task_id:
-            indexed = [(cursor, m) for cursor, m in indexed if getattr(m, 'source_task_id', '') == task_id]
+            indexed = [(cursor, m) for cursor, m in indexed if str(m.source_task_id or "") == task_id]
         if before is not None:
             indexed = [(cursor, m) for cursor, m in indexed if cursor < before]
         if limit > 0:
@@ -1007,21 +1009,7 @@ class SessionMixin:
 
         result: list[dict[str, Any]] = []
         for cursor, msg in indexed:
-            entry: dict[str, Any] = {
-                "cursor": cursor,
-                "id": msg.id,
-                "role": msg.role,
-                "content": msg.content,
-                "message_type": msg.message_type,
-                "created_at": msg.created_at,
-                "source_node_id": msg.source_node_id,
-                # [AutoC 2026-06-03] Why: source_task_id is useful for auditing
-                # hydrated callback rows and remains harmless for ordinary history.
-                # How: include the existing ConversationStore field in the structured
-                # history response. Purpose: frontend message sources can preserve
-                # task metadata after refresh.
-                "source_task_id": msg.source_task_id,
-            }
+            entry: dict[str, Any] = {"cursor": cursor, **public_fields(msg)}
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
                 reasoning = str(
@@ -1103,9 +1091,12 @@ class SessionMixin:
                 _dispatch_summary = str(msg.meta.get("summary") or "").strip()
                 if _dispatch_summary:
                     entry["summary"] = _dispatch_summary
-            # Tool calls (assistant requesting tools)
-            if msg.tool_calls:
-                entry["tool_calls"] = msg.tool_calls
+            # chat/completions 形状的调用也照 provider 的读法认出名字和参数，没有名字的不给
+            calls = tool_calls_of({"role": entry["role"], "tool_calls": msg.tool_calls})
+            if calls:
+                entry["tool_calls"] = [
+                    {"id": call.call_id, "name": call.name, "arguments": call.arguments} for call in calls
+                ]
             # Tool result fields
             if msg.tool_call_id:
                 entry["tool_call_id"] = msg.tool_call_id

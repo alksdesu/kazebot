@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -189,6 +190,88 @@ class TestSessionPaging:
 
         assert [(row["cursor"], row["id"]) for row in latest] == [(3, "m3"), (4, "m4")]
         assert [(row["cursor"], row["id"]) for row in older] == [(1, "m1"), (2, "m2")]
+
+
+def _write_rows(workspace: Path, session_id: str, rows: list[dict[str, Any]]) -> None:
+    path = workspace / "data" / "conversations" / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes("".join(json.dumps(row) + "\n" for row in rows).encode("utf-8"))
+
+
+# 手改或从别处导入的存档：from_dict 不核类型，原样转出去前端整份历史都会读不出来
+_HAND_WRITTEN = [
+    {"id": 7, "role": "user", "content": None, "created_at": 5},
+    {"id": "a", "role": "assistant", "content": {"type": "text", "text": "x"}, "tool_calls": {"name": "read_file"}},
+    {"id": "b", "role": "assistant", "content": ["hi", 3, None, {"type": "text", "text": "y"}], "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": "a.md"})}},
+        "junk",
+        {"id": "c2", "arguments": {}},
+    ]},
+    {"role": None, "content": "z", "meta": {"note": "kept"}},
+]
+
+
+class TestHandWrittenHistoryRows:
+    def test_history_reads_each_row_the_way_the_model_reads_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = state.get_or_create_session(channel="web", conversation_key="web:hand-written")
+        _write_rows(tmp_path, sid, _HAND_WRITTEN)
+
+        response = _get(_app(state, tmp_path), f"/v1/sessions/{sid}/history")
+
+        assert response.status_code == 200, response.text
+        rows = response.json()
+        assert [(row["id"], row["role"], row["content"]) for row in rows] == [
+            ("7", "user", []),
+            ("a", "assistant", [{"type": "text", "text": "x"}]),
+            ("b", "assistant", [{"type": "text", "text": "hi"}, {"type": "text", "text": "3"}, {"type": "text", "text": "y"}]),
+            ("", "", "z"),
+        ]
+        assert rows[0]["created_at"] == "5"
+        # chat/completions 形状的调用照样认出名字和参数，不是对象的、没名字的不给
+        assert rows[2]["tool_calls"] == [{"id": "c1", "name": "read_file", "arguments": {"path": "a.md"}}]
+        assert all("tool_calls" not in row for row in (rows[0], rows[1], rows[3]))
+
+    def test_a_branch_merge_compares_and_sorts_rows_written_by_hand(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = _state(tmp_path)
+        sid = state.get_or_create_session(channel="web", conversation_key="web:hand-branch")
+        _write_rows(tmp_path, sid, [{"id": ["x"], "role": "user", "content": "parent", "created_at": 2}])
+        _write_rows(tmp_path, "branch_hand", [{"id": "y", "role": "assistant", "content": "branch", "created_at": "1"}])
+        monkeypatch.setattr(state, "_entry_branch_ids_for_parent_locked", lambda parent: {"branch_hand"})
+
+        response = _get(_app(state, tmp_path), f"/v1/sessions/{sid}/history")
+
+        assert response.status_code == 200, response.text
+        assert [row["content"] for row in response.json()] == ["branch", "parent"]
+
+    def test_task_filter_matches_the_id_the_row_is_shown_with(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = state.get_or_create_session(channel="web", conversation_key="web:hand-task")
+        _write_rows(tmp_path, sid, [{"id": "n", "role": "user", "content": "numbered", "source_task_id": 42}])
+
+        response = _get(_app(state, tmp_path), f"/v1/sessions/{sid}/history", params={"task_id": "42"})
+
+        assert [(row["source_task_id"], row["content"]) for row in response.json()] == [("42", "numbered")]
+
+    def test_the_console_preview_reads_role_and_content_the_same_way(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        _write_rows(tmp_path, "hand-preview", _HAND_WRITTEN)
+
+        response = _get(_app(state, tmp_path), "/v1/admin/conversations/hand-preview/messages")
+
+        assert response.status_code == 200, response.text
+        messages = response.json()["messages"]
+        assert [(row["role"], row["content"]) for row in messages] == [
+            ("user", []),
+            ("assistant", [{"type": "text", "text": "x"}]),
+            ("assistant", [{"type": "text", "text": "hi"}, {"type": "text", "text": "3"}, {"type": "text", "text": "y"}]),
+            ("", "z"),
+        ]
+        # 预览以外的字段照存档原样带着
+        assert messages[1]["tool_calls"] == {"name": "read_file"}
+        assert messages[3]["meta"] == {"note": "kept"}
 
 
 class TestAttachmentHeaders:

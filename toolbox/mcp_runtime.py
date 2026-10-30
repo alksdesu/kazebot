@@ -133,9 +133,10 @@ def _parse_config(data: Any) -> dict[str, Any]:
     raw_clients = data.get("clients")
     clients: dict[str, Any] = {}
     if isinstance(raw_clients, dict):
+        # id 和列表写法一样去掉空白、空的不收：注册表按去掉空白的 id 去找，空 id 的那项从来连不上
         for cid, spec in raw_clients.items():
-            if isinstance(cid, str) and isinstance(spec, dict):
-                clients[cid] = dict(spec)
+            if isinstance(cid, str) and cid.strip() and isinstance(spec, dict):
+                clients[cid.strip()] = dict(spec)
     elif isinstance(raw_clients, list):
         for item in raw_clients:
             if not isinstance(item, dict):
