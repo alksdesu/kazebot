@@ -347,6 +347,7 @@ class TestKeeping:
         sid = _session(state)
         caller = _inbound(state, sid)
         agent_sid, child = _async_child(state, sid, caller)
+        _finish(state, caller)
 
         _ask(state, child)
         _post_cleanup(state, child)
