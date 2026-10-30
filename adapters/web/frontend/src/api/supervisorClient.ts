@@ -1509,7 +1509,14 @@ export interface MemoryEntry {
   source?: string;
   created_at?: string;
   updated_at?: string;
+  /** expiry_state 不是 none 时是后端按注入、清理同一读法换算好的完整时间；读不懂时是原样文本。 */
+  expires_at?: unknown;
+  /** 老后端没有这一项，那时没有到期时间。 */
+  expiry_state?: MemoryExpiryState;
 }
+
+export const MEMORY_EXPIRY_STATES = ['none', 'active', 'expired', 'unreadable'] as const;
+export type MemoryExpiryState = (typeof MEMORY_EXPIRY_STATES)[number];
 
 export const MEMORY_OWNER = { kind: TEXT, label: TEXT };
 
@@ -1537,7 +1544,11 @@ const MEMORY_NAMESPACE = {
 };
 
 // 条目的其余字段是记忆本里手写的原样，只核后端自己填的那几项。
-const MEMORY_ENTRY = { book: NON_EMPTY_TEXT, constant: BOOLEAN };
+const MEMORY_ENTRY = {
+  book: NON_EMPTY_TEXT,
+  constant: BOOLEAN,
+  expiry_state: optional(oneOf(...MEMORY_EXPIRY_STATES)),
+};
 
 const UNREADABLE_MEMORY_BOOK = { book: NON_EMPTY_TEXT, problem: TEXT };
 

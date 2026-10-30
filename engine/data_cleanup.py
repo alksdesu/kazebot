@@ -16,7 +16,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +42,12 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     _save_book,
     memory_entry_constant,
 )
+from engine.memory_expiry import entry_expired, memory_timezone  # noqa: E402
 from engine.memory_hit_cache import (  # noqa: E402
     HitCacheUnreadable,
     hit_cache_path,
     hit_timestamp,
+    prune_entries_hits,
     prune_orphan_namespace_hits,
     read_hit_cache,
     warn_unreadable,
@@ -83,6 +85,7 @@ ATTACH_MAX_AGE = 24 * 3600            # 24 h
 # Persistent memory entry cleanup. Entries with constant=true are protected.
 # For ordinary entries, use last_hit_at first, then updated_at, then created_at.
 # This keeps recently activated memories even if they were created long ago.
+# 0 turns aging out off; entries past their expires_at are removed either way.
 MEMORY_ENTRY_MAX_AGE = float(os.getenv("CLONOTH_MEMORY_ENTRY_MAX_AGE_SECONDS", str(14 * 24 * 3600)))
 
 TEMP_GLOBS = [
@@ -328,7 +331,7 @@ def _load_hit_stamps(workspace_root: Path) -> dict[str, str] | None:
         return None
 
 
-def _memory_entry_expired(entry: object, namespace: str, cutoff: float, hit_cache: dict[str, str]) -> bool:
+def _memory_entry_aged_out(entry: object, namespace: str, cutoff: float, hit_cache: dict[str, str]) -> bool:
     if not isinstance(entry, dict) or memory_entry_constant(entry):
         return False
     # 只清自动提取写的条目。没有 source 的条目里有人手写的，一律当手工记忆保护，
@@ -346,117 +349,157 @@ def _memory_entry_expired(entry: object, namespace: str, cutoff: float, hit_cach
 @dataclass
 class _MemorySweep:
     scanned_books: int = 0
+    expired_entries: int = 0
     deleted_entries: int = 0
     removed_empty_books: int = 0
     skipped_archives: int = 0
+    removed_hit_keys: int = 0
     # 演练时空目录还在盘上，扫孤儿命中键得照真跑时的样子把它们算成没了。
     removed_namespaces: set[str] = field(default_factory=set)
+    # 这个 namespace 这一轮删掉的条目 id，出了锁再一起摘命中戳。
+    removed_ids: list[str] = field(default_factory=list)
 
 
-def _expire_book_locked(
-    book_path: Path, namespace: str, cutoff: float, hit_cache: dict[str, str],
-) -> tuple[int, bool]:
-    """淘汰一本记忆里过期的自动条目，返回 (删掉的条数, 是否整本删空)。调用方持有记忆写锁。"""
+@dataclass(frozen=True)
+class _SweepRules:
+    now: datetime
+    zone: tzinfo
+    # 两个有一个是 None 就不按年龄淘汰：关掉了、人物档案（cutoff），命中侧车读不了（hit_cache）。
+    cutoff: float | None
+    hit_cache: dict[str, str] | None
+
+
+def _sweep_book_locked(book_path: Path, namespace: str, rules: _SweepRules) -> tuple[list[str], list[str], bool]:
+    """删掉一本记忆里到期的条目和按年龄淘汰的自动条目。
+
+    返回 (到期删掉的 id, 按年龄删掉的 id, 是否整本删空)。调用方持有记忆写锁。
+    """
     data = _load_book(book_path)
-    entries = data["entries"]
-    kept = [entry for entry in entries if not _memory_entry_expired(entry, namespace, cutoff, hit_cache)]
-    deleted = len(entries) - len(kept)
-    if not deleted:
-        return 0, False
+    expired: list[str] = []
+    aged: list[str] = []
+    kept: list[Any] = []
+    for entry in data["entries"]:
+        # 到期时间是写这条的人自己定的：常驻的、手写的到期也删。工具改不了已有常驻条目的到期时间。
+        if isinstance(entry, dict) and entry_expired(entry, rules.zone, rules.now):
+            expired.append(str(entry.get("id") or ""))
+        elif (
+            rules.cutoff is not None and rules.hit_cache is not None
+            and _memory_entry_aged_out(entry, namespace, rules.cutoff, rules.hit_cache)
+        ):
+            aged.append(str(entry.get("id") or ""))
+        else:
+            kept.append(entry)
+    if not expired and not aged:
+        return [], [], False
     if kept:
         data["entries"] = kept
         _rewrite_book(book_path, data)
-        return deleted, False
+        return expired, aged, False
     _unlink(book_path)
-    return deleted, True
+    return expired, aged, True
 
 
 def _sweep_namespace_locked(
     namespace: str,
     directory: Path,
-    cutoff: float,
-    hit_cache: dict[str, str] | None,
+    rules: _SweepRules,
     sweep: _MemorySweep,
 ) -> None:
-    """一个 namespace：淘汰过期的自动条目，删空了连目录一起收掉。调用方持有记忆写锁。
-
-    hit_cache 是 None（命中侧车读不了）时这一轮不淘汰条目，只收空目录。
-    """
+    """一个 namespace：删掉到期的条目、按年龄淘汰自动条目，删空了连目录一起收掉。调用方持有记忆写锁。"""
     books = memory_book_files(directory)
     if namespace.startswith(SUBJECT_PREFIX):
         # 跨会话人物档案不参与年龄淘汰：画像的价值就在长期积累，
-        # 「三个月前提过对象生日」正是它存在的理由。只能手工删。
+        # 「三个月前提过对象生日」正是它存在的理由。只删写明了到期时间的。
         sweep.skipped_archives += len(books)
-    elif hit_cache is not None:
-        for book_path in books:
-            try:
-                deleted, emptied = _expire_book_locked(book_path, namespace, cutoff, hit_cache)
-            except MemoryBookUnreadable as exc:
-                logging.info("[memory] skipped unreadable book %s: %s", book_path, exc.reason)
-                continue
-            except OSError as exc:
-                logging.info("[memory] failed to update book %s: %s", book_path, exc)
-                continue
-            sweep.scanned_books += 1
-            sweep.deleted_entries += deleted
-            sweep.removed_empty_books += int(emptied)
+        rules = _SweepRules(now=rules.now, zone=rules.zone, cutoff=None, hit_cache=rules.hit_cache)
+    for book_path in books:
+        try:
+            expired, aged, emptied = _sweep_book_locked(book_path, namespace, rules)
+        except MemoryBookUnreadable as exc:
+            logging.info("[memory] skipped unreadable book %s: %s", book_path, exc.reason)
+            continue
+        except OSError as exc:
+            logging.info("[memory] failed to update book %s: %s", book_path, exc)
+            continue
+        sweep.scanned_books += 1
+        sweep.expired_entries += len(expired)
+        sweep.deleted_entries += len(aged)
+        sweep.removed_empty_books += int(emptied)
+        sweep.removed_ids.extend(entry_id for entry_id in (*expired, *aged) if entry_id)
     # 判空和 rmdir 都得在锁里：engine 可能正往这个目录里写第一本。
     if namespace and not any(directory.iterdir()):
         _rmdir(directory)
         sweep.removed_namespaces.add(namespace)
 
 
+def _prune_removed_entry_hits(workspace_root: Path, namespace: str, sweep: _MemorySweep) -> None:
+    """删掉的条目连命中戳一起摘：留着的话，之后新建的同 id 记忆一进来就带着旧的命中时间。"""
+    entry_ids, sweep.removed_ids = sweep.removed_ids, []
+    if not entry_ids:
+        return
+    if DRY_RUN:
+        logging.info(
+            "[dry-run] would remove the hit stamps of %d deleted entries in %s", len(entry_ids), namespace or "(root)",
+        )
+        return
+    sweep.removed_hit_keys += prune_entries_hits(workspace_root, namespace, entry_ids)
+
+
 def purge_expired_memory_entries():
-    """Remove stale non-constant memory entries from the memory books.
+    """Remove memory entries past their expires_at, and stale non-constant ones.
 
     Memory books are YAML files shaped like {book, entries}.  Namespaced books
     live under data/memory/<namespace>/*.yaml, while older/global books live
     directly under data/memory/*.yaml.  We scan both layouts.
     """
-    if MEMORY_ENTRY_MAX_AGE <= 0:
-        logging.info("[memory] entry cleanup disabled")
-        return
-
     workspace_root = DATA_DIR.parent
     mem_root = memory_root(workspace_root)
     if not mem_root.is_dir():
         return
 
-    cutoff = time.time() - MEMORY_ENTRY_MAX_AGE
+    if MEMORY_ENTRY_MAX_AGE <= 0:
+        logging.info("[memory] aging out disabled; only entries past their expiry are removed")
+        cutoff, hit_cache = None, None
+    else:
+        cutoff, hit_cache = time.time() - MEMORY_ENTRY_MAX_AGE, _load_hit_stamps(workspace_root)
+    rules = _SweepRules(
+        now=datetime.now(timezone.utc), zone=memory_timezone(workspace_root), cutoff=cutoff, hit_cache=hit_cache,
+    )
     sweep = _MemorySweep()
-    hit_cache = _load_hit_stamps(workspace_root)
 
     namespaces = [("", mem_root), *((directory.name, directory) for directory in namespace_dirs(workspace_root))]
     for namespace, directory in namespaces:
         try:
             # 和 engine 的记忆工具同一把锁：读完到写回之间插进来的那次保存，会被这次整本写回盖掉。
             with _memory_write_lock(workspace_root):
-                _sweep_namespace_locked(namespace, directory, cutoff, hit_cache, sweep)
+                _sweep_namespace_locked(namespace, directory, rules, sweep)
         except (OSError, TimeoutError) as exc:
             logging.info("[memory] namespace %s skipped: %s", namespace or "(root)", exc)
+        _prune_removed_entry_hits(workspace_root, namespace, sweep)
 
-    removed_hit_keys = 0
     try:
         surviving = {p.name for p in mem_root.iterdir() if p.is_dir()} - sweep.removed_namespaces
     except OSError as exc:
         logging.info("[memory] orphan hit-key sweep skipped: %s", exc)
     else:
-        removed_hit_keys = prune_orphan_namespace_hits(workspace_root, surviving, dry_run=DRY_RUN)
-        if DRY_RUN and removed_hit_keys:
+        orphan_keys = prune_orphan_namespace_hits(workspace_root, surviving, dry_run=DRY_RUN)
+        if DRY_RUN and orphan_keys:
             logging.info(
                 "[dry-run] would remove %d orphan hit keys from %s",
-                removed_hit_keys,
+                orphan_keys,
                 hit_cache_path(workspace_root),
             )
+        sweep.removed_hit_keys += orphan_keys
 
     logging.info(
-        "[memory] scanned_books=%d deleted_entries=%d removed_empty_books=%d "
+        "[memory] scanned_books=%d expired_entries=%d deleted_entries=%d removed_empty_books=%d "
         "skipped_archives=%d removed_hit_keys=%d max_age_hours=%.1f",
         sweep.scanned_books,
+        sweep.expired_entries,
         sweep.deleted_entries,
         sweep.removed_empty_books,
         sweep.skipped_archives,
-        removed_hit_keys,
+        sweep.removed_hit_keys,
         MEMORY_ENTRY_MAX_AGE / 3600,
     )
 

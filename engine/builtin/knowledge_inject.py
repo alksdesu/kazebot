@@ -9,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -16,6 +17,17 @@ import yaml
 
 import config_layout
 from clonoth_runtime import SwitchValueError, get_int, parse_bool, switch_arg
+from engine.memory_expiry import (
+    EXPIRES_AT,
+    EXPIRY_FORMS,
+    ExpiryPassed,
+    ExpiryValueError,
+    entry_expired,
+    expiry_field,
+    expiry_text,
+    memory_timezone,
+    new_expiry,
+)
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     memory_book_files,
@@ -693,6 +705,8 @@ def load_memory_catalog(
     if not mem_dir.exists() or not mem_dir.is_dir():
         return []
 
+    zone = memory_timezone(workspace_root)
+    now = datetime.now(timezone.utc)
     items: list[dict[str, Any]] = []
     for yaml_path in memory_book_files(mem_dir):
         stamp = config_layout.file_stamp(yaml_path)
@@ -709,6 +723,9 @@ def load_memory_catalog(
             if not eid:
                 continue
             if not memory_entry_enabled(entry):
+                continue
+            # 到点就不再注入，不等每小时的清理把它删掉。
+            if entry_expired(entry, zone, now):
                 continue
 
             content = str(entry.get("content") or "").strip()
@@ -1900,13 +1917,26 @@ def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if subject and not _subject_is_enrolled(ctx.workspace_root, subject):
         subject = ""
 
+    # None = 没传，更新时沿用旧条目的；空串 = 改成长期有效。
+    expires: str | None = None
+    if EXPIRES_AT in args:
+        try:
+            moment = new_expiry(
+                args.get(EXPIRES_AT), memory_timezone(ctx.workspace_root), datetime.now(timezone.utc),
+            )
+        except ExpiryPassed as exc:
+            return _tool_err(f"{exc}; a memory that is already out of date should be deleted, not saved")
+        except ExpiryValueError:
+            return _tool_err(f"unreadable expires_at: use {EXPIRY_FORMS}, or an empty string to keep it for good")
+        expires = expiry_text(moment) if moment is not None else ""
+
     try:
         _namespaces = _tool_memory_namespaces(ctx, subject)
         # 寻址、改、写必须在同一把锁里：读完再等锁，拿到锁时 data 已经是别人改过之前的快照。
         with _memory_write_lock(ctx.workspace_root):
             return _save_memory_locked(
                 ctx, args, mid, book, content, keywords, constant, enabled,
-                node_ids, priority, scan_depth, subject, _namespaces,
+                node_ids, priority, scan_depth, subject, expires, _namespaces,
             )
     except (InvalidMemoryNamespace, MemoryBookUnreadable) as exc:
         return _memory_store_err(exc)
@@ -1925,6 +1955,7 @@ def _save_memory_locked(
     priority: int,
     scan_depth: int,
     subject: str,
+    expires: str | None,
     _namespaces: list[str],
 ) -> dict[str, Any]:
     """save_memory 的读-改-写主体，调用方必须已持有 _memory_write_lock。"""
@@ -1937,12 +1968,10 @@ def _save_memory_locked(
         data = _load_book(book_path)
     data.setdefault("book", book)
 
-    # [AutoC 2026-05-31] Why: save_memory 之前不写 created_at 和 source，
-    # 导致 dream 的过期/清理逻辑无法判断条目年龄和来源。
-    # How: 新建时写入 created_at + source；更新时保留原 created_at，刷新 updated_at。
-    # Purpose: dream Phase 4 过期判断和 source 保护逻辑能正常工作。
-    from datetime import datetime, timezone
-    _now_iso = datetime.now(timezone.utc).isoformat()
+    # 新建时写入 created_at 和 source，更新时保留原 created_at、刷新 updated_at：dream 和定时清理按它们判年龄和来源。
+    now = datetime.now(timezone.utc)
+    _now_iso = now.isoformat()
+    zone = memory_timezone(ctx.workspace_root)
 
     new_entry: dict[str, Any] = {
         "id": mid,
@@ -1959,6 +1988,8 @@ def _save_memory_locked(
         new_entry["node_ids"] = node_ids
     if subject:
         new_entry["subject"] = subject
+    if expires:
+        new_entry[EXPIRES_AT] = expires
 
     entries = data["entries"]
     found = found_index >= 0
@@ -1971,15 +2002,25 @@ def _save_memory_locked(
         # constant 卸不掉：卸得掉就能先解锁再 delete，绕开那边的 constant 守卫。
         if memory_entry_constant(old) and "constant" in args and not constant:
             return _tool_err(f"cannot clear constant flag: {mid}")
+        # 到期时间同理：改成马上到期，定时清理就会替它删掉。
+        if memory_entry_constant(old) and expires is not None and expires != expiry_field(old, zone):
+            return _tool_err(f"cannot change the expiry of constant memory: {mid}")
         new_entry["created_at"] = str(old.get("created_at") or "").strip() or _now_iso
         new_entry["source"] = _AUTO_SOURCE
         new_entry["updated_at"] = _now_iso
         # 整条替换会抹掉旧字段。判据必须是「args 里有没有这个键」—— keywords/constant
         # 这些在 new_entry 里总带默认值，按 "not in new_entry" 判等于永远不继承，
         # 于是模型只想改 content 就把关键词洗成空，条目下一轮起永久不可召回。
-        for carried in ("keywords", "constant", "enabled", "priority", "scan_depth", "node_ids", "subject"):
+        # dream 的审查标记不继承：内容改过就得重新审。
+        for carried in ("keywords", "constant", "enabled", "priority", "scan_depth", "node_ids", "subject", EXPIRES_AT):
             if carried not in args and carried in old:
                 new_entry[carried] = old[carried]
+        # 沿用下来的到期时间可能已经过了：照存的话，这次更新一落盘就不再注入、随后被删。
+        if entry_expired(new_entry, zone, now):
+            return _tool_err(
+                f"memory {book}/{mid} expired at {expiry_field(new_entry, zone)}: pass a later "
+                "expires_at, or an empty string to keep it for good"
+            )
     else:
         new_entry["created_at"] = _now_iso
         new_entry["updated_at"] = _now_iso
@@ -2001,7 +2042,10 @@ def _save_memory_locked(
     _save_book(book_path, data)
     # invalidate 时也传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
-    return _tool_ok(f"Memory {'updated' if found else 'saved'}: {book}/{mid}", book=book, id=mid, updated=found)
+    return _tool_ok(
+        f"Memory {'updated' if found else 'saved'}: {book}/{mid}",
+        book=book, id=mid, updated=found, expires_at=expiry_field(new_entry, zone),
+    )
 
 
 @_in_thread
@@ -2018,6 +2062,8 @@ def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not mem_dir.exists():
         return _tool_ok("0 memories", entries=[])
 
+    zone = memory_timezone(ctx.workspace_root)
+    now = datetime.now(timezone.utc)
     result: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for yaml_path in memory_book_files(mem_dir):
@@ -2040,6 +2086,9 @@ def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                     "scan_depth": int(e.get("scan_depth") or 0),
                     "node_ids": e.get("node_ids", []),
                     "subject": str(e.get("subject") or ""),
+                    # 过期的还没被清理掉时照样列出来，标明已不再注入。
+                    "expires_at": expiry_field(e, zone),
+                    "expired": entry_expired(e, zone, now),
                 })
         except Exception as read_error:
             logger.warning("memory book %s skipped while listing: %s", yaml_path.name, read_error)
@@ -2225,6 +2274,14 @@ PLUGIN_META["tools"] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Restrict this entry to these node ids. Omit to make it visible to every node.",
+                },
+                "expires_at": {
+                    "type": "string",
+                    "description": "When this memory stops being true or useful: YYYY-MM-DD (valid through that day) "
+                    "or YYYY-MM-DD HH:MM, read in the instance's time zone unless an offset is given. Set it for "
+                    "plans, events, temporary states and time-limited offers; leave it out for lasting facts. "
+                    "Once it passes the memory is no longer injected and is deleted. On update, omit it to keep "
+                    "the current expiry, or pass an empty string to keep the memory for good.",
                 },
             },
             "required": ["id", "content"],

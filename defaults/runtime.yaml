@@ -190,6 +190,10 @@ memory:
   # 0 = 不裁剪。
   max_budget_chars: 30000
 
+  # 记忆的到期时间按这个时区读：只写日期（算到那天结束）或不带时区的时间都按它算；
+  # 提取记忆和 dream 拿到的「当前时间」、对话记录里标的说话时间也按它显示。IANA 时区名。
+  timezone: "Asia/Shanghai"
+
   auto_extract:
     enabled: true             # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
     node_id: "system.memory_extractor"  # 记忆提取节点 id

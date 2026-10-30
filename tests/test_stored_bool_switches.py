@@ -24,7 +24,7 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     load_memory_catalog,
     load_skill_catalog,
 )
-from engine.data_cleanup import _memory_entry_expired  # noqa: E402
+from engine.data_cleanup import _memory_entry_aged_out  # noqa: E402
 from engine.memory_namespace import conversation_namespace  # noqa: E402
 from engine.node import Node, load_node  # noqa: E402
 from engine.prompt import assemble_prompt  # noqa: E402
@@ -163,7 +163,7 @@ class TestMemoryEntries:
     def test_cleanup_protects_exactly_the_constant_ones(self, raw: str, protected: bool) -> None:
         entry = _entry("old", constant=raw, created_at="2020-01-01T00:00:00+00:00")
 
-        expired = _memory_entry_expired(entry, "ns", time.time(), {})
+        expired = _memory_entry_aged_out(entry, "ns", time.time(), {})
 
         assert expired is (not protected)
 

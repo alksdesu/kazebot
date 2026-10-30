@@ -207,11 +207,17 @@ def prune_entry_hits(workspace_root: Path, namespace: str, entry_id: str) -> int
     留着的话，之后在同一个会话里新建同 id 的记忆会继承旧命中时间，一进来就是「老热记忆」。
     根目录条目的命中戳就是扁平 key，同 prune_namespace_hits 一样留着：别的会话的同 id 记忆还靠它判龄。
     """
-    entry = str(entry_id or "").strip()
-    if not entry or not str(namespace or "").strip():
+    return prune_entries_hits(workspace_root, namespace, [entry_id])
+
+
+def prune_entries_hits(workspace_root: Path, namespace: str, entry_ids: Iterable[str]) -> int:
+    """Drop several entries' hit stamps in one rewrite of the sidecar; same rules as prune_entry_hits."""
+    if not str(namespace or "").strip():
         return 0
-    doomed = hit_cache_key(namespace, entry)
-    return _drop_hit_keys(workspace_root, lambda key: key == doomed)
+    doomed = {hit_cache_key(namespace, entry) for entry in (str(raw or "").strip() for raw in entry_ids) if entry}
+    if not doomed:
+        return 0
+    return _drop_hit_keys(workspace_root, lambda key: key in doomed)
 
 
 def _drop_hit_keys(workspace_root: Path, matches: Callable[[str], bool]) -> int:

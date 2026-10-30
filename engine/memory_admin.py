@@ -24,6 +24,17 @@ from engine.builtin.knowledge_inject import (
     memory_entry_constant,
     memory_entry_enabled,
 )
+from engine.memory_expiry import (
+    EXPIRES_AT,
+    EXPIRY_NONE,
+    ExpiryPassed,
+    ExpiryValueError,
+    expiry_field,
+    expiry_state,
+    expiry_text,
+    memory_timezone,
+    new_expiry,
+)
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     is_memory_namespace,
@@ -47,7 +58,7 @@ __all__ = [
     "upsert_entry",
 ]
 
-# 手动条目不参与 14 天淘汰，也不被 dream 整理 —— 人写进去的就该由人删。
+# 手动条目不参与 14 天淘汰，也不被 dream 整理和审查 —— 人写进去的就该由人删，填了到期时间的到期删。
 _MANUAL_SOURCE = "manual"
 _MAX_CONTENT_LEN = 4000
 _MAX_KEYWORDS = 32
@@ -175,6 +186,8 @@ def list_entries(workspace_root: Path, namespace: str) -> MemoryListing:
     listing = MemoryListing()
     if not directory.is_dir():
         return listing
+    zone = memory_timezone(Path(workspace_root))
+    now = datetime.now(timezone.utc)
     for path in memory_book_files(directory):
         book = path.stem
         try:
@@ -191,6 +204,10 @@ def list_entries(workspace_root: Path, namespace: str) -> MemoryListing:
             item["constant"] = memory_entry_constant(entry)
             item["enabled"] = memory_entry_enabled(entry)
             item.setdefault("scan_depth", _DEFAULT_SCAN_DEPTH)
+            # 到期时间同理：手写的只有日期、不带时区，按注入和清理的读法换成同一个时刻再给页面
+            item["expiry_state"] = expiry_state(entry, zone, now)
+            if item["expiry_state"] != EXPIRY_NONE:
+                item[EXPIRES_AT] = expiry_field(entry, zone)
             listing.entries.append(item)
     return listing
 
@@ -218,7 +235,15 @@ def upsert_entry(
     if not keywords and not constant and not subject:
         raise MemoryAdminError("这条记忆永远不会被召回：至少填关键词，或勾选常驻，或指定 subject")
 
-    now = datetime.now(timezone.utc).isoformat()
+    moment = datetime.now(timezone.utc)
+    try:
+        expires = new_expiry(payload.get(EXPIRES_AT), memory_timezone(Path(workspace_root)), moment)
+    except ExpiryPassed:
+        raise MemoryAdminError("到期时间已经过了：过时的记忆不用再加") from None
+    except ExpiryValueError:
+        raise MemoryAdminError("到期时间读不懂：写成 2026-11-05（到那天结束）或 2026-11-05 18:00") from None
+
+    now = moment.isoformat()
     path = directory / f"{book}.yaml"
     with _memory_write_lock(Path(workspace_root)):
         try:
@@ -243,6 +268,8 @@ def upsert_entry(
         }
         if subject:
             entry["subject"] = subject
+        if expires is not None:
+            entry[EXPIRES_AT] = expiry_text(expires)
         if found >= 0:
             old = entries[found]
             entry["created_at"] = str(old.get("created_at") or "").strip() or now

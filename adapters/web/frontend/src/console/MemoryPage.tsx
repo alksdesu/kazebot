@@ -30,7 +30,7 @@ import { errorMessage } from '../api/request';
 import { KEYWORD_INPUT_HINT, splitKeywords } from '../utils/keywords';
 import { appendSentence } from '../utils/sentence';
 
-const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
+const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false, expires: '' };
 
 // 三处列表都会随使用量无限变长，右边内容却还是那么点 —— 分页管住高度。
 // 数值取到各自那一栏跟邻栏高度相当为止。
@@ -81,6 +81,26 @@ function entryText(raw: unknown): string {
 const EntryKeywords = ({ raw }: { raw: unknown }) => {
   const words = keywordsOf(raw);
   return words.length ? <p className={KW}>关键词：{words.join('、')}</p> : null;
+};
+
+/** 后端换算好的是带偏移的完整时间，照它写的时区显示到分钟。 */
+function expiryText(raw: unknown): string {
+  const text = entryText(raw);
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/.exec(text);
+  return match ? `${match[1]} ${match[2]}` : text;
+}
+
+const EntryExpiry = ({ entry }: { entry: MemoryEntry }) => {
+  switch (entry.expiry_state) {
+    case 'active':
+      return <Tag>{expiryText(entry.expires_at)} 到期</Tag>;
+    case 'expired':
+      return <Tag>已过期 · 不再注入，等待清理</Tag>;
+    case 'unreadable':
+      return <span className={UNREADABLE}>到期时间读不懂（{entryText(entry.expires_at)}），一直不会到期</span>;
+    default:
+      return null;
+  }
 };
 
 const unreadableText = (books: readonly UnreadableMemoryBook[]): string => (
@@ -195,6 +215,7 @@ const MemoryBlock = () => {
         content: draft.content.trim(),
         keywords: splitKeywords(draft.keywords),
         constant: draft.constant,
+        ...(draft.expires ? { expires_at: draft.expires } : {}),
       }));
       // 回执读不懂时也已经存上了：草稿照清，条目以紧接着重读到的为准。
       setDraft(EMPTY_DRAFT);
@@ -235,7 +256,7 @@ const MemoryBlock = () => {
   };
 
   return (
-    <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
+    <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理，填了到期日的到期后删掉" title="长期记忆">
       {overviewLoading ? <Empty>正在读取记忆来源…</Empty>
         : overviewFailed ? <Button className="mb-2" onClick={() => void loadOverview()} tone="quiet">重新读取记忆来源</Button>
           : namespaces.length === 0 && <Empty>还没有任何记忆。</Empty>}
@@ -310,6 +331,7 @@ const MemoryBlock = () => {
                     <span className={ID}>{entryText(entry.id)}</span>
                     {entry.constant && <Tag tone="live">常驻 · 每轮都注入</Tag>}
                     {entry.source === 'manual' && <Tag>手动</Tag>}
+                    <EntryExpiry entry={entry} />
                     <span className="flex-1" />
                     <Button disabled={busy || loading} onClick={() => void remove(entry)} tone="danger">删除</Button>
                   </div>
@@ -353,6 +375,17 @@ const MemoryBlock = () => {
                     width="flex"
                   />
                 </label>
+                <div className={FIELD}>
+                  <label className={FIELD}>
+                    <span className={LABEL}>到期日</span>
+                    <Input
+                      onChange={(event) => setDraft({ ...draft, expires: event.target.value })}
+                      type="date"
+                      value={draft.expires}
+                    />
+                  </label>
+                  <span className={META}>可不填。过了这天就不再注入，随后删掉</span>
+                </div>
                 <Check
                   align="start"
                   checked={draft.constant}

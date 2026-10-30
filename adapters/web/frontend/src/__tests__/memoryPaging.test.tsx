@@ -621,6 +621,71 @@ describe('手写的关键词', () => {
   });
 });
 
+describe('到期时间', () => {
+  it('有期限的标出哪天到期，过期的说明已不再注入，读不懂的照原样说出来', async () => {
+    stub({
+      namespaces: [namespace(1, '甲群', 'group')],
+      entries: [
+        { ...entry(1), expires_at: '2026-11-05T23:59:59+08:00', expiry_state: 'active' },
+        { ...entry(2), expires_at: '2026-10-01T23:59:59+08:00', expiry_state: 'expired' },
+        { ...entry(3), expires_at: '下周', expiry_state: 'unreadable' },
+        { ...entry(4), expiry_state: 'none' },
+      ],
+    });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    await screen.findByText('第 1 条');
+    expect(screen.getByText('2026-11-05 23:59 到期')).toBeInTheDocument();
+    expect(screen.getByText('已过期 · 不再注入，等待清理')).toBeInTheDocument();
+    expect(screen.getByText('到期时间读不懂（下周），一直不会到期')).toBeInTheDocument();
+    // 第 4 条没有到期时间，不摆标签。
+    expect(screen.getAllByText(/ 到期$|^已过期|^到期时间读不懂/)).toHaveLength(3);
+  });
+
+  it('老后端不给 expiry_state：当成没有到期时间', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [entry(1)] });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    await screen.findByText('第 1 条');
+    expect(screen.queryByText(/ 到期$|^已过期|^到期时间读不懂/)).toBeNull();
+  });
+
+  it('填了到期日才带上 expires_at，没填的不带', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')] });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await waitFor(() => expect(screen.getByLabelText('内容')).toBeEnabled());
+
+    const add = async (id: string, expires: string) => {
+      fireEvent.change(screen.getByLabelText('标识'), { target: { value: id } });
+      fireEvent.change(screen.getByLabelText('内容'), { target: { value: '周六团建' } });
+      fireEvent.change(screen.getByLabelText('关键词'), { target: { value: '团建' } });
+      fireEvent.change(screen.getByLabelText('到期日'), { target: { value: expires } });
+      fireEvent.click(screen.getByRole('button', { name: '添加' }));
+      await waitFor(() => expect(screen.getByLabelText('标识')).toHaveValue(''));
+    };
+    await add('outing', '2026-11-08');
+    await add('forever', '');
+
+    const bodies = vi.mocked(globalThis.fetch).mock.calls
+      .filter(([, init]) => init?.method === 'POST')
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(bodies[0].expires_at).toBe('2026-11-08');
+    expect('expires_at' in bodies[1]).toBe(false);
+  });
+
+  it('后端回的到期状态对不上就算没读成', async () => {
+    stub({ namespaces: [namespace(1, '甲群', 'group')], entries: [{ ...entry(1), expiry_state: 'soon' }] });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    expect(await screen.findByRole('button', { name: '重新读取这一份' })).toBeInTheDocument();
+    expect(screen.queryByText('第 1 条')).toBeNull();
+  });
+});
+
 // 正则里的逗号被当成分隔符拆开，存下的两截都不成正则，召回时再也命中不了。
 describe('添加时的关键词', () => {
   it('写成 /正则/ 的那段整段存成一个词，别的照逗号拆', async () => {

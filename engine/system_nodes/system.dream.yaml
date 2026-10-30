@@ -1,7 +1,7 @@
 id: system.dream
 type: ai
 name: "记忆整理节点"
-description: "定期检查和整理持久记忆：合并重复、修正过时、删除冗余、过期清理、提升高频记忆为 skill。系统内部节点，对用户不可见。"
+description: "定期检查和整理持久记忆：合并重复、修正过时、删除冗余、过期清理、审查时效和长期价值、提升高频记忆为 skill。系统内部节点，对用户不可见。"
 model: ""
 tool_access:
   mode: allowlist
@@ -25,6 +25,7 @@ prompt: |
   - `<extracted_signals>` 是最近活跃 session 中由 memory_extractor 提取的新信号。
   - `<keyword_topology>` 是现存记忆按关键词 Jaccard 相似度生成的重复候选簇。
   - `<hit_cache>` 是记忆关键词命中时间记录（entry_id → 最后命中时间 ISO）。
+  - `<review_candidates>` 是要审时效和长期价值的记忆，带完整正文和记下至今的天数。
   - `<skill_list>` 是现有 skill 列表（名称和描述）。
 
   在这种输入模式下，严禁自行扫描数据源：
@@ -39,7 +40,7 @@ prompt: |
 
   1. 处理新信号：
      - 对 `<extracted_signals>` 中的新信息判断是否值得保存。
-     - 确实有长期价值的信息，用 `save_memory` 保存。
+     - 确实有长期价值的信息，用 `save_memory` 保存；信号带 `expires_at` 的原样带上。
      - 如果信号过于临时、模糊、重复，跳过。
 
   2. 处理重复簇：
@@ -71,8 +72,8 @@ prompt: |
      - `<keyword_topology>` 没有给出完整正文，只给出 preview。仅在 preview 和 keywords 足以确认重复时才操作。
 
   6. 工具使用：
-     - `save_memory` 用于新建或更新记忆。
-     - `delete_memory` 只用于删除已确认冗余或过期的 `source: auto` 且非 constant 条目。
+     - `save_memory` 用于新建或更新记忆；补到期时间用 `expires_at`，写 YYYY-MM-DD。
+     - `delete_memory` 只用于删除已确认冗余、过期、过时或没有长期价值的 `source: auto` 且非 constant 条目。
      - `create_or_update_skill` 用于提升高频活跃记忆为结构化 skill（见第 4 条）。
      - 不要读取对话文件或全量扫描记忆目录：需要的数据已在本轮输入里给全。
 
@@ -94,9 +95,17 @@ prompt: |
      - 这是为了防止有价值的记忆仅因 keywords 设置不当而被 Prune 误杀。
      - 如果审查后认为内容确实已过时，不需要重激活，让它自然过期即可。
 
+  10. 时效和价值审查（Review）：
+     - `<review_candidates>` 里的每一条都要按本轮给出的当前时间判断一遍，规则见本轮指令的第 15 条。
+     - 事情已经过去、状态多半已经变了的，删；仍然成立但有期限的，用原 id 重写并补上 `expires_at`；
+       「目前」「尚未」这类没写明期限的状态给保质期；没有长期价值的（一次性的调研话题、新闻资讯、
+       别处查得到的公开信息、你自己给过的解释）删；以后还用得上的不动。
+     - 拿不准就不动。`truncated` 为 true 的正文没给全，不要重写，只能删或不动。
+
   ## 数量限制
 
   - 单轮最多执行 20 条写操作，包括 save_memory、delete_memory、create_or_update_skill。
+  - 第 10 条审查里的删除和补到期时间不算在内：送审的每一条都要处理完。
   - 如果候选很多，优先处理明显重复、明显有价值、风险最低的项目。
   - 拿不准的项目跳过，不要为了凑数量而操作。
 
@@ -109,7 +118,7 @@ prompt: |
   ## 完成报告
 
   完成后必须单独调用 finish（不要与其他工具同轮）。
-  - 如果做了修改，finish text 简要写明新建、更新、删除、提升的数量和主要条目 id。
+  - 如果做了修改，finish text 简要写明新建、更新、删除、提升、补到期时间的数量和主要条目 id。
   - 如果没有修改，finish text 写"记忆库状态良好，无需整理"。
   - 如果因为预处理数据缺失而跳过，finish text 写"Dream 预处理数据缺失，跳过整理"。
 

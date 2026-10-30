@@ -22,13 +22,25 @@ from engine.builtin.knowledge_inject import (
     MemoryBookUnreadable,
     _as_int,
     _first_report,
+    _is_tool_writable,
     _load_book,
+    _memory_write_lock,
+    _save_book,
     _short_text,
     memory_entry_constant,
+    memory_entry_enabled,
     skill_files,
 )
 from engine.builtin.memory_extract import _format_transcript_for_extract
 from engine import memory_subjects
+from engine.memory_expiry import (
+    REVIEWED_AT,
+    entry_expired,
+    entry_expiry,
+    expiry_field,
+    memory_timezone,
+    now_text,
+)
 from engine.memory_hit_cache import HitCacheUnreadable, hit_timestamp, read_hit_cache, warn_unreadable
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
@@ -68,6 +80,14 @@ _PROMOTE_RECENT_HIT_DAYS = 7
 _PROMOTE_MIN_CHARS = 200
 _REACTIVATE_IDLE_DAYS = 20
 _MAX_MAINTENANCE_PER_KIND = 20
+
+# 时效和长期价值审查：每个 namespace 每晚送审几条、每条给模型看多长的正文、审过多久再审一遍。
+# 补到期时间要用 save_memory 整条重写，正文给不全的条目只能删或不动，所以这里给得宽。
+_MAX_REVIEW_PER_NAMESPACE = 20
+_REVIEW_CONTENT_CHARS = 2000
+_REVIEW_AGAIN_DAYS = 90
+# 「目前」「尚未」这类没有明确期限的状态记忆，从记下那天算起的保质期。
+_STATE_SHELF_LIFE_DAYS = 30
 
 # 一轮 dream 要把同一批记忆本读好几遍：同一本写坏的同一版，每种用途只记一次日志。
 _WARNED_BOOKS: OrderedDict[tuple[str, str], tuple[int, int, int] | None] = OrderedDict()
@@ -205,6 +225,7 @@ class DreamHandler:
         extractors: list[dict[str, str]] = []
         extractor_node = "system.memory_extractor"
         generation_cb = ctx.get("current_session_generation")
+        current_time = now_text(memory_timezone(workspace_root), now)
 
         for sid in session_ids:
             conversation_key, namespace = targets.get(sid, ("", ""))
@@ -225,7 +246,9 @@ class DreamHandler:
             # 每个会话读自己 namespace 的 book：提取器建议的 book 名要落在同一目录，
             # 否则模型会照着别的群的 book 名分类。
             instruction = self._build_extractor_instruction(
-                transcript, book_list=self._build_book_list(workspace_root, namespace),
+                transcript,
+                book_list=self._build_book_list(workspace_root, namespace),
+                current_time=current_time,
             )
             try:
                 # [AutoC 2026-05-31] Why: Dream preprocessing must reuse the
@@ -386,6 +409,8 @@ class DreamHandler:
         runtime_cfg = load_runtime_config(workspace_root)
         skill_list = self._load_skill_list(workspace_root)
         created: list[str] = []
+        # 整理任务 id → 它送审的条目；任务跑完才把这些条目标成审过。
+        reviews: dict[str, dict[str, Any]] = {}
         for namespace, signals in sorted(signals_by_namespace.items()):
             task_id = self._create_namespace_dream_task(
                 ctx=ctx,
@@ -395,12 +420,13 @@ class DreamHandler:
                 namespace=namespace,
                 signals=signals,
                 skill_list=skill_list,
+                reviews=reviews,
             )
             if task_id:
                 created.append(task_id)
 
         created.extend(self._create_profile_dream_tasks(
-            ctx=ctx, runtime_cfg=runtime_cfg, workspace_root=workspace_root, now=now,
+            ctx=ctx, runtime_cfg=runtime_cfg, workspace_root=workspace_root, now=now, reviews=reviews,
         ))
 
         if not created:
@@ -416,6 +442,7 @@ class DreamHandler:
         # pending payload and add the final task ids plus creation time. Purpose:
         # a later tick can detect successful completion and write .dream-lock.
         pending["dream_task_ids"] = created
+        pending["reviews"] = reviews
         pending["dream_created_at"] = now.astimezone().isoformat(timespec="seconds")
         log.info(
             "[scheduler] dream tasks created after preprocessing extractors=%d namespaces=%d tasks=%d",
@@ -431,8 +458,9 @@ class DreamHandler:
         runtime_cfg: dict[str, Any],
         workspace_root: Path,
         now: datetime,
+        reviews: dict[str, dict[str, Any]],
     ) -> list[str]:
-        """给每份人物档案建一个去重任务。
+        """给每份人物档案建一个整理任务：去重，审时效和长期价值。
 
         档案跨会话共享、又不参与年龄淘汰，同一件事被反复记成好几条只增不减，
         长期会把注入预算吃满。这里用的是不带 create_or_update_skill 的专用节点：
@@ -449,20 +477,23 @@ class DreamHandler:
             namespace = subject_namespace(subject)
             if not namespace:
                 continue
-            entries = self._load_memory_topology_entries(workspace_root, namespace)
-            # 一条记忆无从谈起重复，两条起才有合并的余地。
-            if len(entries) < 2:
+            entries = self._load_memory_topology_entries(workspace_root, namespace, now=now)
+            review = self._review_candidates(workspace_root, namespace, now=now)
+            # 一条记忆无从谈起重复，两条起才有合并的余地；只有一条也得审它过没过时、值不值得留。
+            if len(entries) < 2 and not review:
                 continue
             hit_cache_json, maintenance_json = self._hit_blocks(workspace_root, namespace, entries, now=now)
             instruction = self._build_dream_instruction(
                 run_id=str(uuid.uuid4()),
                 now=now,
                 signals=[],
-                topology_json=self._build_keyword_topology_json(workspace_root, namespace),
+                topology_json=self._build_keyword_topology_json(workspace_root, namespace, now=now),
                 hit_cache_json=hit_cache_json,
                 maintenance_json=maintenance_json,
                 skill_list=skill_list,
                 book_list=self._build_book_list(workspace_root, namespace),
+                review_json=self._review_json(review),
+                current_time=now_text(memory_timezone(workspace_root), now),
             )
             task_id = self._create_final_dream_task(
                 ctx=ctx,
@@ -475,6 +506,7 @@ class DreamHandler:
             )
             if task_id:
                 created.append(task_id)
+                self._remember_review(reviews, task_id, namespace, review)
         return created
 
     def _create_namespace_dream_task(
@@ -487,33 +519,52 @@ class DreamHandler:
         namespace: str,
         signals: list[dict[str, Any]],
         skill_list: str,
+        reviews: dict[str, dict[str, Any]],
     ) -> str:
         """Create one final Dream task scoped to a single memory namespace."""
-        entries = self._load_memory_topology_entries(workspace_root, namespace)
+        entries = self._load_memory_topology_entries(workspace_root, namespace, now=now)
         if not signals and not entries:
             return ""
-        # [AutoC 2026-05-31] Why: the final organizer also needs to know the
-        # current book landscape. How: rebuild the list at final task creation
-        # time so files created during preprocessing are visible. Purpose: guide
-        # save/delete decisions with live book names.
+        review = self._review_candidates(workspace_root, namespace, now=now)
+        # book 列表在建整理任务时现取：预处理期间新建的 book 也要让它看见。
         hit_cache_json, maintenance_json = self._hit_blocks(workspace_root, namespace, entries, now=now)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
             signals=signals,
-            topology_json=self._build_keyword_topology_json(workspace_root, namespace),
+            topology_json=self._build_keyword_topology_json(workspace_root, namespace, now=now),
             hit_cache_json=hit_cache_json,
             maintenance_json=maintenance_json,
             skill_list=skill_list,
             book_list=self._build_book_list(workspace_root, namespace),
+            review_json=self._review_json(review),
+            current_time=now_text(memory_timezone(workspace_root), now),
         )
-        return self._create_final_dream_task(
+        task_id = self._create_final_dream_task(
             ctx=ctx,
             runtime_cfg=runtime_cfg,
             now=now,
             namespace=namespace,
             instruction=instruction,
         )
+        if task_id:
+            self._remember_review(reviews, task_id, namespace, review)
+        return task_id
+
+    @staticmethod
+    def _remember_review(
+        reviews: dict[str, dict[str, Any]], task_id: str, namespace: str, review: list[dict[str, Any]],
+    ) -> None:
+        """记下这个整理任务送审的是哪几条的哪一版：任务跑完后只标这一版。"""
+        if not review:
+            return
+        reviews[task_id] = {
+            "namespace": namespace,
+            "items": [
+                {"file": item["file"], "id": item["id"], "updated_at": item["updated_at"]}
+                for item in review
+            ],
+        }
 
     def _create_final_dream_task(
         self,
@@ -604,6 +655,8 @@ class DreamHandler:
                 self._dream_pending = None
             return
 
+        # 按任务分开标：一个档案的整理失败了，不该连累别的档案这一轮审过的条目明晚再审一遍。
+        self._mark_reviewed(workspace_root=workspace_root, now=now, pending=pending, statuses=statuses)
         failed = [tid for tid, status in statuses.items() if status != "completed"]
         if not failed:
             # 写锁失败也要照常清 pending：锁文件全仓没有任何读取方，丢一次远比把
@@ -635,6 +688,67 @@ class DreamHandler:
                 f"记忆整理没能完成：{len(dream_task_ids)} 个整理任务里有 {len(failed)} 个失败。",
             )
         self._dream_pending = None
+
+    def _mark_reviewed(
+        self,
+        *,
+        workspace_root: Path,
+        now: datetime,
+        pending: dict[str, Any],
+        statuses: dict[str, str],
+    ) -> None:
+        """跑完了的整理任务，把它送审的条目标成审过；失败、取消的不标，下一晚重审。"""
+        reviews = pending.get("reviews")
+        if not isinstance(reviews, dict):
+            return
+        for task_id, batch in reviews.items():
+            if statuses.get(task_id) == "completed" and isinstance(batch, dict):
+                self._mark_batch_reviewed(workspace_root, batch, now=now)
+
+    def _mark_batch_reviewed(self, workspace_root: Path, batch: dict[str, Any], *, now: datetime) -> None:
+        """只标还是送审那一版的条目：这一轮里被改写过的（updated_at 变了）明晚接着审。"""
+        namespace = str(batch.get("namespace") or "")
+        mem_dir = self._namespace_dir(workspace_root, namespace)
+        if mem_dir is None:
+            return
+        versions: dict[str, dict[str, str]] = {}
+        for item in batch.get("items") or []:
+            name = str(item.get("file") or "")
+            # 文件名是送审时从目录里列出来的；再核一遍只是一个文件名，不让它指到目录外面。
+            if name and Path(name).name == name:
+                versions.setdefault(name, {})[str(item.get("id") or "")] = str(item.get("updated_at") or "")
+        zone = memory_timezone(workspace_root)
+        stamp = now.astimezone(timezone.utc).isoformat()
+        marked = 0
+        try:
+            # 和记忆工具同一把锁：读完到写回之间插进来的那次保存，会被这次整本写回盖掉。
+            with _memory_write_lock(workspace_root):
+                for name, wanted in versions.items():
+                    path = mem_dir / name
+                    if not path.is_file():
+                        continue
+                    data = self._read_book(path, "review marks")
+                    if data is None:
+                        continue
+                    changed = False
+                    for entry in data["entries"]:
+                        if not isinstance(entry, dict):
+                            continue
+                        eid = str(entry.get("id") or "").strip()
+                        if eid not in wanted or str(entry.get("updated_at") or "") != wanted[eid]:
+                            continue
+                        if entry_expiry(entry, zone) is not None:
+                            continue
+                        entry[REVIEWED_AT] = stamp
+                        changed = True
+                        marked += 1
+                    if changed:
+                        _save_book(path, data)
+        except (OSError, TimeoutError) as exc:
+            log.warning("[scheduler] dream could not mark reviewed memories in %s: %s", namespace or "(root)", exc)
+            return
+        if marked:
+            log.info("[scheduler] dream marked %d memories reviewed in %s", marked, namespace or "(root)")
 
     def _write_dream_lock(self, *, workspace_root: Path, completed_at: datetime) -> bool:
         """Write data/memory/.dream-lock for a successful Dream cycle."""
@@ -764,9 +878,11 @@ class DreamHandler:
 
     def _session_transcript(self, *, workspace_root: Path, ctx: dict[str, Any], session_id: str) -> str:
         """Format one session transcript with the memory extractor formatter."""
+        # 这里整理的多是前一天的对话：说话时间得标在记录里，不然「明天」会按整理那一刻去换算。
+        zone = memory_timezone(workspace_root)
         try:
             messages = self._load_recent_conversation_messages(workspace_root=workspace_root, session_id=session_id)
-            transcript = _format_transcript_for_extract(messages, max_chars=_DREAM_TRANSCRIPT_MAX_CHARS)
+            transcript = _format_transcript_for_extract(messages, max_chars=_DREAM_TRANSCRIPT_MAX_CHARS, zone=zone)
             if transcript.strip():
                 return transcript
         except Exception as exc:
@@ -779,7 +895,7 @@ class DreamHandler:
             messages = session_messages(session_id, 200)
         except Exception:
             return ""
-        return _format_transcript_for_extract(messages, max_chars=_DREAM_TRANSCRIPT_MAX_CHARS)
+        return _format_transcript_for_extract(messages, max_chars=_DREAM_TRANSCRIPT_MAX_CHARS, zone=zone)
 
     def _load_recent_conversation_messages(self, *, workspace_root: Path, session_id: str) -> list[dict[str, Any]]:
         """Read a bounded recent JSONL window for one conversation session."""
@@ -831,13 +947,11 @@ class DreamHandler:
             recent_reversed.append(item)
         return list(reversed(recent_reversed))
 
-    def _build_extractor_instruction(self, transcript: str, book_list: str = "") -> str:
+    def _build_extractor_instruction(self, transcript: str, book_list: str = "", current_time: str = "") -> str:
         """Build the one-shot instruction that turns memory_extractor into a signal emitter."""
-        # [AutoC 2026-05-31] Why: preprocessing emits candidate memory records
-        # with book names but must not rely on static categories. How: include the
-        # dynamic book list before the transcript. Purpose: make later Dream
-        # organization prefer existing books without blocking new ones.
+        # book 列表每次现取：提取器建议的 book 名要落在已有的 book 里，又不拦着它开新的。
         return f"""本次调用来自 Dream 预处理流水线。
+当前时间：{current_time}
 以下是当前 memory book 列表：
 <book_list>
 {book_list}
@@ -845,9 +959,10 @@ class DreamHandler:
 保存时优先使用已有 book，也可以创建新 book。
 
 禁止调用 save_memory、delete_memory、list_memories。
-只分析下方 transcript。
+只分析下方 transcript，按节点提示词里的标准挑：以后用不上的不要列出来。
 最终必须调用 finish，finish 的 text 必须是纯 JSON 数组：
-[{{"id": "...", "book": "...", "content": "...", "keywords": ["..."]}}]
+[{{"id": "...", "book": "...", "content": "...", "keywords": ["..."], "expires_at": "YYYY-MM-DD"}}]
+expires_at 只给有期限的条目，长期有效的不写这个键。
 无可保存信息时返回 []。
 
 --- 以下是对话记录 ---
@@ -880,9 +995,11 @@ class DreamHandler:
                 log.warning("[scheduler] dream %s: memory book %s is unreadable: %s", purpose, path.name, exc.reason)
             return None
 
-    def _build_keyword_topology_json(self, workspace_root: Path, namespace: str) -> str:
+    def _build_keyword_topology_json(
+        self, workspace_root: Path, namespace: str, *, now: datetime | None = None,
+    ) -> str:
         """Build Jaccard keyword clusters from one namespace's memory books."""
-        entries = self._load_memory_topology_entries(workspace_root, namespace)
+        entries = self._load_memory_topology_entries(workspace_root, namespace, now=now)
         clusterable = [entry for entry in entries if entry["keyword_set"]]
         parent = list(range(len(clusterable)))
 
@@ -942,6 +1059,7 @@ class DreamHandler:
                             "source": m["source"],
                             "created_at": m["created_at"],
                             "priority": m["priority"],
+                            "expires_at": m["expires_at"],
                         }
                         for m in sorted(members, key=lambda item: (item["book"], item["id"]))
                     ],
@@ -965,12 +1083,19 @@ class DreamHandler:
             log.warning("[scheduler] dream skipped memory namespace %s: %s", namespace, exc)
             return None
 
-    def _load_memory_topology_entries(self, workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
-        """Read minimal memory fields required for topology clustering."""
+    def _load_memory_topology_entries(
+        self, workspace_root: Path, namespace: str, *, now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read minimal memory fields required for topology clustering.
+
+        已经到期、只等清理删掉的条目不算：拿它去合并，会把作废的内容并进还有效的那条。
+        """
         mem_dir = self._namespace_dir(workspace_root, namespace)
         if mem_dir is None or not mem_dir.is_dir():
             return []
 
+        zone = memory_timezone(workspace_root)
+        moment = now or datetime.now(timezone.utc)
         result: list[dict[str, Any]] = []
         for yaml_path in memory_book_files(mem_dir):
             data = self._read_book(yaml_path, "topology")
@@ -981,7 +1106,7 @@ class DreamHandler:
                 if not isinstance(entry, dict):
                     continue
                 eid = str(entry.get("id") or "").strip()
-                if not eid:
+                if not eid or entry_expired(entry, zone, moment):
                     continue
                 raw_keywords = entry.get("keywords")
                 if isinstance(raw_keywords, list):
@@ -1011,6 +1136,8 @@ class DreamHandler:
                         "created_at": str(entry.get("created_at") or ""),
                         # 和注入同一套读法：写成 high、.inf 的不能让整轮整理崩掉。
                         "priority": _as_int(entry.get("priority"), 0),
+                        # 合并时要把到期时间带到留下的那条上，否则有期限的事会变成长期记忆。
+                        "expires_at": expiry_field(entry, zone),
                     }
                 )
         return result
@@ -1169,6 +1296,77 @@ class DreamHandler:
                 filtered[eid] = stamp
         return json.dumps(filtered, ensure_ascii=False)
 
+    def _review_candidates(self, workspace_root: Path, namespace: str, *, now: datetime) -> list[dict[str, Any]]:
+        """该审时效和长期价值的自动记忆：这一版没审过的先审、记得早的先审，再轮到审过很久的。
+
+        常驻的、手写的、停用的、已经写了到期时间的不审：前两样只有人能删，停用的不注入，
+        写了到期时间的到点自然会删。到期时间写得读不懂的照样送审，模型可以替它补一个能读的。
+        """
+        mem_dir = self._namespace_dir(workspace_root, namespace)
+        if mem_dir is None or not mem_dir.is_dir():
+            return []
+        zone = memory_timezone(workspace_root)
+        found: list[dict[str, Any]] = []
+        for path in memory_book_files(mem_dir):
+            data = self._read_book(path, "review")
+            if data is None:
+                continue
+            book = str(data.get("book") or path.stem).strip() or path.stem
+            for entry in data["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                eid = str(entry.get("id") or "").strip()
+                if (
+                    not eid
+                    or not _is_tool_writable(entry)
+                    or memory_entry_constant(entry)
+                    or not memory_entry_enabled(entry)
+                    or entry_expiry(entry, zone) is not None
+                ):
+                    continue
+                reviewed_days = _days_since(str(entry.get(REVIEWED_AT) or ""), now=now)
+                if reviewed_days is not None and reviewed_days < _REVIEW_AGAIN_DAYS:
+                    continue
+                content = str(entry.get("content") or "").strip()
+                created_at = str(entry.get("created_at") or "")
+                found.append({
+                    "file": path.name,
+                    "book": book,
+                    "id": eid,
+                    "content": content[:_REVIEW_CONTENT_CHARS],
+                    "content_chars": len(content),
+                    "created_at": created_at,
+                    "age_days": _days_since(created_at, now=now),
+                    "updated_at": str(entry.get("updated_at") or ""),
+                    "reviewed_days": reviewed_days,
+                })
+
+        def _order(item: dict[str, Any]) -> tuple[int, float]:
+            if item["reviewed_days"] is None:
+                age = item["age_days"]
+                return 0, -(float("inf") if age is None else age)
+            return 1, -item["reviewed_days"]
+
+        found.sort(key=_order)
+        return found[:_MAX_REVIEW_PER_NAMESPACE]
+
+    @staticmethod
+    def _review_json(review: list[dict[str, Any]]) -> str:
+        """送给模型的那几个字段；文件名、版本号只给系统事后打标记用。"""
+        rows: list[dict[str, Any]] = []
+        for item in review:
+            row = {
+                "book": item["book"],
+                "id": item["id"],
+                "content": item["content"],
+                "created_at": item["created_at"],
+                "age_days": item["age_days"],
+            }
+            if item["content_chars"] > len(item["content"]):
+                row["truncated"] = True
+            rows.append(row)
+        return json.dumps(rows, ensure_ascii=False)
+
     def _load_skill_list(self, workspace_root: Path) -> str:
         """现有 skill 的目录名和描述：Promote 阶段拿它判断有没有同主题的 skill，免得重复建。
 
@@ -1196,18 +1394,16 @@ class DreamHandler:
         maintenance_json: str = "{}",
         skill_list: str = "",
         book_list: str = "",
+        review_json: str = "[]",
+        current_time: str = "",
     ) -> str:
         """Assemble the final Dream task instruction from preprocessed data."""
         signals_json = json.dumps(signals, ensure_ascii=False, indent=2)
-        # [AutoC 2026-05-31] Why: Dream should preserve reusable lessons,
-        # related-memory activation, and valuable-but-dormant memories during
-        # scheduled cleanup. How: include pattern extraction, association
-        # discovery, and reactivation constraints in every generated Dream task.
-        # Purpose: prevent memory organization from collapsing recurring
-        # incidents into one concrete record or pruning useful rules too early.
+        # 结构抽象、关联链强化、重激活每次都写进约束：整理时别把反复发生的事收成一条具体记录，也别过早清掉有用的规则。
         return f"""[auto_dream]
 run_id: {run_id}
 time: {now.strftime('%Y-%m-%d %H:%M UTC')}
+当前时间：{current_time or now.strftime('%Y-%m-%d %H:%M UTC')}
 
 以下是从最近活跃 session 中提取的新信号：
 <extracted_signals>
@@ -1240,18 +1436,31 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 {book_list}
 </book_list>
 
+以下是要审时效和长期价值的记忆（给的是完整正文，truncated 为 true 的除外；age_days 是记下至今的天数）：
+<review_candidates>
+{review_json}
+</review_candidates>
+
 约束：
 1. 不要调用 list_memories 全量扫描。
 2. 不要读取对话文件（tail/cat/read_file）。
-3. 只基于上面的 signals、topology、hit_cache 和 skill_list 做操作。
-4. 对 signals 中的新信息：判断是否值得保存，调用 save_memory。
-5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 save_memory/delete_memory。
+3. 只基于上面的 signals、topology、hit_cache、maintenance_candidates、review_candidates 和 skill_list 做操作。
+4. 对 signals 中的新信息：判断是否值得保存，调用 save_memory；信号带 expires_at 的原样传给 save_memory。
+5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 save_memory/delete_memory；被合并的条目有 expires_at 的，留下的那条也带上。
 6. 过期清理（Prune）：从 maintenance_candidates.prune 里逐条审查，确认无保留价值的用 delete_memory 清理。
 7. 提升（Promote）：对 maintenance_candidates.promote 中的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 create_or_update_skill 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
-8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
+8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill），第 15 条审查里的删除和补到期时间不算在内：送审的每一条都要处理完。
 9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
 10. 完成后用 finish 报告操作摘要。
 11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。
 12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。
 13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆的最后命中时间彼此相差在 48h 内，说明它们在实际使用中经常一起被需要。用 save_memory 给它们互相补充 keywords，使它们更容易一起被激活。
-14. 重激活（Reactivation）：对 maintenance_candidates.reactivate 中的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。"""
+14. 重激活（Reactivation）：对 maintenance_candidates.reactivate 中的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。
+15. 时效和价值审查（Review）：review_candidates 里的每一条按当前时间逐条判断：
+   - 说的事已经过去，或者状态多半已经变了 → delete_memory；
+   - 仍然成立但有期限（计划、活动、临时状态）→ save_memory 用原 id 重写，补上 expires_at（YYYY-MM-DD，事情结束的第二天），内容里「明天」「下周」这类说法换成具体日期；
+   - 「目前」「尚未」「还没」这类没写明期限的状态 → 补 expires_at，从 created_at 起算 {_STATE_SHELF_LIFE_DAYS} 天；已经超过的直接删；
+   - 没有长期价值的 → delete_memory：一次性的调研话题、随口问过的东西、新闻资讯和别处查得到的公开信息、bot 自己给出的解释，以及只对当时那段对话有用的内容；
+   - 身份、长期偏好、规矩、决定这类以后还用得上的 → 不动；拿不准的也不动。
+   truncated 为 true 的正文没给全，不要用 save_memory 重写它，只能删或不动。
+   审完的条目由系统记下，内容不改就有一段时间不会再送来。"""

@@ -4,11 +4,12 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from engine.memory_expiry import local_stamp, memory_timezone, now_text
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     conversation_namespace,
@@ -326,7 +327,7 @@ class MemoryExtractHandler:
         # readable and includes every message from each pending task.
         pending_task_id_set = set(pending_task_ids)
         task_msgs = [m for m in all_msgs if m.source_task_id in pending_task_id_set]
-        transcript = _format_transcript_for_extract(task_msgs)
+        transcript = _format_transcript_for_extract(task_msgs, zone=memory_timezone(workspace_root))
         if not transcript.strip():
             return None
 
@@ -467,11 +468,12 @@ class MemoryExtractHandler:
                 # 抛出去 supervisor 会隔几秒重放；坏掉的意图重放多少遍都一样，只能丢掉。
                 log.warning("memory_extract: dropping intent %s: %s", intent_id, exc)
             else:
-                book_list_header = ""
+                # 换算「明天」「下周」、判断到期时间都得知道今天几号；对话记录里另外标着每段话是什么时候说的。
+                header = f"当前时间：{now_text(memory_timezone(workspace_root))}\n"
                 if book_names:
-                    book_list_header = (
+                    header += (
                         f"当前已有的 memory book 列表：{', '.join(book_names)}\n"
-                        "保存时优先使用已有 book，也可以创建新 book。\n\n"
+                        "保存时优先使用已有 book，也可以创建新 book。\n"
                     )
                 child_sid = f"child_{uuid.uuid4().hex[:12]}"
                 create_task(
@@ -480,7 +482,7 @@ class MemoryExtractHandler:
                     kind=pending_extract.get("kind") or "node",
                     node_id=extractor_node,
                     input_data={
-                        "instruction": book_list_header + transcript,
+                        "instruction": f"{header}\n{transcript}",
                         "child_session_id": child_sid,
                         "_system_task": True,
                         "_memory_extract_intent_id": intent_id,
@@ -539,26 +541,44 @@ def _task_kind_is_node(task: Any) -> bool:
     return str(value) == "node"
 
 
-def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 12000) -> str:
-    """Format task-scoped messages into readable transcript text."""
-    # [AutoC 2026-05-24] Why: memory extraction now receives ConversationStore
-    # Message objects selected by source_task_id, and the old [role]\ncontent
-    # blocks are harder for the extractor to read. How: format each message as a
-    # natural role label such as "User: ..." or "Assistant: ...". Purpose: give
-    # the memory extractor only the precise pending-task dialogue in a stable form.
-    parts: list[str] = []
-    total = 0
+def _message_time(raw: Any) -> datetime | None:
+    """消息的 created_at；空的、读不懂的是 None，不带时区的按 UTC 读。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+# 隔这么久才接着说的话另标一次时间，跨了天也标：提取器要据此把「明天」「下周」换成具体日期。
+_TIME_MARK_GAP = timedelta(minutes=30)
+
+
+def _format_transcript_for_extract(
+    messages: list[Any], *, max_chars: int = 12000, zone: tzinfo | None = None,
+) -> str:
+    """Format task-scoped messages into readable transcript text.
+
+    Each message reads "User: ..." or "Assistant: ...". Given a zone, a line such as
+    "[2026-10-30 21:15 周五]" marks when each stretch of the conversation was said.
+    """
+    lines: list[tuple[str, datetime | None]] = []
     for msg in messages:
         if isinstance(msg, dict):
             role = str(msg.get("role") or "")
             content: Any = msg.get("content", "")
             message_type = str(msg.get("message_type") or msg.get("type") or "")
             name = str(msg.get("name") or "")
+            created_at = msg.get("created_at")
         else:
             role = str(getattr(msg, "role", "") or "")
             content = getattr(msg, "content", "")
             message_type = str(getattr(msg, "message_type", "") or "")
             name = str(getattr(msg, "name", "") or "")
+            created_at = getattr(msg, "created_at", "")
         if role == "system":
             continue
         if isinstance(content, list):
@@ -583,20 +603,34 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
             label = "Assistant"
         else:
             label = role.capitalize() if role else "Message"
-        parts.append(f"{label}: {content}")
+        lines.append((f"{label}: {content}", _message_time(created_at) if zone is not None else None))
 
     # 超预算时保留最近的几条。原来是正序累加、超了就 break，丢掉的是当条**及其后
     # 全部** —— 于是一个长回合里提取器只看得到最早的部分，跟「总结刚刚发生了什么」
     # 正好相反。（送压缩器的文本方向相反是对的：它要总结的是即将被删的最老内容。）
-    kept: list[str] = []
+    kept: list[tuple[str, datetime | None]] = []
     total = 0
-    for line in reversed(parts):
+    for line, said_at in reversed(lines):
         if kept and total + len(line) > max_chars:
             break
         total += len(line)
-        kept.append(line)
+        kept.append((line, said_at))
     kept.reverse()
-    return "\n\n".join(kept)
+
+    # 时间标记在截断之后再加：留下的第一条总带着时间。
+    parts: list[str] = []
+    previous: datetime | None = None
+    for line, said_at in kept:
+        if said_at is not None and zone is not None:
+            if (
+                previous is None
+                or said_at.astimezone(zone).date() != previous.astimezone(zone).date()
+                or said_at - previous >= _TIME_MARK_GAP
+            ):
+                parts.append(f"[{local_stamp(said_at, zone)}]")
+            previous = said_at
+        parts.append(line)
+    return "\n\n".join(parts)
 
 
 def _safe_int(value: Any, default: int) -> int:
