@@ -11,7 +11,8 @@ import time
 import os
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
 
 import config_layout
 from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, env_bool, process_workspace
@@ -49,7 +50,16 @@ def _mount_instance(app: FastAPI, prefix: str) -> FastAPI:
         async with app.router.lifespan_context(app):
             yield
 
-    mounted = FastAPI(lifespan=lifespan)
+    # 整个域名都可能转到这个端口：外层壳的接口文档同样不开
+    mounted = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @mounted.get("/", include_in_schema=False)
+    async def domain_root(request: Request) -> RedirectResponse:
+        """根实例停了、反代把整个域名交给这个端口时，根路径转进本实例，去控制台还是 404 由它定。"""
+        query = request.url.query
+        target = f"{prefix}/?{query}" if query else f"{prefix}/"
+        return RedirectResponse(url=target, headers={"Cache-Control": "no-store"})
+
     mounted.mount(prefix, app)
     return mounted
 
