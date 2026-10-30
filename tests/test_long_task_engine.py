@@ -526,6 +526,31 @@ class TestHandleRendering:
             "句柄：t1@child_a\n要它从停下的地方接着做，就再委派给 scout，带上 continue_from 填这个句柄。"
         )
 
+    @pytest.mark.parametrize("status,line", [
+        pytest.param(
+            "ask",
+            "补齐它要的信息后，再委派给 scout，带上 continue_from 填这个句柄，它会从停下的地方接着做；不带句柄就是从零开始的另一份。",
+            id="ask",
+        ),
+        pytest.param(
+            "preempted",
+            "它的会话为接着做留着；要它从打断的地方接着做，就再委派给 scout，带上 continue_from 填这个句柄。",
+            id="preempted",
+        ),
+        pytest.param(
+            "finish",
+            "它的会话留着；要它带着这段历史接着做，就再委派给 scout，带上 continue_from 填这个句柄。",
+            id="finish-with-its-session-kept",
+        ),
+        pytest.param("fail", "要它从停下的地方接着做，就再委派给 scout，带上 continue_from 填这个句柄。", id="fail"),
+    ])
+    def test_each_way_of_stopping_gets_its_own_continue_line(self, status: str, line: str) -> None:
+        [message] = _build_resume_messages({"type": "batch_results", "entries": [
+            _batch_entry(status=status, handle="t1@child_a", continuable=True),
+        ]})
+
+        assert message["content"].endswith(f"句柄：t1@child_a\n{line}")
+
     def test_a_child_that_finished_only_shows_its_handle(self) -> None:
         [message] = _build_resume_messages({"type": "batch_results", "entries": [
             _batch_entry(handle="t1@child_a", continuable=False),

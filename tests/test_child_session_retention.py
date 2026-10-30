@@ -1,6 +1,6 @@
-"""accumulate 子会话的历史不按空闲时长删；子会话 TTL 在 supervisor 和 data_cleanup 读同一个 engine.child_session.ttl_hours。
+"""还登记着的子会话 data_cleanup 一概不删，登记和历史由 supervisor 一起收；子会话 TTL 两边读同一个 engine.child_session.ttl_hours。
 
-supervisor 永久留着 accumulate 的登记，data_cleanup 却按修改时间删空闲满一天的 child_*.jsonl：登记还在、历史没了。
+data_cleanup 只看文件修改时间：accumulate 的登记还在、历史却没了；挂起等孙任务的同步子任务文件闲置过了 TTL，恢复时历史是空的。
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from supervisor._helpers import _now  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
 
 _HOUR = 3600.0
 
@@ -117,7 +119,11 @@ class TestRetentionRule:
         assert supervisor_state.child_session_ttl_hours is retention.child_session_ttl_hours
         assert supervisor_state.is_retained_child_row is retention.is_retained_child_row
         assert cleanup.child_session_ttl_hours is retention.child_session_ttl_hours
-        assert cleanup.is_retained_child_row is retention.is_retained_child_row
+
+    def test_cleanup_does_not_judge_registered_rows_itself(self) -> None:
+        # 登记着的行该不该收要看有没有任务在用，只有 supervisor 看得到
+        for name in ("is_retained_child_row", "is_held_row", "_retained_child_sessions"):
+            assert not hasattr(cleanup, name), name
 
 
 class TestChildConversationRetention:
@@ -129,16 +135,17 @@ class TestChildConversationRetention:
             cleanup.purge_expired_child_sessions()
 
         assert kept.exists()
-        assert any("kept 1 child sessions past the ttl" in r.getMessage() for r in caplog.records)
+        assert any("kept 1 registered child sessions past the ttl" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize("mode", ["fresh", "fork"])
-    def test_idle_fresh_and_fork_children_are_deleted(self, data: Path, mode: str) -> None:
-        gone = _conversation(data, "child_tmp", idle_hours=25)
+    def test_registered_idle_fresh_and_fork_children_are_left_to_the_supervisor(self, data: Path, mode: str) -> None:
+        # 挂起等孙任务的同步子任务，会话文件可以闲置过 TTL；登记着就由 supervisor 看有没有任务在用再收
+        kept = _conversation(data, "child_tmp", idle_hours=25)
         _registry(data, {"child_tmp": _row("child_tmp", mode)})
 
         cleanup.purge_expired_child_sessions()
 
-        assert not gone.exists()
+        assert kept.exists()
 
     def test_an_unregistered_child_is_deleted(self, data: Path) -> None:
         # dream、记忆提取这类系统子会话从不进登记表。
@@ -159,13 +166,14 @@ class TestChildConversationRetention:
 
         assert not gone.exists()
 
-    def test_a_legacy_row_without_a_mode_does_not_protect_either(self, data: Path) -> None:
-        gone = _conversation(data, "child_old", idle_hours=25)
+    def test_a_registered_legacy_row_without_a_mode_is_left_to_the_supervisor_too(self, data: Path) -> None:
+        # supervisor 的定期清理见到这种行就连登记带文件一起删，用不着这里抢先
+        kept = _conversation(data, "child_old", idle_hours=25)
         _registry(data, {"child_old": _row("child_old", "")})
 
         cleanup.purge_expired_child_sessions()
 
-        assert not gone.exists()
+        assert kept.exists()
 
     @pytest.mark.parametrize("mode", ["fresh", "fork", "accumulate"])
     def test_a_recent_child_is_kept_whatever_its_mode(self, data: Path, mode: str) -> None:
@@ -251,6 +259,7 @@ class TestChildConversationRetention:
     def test_a_dry_run_reports_only_what_would_really_go(self, data: Path, monkeypatch, caplog) -> None:
         accumulate = _conversation(data, "child_acc", idle_hours=25)
         fresh = _conversation(data, "child_tmp", idle_hours=25)
+        unregistered = _conversation(data, "child_dream", idle_hours=25)
         branch = _conversation(data, "branch_7", idle_hours=25)
         _registry(data, {
             "child_acc": _row("child_acc", "accumulate"),
@@ -261,11 +270,12 @@ class TestChildConversationRetention:
         with caplog.at_level(logging.INFO):
             cleanup.purge_expired_child_sessions()
 
-        assert accumulate.exists() and fresh.exists() and branch.exists()
+        assert accumulate.exists() and fresh.exists() and unregistered.exists() and branch.exists()
         reported = [r.getMessage() for r in caplog.records if "would delete file" in r.getMessage()]
-        assert any("child_tmp.jsonl" in message for message in reported)
+        assert any("child_dream.jsonl" in message for message in reported)
         assert any("branch_7.jsonl" in message for message in reported)
         assert not any("child_acc.jsonl" in message for message in reported)
+        assert not any("child_tmp.jsonl" in message for message in reported)
 
 
 _NOW = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
@@ -372,9 +382,10 @@ class TestHeldChildrenAndRegisteredBranches:
 
         assert kept.exists()
 
-    def test_an_expired_hold_goes_by_the_ttl_again(self, data: Path) -> None:
+    def test_an_expired_hold_is_left_to_the_supervisor(self, data: Path) -> None:
+        # 过了保留期的行由 supervisor 的定期清理连登记带文件一起删；这一刻可能又被接着派出去了
         until = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        gone = _conversation(data, "child_held", idle_hours=25)
+        idle = _conversation(data, "child_held", idle_hours=25)
         recent = _conversation(data, "child_recent", idle_hours=1)
         _registry(data, {
             "child_held": _held("child_held", until=until),
@@ -383,7 +394,7 @@ class TestHeldChildrenAndRegisteredBranches:
 
         cleanup.purge_expired_child_sessions()
 
-        assert not gone.exists()
+        assert idle.exists()
         assert recent.exists()
 
     def test_a_reset_row_drops_its_hold(self, data: Path) -> None:
@@ -438,12 +449,12 @@ class TestChildTtlInCleanup:
         pytest.param("48", 25, False, id="long-ttl-outlives-the-old-24h"),
         pytest.param("48", 49, True, id="long-ttl-expired"),
     ])
-    def test_children_follow_the_configured_ttl(
+    def test_unregistered_children_follow_the_configured_ttl(
         self, data: Path, raw: str, idle_hours: float, deleted: bool,
     ) -> None:
         _child_ttl(data.parent, raw)
         path = _conversation(data, "child_tmp", idle_hours=idle_hours)
-        _registry(data, {"child_tmp": _row("child_tmp", "fresh")})
+        _registry(data, {})
 
         cleanup.purge_expired_child_sessions()
 
@@ -549,33 +560,107 @@ class TestSharedRegistryReader:
         assert cleanup._load_session_registry() == rows
 
 
+def _supervisor(data: Path) -> SupervisorState:
+    workspace = data.parent
+    return SupervisorState(
+        workspace_root=workspace,
+        eventlog=EventLog(data / "events.jsonl", run_id="run-child-retention"),
+        policy=PolicyEngine(workspace_root=workspace),
+    )
+
+
+def _supervisor_sweep(state: SupervisorState) -> None:
+    with state._lock:
+        state._cleanup_stale_sessions_locked()
+    # 删文件放在锁外的后台线程里
+    for thread in threading.enumerate():
+        if thread.name == "stale-session-purge":
+            thread.join(timeout=10)
+
+
+def _idle_for(state: SupervisorState, session_id: str, hours: float) -> None:
+    state._session_store.set_entry_field(session_id, "last_active_at", (_now() - timedelta(hours=hours)).isoformat())
+
+
+def _child_task(task_id: str, child_session_id: str, status: TaskStatus) -> Task:
+    moment = _now()
+    return Task(
+        task_id=task_id, session_id=child_session_id, kind=TaskKind.node, node_id="helper.node",
+        caller_task_id="task-caller", status=status,
+        input={"child_session_id": child_session_id, "context_mode": "fresh"},
+        created_at=moment, updated_at=moment,
+    )
+
+
 class TestSupervisorAndCleanupAgree:
     def test_registry_rows_and_history_files_survive_or_go_together(self, data: Path) -> None:
-        workspace = data.parent
-        _child_ttl(workspace, "6")
-        state = SupervisorState(
-            workspace_root=workspace,
-            eventlog=EventLog(data / "events.jsonl", run_id="run-child-retention"),
-            policy=PolicyEngine(workspace_root=workspace),
-        )
+        _child_ttl(data.parent, "6")
+        state = _supervisor(data)
         parent = state.get_or_create_session(channel="test", conversation_key="test:child-retention")
         accumulate_sid, _ = state.get_or_create_child_session(parent, "scout.node", "case", "accumulate")
         fresh_sid, _ = state.get_or_create_child_session(parent, "helper.node", "case", "fresh")
-        idle_since = (_now() - timedelta(hours=10)).isoformat()
         for session_id in (accumulate_sid, fresh_sid):
-            state._session_store.set_entry_field(session_id, "last_active_at", idle_since)
+            _idle_for(state, session_id, 10)
         accumulate_file = _conversation(data, accumulate_sid, idle_hours=10)
         fresh_file = _conversation(data, fresh_sid, idle_hours=10)
 
         cleanup.purge_expired_child_sessions()
-        with state._lock:
-            state._cleanup_stale_sessions_locked()
+
+        assert accumulate_file.exists() and fresh_file.exists()
+
+        _supervisor_sweep(state)
 
         registry = json.loads((data / "sessions.json").read_text(encoding="utf-8"))
         assert accumulate_file.exists() and accumulate_sid in registry
         assert not fresh_file.exists() and fresh_sid not in registry
         reused, is_new = state.get_or_create_child_session(parent, "scout.node", "case", "accumulate")
         assert (reused, is_new) == (accumulate_sid, False)
+
+    def test_a_suspended_sync_child_outlives_the_ttl_on_both_sides(self, data: Path) -> None:
+        # TTL 比任务总寿命短时，挂起等孙任务的 fresh 子任务文件会闲置过 TTL；恢复时历史不能是空的
+        _child_ttl(data.parent, "1")
+        state = _supervisor(data)
+        parent = state.get_or_create_session(channel="test", conversation_key="test:suspended-child")
+        child_sid, _ = state.get_or_create_child_session(parent, "helper.node", "case", "fresh")
+        _idle_for(state, child_sid, 3)
+        history = _conversation(data, child_sid, idle_hours=3)
+        waiting = _child_task("task-child", child_sid, TaskStatus.suspended)
+        with state._lock:
+            state.tasks[waiting.task_id] = waiting
+
+        cleanup.purge_expired_child_sessions()
+        _supervisor_sweep(state)
+
+        assert history.exists()
+        assert state._session_store.get_entry(child_sid) is not None
+
+        with state._lock:
+            waiting.status = TaskStatus.completed
+        cleanup.purge_expired_child_sessions()
+        _supervisor_sweep(state)
+
+        assert not history.exists()
+        assert state._session_store.get_entry(child_sid) is None
+
+    def test_an_expired_hold_goes_with_its_registry_row(self, data: Path) -> None:
+        state = _supervisor(data)
+        parent = state.get_or_create_session(channel="test", conversation_key="test:expired-hold")
+        child_sid, _ = state.get_or_create_child_session(parent, "helper.node", "case", "fresh")
+        until = (_now() - timedelta(minutes=5)).isoformat()
+        state._session_store.set_entry_field(
+            child_sid, retention.RETAIN_FIELD,
+            {"task_id": "task-child", "parent_task_id": "task-caller", "until": until},
+        )
+        history = _conversation(data, child_sid, idle_hours=25)
+
+        cleanup.purge_expired_child_sessions()
+
+        assert history.exists()
+
+        _supervisor_sweep(state)
+
+        assert not history.exists()
+        assert state._session_store.get_entry(child_sid) is None
 
 
 class TestNoHardCodedChildTtl:

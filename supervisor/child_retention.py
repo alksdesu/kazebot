@@ -1,6 +1,7 @@
-"""失败或到点收尾的子 agent 会话：留到发起它的任务结束后再过一段宽限期，期间父节点能用句柄接着派。
+"""没做完就交回的子 agent 会话（失败、到点收尾、ask 要补充信息、被软打断）：留到发起它的任务结束后再过一段宽限期，期间父节点能用句柄接着派。
 
-保留记录写在 sessions.json 那一行的 retain 字段，engine 的 data_cleanup 也按它判。
+保留记录写在 sessions.json 那一行的 retain 字段；还登记着的子会话 engine 的 data_cleanup 一概不删，登记和文件由 supervisor 的定期清理按它收。
+accumulate 的 agent: 会话本来就一直留着，那一行另记它属于哪段对话、哪个节点，产出它的任务清出内存后照样接得上。
 子任务的结果交回去之前，结果里引用到的超长输出先复制到读结果的那一方的会话名下，子会话删了也读得到。
 """
 from __future__ import annotations
@@ -37,7 +38,15 @@ KIND_CHILD = "child"
 KIND_AGENT = "agent"
 REASON_FAILED = "failed"
 REASON_WRAPUP = "wrapup"
+REASON_ASK = "ask"
+REASON_PREEMPTED = "preempted"
+# 子任务这一程交回父节点的结局：都带句柄，没做完的会话按 retention_reason 留着
+HANDED_BACK = frozenset({"finish", "ask", "fail", "preempted"})
+_UNFINISHED_REASONS = {"fail": REASON_FAILED, "ask": REASON_ASK, "preempted": REASON_PREEMPTED}
 AGENT_KEY_PREFIX = "agent:"
+ACCUMULATE = "accumulate"
+# accumulate 的 agent: 会话属于哪段对话、哪个节点：产出它的任务清出内存后，continue_from 靠它核对
+LINEAGE_FIELD = "dispatch_lineage"
 # accumulate 的 agent: 会话本来就一直留着；用后即删的只有这两种
 _DISPOSABLE_AGENT_MODES = frozenset({"fresh", "fork"})
 
@@ -66,6 +75,11 @@ def _outcome(task: Task) -> str:
     return str((task.result or {}).get("action") or "").strip()
 
 
+def outcome_of(task: Task) -> str:
+    """子任务这一程的结局：被取消的以状态为准，其余是 worker 交回的动作（finish、ask、fail、preempted）。"""
+    return _outcome(task)
+
+
 def _inner_result(task: Task) -> dict[str, Any]:
     inner = (task.result or {}).get("result")
     return inner if isinstance(inner, dict) else {}
@@ -80,9 +94,11 @@ def wrapup_reason(task: Task) -> str:
 
 
 def retention_reason(task: Task) -> str:
+    """子任务的会话为什么要为接着做留着：没做完就交回的（失败、ask、被软打断、到点收尾）给原因，做完或取消的给空串。"""
     outcome = _outcome(task)
-    if outcome == "fail":
-        return REASON_FAILED
+    reason = _UNFINISHED_REASONS.get(outcome, "")
+    if reason:
+        return reason
     if outcome == "finish" and wrapup_reason(task):
         return REASON_WRAPUP
     return ""
@@ -121,17 +137,21 @@ def storage_locked(state: "SupervisorState", task: Task) -> ChildStorage | None:
 
 
 def mark_locked(state: "SupervisorState", task: Task) -> bool:
-    """失败或到点收尾的子任务：给它的会话记一笔保留，返回记了没有。截止时刻等发起任务结束后由清理时补上。"""
-    reason = retention_reason(task)
-    if not reason:
-        return False
+    """没做完就交回的子任务：给它的会话记一笔保留，返回记了没有。截止时刻等发起任务结束后由清理时补上。
+
+    accumulate 的 agent: 会话不记保留，只记下它的来历。
+    """
     storage = storage_locked(state, task)
     if storage is None:
         return False
-    if storage.kind == KIND_AGENT and storage.context_mode not in _DISPOSABLE_AGENT_MODES:
-        return False
     entry = state._session_store.get_entry(storage.session_id)
     if entry is None or entry.get("reset"):
+        return False
+    if storage.kind == KIND_AGENT and storage.context_mode not in _DISPOSABLE_AGENT_MODES:
+        _record_lineage_locked(state, task, storage, entry)
+        return False
+    reason = retention_reason(task)
+    if not reason:
         return False
     hold = {
         "task_id": task.task_id,
@@ -153,8 +173,39 @@ def mark_locked(state: "SupervisorState", task: Task) -> bool:
     return True
 
 
+def _record_lineage_locked(
+    state: "SupervisorState", task: Task, storage: ChildStorage, entry: dict[str, Any],
+) -> None:
+    if storage.context_mode != ACCUMULATE:
+        return
+    lineage = {
+        "family_root": state._task_family_root_locked(task),
+        "node_id": str(task.node_id or "").strip(),
+        "context_mode": ACCUMULATE,
+    }
+    if not lineage["family_root"] or not lineage["node_id"] or entry.get(LINEAGE_FIELD) == lineage:
+        return
+    state._session_store.set_entry_field(storage.session_id, LINEAGE_FIELD, lineage)
+
+
+def lineage_of(entry: dict[str, Any] | None) -> dict[str, str]:
+    """accumulate 的 agent: 会话那一行记的来历；没记或写坏了给空表。"""
+    raw = (entry or {}).get(LINEAGE_FIELD)
+    if not isinstance(raw, dict):
+        return {}
+    return {key: str(raw.get(key) or "").strip() for key in ("family_root", "node_id", "context_mode")}
+
+
+def hand_back_locked(state: "SupervisorState", task: Task) -> None:
+    """子任务这一程交回父节点之前：没做完的会话记上保留，结果里引用的超长输出复制到父节点名下。"""
+    if _outcome(task) not in HANDED_BACK:
+        return
+    mark_locked(state, task)
+    adopt(state.workspace_root, adoption_locked(state, task))
+
+
 def continue_fields_locked(state: "SupervisorState", task: Task) -> dict[str, Any]:
-    """交还给父节点的结果里附带的几项：句柄，到点收尾的原因，以及会话是不是为接着做留着。"""
+    """交还给父节点的结果里附带的几项：句柄，到点收尾的原因，以及会话是不是能用 continue_from 接着做。"""
     storage = storage_locked(state, task)
     if storage is None:
         return {}
@@ -165,9 +216,19 @@ def continue_fields_locked(state: "SupervisorState", task: Task) -> dict[str, An
     reason = wrapup_reason(task)
     if reason:
         fields["wrapup"] = reason
-    hold = retention_hold(state._session_store.get_entry(storage.session_id))
-    fields["continuable"] = bool(hold and str(hold.get("task_id") or "") == task.task_id)
+    fields["continuable"] = _continuable_locked(state, task, storage)
     return fields
+
+
+def _continuable_locked(state: "SupervisorState", task: Task, storage: ChildStorage) -> bool:
+    entry = state._session_store.get_entry(storage.session_id)
+    if entry is None or entry.get("reset"):
+        return False
+    # accumulate 的会话不靠保留记录，一直在：同步的跟着这次任务，异步的跟着这段对话
+    if storage.context_mode == ACCUMULATE:
+        return True
+    hold = retention_hold(entry)
+    return bool(hold and str(hold.get("task_id") or "") == task.task_id)
 
 
 def is_held_locked(state: "SupervisorState", session_id: str, *, now: datetime | None = None) -> bool:
@@ -200,8 +261,11 @@ def reparent_locked(
     """保留着的子会话改挂到另一个上级：原来那个分支收束了，或被新的调用方接着用。
 
     sessions.json 里的上级链要一直连到用户会话：会话家族和用量汇总都顺着它往上找。
+    上级没变（同一次任务里 continue_from 接着派）时不摘 accumulate 的映射，之后同一个 context_key 还接得上。
     """
-    detach_locked(state, session_id)
+    entry = state._session_store.get_entry(session_id)
+    if str((entry or {}).get("parent_session_id") or "") != parent_session_id:
+        detach_locked(state, session_id)
     state.parent_children.setdefault(parent_session_id, set()).add(session_id)
     return state._session_store.set_entry_field(session_id, "parent_session_id", parent_session_id, flush=flush)
 
@@ -266,7 +330,7 @@ def adoption_locked(state: "SupervisorState", task: Task) -> RefAdoption | None:
 
     同步委派复制到 caller 名下；异步委派复制到真正读它的一方：在等它的 await 的那个任务名下，否则是结果的落点会话。
     """
-    if _outcome(task) not in ("finish", "fail") or storage_locked(state, task) is None:
+    if _outcome(task) not in HANDED_BACK or storage_locked(state, task) is None:
         return None
     source = archive_session(task)
     origin = task.input.get("_dispatch_origin")

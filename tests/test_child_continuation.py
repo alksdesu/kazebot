@@ -1,4 +1,4 @@
-"""失败或到点收尾的子 agent：会话留到发起任务结束后再过宽限期；父节点拿句柄 continue_from 接着派，句柄要核对家族、节点和委派方式；结果里引用的超长输出复制到父节点名下。"""
+"""没做完就交回的子 agent（失败、到点收尾、ask、被软打断）：会话留到发起任务结束后再过宽限期；父节点拿句柄 continue_from 接着派，句柄要核对家族、节点和委派方式；结果里引用的超长输出复制到父节点名下。"""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +23,7 @@ if str(_ROOT) not in sys.path:
 from engine.conversation_store import ConversationStore, Message  # noqa: E402
 from engine.dispatch_handle import format_handle, parse_handle  # noqa: E402
 from engine.tool_outputs import ToolOutputNotFound, ToolOutputStore, mentioned_refs  # noqa: E402
-from supervisor import admin_api, continuation  # noqa: E402
+from supervisor import admin_api, child_retention, continuation  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -132,6 +132,14 @@ def _finish(state: SupervisorState, task: Task, text: str = "done") -> None:
 def _wrapped(state: SupervisorState, task: Task, reason: str = "steps") -> None:
     flag = "time_limit_reached" if reason == "time" else "step_limit_reached"
     _report(state, task, {"action": "finish", "result": {"text": "做了一半", flag: True, "wrapup": {"reason": reason}}})
+
+
+def _ask(state: SupervisorState, task: Task, question: str = "要查哪一年的？") -> None:
+    _report(state, task, {"action": "ask", "result": {"text": question}})
+
+
+def _preempt(state: SupervisorState, task: Task) -> None:
+    _report(state, task, {"action": "preempted", "context_ref": "ctx-1"})
 
 
 def _post_cleanup(state: SupervisorState, task: Task) -> None:
@@ -264,9 +272,127 @@ class TestKeeping:
         _fail(state, child)
 
         assert _hold(state, agent_sid) is None
+        # 会话本来就一直留着，能接着做；这一行另记它属于哪段对话、哪个节点
+        assert state._session_store.get_entry(agent_sid)[child_retention.LINEAGE_FIELD] == {
+            "family_root": sid, "node_id": "a.node", "context_mode": "accumulate",
+        }
         [callback] = [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
         assert callback.input["inbound_child_handle"] == f"{child.task_id}@{agent_sid}"
-        assert "inbound_child_continuable" not in callback.input
+        assert callback.input["inbound_child_continuable"] is True
+
+    def test_an_accumulate_child_is_continuable_without_a_hold(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        [child] = _dispatch(state, caller, _item(context_mode="accumulate"))
+
+        _finish(state, child)
+
+        [entry] = caller.input["resume_data"]["entries"]
+        assert entry["handle"] == f"{child.task_id}@{child.input['child_session_id']}"
+        assert entry["continuable"] is True
+        assert _hold(state, child.input["child_session_id"]) is None
+
+    def test_an_asking_child_is_kept_and_its_entry_says_how_to_continue(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        [child] = _dispatch(state, caller, _item(call_id="w1"))
+        child_sid = child.input["child_session_id"]
+        path = _conversation(tmp_path, child_sid)
+
+        _ask(state, child)
+        _post_cleanup(state, child)
+
+        [entry] = caller.input["resume_data"]["entries"]
+        assert entry["status"] == "ask" and entry["text"] == "要查哪一年的？"
+        assert entry["handle"] == f"{child.task_id}@{child_sid}" and entry["continuable"] is True
+        hold = _hold(state, child_sid)
+        assert hold["reason"] == "ask" and hold["task_id"] == child.task_id and hold["parent_task_id"] == caller.task_id
+        assert path.exists() and state._session_store.get_entry(child_sid) is not None
+
+    def test_an_asking_child_picks_up_where_it_stopped(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        [child] = _dispatch(state, caller, _item(call_id="w1"))
+        child_sid = child.input["child_session_id"]
+        _ask(state, child)
+        handle = caller.input["resume_data"]["entries"][0]["handle"]
+
+        assert continuation.resolve(state, caller.task_id, handle, "a.node", wait=True)["ok"] is True
+        [again] = _dispatch(state, caller, _item(call_id="w2", continue_from=handle, instruction="查 2025 年的"))
+
+        assert again.input["child_session_id"] == child_sid
+        assert again.input["continue_from"] == handle
+        assert _hold(state, child_sid) is None
+
+    def test_a_preempted_child_is_kept_with_its_handle(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        [child] = _dispatch(state, caller, _item(call_id="w1"))
+        child_sid = child.input["child_session_id"]
+        path = _conversation(tmp_path, child_sid)
+
+        _preempt(state, child)
+        _post_cleanup(state, child)
+
+        [entry] = caller.input["resume_data"]["entries"]
+        assert entry["status"] == "preempted"
+        assert entry["handle"] == f"{child.task_id}@{child_sid}" and entry["continuable"] is True
+        assert _hold(state, child_sid)["reason"] == "preempted"
+        assert path.exists()
+        assert continuation.resolve(state, caller.task_id, entry["handle"], "a.node", wait=True)["ok"] is True
+
+    def test_an_asking_async_agent_is_kept_and_its_callback_carries_the_handle(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        agent_sid, child = _async_child(state, sid, caller)
+
+        _ask(state, child)
+        _post_cleanup(state, child)
+
+        hold = _hold(state, agent_sid)
+        assert hold["kind"] == "agent" and hold["reason"] == "ask" and hold["parent_task_id"] == caller.task_id
+        assert agent_sid in state.sessions and state._session_store.get_entry(agent_sid) is not None
+        [callback] = [task for task in state.tasks.values() if task.input.get("inbound_message_type") == "dispatch_result"]
+        assert callback.input["inbound_child_status"] == "ask"
+        assert callback.input["inbound_child_handle"] == f"{child.task_id}@{agent_sid}"
+        assert callback.input["inbound_child_continuable"] is True
+
+    def test_a_continued_child_is_not_torn_down_by_the_late_cleanup_of_its_previous_run(self, tmp_path: Path) -> None:
+        # 这一程结束到清理轮到之间，会话已被接着派出去：保留记录清掉了，可新任务正在写它
+        state = _state(tmp_path)
+        sid, caller, child, child_sid = _kept(state)
+        path = _conversation(tmp_path, child_sid)
+        [again] = _dispatch(state, caller, _item(call_id="w2", continue_from=format_handle(child.task_id, child_sid)))
+        assert _hold(state, child_sid) is None and again.status == TaskStatus.pending
+
+        _post_cleanup(state, child)
+
+        assert path.exists()
+        assert state._session_store.get_entry(child_sid) is not None
+        assert child_sid in state.parent_children.get(caller.session_id, set())
+
+    def test_a_continued_async_agent_is_not_torn_down_by_the_late_cleanup_of_its_previous_run(
+        self, tmp_path: Path,
+    ) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        agent_sid, child = _async_child(state, sid, caller)
+        _fail(state, child)
+        path = _conversation(tmp_path, agent_sid)
+        again = _inbound(
+            state, agent_sid, node="a.node", dispatch_context_mode="fresh",
+            dispatch_origin=_origin(sid, caller, continue_from=format_handle(child.task_id, agent_sid)),
+        )
+        assert _hold(state, agent_sid) is None and not state._task_terminal(again)
+
+        _post_cleanup(state, child)
+
+        assert path.exists()
+        assert agent_sid in state.sessions and state._session_store.get_entry(agent_sid) is not None
+        assert state.conversation_map[state.sessions[agent_sid].conversation_key] == agent_sid
 
 
 class TestQuotedOutputs:
@@ -297,6 +423,18 @@ class TestQuotedOutputs:
         _fail(state, child, f"构建失败，日志见 ref={saved.ref}")
 
         assert outputs.load(sid, saved.ref) == "构建日志"
+
+    def test_an_output_an_asking_child_quoted_stays_readable_by_the_caller(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _caller(state, sid)
+        [child] = _dispatch(state, caller, _item())
+        outputs = ToolOutputStore(tmp_path)
+        saved = outputs.save(child.input["child_session_id"], "候选列表\n" * 100)
+
+        _ask(state, child, f"候选太多，见 ref={saved.ref}，要哪一个？")
+
+        assert outputs.load(sid, saved.ref) == "候选列表\n" * 100
 
     def test_a_quoted_output_that_does_not_exist_is_skipped(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -474,6 +612,145 @@ class TestResolve:
         )
 
         assert refused["reason"] == "not_retained"
+        assert "已经正常做完" in refused["message"]
+
+
+class TestNotRetainedSaysWhatHappened:
+    """fresh / fork 子会话没有保留记录时，拒绝理由按产出这个句柄的那一程真实的结局说。"""
+
+    def test_a_cancelled_child(self, tmp_path: Path) -> None:
+        # 拆除在锁外的线程里做，拆完之前句柄还查得到会话
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        [child] = _dispatch(state, caller, _item())
+        with state._lock:
+            child.status = TaskStatus.cancelled
+
+        refused = continuation.resolve(
+            state, caller.task_id, format_handle(child.task_id, child.input["child_session_id"]), "a.node", wait=True,
+        )
+
+        assert refused["reason"] == "not_retained"
+        assert "已被取消" in refused["message"] and "正常做完" not in refused["message"]
+
+    def test_a_handle_of_an_earlier_run_after_the_child_was_continued(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, child_sid = _kept(state)
+        old = format_handle(child.task_id, child_sid)
+        [again] = _dispatch(state, caller, _item(call_id="w2", continue_from=old))
+        _finish(state, again)
+
+        refused = continuation.resolve(state, caller.task_id, old, "a.node", wait=True)
+
+        assert refused["reason"] == "not_retained"
+        assert "又被接着派过" in refused["message"]
+        latest = caller.input["resume_data"]["entries"][0]["handle"]
+        assert latest == format_handle(again.task_id, child_sid)
+
+    def test_a_handle_whose_run_left_memory(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        caller = _caller(state, _session(state))
+        [child] = _dispatch(state, caller, _item())
+        _finish(state, child)
+        with state._lock:
+            state.tasks.pop(child.task_id)
+
+        refused = continuation.resolve(
+            state, caller.task_id, format_handle(child.task_id, child.input["child_session_id"]), "a.node", wait=True,
+        )
+
+        assert refused["reason"] == "not_retained"
+        assert "结局已经查不到" in refused["message"]
+
+
+class TestAsyncAccumulateContinuation:
+    """异步 accumulate 的 agent: 会话没有保留记录：产出句柄的任务在不在内存里，核对结果都一样。"""
+
+    def _finished(self, state: SupervisorState) -> tuple[str, Task, Task, str]:
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        agent_sid, child = _async_child(state, sid, caller, mode="accumulate")
+        _finish(state, child)
+        return sid, caller, child, agent_sid
+
+    def test_it_can_be_continued_while_its_producer_is_in_memory(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+
+        found = continuation.resolve(state, caller.task_id, format_handle(child.task_id, agent_sid), "a.node", wait=False)
+
+        assert found["ok"] is True and found["context_mode"] == "accumulate" and found["session_id"] == agent_sid
+
+    def test_it_can_still_be_continued_after_its_producer_left_memory(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+        with state._lock:
+            state.tasks.pop(child.task_id)
+
+        found = continuation.resolve(state, caller.task_id, format_handle(child.task_id, agent_sid), "a.node", wait=False)
+
+        assert found == {
+            "ok": True, "session_id": agent_sid, "task_id": child.task_id, "kind": "agent",
+            "node_id": "a.node", "context_mode": "accumulate",
+            "conversation_key": state.sessions[agent_sid].conversation_key,
+        }
+
+    def test_another_conversation_is_still_refused_by_the_recorded_lineage(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+        with state._lock:
+            state.tasks.pop(child.task_id)
+        stranger = _inbound(state, _session(state, OTHER_CONV))
+
+        refused = continuation.resolve(
+            state, stranger.task_id, format_handle(child.task_id, agent_sid), "a.node", wait=False,
+        )
+
+        assert refused["reason"] == "not_in_family"
+
+    def test_the_recorded_node_is_checked_too(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+        with state._lock:
+            state.tasks.pop(child.task_id)
+
+        refused = continuation.resolve(state, caller.task_id, format_handle(child.task_id, agent_sid), "b.node", wait=False)
+
+        assert refused["reason"] == "target_mismatch"
+        assert "a.node" in refused["message"]
+
+    def test_an_old_row_without_a_lineage_says_so_instead_of_blaming_the_conversation(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+        with state._lock:
+            state.tasks.pop(child.task_id)
+        state._session_store.set_entry_field(agent_sid, child_retention.LINEAGE_FIELD, None)
+
+        refused = continuation.resolve(state, caller.task_id, format_handle(child.task_id, agent_sid), "a.node", wait=False)
+
+        assert refused["reason"] == "lineage_unknown"
+        assert refused["message"] == continuation.refusal("lineage_unknown")["message"]
+
+    def test_the_lineage_is_on_disk_so_a_restart_keeps_it(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid, caller, child, agent_sid = self._finished(state)
+        on_disk = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))
+
+        assert on_disk[agent_sid][child_retention.LINEAGE_FIELD] == {
+            "family_root": sid, "node_id": "a.node", "context_mode": "accumulate",
+        }
+
+    def test_a_fresh_agent_gets_a_hold_and_no_lineage(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        caller = _inbound(state, sid)
+        agent_sid, child = _async_child(state, sid, caller)
+
+        _fail(state, child)
+
+        entry = state._session_store.get_entry(agent_sid)
+        assert entry["retain"]["reason"] == "failed"
+        assert child_retention.LINEAGE_FIELD not in entry
 
 
 class TestContinueInABatch:

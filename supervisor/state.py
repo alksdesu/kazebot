@@ -956,7 +956,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         #   - accumulate: 永久保留
         #   - 无 context_mode（历史遗留）: 直接清理，不等 TTL
         #   - fresh/fork: 空闲超过 engine.child_session.ttl_hours 后清理
-        #   - 失败或到点收尾留着的：上一进程的任务都不在了，宽限期从现在起算，过了期才清
+        #   - 没做完就交回、为接着做留着的：上一进程的任务都不在了，宽限期从现在起算，过了期才清
         now = datetime.now(timezone.utc)
         stale_threshold = now - self._child_session_ttl()
         grace = child_retention.grace_period(self)
@@ -1391,6 +1391,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         - fresh：强制创建新 child session，旧的不删除（等 TTL 过期清理）
         - fork：创建新 child session，调用方需额外做 ConversationStore.fork()
 
+        只有 accumulate 的会话记进 child_session_map：同一个 (父会话, 节点, context_key) 混用模式时，
+        fresh / fork 不能顶掉 accumulate 要沿用的那个。
+
         别的取值抛 ValueError。accumulate 沿用的会话此刻能不能派由调用方先用 session_reuse 判。
 
         Returns:
@@ -1406,7 +1409,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
         elif context_mode == "fresh":
-            # 强制新建，旧映射更新为新 ID
             return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
         elif context_mode == "fork":
@@ -1423,19 +1425,34 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return existing_cid
         return ""
 
+    def _dispatch_session_locked(
+        self, parent_session_id: str, node_id: str, context_key: str, context_mode: str, continued: dict[str, Any],
+    ) -> str:
+        """这次同步委派会接着写的已有子会话：continue_from 接着的那个，或 accumulate 会沿用的那个；会另开新会话的给空串。"""
+        if continued:
+            return str(continued.get("session_id") or "")
+        if context_mode == "accumulate":
+            return self._reusable_child_session_locked(parent_session_id, node_id, context_key)
+        return ""
+
+    def _single_dispatch_session_locked(self, task: Task, target: str, dispatch_input: dict[str, Any]) -> str:
+        """单节点同步委派会接着写的已有子会话；模式写错的给空串，委派路由随后按模式拒掉。"""
+        context_mode = self._resolve_dispatch_context_mode(target, dispatch_input.get("context_mode"))
+        context_key = str(dispatch_input.get("context_key") or "").strip()
+        return self._dispatch_session_locked(task.session_id, target, context_key, context_mode or "", {})
+
     def _create_child_session(
         self, parent_session_id: str, node_id: str, context_key: str, context_mode: str,
     ) -> str:
-        """生成新 child session 并持久化映射。
+        """生成新 child session 并持久化。
 
-        Child Session 隔离（Phase A）：生成 child_{uuid4().hex[:12]} 格式的 ID，
-        写入 child_session_map、parent_children、sessions.json。
+        生成 child_{uuid4().hex[:12]} 格式的 ID，写入 parent_children、sessions.json；
+        accumulate 的另记进 child_session_map，之后同一个 (父会话, 节点, context_key) 沿用它。
         """
         child_sid = f"child_{uuid.uuid4().hex[:12]}"
-        map_key = (parent_session_id, node_id, context_key)
 
-        # 更新内存映射
-        self.child_session_map[map_key] = child_sid
+        if context_mode == "accumulate":
+            self.child_session_map[(parent_session_id, node_id, context_key)] = child_sid
         self.parent_children.setdefault(parent_session_id, set()).add(child_sid)
 
         # 持久化到 sessions.json
@@ -1498,7 +1515,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         branch/child session 只标 reset 不删的话，sessions.json 会无限膨胀。这里删掉所有 reset=true 的条目、
         没有任务在用的入口分支，以及空闲超过 engine.child_session.ttl_hours 的非 accumulate child session。
-        失败或到点收尾留着的子会话（含异步委派的 agent: 会话）不按空闲时长清：发起任务结束后再过宽限期才删。
+        没做完就交回、为接着做留着的子会话（含异步委派的 agent: 会话）不按空闲时长清：发起任务结束后再过宽限期才删。
         """
         now = datetime.now(timezone.utc)
         stale_threshold = now - self._child_session_ttl()

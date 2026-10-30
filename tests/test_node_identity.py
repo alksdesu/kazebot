@@ -8,6 +8,7 @@ qq.orchestrator.yaml：列表显示示例文件的内容，保存却按文件名
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor.admin_api as admin_api  # noqa: E402
-from engine.node import internal_node, load_node  # noqa: E402
+from engine.node import (  # noqa: E402
+    canonical_node_id,
+    declared_id,
+    internal_node,
+    known_node_ids,
+    load_node,
+    template_reference_warnings,
+)
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -226,3 +234,91 @@ def test_hand_written_fields_come_back_the_way_the_engine_reads_them(client, wor
     assert rows["sloppy"]["description"] == ""
     assert rows["sloppy"]["delegate_targets"] == []
     assert rows["listed"]["delegate_targets"] == ["helper"]
+
+
+# 文件名是 probe.lead，yaml 里写的 id 却是 probe.lead.v2，委派名单里列的是文件名
+_RENAMED = """id: probe.lead.v2
+type: ai
+delegate_targets:
+  - probe.lead
+"""
+
+
+def _write_renamed(workspace: Path, content: str = _RENAMED) -> Path:
+    path = workspace / "config" / "nodes" / "probe.lead.yaml"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_a_node_s_id_is_its_file_name_and_the_written_id_an_old_one(workspace: Path) -> None:
+    _write_renamed(workspace)
+
+    node = load_node(workspace, "probe.lead")
+    by_old_id = load_node(workspace, "probe.lead.v2")
+
+    assert node is not None and node.id == "probe.lead"
+    assert by_old_id is not None and by_old_id.id == "probe.lead"
+    assert node.aliases[0] == "probe.lead.v2"
+    assert node.delegate_targets == ["probe.lead"]
+    # 会话里存的入口、定时任务、技能的 node_ids 写着旧 id 的，都按它找回这个节点
+    assert canonical_node_id(workspace, "probe.lead.v2") == "probe.lead"
+    assert known_node_ids(workspace, "probe.lead") == ("probe.lead", "probe.lead.v2")
+
+
+def test_the_written_id_is_warned_about_once_per_version_of_the_file(
+    workspace: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = _write_renamed(workspace)
+
+    def warned() -> int:
+        return sum("declares id probe.lead.v2" in record.getMessage() for record in caplog.records)
+
+    with caplog.at_level(logging.WARNING):
+        load_node(workspace, "probe.lead")
+        load_node(workspace, "probe.lead.v2")
+        assert warned() == 1
+        path.write_text(_RENAMED + "description: edited\n", encoding="utf-8")
+        load_node(workspace, "probe.lead")
+
+    assert warned() == 2
+
+
+def test_a_written_id_that_names_another_file_stays_with_that_file(workspace: Path) -> None:
+    nodes = workspace / "config" / "nodes"
+    (nodes / "probe.a.yaml").write_text("id: probe.b\ntype: ai\n", encoding="utf-8")
+    (nodes / "probe.b.yaml").write_text("type: ai\n", encoding="utf-8")
+
+    assert load_node(workspace, "probe.a").id == "probe.a"
+    assert load_node(workspace, "probe.b").id == "probe.b"
+    assert known_node_ids(workspace, "probe.a") == ("probe.a",)
+    assert canonical_node_id(workspace, "probe.b") == "probe.b"
+
+
+def test_a_written_id_that_matches_the_file_name_is_no_old_id(workspace: Path) -> None:
+    (workspace / "config" / "nodes" / "probe.same.yaml").write_text("id: probe.same\ntype: ai\n", encoding="utf-8")
+
+    assert declared_id({"id": "probe.same"}, "probe.same") == ""
+    assert known_node_ids(workspace, "probe.same") == ("probe.same",)
+
+
+@pytest.mark.parametrize("raw", [None, "", "  ", True, ["probe.x"], {"id": "probe.x"}, "a/b", "..", "C:x"])
+def test_an_id_that_is_not_a_node_name_is_ignored(raw: Any) -> None:
+    assert declared_id({"id": raw}, "probe.lead") == ""
+
+
+def test_a_template_name_written_as_the_id_is_reported_on_save() -> None:
+    warnings = template_reference_warnings({"id": "_draft", "type": "ai"})
+
+    assert "id 写的 _draft 是模板或示例的名字，按它找不到这个节点" in warnings
+
+
+def test_the_console_lists_the_written_id_as_an_old_one_and_guards_it(client, workspace: Path) -> None:
+    _write_renamed(workspace)
+
+    row = _nodes(client)["probe.lead"]
+    created = client("POST", _BASE, headers=_AUTH, json={"id": "probe.lead.v2", "content": "type: ai\n"})
+
+    assert row["declared_id"] == "probe.lead.v2"
+    assert row["aliases"] == ["probe.lead.v2"]
+    assert created.status_code == 409
+    assert not (workspace / "config" / "nodes" / "probe.lead.v2.yaml").exists()

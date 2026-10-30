@@ -1,6 +1,6 @@
 """子会话的保留规则：fresh / fork 空闲多久算过期，哪些登记行的历史永久保留，哪些在发起任务结束后再留一段。
 
-supervisor 清登记、data_cleanup 删文件都按这里判；两边各写一份，就会一边留着登记、一边把历史删掉。
+supervisor 清登记时按这里判；data_cleanup 不动还登记着的子会话，只按同一个 TTL 删没登记的文件。
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def child_session_ttl_hours(runtime_config: dict[str, Any]) -> int:
 
 
 def retain_grace_hours(runtime_config: dict[str, Any]) -> int:
-    """失败或到点收尾的子会话，在发起它的任务结束后再留多少小时：最少 1，读不出整数按默认的 24。"""
+    """没做完就交回的子会话（失败、到点收尾、ask、被软打断），在发起它的任务结束后再留多少小时：最少 1，读不出整数按默认的 24。"""
     return get_int(runtime_config, RETAIN_GRACE_KEY, DEFAULT_RETAIN_GRACE_HOURS, min_value=1)
 
 

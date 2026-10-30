@@ -93,8 +93,9 @@ def load_workflow(workspace_root: Path, workflow_id: str) -> Workflow | None:
     entry = str(data.get("entry_node") or "").strip()
     if not entry:
         entry = next(iter(edges), "")
+    # 和节点一样按文件名认，yaml 里写的 id 不算：按它找不到这份文件
     return Workflow(
-        id=str(data.get("id") or wid).strip(),
+        id=wid,
         name=str(data.get("name") or wid).strip(),
         entry_node=entry,
         edges=edges,

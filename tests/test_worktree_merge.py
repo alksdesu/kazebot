@@ -139,6 +139,26 @@ class TestPreviewAndMerge:
         assert not (env.ws / "app" / "new.py").exists()
         assert git(env.ws, "status", "--porcelain", "--", "app").strip() == ""
 
+    def test_the_merged_files_are_recorded_for_a_later_worktree_to_carry(self, env: Env) -> None:
+        # 合回不提交：之后接着这个子 agent 另建副本时，按这份清单把原仓库工作区里的这些文件带进基准提交
+        caller, child, view = _finished_child(env)
+        preview = env.service.preview(task_id=caller.task_id, handle=view["handle"])
+
+        merged = env.service.merge(task_id=caller.task_id, handle=view["handle"], digest=preview["digest"])
+
+        assert merged["ok"] is True, merged
+        entry = env.entry(child)
+        assert sorted(entry["merged_files"]) == ["app/main.py", "app/new.py", "app/old.py"]
+        assert entry["merged_at"] and entry["cleanup_reason"] == "merged"
+
+    def test_a_merge_with_nothing_to_apply_records_no_files(self, env: Env) -> None:
+        caller, child, view = _finished_child(env, edit=False)
+        preview = env.service.preview(task_id=caller.task_id, handle=view["handle"])
+
+        env.service.merge(task_id=caller.task_id, handle=view["handle"], digest=preview["digest"])
+
+        assert env.entry(child)["merged_files"] == []
+
     def test_a_worktree_without_changes_merges_to_nothing(self, env: Env) -> None:
         caller, child, view = _finished_child(env, edit=False)
         preview = env.service.preview(task_id=caller.task_id, handle=view["handle"])

@@ -83,7 +83,7 @@ def _build_resume_messages(resume_data: dict[str, Any], *, can_merge: bool = Tru
     can_merge 是这个任务的工具表里有没有合回工具，子任务交回的隔离副本说明按它写怎么合回。
     """
     messages = _resume_messages(resume_data, can_merge=can_merge)
-    rtype = str(resume_data.get("type") or "").strip()
+    rtype = _single_resume_type(resume_data)
     if rtype in _CHILD_RESUME_TYPES:
         # 下游结果的判定读这里，不去匹配中文正文；_meta 发给模型前会被剥掉。
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
@@ -118,22 +118,55 @@ def _preview(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-def _continue_lines(source: dict[str, Any], node: str) -> list[str]:
-    """子任务的句柄；它的会话为接着做留着时，再说清怎么用 continue_from 接着派。"""
+def _continue_lines(source: dict[str, Any], node: str, status: str = "") -> list[str]:
+    """子任务的句柄；它的会话能用 continue_from 接着做时，按它这一程怎么停下的说清怎么接着派。"""
     handle = str(source.get("handle") or "").strip()
     if not handle:
         return []
     lines = [f"句柄：{handle}"]
     if not source.get("continuable"):
         return lines
-    target = node or "同一个节点"
+    again = f"再委派给 {node or '同一个节点'}，带上 continue_from 填这个句柄"
     wrapup = str(source.get("wrapup") or "").strip()
-    if wrapup:
+    outcome = status or "finish"
+    if outcome == "ask":
+        lines.append(f"补齐它要的信息后，{again}，它会从停下的地方接着做；不带句柄就是从零开始的另一份。")
+    elif outcome == "preempted":
+        lines.append(f"它的会话为接着做留着；要它从打断的地方接着做，就{again}。")
+    elif wrapup:
         limit = "运行时长" if wrapup == WRAPUP_TIME else "步数"
-        lines.append(f"它是到了{limit}上限停下的，还没做完；要它接着做，就再委派给 {target}，带上 continue_from 填这个句柄。")
+        lines.append(f"它是到了{limit}上限停下的，还没做完；要它接着做，就{again}。")
+    elif outcome == "finish":
+        lines.append(f"它的会话留着；要它带着这段历史接着做，就{again}。")
     else:
-        lines.append(f"要它从停下的地方接着做，就再委派给 {target}，带上 continue_from 填这个句柄。")
+        lines.append(f"要它从停下的地方接着做，就{again}。")
     return lines
+
+
+def _kept_for_continuing(source: dict[str, Any]) -> bool:
+    return bool(source.get("continuable") and str(source.get("handle") or "").strip())
+
+
+def _ask_closing(source: dict[str, Any]) -> list[str]:
+    """ask 交回的子任务会话没为接着做留着时，说清补齐信息后只能重新委派。"""
+    if _kept_for_continuing(source):
+        return []
+    return ["它这一程已经结束，会话没有为接着做留着；补齐信息后要重新委派，那是从零开始的另一份。"]
+
+
+def _preempted_closing(source: dict[str, Any]) -> list[str]:
+    """被打断的子任务会话没为接着做留着时，说清要做完只能重新委派。"""
+    if _kept_for_continuing(source):
+        return []
+    return ["它的会话没有为接着做留着；要做完得重新委派。"]
+
+
+def _single_resume_type(resume_data: dict[str, Any]) -> str:
+    rtype = str(resume_data.get("type") or "").strip()
+    # 单个委派的 ask 和 finish 走同一条路交回，靠 action_type 分开：要补充信息的不能说成已完成
+    if rtype == "child_result" and str(resume_data.get("action_type") or "").strip() == "ask":
+        return "child_ask"
+    return rtype
 
 
 def _unavailable_message(entry: dict[str, Any]) -> dict[str, Any]:
@@ -191,7 +224,7 @@ def _batch_node_message(entry: dict[str, Any], *, can_merge: bool = True) -> dic
         lines = [
             f"子节点 {node}{where}没有做完，需要补充信息：",
             text.strip() or summary or "（它没有说明需要什么）",
-            "它这一程已经结束；补齐信息后要重新委派。",
+            *_ask_closing(entry),
         ]
     elif status == "fail":
         lines = [f"子节点 {node}{where}执行失败：{error or '未知错误'}", "它没有给出结果，不要臆测它的输出。"]
@@ -203,6 +236,7 @@ def _batch_node_message(entry: dict[str, Any], *, can_merge: bool = True) -> dic
         lines = [f"子节点 {node}{where}被打断，没有做完，也没有结果。"]
         if summary:
             lines.append(f"打断前的摘要：{summary}")
+        lines.extend(_preempted_closing(entry))
     elif status == AWAIT_RUNNING:
         lines = _running_lines(entry, node, where)
     else:
@@ -212,7 +246,7 @@ def _batch_node_message(entry: dict[str, Any], *, can_merge: bool = True) -> dic
     earlier = _DELIVERED_EARLIER_NOTES.get(str(entry.get("delivered_earlier") or "").strip())
     if earlier:
         lines.append(earlier)
-    lines.extend(_continue_lines(entry, node))
+    lines.extend(_continue_lines(entry, node, status))
     lines.extend(worktree_lines(entry.get("worktree"), can_merge=can_merge))
 
     meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}
@@ -229,7 +263,7 @@ def _batch_node_message(entry: dict[str, Any], *, can_merge: bool = True) -> dic
 
 
 def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> list[dict[str, Any]]:
-    rtype = str(resume_data.get("type") or "").strip()
+    rtype = _single_resume_type(resume_data)
     worktree = worktree_lines(resume_data.get("worktree"), can_merge=can_merge)
 
     # v2: child_result
@@ -245,7 +279,7 @@ def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> 
         if text:
             lines.append("结果：")
             lines.append(text)
-        lines.extend(_continue_lines(resume_data, from_node))
+        lines.extend(_continue_lines(resume_data, from_node, "finish"))
         lines.extend(worktree)
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
@@ -265,7 +299,12 @@ def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> 
             content = f"下游节点 {from_node} 需要补充信息。"
         else:
             content = "下游节点需要补充信息。"
-        return [_child_message("\n".join([content, *worktree]), from_node)]
+        return [_child_message("\n".join([
+            content,
+            *_ask_closing(resume_data),
+            *_continue_lines(resume_data, from_node, "ask"),
+            *worktree,
+        ]), from_node)]
 
     # v2: child_failed
     if rtype == "child_failed":
@@ -274,7 +313,7 @@ def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> 
         prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
         return [_child_message("\n".join([
             f"{prefix}{error}",
-            *_continue_lines(resume_data, from_node),
+            *_continue_lines(resume_data, from_node, "fail"),
             *worktree,
         ]), from_node)]
 
@@ -287,11 +326,13 @@ def _resume_messages(resume_data: dict[str, Any], *, can_merge: bool = True) -> 
     # v2: child_preempted
     if rtype == "child_preempted":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-        ctx_ref = str(resume_data.get("context_ref") or "")
-        prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
-        if ctx_ref:
-            prefix += f"（context_ref: {ctx_ref}）"
-        return [_child_message("\n".join([prefix, *worktree]), from_node)]
+        prefix = f"下游节点 {from_node} 被打断，没有做完，也没有结果。" if from_node else "下游节点被打断，没有做完，也没有结果。"
+        return [_child_message("\n".join([
+            prefix,
+            *_preempted_closing(resume_data),
+            *_continue_lines(resume_data, from_node, "preempted"),
+            *worktree,
+        ]), from_node)]
 
     # 服务重启打断后重排的任务：缺结果的工具调用 runner 已补成「中断，结果未知」，这里只提醒先核对再接着做
     if rtype == INTERRUPTED_RESUME_TYPE:

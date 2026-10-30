@@ -81,6 +81,8 @@ _EXAMPLE_MARK = re.compile(re.escape(".example"), re.IGNORECASE)
 _ALIAS_CACHE: dict[str, tuple[tuple[int, int, int], tuple[str, ...]]] = {}
 _WARNED_ALIAS_CONFLICTS: set[tuple[str, ...]] = set()
 _WARNED_TEMPLATE_TARGETS: set[tuple[str, str]] = set()
+# 节点每加载一次都会解析，写的 id 和文件名不一致的提醒按 (文件, 写的 id, 文件版本) 只记一次
+_WARNED_DECLARED_IDS: set[tuple[str, str, tuple[int, int, int]]] = set()
 
 
 def _node_dirs(workspace_root: Path) -> tuple[Path, ...]:
@@ -126,6 +128,23 @@ def _parse_aliases(data: dict[str, Any], stem: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+def declared_id(data: dict[str, Any], stem: str) -> str:
+    """yaml 里写的、和文件名不同的 id；没写或和文件名一样给空串。
+
+    节点的 id 一律是文件名。写的这个 id 以前当过节点 id，会话、配置、定时任务里可能存着它，所以当旧 id 认。
+    """
+    raw = data.get("id")
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return ""
+    name = str(raw).strip()
+    return name if _is_node_name(name) and name != stem else ""
+
+
+def _old_ids(data: dict[str, Any], stem: str) -> tuple[str, ...]:
+    """文件名之外节点还认的 id：写的 id 和文件名不同时排最前，然后是 aliases 里声明的。"""
+    return tuple(dict.fromkeys(name for name in (declared_id(data, stem), *_parse_aliases(data, stem)) if name))
+
+
 def _declared_aliases(path: Path) -> tuple[str, ...]:
     stamp = config_layout.file_stamp(path)
     if stamp is None:
@@ -136,9 +155,21 @@ def _declared_aliases(path: Path) -> tuple[str, ...]:
         return cached[1]
     # kind、type 写错的定义也认它的旧 id：按旧 id 找过来，报的才是「不是能用的节点定义」而不是「找不到」。
     data, _problem = read_node_definition(path)
-    aliases = _parse_aliases(data or {}, path.stem)
+    aliases = _old_ids(data or {}, path.stem)
     _ALIAS_CACHE[key] = (stamp, aliases)
     return aliases
+
+
+def _warn_declared_id(path: Path, declared: str) -> None:
+    stamp = config_layout.file_stamp(path)
+    key = (str(path), declared, stamp or (0, 0, 0))
+    if key in _WARNED_DECLARED_IDS:
+        return
+    _WARNED_DECLARED_IDS.add(key)
+    logger.warning(
+        "%s declares id %s; a node's id is its file name %s, so %s is only kept as an old id",
+        path.name, declared, path.stem, declared,
+    )
 
 
 def node_files(workspace_root: Path) -> list[Path]:
@@ -316,6 +347,9 @@ def template_reference_warnings(data: dict[str, Any]) -> list[str]:
         for name in listed_targets(data.get("delegate_targets"))
         if template_node_name(name)
     ]
+    written_id = declared_id(data, stem="")
+    if written_id and template_node_name(written_id):
+        warnings.append(f"id 写的 {written_id} 是模板或示例的名字，按它找不到这个节点")
     warnings.extend(
         f"aliases 里的 {name} 是模板或示例的名字，按它找不到这个节点"
         for name in _parse_aliases(data, stem="")
@@ -445,8 +479,13 @@ def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
     }
     extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
 
+    # 委派名单、子会话键、自派判断都按文件名认节点，id 跟着它走；写的不同 id 只当旧 id
+    written_id = declared_id(data, nid)
+    if written_id and not template_node_name(nid):
+        _warn_declared_id(node_path, written_id)
+
     return Node(
-        id=str(data.get("id") or nid).strip(),
+        id=nid,
         type=node_type,
         name=str(data.get("name") or nid).strip(),
         description=str(data.get("description") or "").strip(),
@@ -462,7 +501,7 @@ def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
         provider=provider,
         provider_options=provider_options,
         delegate_targets=delegate_targets,
-        aliases=list(_effective_aliases(workspace_root, node_path, _parse_aliases(data, nid))),
+        aliases=list(_effective_aliases(workspace_root, node_path, _old_ids(data, nid))),
         persistent=persistent,
         extra=extra,
     )

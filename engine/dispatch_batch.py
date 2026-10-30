@@ -11,7 +11,6 @@ from typing import Any
 from clonoth_runtime import get_int, get_str
 
 from .attachments import is_allowed_attachment_path
-from .dispatch_handle import parse_handle
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +28,7 @@ REPO_KEY = "repo"
 # 每次各开一个子会话的上下文模式；accumulate 沿用同一个子会话，那个会话在用或是发起方上级在写的就不派
 OWN_SESSION_MODES = ("fresh", "fork")
 CONTEXT_MODES = (*OWN_SESSION_MODES, "accumulate")
-# supervisor 拒收异步委派的入站：要沿用的会话不能派是 409，context_mode 写错是 422，detail 是给模型看的原因
+# supervisor 拒收异步委派的入站：要沿用的会话不能派、continue_from 接不上是 409，context_mode 或句柄写错是 422，detail 是给模型看的原因
 INBOUND_CONFLICT_STATUS = 409
 INBOUND_BAD_MODE_STATUS = 422
 
@@ -235,14 +234,6 @@ def dispatch_repo(item: Any) -> str:
         return ""
     raw = item.get(REPO_KEY)
     return raw.strip() if isinstance(raw, str) else ""
-
-
-def batch_item_continue_from(item: Any) -> str:
-    """批次项带的 continue_from 句柄；没带或格式不对给空串。"""
-    if not isinstance(item, dict):
-        return ""
-    handle = parse_handle(item.get(CONTINUE_FROM_KEY))
-    return str(handle) if handle is not None else ""
 
 
 def _relative_attachment_path(raw: Any) -> str:

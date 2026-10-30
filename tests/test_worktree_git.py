@@ -384,3 +384,87 @@ class TestRemoval:
 
     def test_a_missing_tree_is_not_an_error(self, tmp_path: Path) -> None:
         wt_git.remove_tree(tmp_path / "never-made")
+
+
+@requires_git
+class TestCarriedBase:
+    def test_the_named_files_go_into_a_commit_on_top_of_head(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = head(repo)
+        write(repo / "app" / "main.py", "def main():\n    return 2\n")
+        (repo / "app" / "old.py").unlink()
+        write(repo / "app" / "new.py", "NEW = 1\n")
+        write(repo / "README.md", "not carried\n")
+        git(repo, "add", "README.md")
+        index_before = git(repo, "diff", "--cached", "--name-only")
+        status_before = _status_lines(repo)
+
+        commit = wt_git.carried_base(repo, base, ["app/main.py", "app/old.py", "app/new.py"], label="task-1")
+
+        assert commit != base and wt_git.is_commit(commit)
+        assert git(repo, "rev-parse", f"{commit}^").strip() == base
+        assert sorted(git(repo, "diff", "--name-only", base, commit).split()) == ["app/main.py", "app/new.py", "app/old.py"]
+        assert git(repo, "show", f"{commit}:app/main.py") == "def main():\n    return 2\n"
+        assert git(repo, "show", f"{commit}:README.md") == "hello\n"
+        assert "task-1" in git(repo, "log", "-1", "--format=%s", commit)
+        # 原仓库的分支、索引和工作区都不动，提交也不挂在哪个分支上
+        assert head(repo) == base
+        assert git(repo, "diff", "--cached", "--name-only") == index_before
+        assert _status_lines(repo) == status_before
+        assert git(repo, "branch", "--contains", commit).strip() == ""
+
+    def test_a_new_worktree_can_be_built_on_it(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = head(repo)
+        write(repo / "app" / "main.py", "def main():\n    return 2\n")
+        commit = wt_git.carried_base(repo, base, ["app/main.py"])
+        worktree = tmp_path / "repo-worktrees" / "repo-key" / "task-2"
+
+        wt_git.add_worktree(repo, worktree, wt_git.branch_name("task-2"), commit)
+
+        assert (worktree / "app" / "main.py").read_text(encoding="utf-8") == "def main():\n    return 2\n"
+        assert git(worktree, "status", "--porcelain").strip() == ""
+
+    def test_files_that_still_match_head_give_head_back(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = head(repo)
+
+        assert wt_git.carried_base(repo, base, ["app/main.py", "README.md"]) == base
+        assert wt_git.carried_base(repo, base, []) == base
+        assert git(repo, "status", "--porcelain").strip() == ""
+
+    def test_paths_that_leave_the_repo_are_dropped(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = head(repo)
+        write(tmp_path / "outside.txt", "x\n")
+
+        assert wt_git.carried_base(repo, base, ["../outside.txt", "..", "C:/outside.txt", "", "."]) == base
+
+    def test_a_base_that_is_not_a_commit_id_is_refused(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+
+        with pytest.raises(wt_git.GitError):
+            wt_git.carried_base(repo, "HEAD", ["app/main.py"])
+
+
+@requires_git
+class TestPatchPaths:
+    def test_it_lists_every_file_the_patch_touches(self, checkout: SimpleNamespace) -> None:
+        wt = checkout.wt
+        write(wt / "app" / "main.py", "def main():\n    return 2\n")
+        (wt / "app" / "old.py").unlink()
+        write(wt / "app" / "new.py", "NEW = 1\n")
+        write(wt / "assets" / "logo.bin", BINARY)
+        wt_git.compute_diff(wt, checkout.base, checkout.patch)
+        before = _status_lines(checkout.repo)
+
+        paths = wt_git.patch_paths(checkout.repo, checkout.patch)
+
+        assert sorted(paths) == ["app/main.py", "app/new.py", "app/old.py", "assets/logo.bin"]
+        assert _status_lines(checkout.repo) == before
+
+    def test_a_patch_that_is_gone_is_an_error(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+
+        with pytest.raises(wt_git.GitError):
+            wt_git.patch_paths(repo, tmp_path / "gone.patch")

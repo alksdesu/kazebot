@@ -27,6 +27,7 @@ from engine.inference.message_assembly import assemble_initial_messages, assembl
 from engine.isolation_notice import (  # noqa: E402
     ISOLATION_CLOSE,
     ISOLATION_OPEN,
+    NOT_ISOLATED_MODE,
     isolation_parts,
     nested_isolation_refusal,
     task_isolation,
@@ -157,22 +158,73 @@ class TestRendering:
         assert lines[2] == "- 这是你上次用的那个副本，之前的改动都还在。"
 
     @pytest.mark.parametrize("state, label", [
-        ("merged", "已经合回"),
         ("abandoned", "已经放弃"),
         ("expired", "过了保留期"),
         ("removed", "已经清理"),
         ("failed", "没建成"),
         ("merging", "正在合回"),
+        ("missing", "在登记里已经查不到"),
         ("", "用不了了"),
         ("strange", "用不了了"),
     ])
     def test_a_replaced_worktree_is_explained(self, tmp_path: Path, state: str, label: str) -> None:
         lines = _lines(_isolation(tmp_path, previous={"worktree": "old-1", "state": state}), tmp_path)
 
+        assert lines[2] == f"- 原来的副本 old-1 {label}，这是另建的，基于原仓库现在的提交：旧副本里没合回的改动不在这里。"
+
+    def test_a_merged_worktree_without_a_carry_record_says_merging_does_not_commit(self, tmp_path: Path) -> None:
+        lines = _lines(_isolation(tmp_path, previous={"worktree": "old-1", "state": "merged"}), tmp_path)
+
         assert lines[2] == (
-            f"- 原来的副本 old-1 {label}，这是按原仓库现在的提交另建的；"
-            "旧副本里的改动，除非已经合回并提交到原仓库，否则不在这里。"
+            "- 原来的副本 old-1 已经合回，这是另建的，基于原仓库现在的提交：合回只改原仓库的工作区、不提交，它合回的改动不在这里。"
         )
+
+    def test_merged_files_carried_into_the_base_are_explained(self, tmp_path: Path) -> None:
+        previous = {"worktree": "old-1", "state": "merged", "carry": {"status": "carried", "count": 3, "error": ""}}
+
+        lines = _lines(_isolation(tmp_path, previous=previous), tmp_path)
+
+        assert lines[2] == (
+            "- 原来的副本 old-1 已经合回，这是另建的：合回只改原仓库的工作区、不提交，所以它合回过的 3 个文件"
+            "按原仓库工作区里现在的内容带进了基准提交，你在这之上接着做；没合回的改动不在这里。"
+        )
+        assert (
+            "- 副本从基准提交检出：除了上面说的带进来的文件，原仓库里还没提交的改动不在这里，"
+            ".venv、node_modules 和被 gitignore 的文件也没有。"
+        ) in lines
+
+    def test_merged_files_already_committed_need_no_carrying(self, tmp_path: Path) -> None:
+        previous = {"worktree": "old-1", "state": "removed", "carry": {"status": "committed", "count": 2, "error": ""}}
+
+        lines = _lines(_isolation(tmp_path, previous=previous), tmp_path)
+
+        assert lines[2] == (
+            "- 原来的副本 old-1 已经清理，这是另建的，基于原仓库现在的提交：它合回过的 2 个文件在原仓库里已经提交（或已撤回），"
+            "不用另外带；没合回的改动不在这里。"
+        )
+        assert "- 副本从基准提交检出：原仓库里还没提交的改动不在这里，.venv、node_modules 和被 gitignore 的文件也没有。" in lines
+
+    @pytest.mark.parametrize("count, files", [(3, " 3 个"), (0, ""), (True, ""), ("3", "")])
+    def test_merged_files_that_could_not_be_carried_say_why_and_what_to_do(
+        self, tmp_path: Path, count: Any, files: str,
+    ) -> None:
+        previous = {"worktree": "old-1", "state": "merged", "carry": {"status": "failed", "count": count, "error": "boom"}}
+
+        lines = _lines(_isolation(tmp_path, previous=previous), tmp_path)
+
+        assert lines[2] == (
+            f"- 原来的副本 old-1 已经合回，这是另建的，基于原仓库现在的提交：它合回过的{files}文件没能带进来（boom），"
+            "这些改动在原仓库的工作区里、不在这里；要接着改它们，先核对这里的内容，需要的话重做，"
+            "或者请上级先把原仓库里的改动提交再派。"
+        )
+        assert "- 副本从基准提交检出：原仓库里还没提交的改动不在这里，.venv、node_modules 和被 gitignore 的文件也没有。" in lines
+
+    def test_a_grandchild_never_hears_of_its_owner_s_carried_files(self, tmp_path: Path) -> None:
+        previous = {"worktree": "old-1", "state": "merged", "carry": {"status": "carried", "count": 3, "error": ""}}
+
+        lines = _lines(_isolation(tmp_path, inherited=True, previous=previous), tmp_path)
+
+        assert not any("old-1" in line or "带进" in line for line in lines)
 
     def test_linked_directories_are_listed(self, tmp_path: Path) -> None:
         lines = _lines(_isolation(tmp_path, links=["node_modules", " web/node_modules ", "", 3]), tmp_path)
@@ -187,6 +239,62 @@ class TestRendering:
 
     def test_the_mode_is_read_the_way_the_supervisor_reads_it(self, tmp_path: Path) -> None:
         assert len(isolation_parts({**_isolation(tmp_path), "mode": " WorkTree "}, workspace_root=tmp_path)) == 1
+
+
+def _reminder(**previous: Any) -> dict[str, Any]:
+    """supervisor 给不隔离、接着一段隔离过的对话的子任务写的提醒。"""
+    return {"mode": NOT_ISOLATED_MODE, "previous": {"worktree": "old-1", "state": "finished", "inherited": False, **previous}}
+
+
+class TestReminder:
+    def test_a_conversation_isolated_before_is_told_this_run_is_not(self, tmp_path: Path) -> None:
+        [block] = isolation_parts(_reminder(), workspace_root=tmp_path)
+
+        assert block.split("\n") == [
+            ISOLATION_OPEN,
+            "你这次不在隔离副本里：文件工具和命令直接作用于原仓库。",
+            "- 这段对话之前在隔离副本 old-1 里做过（那个副本还留着等合回）：历史里的副本路径、"
+            "在副本里改过的文件都指那个副本，不是这次的工作目录。",
+            "- 那个副本里没合回的改动不在原仓库里，不要凭历史以为它们已经在了；要接着那份改动，"
+            "请委派方带 isolation: worktree 再派，不要在原仓库里凭记忆重做。",
+            ISOLATION_CLOSE,
+        ]
+
+    def test_a_worktree_it_only_followed_its_dispatcher_into_is_said_so(self, tmp_path: Path) -> None:
+        [block] = isolation_parts(_reminder(inherited=True, state="merged"), workspace_root=tmp_path)
+
+        assert "- 这段对话之前跟着派你来的任务在隔离副本 old-1 里做过（那个副本已经合回）" in block
+
+    @pytest.mark.parametrize("state, label", [
+        ("ready", "还有任务在用"),
+        ("missing", "在登记里已经查不到"),
+        ("strange", "现在用不了"),
+        ("", "现在用不了"),
+    ])
+    def test_the_state_of_the_old_worktree_is_named(self, tmp_path: Path, state: str, label: str) -> None:
+        [block] = isolation_parts(_reminder(state=state), workspace_root=tmp_path)
+
+        assert f"（那个副本{label}）" in block
+
+    @pytest.mark.parametrize("raw", [
+        {"mode": NOT_ISOLATED_MODE},
+        {"mode": NOT_ISOLATED_MODE, "previous": {}},
+        {"mode": NOT_ISOLATED_MODE, "previous": {"worktree": "  "}},
+        {"mode": NOT_ISOLATED_MODE, "previous": "old-1"},
+    ])
+    def test_nothing_is_said_without_an_old_worktree(self, raw: Any) -> None:
+        assert isolation_parts(raw, workspace_root=Path(".")) == []
+
+    def test_a_reminded_task_does_not_count_as_isolated(self) -> None:
+        assert task_isolation({ISOLATION_CONTEXT_KEY: _reminder()}) == {}
+
+    @pytest.mark.parametrize("mode", list(_PROMPTS))
+    def test_it_goes_where_the_notice_would(self, tmp_path: Path, mode: str) -> None:
+        messages = _assemble(tmp_path, mode, isolation=_reminder())
+
+        dynamic = _dynamic(messages)
+        assert "你这次不在隔离副本里" in dynamic and "old-1" in dynamic
+        assert not any("old-1" in str(message["content"]) for message in messages if not message.get("_dynamic"))
 
 
 class TestHelpers:

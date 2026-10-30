@@ -364,24 +364,42 @@ def _iso(moment: datetime | None) -> str | None:
     return moment.isoformat() if moment is not None else None
 
 
-def _group_key(dimension: str, copies: _Copies, run_session: str, tree: _SessionTree) -> str:
+def _group_key(
+    dimension: str, copies: _Copies, run_session: str, tree: _SessionTree, node_ids: Mapping[str, str],
+) -> str:
     segment = copies.segment
     if dimension == "session":
         return _conversation(copies, run_session, tree)
     if dimension == "node":
-        return segment.node_id
+        return node_ids.get(segment.node_id, segment.node_id)
     if dimension == "model":
         return segment.model
     return segment.channel
 
 
+def current_node_ids(workspace_root: Path, segments: Iterable[UsageSegment]) -> dict[str, str]:
+    """记录里的节点名 → 节点现在的 id。改过名、或 yaml 里写过不同 id 的节点，新旧记录记的名字不一样，要归到同一行。
+
+    要读节点文件，放在锁外调用。
+    """
+    from engine.node import canonical_node_id
+
+    names = {segment.node_id for segment in segments if segment.node_id}
+    return {name: canonical_node_id(workspace_root, name) for name in names}
+
+
 def build_cache_report(
-    segments: Iterable[UsageSegment], query: CacheQuery, *, parents: Mapping[str, str] | None = None,
+    segments: Iterable[UsageSegment],
+    query: CacheQuery,
+    *,
+    parents: Mapping[str, str] | None = None,
+    node_ids: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """命中率 = 命中 token / 输入 token。报不出缓存的「无数据」不进分子分母，单独计数。
 
     老记录命中为 0 时不写 cache_read_tokens：它实际跑的会话里有记录报过这一项（新记录报的 0 也算）就按 0 算，
     从没报过的算无数据。新记录报了就照记，缺了是渠道没报。
+    node_ids 把记录里的节点名换成节点现在的 id（current_node_ids），没给的照记录里的名字分行。
     """
     tree = _SessionTree(parents or {})
     merged = _merge_copies(segments)
@@ -412,7 +430,7 @@ def build_cache_report(
         hit = segment.cache_read_tokens
         if hit is None and segment.completed_at is None and run_session in reporting_sessions:
             hit = 0
-        key = _group_key(query.group_by, copies, run_session, tree)
+        key = _group_key(query.group_by, copies, run_session, tree, node_ids or {})
         tallies = groups.setdefault(key, {CURRENT: _Tally(), BASELINE: _Tally()})
         for side in sides:
             tallies[side].add(segment, hit)
@@ -481,7 +499,8 @@ def create_usage_router(workspace_root: Path) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         segments, scan = index.snapshot()
         sessions = load_sessions(root)
-        report = build_cache_report(segments, query, parents=session_parents(sessions))
+        node_ids = current_node_ids(root, segments) if query.group_by == "node" else None
+        report = build_cache_report(segments, query, parents=session_parents(sessions), node_ids=node_ids)
         report["scan"] = {**scan.to_dict(), **report["scan"]}
         if query.group_by == "session":
             described = describe_sessions(root, (row["key"] for row in report["rows"]), sessions)

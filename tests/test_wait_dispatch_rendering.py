@@ -83,9 +83,11 @@ class TestNodeEntries:
     def test_a_preempted_child_says_it_did_not_finish(self) -> None:
         [message] = _render(_node(status="preempted", text="", summary="read half of it"))
 
-        assert message["content"] == (
-            "子节点 scout（调用 w1；指令：list the files）被打断，没有做完，也没有结果。\n打断前的摘要：read half of it"
-        )
+        assert message["content"].splitlines() == [
+            "子节点 scout（调用 w1；指令：list the files）被打断，没有做完，也没有结果。",
+            "打断前的摘要：read half of it",
+            "它的会话没有为接着做留着；要做完得重新委派。",
+        ]
         assert resume_outcome(message) == ("child_preempted", "scout")
 
     def test_a_child_that_asks_back_hands_over_its_question(self) -> None:
@@ -94,9 +96,49 @@ class TestNodeEntries:
         assert message["content"].splitlines() == [
             "子节点 scout（调用 w1；指令：list the files）没有做完，需要补充信息：",
             "要列哪个目录？",
-            "它这一程已经结束；补齐信息后要重新委派。",
+            "它这一程已经结束，会话没有为接着做留着；补齐信息后要重新委派，那是从零开始的另一份。",
         ]
         assert resume_outcome(message) == ("child_ask", "scout")
+
+    def test_a_kept_asking_child_says_how_to_pick_up_where_it_stopped(self) -> None:
+        [message] = _render(_node(status="ask", text="要列哪个目录？", handle="child-1@child_abc", continuable=True))
+
+        assert message["content"].splitlines() == [
+            "子节点 scout（调用 w1；指令：list the files）没有做完，需要补充信息：",
+            "要列哪个目录？",
+            "句柄：child-1@child_abc",
+            "补齐它要的信息后，再委派给 scout，带上 continue_from 填这个句柄，它会从停下的地方接着做；不带句柄就是从零开始的另一份。",
+        ]
+        assert message["_meta"]["handle"] == "child-1@child_abc"
+        assert resume_outcome(message) == ("child_ask", "scout")
+
+    def test_an_asking_child_whose_session_was_not_kept_still_shows_its_handle(self) -> None:
+        [message] = _render(_node(status="ask", text="要列哪个目录？", handle="child-1@child_abc", continuable=False))
+
+        assert message["content"].splitlines()[-2:] == [
+            "它这一程已经结束，会话没有为接着做留着；补齐信息后要重新委派，那是从零开始的另一份。",
+            "句柄：child-1@child_abc",
+        ]
+
+    def test_a_kept_preempted_child_says_how_to_continue(self) -> None:
+        [message] = _render(_node(
+            status="preempted", text="", summary="read half of it", handle="child-1@child_abc", continuable=True,
+        ))
+
+        assert message["content"].splitlines() == [
+            "子节点 scout（调用 w1；指令：list the files）被打断，没有做完，也没有结果。",
+            "打断前的摘要：read half of it",
+            "句柄：child-1@child_abc",
+            "它的会话为接着做留着；要它从打断的地方接着做，就再委派给 scout，带上 continue_from 填这个句柄。",
+        ]
+
+    def test_a_finished_child_whose_session_stays_says_it_can_carry_on_with_its_history(self) -> None:
+        [message] = _render(_node(handle="child-1@child_abc", continuable=True))
+
+        assert message["content"].endswith(
+            "结果：\na.py\nb.py\n句柄：child-1@child_abc\n"
+            "它的会话留着；要它带着这段历史接着做，就再委派给 scout，带上 continue_from 填这个句柄。"
+        )
 
     def test_an_unexpected_status_is_not_reported_as_done(self) -> None:
         [message] = _render(_node(status="dispatch", text="", error=""))
@@ -253,6 +295,56 @@ class TestSingleChildResumes:
         assert message["_meta"]["message_type"] == DISPATCH_RESULT_TYPE
         assert message["_meta"]["child_node_id"] == "scout"
         assert resume_outcome(message) == (rtype, "scout")
+
+    def test_a_single_child_that_asks_is_not_reported_as_done(self) -> None:
+        # 单个委派的 ask 和 finish 走同一条路交回，只靠 action_type 分开
+        [message] = _build_resume_messages({
+            "type": "child_result", "action_type": "ask", "child_node_id": "scout",
+            "result": {"text": "要列哪个目录？"}, "handle": "child-1@child_abc", "continuable": True,
+        })
+
+        assert message["content"].splitlines() == [
+            "下游节点 scout 需要补充信息：要列哪个目录？",
+            "句柄：child-1@child_abc",
+            "补齐它要的信息后，再委派给 scout，带上 continue_from 填这个句柄，它会从停下的地方接着做；不带句柄就是从零开始的另一份。",
+        ]
+        assert resume_outcome(message) == ("child_ask", "scout")
+
+    def test_a_single_child_that_asks_without_a_kept_session_says_to_dispatch_again(self) -> None:
+        [message] = _build_resume_messages({
+            "type": "child_result", "action_type": "ask", "child_node_id": "scout", "result": {"text": "要列哪个目录？"},
+        })
+
+        assert message["content"] == (
+            "下游节点 scout 需要补充信息：要列哪个目录？\n"
+            "它这一程已经结束，会话没有为接着做留着；补齐信息后要重新委派，那是从零开始的另一份。"
+        )
+
+    def test_a_single_finish_is_still_a_result(self) -> None:
+        [message] = _build_resume_messages({
+            "type": "child_result", "action_type": "finish", "child_node_id": "scout", "result": {"text": "a.py"},
+        })
+
+        assert message["content"] == "下游节点 scout 已完成。\n结果：\na.py"
+        assert resume_outcome(message) == ("child_result", "scout")
+
+    def test_a_single_preempted_child_kept_for_continuing(self) -> None:
+        [message] = _build_resume_messages({
+            "type": "child_preempted", "child_node_id": "scout", "context_ref": "ctx-1",
+            "handle": "child-1@child_abc", "continuable": True,
+        })
+
+        assert message["content"].splitlines() == [
+            "下游节点 scout 被打断，没有做完，也没有结果。",
+            "句柄：child-1@child_abc",
+            "它的会话为接着做留着；要它从打断的地方接着做，就再委派给 scout，带上 continue_from 填这个句柄。",
+        ]
+        assert "ctx-1" not in message["content"]
+
+    def test_a_single_preempted_child_that_was_not_kept_says_to_dispatch_again(self) -> None:
+        [message] = _build_resume_messages({"type": "child_preempted", "child_node_id": "scout", "context_ref": "ctx-1"})
+
+        assert message["content"] == "下游节点 scout 被打断，没有做完，也没有结果。\n它的会话没有为接着做留着；要做完得重新委派。"
 
     def test_the_old_tool_results_shape_is_typed_as_tool_output(self) -> None:
         [message] = _build_resume_messages({"type": "tool_results", "tool_results": [{"name": "probe", "raw_inline": "ok"}]})

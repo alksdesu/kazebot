@@ -331,12 +331,12 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
-        """节点列表。id 一律取文件名。
+        """节点列表。id 一律取文件名，和 engine 一样。
 
-        engine 的 load_node 是拿 node_id 直接拼 {node_id}.yaml 去找文件的，yaml 里那个
-        id 字段它根本不读。这里以前用 id 字段去重，于是 qq.orchestrator.example.yaml
-        把同名的 qq.orchestrator.yaml 顶掉了：界面显示示例文件的内容，写回却按文件名
-        落到真文件上——读一份、写另一份。
+        engine 的 load_node 拿 node_id 直接拼 {node_id}.yaml 去找文件，节点的 id 也就是文件名；
+        yaml 里写的 id 和文件名不同时只当旧 id 认，和 aliases 一样。按 id 字段去重的话，
+        qq.orchestrator.example.yaml 会把同名的 qq.orchestrator.yaml 顶掉：界面显示示例文件的内容，
+        写回却按文件名落到真文件上——读一份、写另一份。
         """
         # 系统节点、实例改过或自己加的、仓库默认依次排，同名时排在前面的那份才会被加载，
         # 和 load_node 的取舍顺序一致。
@@ -365,7 +365,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "active": not template_node_name(nid),
                     # 回给程序看的判定值，网页的入口和切换列表跟 switch_node 枚举一样不列它。
                     "internal": declares_internal(data),
-                    # yaml 里写的 id。和文件名不一致时它是个摆设，改了也不会换节点。
+                    # yaml 里写的 id。和文件名不一致时只当旧 id 认（engine 认得的会列在 aliases 里），改了不会换节点。
                     "declared_id": declared if declared and declared != nid else "",
                     # engine 实际认的旧 id：被同名文件或排在前面的节点占掉的不算，模板和示例没有。
                     "aliases": list(known_node_ids(workspace_root, nid)[1:]),

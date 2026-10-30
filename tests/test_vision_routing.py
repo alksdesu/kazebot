@@ -274,16 +274,15 @@ class TestTheVisionNodeMustBeWorthTheDetour:
         state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
         assert _route(state) == "qq.vision"
 
-    def test_an_id_field_alone_does_not_make_a_file_the_node(self, tmp_path) -> None:
-        # engine 按文件名加载，yaml 里的 id 字段不参与查找：照那个字段找到的定义根本跑不起来，
-        # 拿它判断配没配只会得出一个和实际执行对不上的结论，所以同样按「读不到」处理。
+    def test_an_id_field_that_differs_from_the_file_name_is_judged_as_an_old_id(self, tmp_path) -> None:
+        # yaml 里写的 id 和文件名不同时当旧 id 认，engine 按它也找得到这份文件：没配自己的模型就不绕
         nodes = tmp_path / "config" / "nodes"
         nodes.mkdir(parents=True, exist_ok=True)
         (nodes / "whatever.yaml").write_text(
             yaml.safe_dump({"id": "qq.vision", "type": "ai"}, sort_keys=False), encoding="utf-8",
         )
         state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
-        assert _route(state) == "qq.vision"
+        assert _route(state) == "qq.orchestrator"
 
     def test_a_renamed_node_is_judged_under_its_old_id(self, tmp_path) -> None:
         # runtime.yaml 还写着旧 id，节点文件已经改名、把旧 id 记进了 aliases。

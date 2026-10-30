@@ -45,12 +45,10 @@ from engine.dispatch_batch import (
     DispatchTimeouts,
     await_request,
     batch_item_attachments,
-    batch_item_continue_from,
     batch_item_timeout,
     context_mode_refusal,
     parse_context_mode,
 )
-from engine.dispatch_handle import parse_handle
 from engine.dispatch_results import (
     CONTINUES_TASK_PAYLOAD_KEY,
     DELIVERY_NOTE_PAYLOAD_KEY,
@@ -674,13 +672,15 @@ class TaskRouterMixin:
         task_ended = self._task_terminal(task)
         with self._lock:
             dispatch_info = self.sessions.get(dispatch_sid)
-            # 失败或到点收尾的子会话在保留期里，父节点可能还要接着派，到期由定期清理删
+            # 没做完就交回的子会话在保留期里，父节点可能还要接着派，到期由定期清理删；
+            # 这一程结束到清理轮到之间，会话可能已被接着派出去、有新任务在写，也不删
             cleanup_dispatch = bool(
                 task_ended
                 and context_mode in {"fresh", "fork"}
                 and dispatch_info is not None
                 and dispatch_info.conversation_key.startswith("agent:")
                 and not child_retention.is_held_locked(self, dispatch_sid)
+                and not child_retention.session_busy_locked(self, dispatch_sid)
             )
             dispatch_conv = dispatch_info.conversation_key if cleanup_dispatch else ""
             child_entry = self._session_store.get_entry(child_sid)
@@ -689,6 +689,7 @@ class TaskRouterMixin:
                 child_sid and task_ended
                 and (child_mode or str(task.input.get("context_mode") or "").strip()) != "accumulate"
                 and not child_retention.is_held_locked(self, child_sid)
+                and not child_retention.session_busy_locked(self, child_sid)
             )
 
         # All potentially slow filesystem work is outside Supervisor._lock.
@@ -1444,6 +1445,7 @@ class TaskRouterMixin:
         action = task.result or {}
         act = str(action.get("action") or "").strip()
         if act == "preempted":
+            child_retention.hand_back_locked(self, task)
             self._finalize_branch_task_locked(task, merge=True)
             self._route_preempted_locked(task, action)
             return
@@ -1457,10 +1459,8 @@ class TaskRouterMixin:
             # 同一任务的压缩连续失败到上限，这次 dispatch 已改判为失败，按失败继续路由
             action = task.result
             act = "fail"
-        if act in ("finish", "fail"):
-            # 结果交回父节点之前：失败或到点收尾的子会话记上保留，结果里引用的超长输出复制到父节点名下
-            child_retention.mark_locked(self, task)
-            child_retention.adopt(self.workspace_root, child_retention.adoption_locked(self, task))
+        if act in child_retention.HANDED_BACK:
+            child_retention.hand_back_locked(self, task)
         if task.batch_id:
             if act in _TASK_END_ACTIONS:
                 self._collect_batch_locked(task)
@@ -1709,23 +1709,15 @@ class TaskRouterMixin:
                         )
                         created_child_ids.append(refused.task_id)
                         continue
-                    _continue_handle = parse_handle(batch_item_continue_from(item))
-                    _continued: dict[str, Any] = {}
-                    if _continue_handle is not None:
-                        # engine 派出前核对过；这期间子会话可能过了保留期或被别的任务接走，按当下的状态再核一遍
-                        _continued = continuation.resolve_locked(
-                            self, task.task_id, _continue_handle,
-                            continuation.target_ids(self.workspace_root, item_target),
-                            wait=True, require_live_caller=False,
+                    _continue_handle, _continued = continuation.batch_item_locked(self, task, item, item_target)
+                    if _continued and not _continued.get("ok"):
+                        refused = self._create_refused_batch_child_locked(
+                            task, item, target=item_target, batch_id=batch_id, index=idx,
+                            delivery_key=delivery_key,
+                            error=str(_continued.get("message") or "continue_from 被拒绝。"),
                         )
-                        if not _continued.get("ok"):
-                            refused = self._create_refused_batch_child_locked(
-                                task, item, target=item_target, batch_id=batch_id, index=idx,
-                                delivery_key=delivery_key,
-                                error=str(_continued.get("message") or "continue_from 被拒绝。"),
-                            )
-                            created_child_ids.append(refused.task_id)
-                            continue
+                        created_child_ids.append(refused.task_id)
+                        continue
                     _item_refusal = ""
                     if _continued:
                         # 接着的是那个子会话自己的历史：模式沿用它当初的，context_key 不再参与找会话
@@ -1751,6 +1743,9 @@ class TaskRouterMixin:
                         caller=task,
                         request=item,
                         continued_task_id=str(_continued.get("task_id") or "") if _continued else "",
+                        session_id=self._dispatch_session_locked(
+                            task.session_id, item_target, _batch_ctx_key or "", _batch_ctx_mode, _continued,
+                        ),
                     )
                     if _plan.refused:
                         refused = self._create_refused_batch_child_locked(
@@ -1833,7 +1828,10 @@ class TaskRouterMixin:
             # 压缩这类系统子任务不碰文件，不跟着进隔离副本
             _single_plan = (
                 NO_ISOLATION if compact_request is not None
-                else worktrees.plan_child_locked(caller=task, request=dispatch_input)
+                else worktrees.plan_child_locked(
+                    caller=task, request=dispatch_input,
+                    session_id=self._single_dispatch_session_locked(task, target, dispatch_input),
+                )
             )
             if _single_plan.refused:
                 log.warning("dispatch of task %s refused: %s", task.task_id[:12], _single_plan.error)
@@ -2102,6 +2100,7 @@ class TaskRouterMixin:
                 "type": "child_preempted",
                 "child_node_id": str(task.node_id or ""),
                 "context_ref": context_ref,
+                **child_retention.continue_fields_locked(self, task),
                 **worktree_service_of(self).result_fields_locked(task),
             }, action_type="preempted")
         else:
@@ -2323,7 +2322,7 @@ class TaskRouterMixin:
                 value = str(t.input.get(source_key) or "").strip()
                 if value:
                     entry[entry_key] = value
-            if act in ("finish", "fail"):
+            if act in child_retention.HANDED_BACK:
                 entry.update(child_retention.continue_fields_locked(self, t))
         elif t.kind == TaskKind.tool:
             entry["name"] = str(t.tool_name or tr.get("tool_name") or "")

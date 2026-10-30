@@ -876,6 +876,7 @@ class TaskStoreMixin:
             continued_task_id=_continued_ref.task_id if _continued_ref is not None else "",
             source=_worktree_source,
             requested_by=_dispatcher_id,
+            session_id=session_id if _dispatch_origin else "",
         )
         _dispatcher_worktree = _worktrees.caller_record_locked(_dispatcher)
 

@@ -114,11 +114,13 @@ def run_git(
     timeout: float = GIT_TIMEOUT_SEC,
     stdout_file: IO[bytes] | None = None,
     check: bool = True,
+    input_data: bytes | None = None,
 ) -> GitOutput:
-    """跑一条 git 命令。别的 git 进程正拿着锁时稍等重试几次；check 为真时失败抛 GitError。"""
+    """跑一条 git 命令。别的 git 进程正拿着锁时稍等重试几次；check 为真时失败抛 GitError。input_data 是喂给标准输入的内容。"""
     command = [*_base_command(), *args]
     full_env = git_env(env)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    stdin_args: dict[str, object] = {"input": input_data} if input_data is not None else {"stdin": subprocess.DEVNULL}
     for attempt in range(_LOCK_RETRIES):
         if stdout_file is not None:
             stdout_file.seek(0)
@@ -128,12 +130,12 @@ def run_git(
                 command,
                 cwd=str(cwd),
                 env=full_env,
-                stdin=subprocess.DEVNULL,
                 stdout=stdout_file if stdout_file is not None else subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
                 check=False,
                 creationflags=creationflags,
+                **stdin_args,
             )
         except FileNotFoundError as exc:
             raise GitError(f"找不到 git 命令（{exc}）") from None
@@ -556,6 +558,73 @@ def apply_patch(repo: Path | str, patch_path: Path) -> None:
         if exc.long_path:
             raise GitError(long_path_message(repo), returncode=exc.returncode, stderr=exc.stderr, long_path=True) from None
         raise
+
+
+def patch_paths(repo: Path | str, patch_path: Path) -> list[str]:
+    """补丁改了哪些文件（仓库根下 / 分隔的路径）；只读补丁，什么也不改。"""
+    if not patch_path.is_file():
+        raise GitError(f"补丁 {patch_path.as_posix()} 已经不在了")
+    out = run_git(["apply", "--numstat", "-z", str(patch_path)], cwd=repo, timeout=60.0)
+    return list(_parse_numstat(out.stdout))
+
+
+# 带着合回内容的基准提交是 supervisor 自己做的：不借仓库配置的用户身份，也不按 commit.gpgSign 签名
+_CARRY_IDENTITY = {
+    "GIT_AUTHOR_NAME": "clonoth",
+    "GIT_AUTHOR_EMAIL": "clonoth@localhost",
+    "GIT_COMMITTER_NAME": "clonoth",
+    "GIT_COMMITTER_EMAIL": "clonoth@localhost",
+}
+
+
+def _carry_paths(paths: Iterable[str]) -> list[str]:
+    names: list[str] = []
+    for raw in paths:
+        clean = PurePosixPath(str(raw or "").replace("\\", "/")).as_posix().strip("/")
+        if not clean or clean == "." or clean.startswith("../") or clean == ".." or ":" in clean.split("/", 1)[0]:
+            continue
+        if clean not in names:
+            names.append(clean)
+    return names
+
+
+def carried_base(repo: Path | str, head: str, paths: Iterable[str], *, label: str = "") -> str:
+    """head 加上 paths 这些文件在 repo 工作区里现在的内容，做成一个提交给新副本当基准；内容和 head 一样时就给 head。
+
+    只用一份临时索引：原仓库的索引、工作区和分支都不动，工作区里已经没有的文件按删掉算。
+    这个提交不挂在任何分支上，副本建在它上面以后由副本的分支引用着。
+    """
+    if not is_commit(head):
+        raise GitError(f"基准提交写得不对：{head!r}")
+    names = _carry_paths(paths)
+    if not names:
+        return head
+    scratch = Path(tempfile.mkdtemp(prefix="clonoth-carry-"))
+    try:
+        env = {"GIT_INDEX_FILE": str(scratch / "index")}
+        run_git(["read-tree", head], cwd=repo, env=env)
+        run_git(
+            ["update-index", "--add", "--remove", "-z", "--stdin"], cwd=repo, env=env,
+            input_data=b"".join(name.encode("utf-8") + b"\0" for name in names),
+        )
+        tree = run_git(["write-tree"], cwd=repo, env=env).text.strip()
+        head_tree = run_git(["rev-parse", "--verify", f"{head}^{{tree}}"], cwd=repo, timeout=60.0).text.strip()
+        if tree == head_tree:
+            return head
+        message = f"clonoth: changes merged from worktree {label}" if label else "clonoth: merged changes"
+        commit = run_git(
+            ["commit-tree", tree, "-p", head, "--no-gpg-sign", "-m", message],
+            cwd=repo, env={**env, **_CARRY_IDENTITY},
+        ).text.strip().lower()
+    except GitError as exc:
+        if exc.long_path:
+            raise GitError(long_path_message(repo), returncode=exc.returncode, stderr=exc.stderr, long_path=True) from None
+        raise
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if not is_commit(commit):
+        raise GitError(f"git commit-tree 没有给出提交号：{commit[:80]!r}")
+    return commit
 
 
 def _long(path: Path | str) -> str:

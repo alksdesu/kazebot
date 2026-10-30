@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +52,10 @@ class InboundRefusal:
 
     status: int
     message: str
+
+
+# 入站的一项核对：不收就给出原因，收给 None
+InboundCheck = Callable[["SupervisorState", dict[str, Any]], "InboundRefusal | None"]
 
 
 def lineage_sessions_locked(state: "SupervisorState", task: Task) -> set[str]:
@@ -109,13 +113,39 @@ def child_refusal_locked(
 
 
 def inbound_refusal_locked(state: "SupervisorState", payload: dict[str, Any]) -> InboundRefusal | None:
-    """一条入站能不能收：异步委派写错了 context_mode、或要沿用的会话不能派时拒收，其余一律收。"""
+    """一条入站能不能收：不是异步委派的一律收；是的话依次过每一项核对，第一项不收的给出原因。"""
     origin = payload.get("dispatch_origin")
     if not isinstance(origin, dict) or not origin:
         return None
+    for check in _inbound_checks():
+        refused = check(state, payload)
+        if refused is not None:
+            return refused
+    return None
+
+
+def _inbound_checks() -> tuple[InboundCheck, ...]:
+    # continuation 在模块层引用本模块，只能在这里取
+    from . import continuation
+
+    return (
+        _context_mode_refusal,
+        continuation.inbound_refusal_locked,
+        _reused_session_refusal_locked,
+    )
+
+
+def _context_mode_refusal(state: "SupervisorState", payload: dict[str, Any]) -> InboundRefusal | None:
+    origin = payload.get("dispatch_origin") or {}
     for raw_mode in (payload.get("dispatch_context_mode"), origin.get("context_mode")):
         if parse_context_mode(raw_mode) is None:
             return InboundRefusal(INBOUND_BAD_MODE_STATUS, context_mode_refusal(raw_mode))
+    return None
+
+
+def _reused_session_refusal_locked(state: "SupervisorState", payload: dict[str, Any]) -> InboundRefusal | None:
+    """要落进的会话已经在了（accumulate、continue_from）：此刻有任务在用、或是发起方委派链上在写的，不收。"""
+    origin = payload.get("dispatch_origin") or {}
     session_id = state.conversation_map.get(str(payload.get("conversation_key") or ""))
     if not session_id or session_id not in state.sessions:
         return None

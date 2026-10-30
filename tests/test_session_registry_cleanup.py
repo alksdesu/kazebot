@@ -292,7 +292,8 @@ def test_route_completed_dispatch_keeps_child_session_while_task_is_suspended(tm
     registry = _registry(tmp_path)
     assert task.status == TaskStatus.suspended
     assert child_sid in registry
-    assert child_sid in state.child_session_map.values()
+    # A fresh child never enters the accumulate map; parent_children still finds it.
+    assert child_sid not in state.child_session_map.values()
     assert child_sid in state.parent_children[parent]
 
 

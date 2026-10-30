@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import uuid
@@ -43,16 +44,20 @@ from engine.dispatch_batch import (  # noqa: E402
     context_mode_refusal,
     parse_context_mode,
 )
+from engine.conversation_migration import ConversationRekey  # noqa: E402
 from engine.dispatch_handle import format_handle  # noqa: E402
 from engine.inference.ai_step import _handle_tool_calls  # noqa: E402
 from engine.inference.pseudo_handlers import prepare_wait_dispatches  # noqa: E402
 from engine.inference.pseudo_tools import _dispatch_delegate_spec  # noqa: E402
+import supervisor.session_store as session_store_module  # noqa: E402
 from supervisor import admin_api, child_retention, continuation, session_reuse  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.session_store import SessionStore  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.task_router import PostCompletionWork  # noqa: E402
 from supervisor.types import Task, TaskKind, TaskStatus  # noqa: E402
 
 SCOUT = "scout"
@@ -341,6 +346,24 @@ def _idle(state: SupervisorState, session_id: str) -> bool:
     return _wait_until(settled)
 
 
+def _post_cleanup(state: SupervisorState, task: Task) -> None:
+    """跑一遍完成后的会话拆除那一步，和后台 post-work 里的是同一个函数。"""
+    with state._lock:
+        work = PostCompletionWork(
+            task=task.model_copy(deep=True),
+            route_session_id=state._route_session_id_for_task_locked(task),
+            session_generation=task.session_generation,
+        )
+    state._execute_post_cleanup(work, {"phase_id": f"test:{task.task_id}:cleanup", "kind": "cleanup"})
+
+
+def _history(workspace: Path, session_id: str) -> Path:
+    path = workspace / "data" / "conversations" / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"role": "user", "content": "x"}\n', encoding="utf-8")
+    return path
+
+
 class TestWaitBatch:
     def test_a_cycle_does_not_land_in_the_session_its_ancestor_is_waiting_in(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -522,6 +545,320 @@ class TestChildSessionLookup:
         with state._lock:
             assert state._reusable_child_session_locked(parent, "scout.node", "") == ""
         assert state.child_session_map == {}
+
+    @pytest.mark.parametrize("mode", ["fresh", "fork"])
+    def test_a_new_fresh_or_fork_session_is_not_mapped(self, tmp_path: Path, mode: str) -> None:
+        state = _state(tmp_path)
+        parent = _session(state)
+        with state._lock:
+            kept, _new = state.get_or_create_child_session(parent, "scout.node", "", "accumulate")
+
+            other, is_new = state.get_or_create_child_session(parent, "scout.node", "", mode)
+
+            assert is_new and other != kept
+            assert state.child_session_map == {(parent, "scout.node", ""): kept}
+            assert state.parent_children[parent] == {kept, other}
+
+
+class TestMixedModes:
+    """同一个调用方对同一个目标、同一个 context_key 混用 fresh / fork 和 accumulate。"""
+
+    def test_a_fresh_child_in_between_does_not_orphan_the_accumulate_history(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [first] = _dispatch(state, top, _item("scout.node"))
+        _finish(state, first)
+        [fresh] = _dispatch(state, top, _item("scout.node", mode="fresh"))
+        _finish(state, fresh)
+        _post_cleanup(state, fresh)
+
+        [again] = _dispatch(state, top, _item("scout.node"))
+
+        assert fresh.input["child_session_id"] != first.input["child_session_id"]
+        assert again.status == TaskStatus.pending
+        assert again.input["child_session_id"] == first.input["child_session_id"]
+
+    def test_accumulate_does_not_pick_up_a_kept_fresh_child(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [fresh] = _dispatch(state, top, _item("scout.node", mode="fresh"))
+        _fail(state, fresh)
+        kept = fresh.input["child_session_id"]
+
+        [acc] = _dispatch(state, top, _item("scout.node"))
+
+        assert acc.status == TaskStatus.pending
+        assert acc.input["child_session_id"] != kept
+        assert state._session_store.get_entry(kept)["retain"]["task_id"] == fresh.task_id
+
+    def test_fresh_then_accumulate_in_one_batch_both_go_out(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+
+        fresh, acc = _dispatch(
+            state, top, _item("scout.node", mode="fresh", call_id="w1"), _item("scout.node", call_id="w2"),
+        )
+
+        assert fresh.status == acc.status == TaskStatus.pending
+        assert fresh.input["child_session_id"] != acc.input["child_session_id"]
+        assert top.status == TaskStatus.suspended
+
+    def test_cleaning_up_a_finished_fresh_child_leaves_the_accumulate_session_alone(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [fresh] = _dispatch(state, top, _item("scout.node", mode="fresh"))
+        _finish(state, fresh)
+        # fresh 做完、清理还没轮到时派 accumulate
+        [acc] = _dispatch(state, top, _item("scout.node"))
+        acc_sid = acc.input["child_session_id"]
+        history = _history(tmp_path, acc_sid)
+
+        _post_cleanup(state, fresh)
+
+        assert acc_sid != fresh.input["child_session_id"]
+        assert state._session_store.get_entry(fresh.input["child_session_id"]) is None
+        assert history.exists() and state._session_store.get_entry(acc_sid) is not None
+        _finish(state, acc)
+        [again] = _dispatch(state, top, _item("scout.node"))
+        assert again.input["child_session_id"] == acc_sid
+
+    def test_continuing_an_accumulate_child_keeps_it_reachable_by_its_key(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+        [first] = _dispatch(state, top, _item("scout.node"))
+        _finish(state, first)
+        handle = format_handle(first.task_id, first.input["child_session_id"])
+
+        [continued] = _dispatch(state, top, _item("scout.node", continue_from=handle))
+        _finish(state, continued)
+        [again] = _dispatch(state, top, _item("scout.node"))
+
+        assert continued.input["child_session_id"] == first.input["child_session_id"]
+        assert again.input["child_session_id"] == first.input["child_session_id"]
+
+    def test_a_malformed_continue_from_fails_its_item_instead_of_dispatching_afresh(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        top = _caller(state, _session(state))
+
+        bad, good = _dispatch(
+            state, top,
+            _item("scout.node", mode="fresh", call_id="w1", continue_from="not a handle"),
+            _item("helper.node", mode="fresh", call_id="w2"),
+        )
+
+        assert bad.status == TaskStatus.failed and "child_session_id" not in bad.input
+        assert bad.result["error"] == continuation.refusal("invalid_handle")["message"]
+        assert good.status == TaskStatus.pending
+        assert top.status == TaskStatus.suspended
+
+
+# ---- 重启时重建的子会话映射和读不出的登记表 ----
+
+
+_ACTIVE = "2026-01-01T00:00:00+00:00"
+
+
+def _user_row(session_id: str = "user") -> dict[str, Any]:
+    return {"session_id": session_id, "channel": "qq", "conversation_key": CONV, "created_at": _ACTIVE, "reset": False}
+
+
+def _branch_row(session_id: str, parent: str = "user") -> dict[str, Any]:
+    return {
+        "session_id": session_id, "channel": "internal", "conversation_key": CONV, "created_at": _ACTIVE,
+        "reset": False, "is_child": True, "parent_session_id": parent, "node_id": "__entry_branch__",
+        "context_key": session_id.removeprefix("branch_"), "context_mode": "branch",
+    }
+
+
+def _child_row(
+    session_id: str, parent: str, mode: str, *, node: str = "scout.node", active: str = _ACTIVE, **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id, "channel": "internal", "conversation_key": CONV, "created_at": _ACTIVE,
+        "reset": False, "is_child": True, "parent_session_id": parent, "node_id": node, "context_key": "",
+        "context_mode": mode, "last_active_at": active, **extra,
+    }
+
+
+def _write_registry(workspace: Path, rows: dict[str, Any]) -> Path:
+    path = workspace / "data" / "sessions.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _unreadable(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    real_read_bytes = Path.read_bytes
+
+    def _read_bytes(self: Path) -> bytes:
+        if self == path:
+            raise PermissionError(13, "the file is locked by another process", str(path))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+
+
+class TestRestartMapping:
+    def test_only_accumulate_rows_are_mapped_again(self, tmp_path: Path) -> None:
+        path = _write_registry(tmp_path, {
+            "user": _user_row(),
+            "branch_7": _branch_row("branch_7"),
+            "child_acc": _child_row("child_acc", "branch_7", "accumulate"),
+            "child_fresh": _child_row("child_fresh", "branch_7", "fresh", active="2026-01-02T00:00:00+00:00"),
+            "child_fork": _child_row("child_fork", "branch_7", "fork"),
+            "child_legacy": _child_row("child_legacy", "branch_7", ""),
+        })
+
+        _sessions, _conversations, child_map, parent_children = SessionStore(path).load()
+
+        assert child_map == {("branch_7", "scout.node", ""): "child_acc"}
+        assert parent_children["branch_7"] == {"child_acc", "child_fresh", "child_fork", "child_legacy"}
+        assert parent_children["user"] == {"branch_7"}
+
+    def test_the_most_recently_active_accumulate_row_wins_whatever_the_file_order(self, tmp_path: Path) -> None:
+        path = _write_registry(tmp_path, {
+            "user": _user_row(),
+            "child_new": _child_row("child_new", "user", "accumulate", active="2026-01-03T00:00:00+00:00"),
+            "child_old": _child_row("child_old", "user", "accumulate", active="2026-01-02T00:00:00+00:00"),
+        })
+
+        _sessions, _conversations, child_map, _children = SessionStore(path).load()
+
+        assert child_map == {("user", "scout.node", ""): "child_new"}
+
+    def test_a_kept_row_moved_to_the_user_session_is_not_mapped_again(self, tmp_path: Path) -> None:
+        # 分支收束时保留着的子会话改挂到用户会话下，运行时就摘了映射；重建出来会让以后按用户会话找的委派落进它
+        hold = {"retain": {"task_id": "task-child", "parent_task_id": "task-caller", "until": ""}}
+        path = _write_registry(tmp_path, {
+            "user": _user_row(),
+            "branch_7": _branch_row("branch_7"),
+            "child_moved": _child_row("child_moved", "user", "accumulate", **hold),
+            "child_held": _child_row("child_held", "branch_7", "accumulate", **hold),
+            "child_plain": _child_row("child_plain", "user", "accumulate", node="plain.node"),
+        })
+
+        _sessions, _conversations, child_map, parent_children = SessionStore(path).load()
+
+        assert child_map == {
+            ("branch_7", "scout.node", ""): "child_held",
+            ("user", "plain.node", ""): "child_plain",
+        }
+        assert "child_moved" in parent_children["user"]
+
+    def test_a_restarted_supervisor_reuses_the_accumulate_session_and_not_the_fresh_one(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        sid = _session(state)
+        top = _caller(state, sid)
+        [acc] = _dispatch(state, top, _item("scout.node"))
+        _finish(state, acc)
+        [fresh] = _dispatch(state, top, _item("scout.node", mode="fresh"))
+        _finish(state, fresh)
+
+        restarted = _state(tmp_path)
+
+        with restarted._lock:
+            assert restarted._reusable_child_session_locked(sid, "scout.node", "") == acc.input["child_session_id"]
+        assert fresh.input["child_session_id"] not in restarted.child_session_map.values()
+
+
+class TestUnreadableRegistry:
+    def test_a_registry_that_cannot_be_read_is_never_overwritten(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        first = _state(tmp_path)
+        sid = _session(first)
+        path = tmp_path / "data" / "sessions.json"
+        before = path.read_text(encoding="utf-8")
+        _unreadable(monkeypatch, path)
+
+        with caplog.at_level(logging.ERROR):
+            restarted = _state(tmp_path)
+            other = _session(restarted, "qq_group:2002")
+
+        assert "读不出来" in restarted._session_store.load_error
+        assert sid not in restarted.sessions and other in restarted.sessions
+        assert path.read_text(encoding="utf-8") == before
+        assert any("not written while it cannot be read" in r.getMessage() for r in caplog.records)
+
+        monkeypatch.undo()
+        repaired = _state(tmp_path)
+
+        assert repaired.conversation_map[CONV] == sid
+        assert repaired._session_store.load_error == ""
+
+    @pytest.mark.parametrize("broken", [
+        pytest.param("{ not json", id="corrupt"),
+        pytest.param("[1, 2]", id="list-root"),
+        pytest.param(b"\xff\xfe{}", id="not-utf8"),
+    ])
+    def test_a_corrupt_registry_is_set_aside_and_a_new_one_started(
+        self, tmp_path: Path, caplog, broken: str | bytes,
+    ) -> None:
+        path = tmp_path / "data" / "sessions.json"
+        path.parent.mkdir(parents=True)
+        if isinstance(broken, bytes):
+            path.write_bytes(broken)
+        else:
+            path.write_text(broken, encoding="utf-8")
+        original = path.read_bytes()
+
+        with caplog.at_level(logging.ERROR):
+            state = _state(tmp_path)
+        sid = _session(state)
+
+        [aside] = list(path.parent.glob("sessions.json.corrupt-*"))
+        assert aside.read_bytes() == original
+        assert aside.name in state._session_store.load_error
+        assert any(aside.name in r.getMessage() for r in caplog.records)
+        assert sid in json.loads(path.read_text(encoding="utf-8"))
+
+    def test_a_corrupt_registry_that_cannot_be_moved_is_not_overwritten_either(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        path = tmp_path / "data" / "sessions.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{ not json", encoding="utf-8")
+
+        def _refuse(_src: Any, _dst: Any) -> None:
+            raise PermissionError(13, "in use")
+
+        monkeypatch.setattr(session_store_module.os, "replace", _refuse)
+        store = SessionStore(path)
+
+        assert store.load() == ({}, {}, {}, {})
+        store.upsert_entry("user", _user_row())
+
+        assert "改名留存也失败了" in store.load_error
+        assert store.read_only
+        assert path.read_text(encoding="utf-8") == "{ not json"
+        # 不写不算写失败：分支合并、子会话清理照常走，登记这次只在内存里
+        assert store._flush() is True
+        assert path.read_text(encoding="utf-8") == "{ not json"
+        assert store.get_entry("user") is not None
+
+    def test_a_read_only_run_refuses_an_online_rekey_before_touching_memory(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        path = _write_registry(tmp_path, {"user": _user_row()})
+        before = path.read_text(encoding="utf-8")
+        _unreadable(monkeypatch, path)
+        store = SessionStore(path)
+        store.load()
+        store.upsert_entry("other", {**_user_row("other"), "conversation_key": "qq_group:2002"})
+        rekey = ConversationRekey(keys={"qq_group:2002": "qq_group:3003"})
+
+        assert store.read_only
+        with pytest.raises(OSError, match="这次运行不写"):
+            store.rekey_conversations(rekey, apply=True)
+
+        assert store.get_entry("other")["conversation_key"] == "qq_group:2002"
+        assert store.rekey_conversations(rekey, apply=False).moved == 1
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_a_registry_read_normally_is_writable(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        _session(state)
+
+        assert state._session_store.read_only is False
+        assert state._session_store.load_error == ""
 
 
 # ---- 异步委派的入站 ----
@@ -760,3 +1097,101 @@ class TestAsyncInbound:
         [callback] = callbacks()
         assert _agent_session(callback) == _agent_session(agent)
         assert agent.status == TaskStatus.suspended and sub.status == TaskStatus.pending
+
+
+@pytest.mark.usefixtures("admin_token")
+class TestAsyncContinuationRecheck:
+    """带 continue_from 的异步委派入站时在锁里按句柄重核：engine 核过之后到投递之间，会话可能已经不在或对不上。"""
+
+    @staticmethod
+    def _kept_agent(state: SupervisorState, app: Any) -> tuple[Task, Task, str]:
+        top = _inbound(state, _session(state))
+        helper = _accepted(state, _post(app, _dispatch_payload(state, top, "helper.node", mode="fresh")))
+        _fail(state, helper)
+        assert _idle(state, _agent_session(helper))
+        return top, helper, format_handle(helper.task_id, _agent_session(helper))
+
+    def test_a_session_swept_after_the_check_is_refused_and_not_recreated_empty(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top, helper, handle = self._kept_agent(state, app)
+        agent_sid = _agent_session(helper)
+        assert continuation.resolve(state, top.task_id, handle, "helper.node", wait=False)["ok"] is True
+        payload = _dispatch_payload(state, top, "helper.node", mode="fresh", continue_from=handle)
+        # engine 核过之后、投递之前保留期到点，定期清理把会话删了
+        hold = state._session_store.get_entry(agent_sid)["retain"]
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        state._session_store.set_entry_field(agent_sid, "retain", {**hold, "until": past})
+        with state._lock:
+            state._cleanup_stale_sessions_locked()
+        events = _inbound_events(state)
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+        assert response.json()["detail"] == continuation.refusal("session_not_found")["message"]
+        assert payload["conversation_key"] not in state.conversation_map
+        assert _inbound_events(state) == events
+
+    def test_a_malformed_handle_is_refused_as_a_bad_request(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        payload = _dispatch_payload(state, top, "helper.node", mode="fresh")
+        payload["dispatch_origin"]["continue_from"] = "not a handle"
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_BAD_MODE_STATUS
+        assert response.json()["detail"] == continuation.refusal("invalid_handle")["message"]
+        assert payload["conversation_key"] not in state.conversation_map
+
+    def test_a_handle_delivered_under_another_conversation_key_is_refused(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top, helper, handle = self._kept_agent(state, app)
+        payload = _dispatch_payload(state, top, "helper.node", mode="fresh", continue_from=handle)
+        payload["conversation_key"] = f"agent:helper.node:{CONV}:{uuid.uuid4()}"
+
+        response = _post(app, payload)
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+        assert response.json()["detail"] == continuation.refusal("conversation_mismatch")["message"]
+        assert payload["conversation_key"] not in state.conversation_map
+        assert state._session_store.get_entry(_agent_session(helper))["retain"]["task_id"] == helper.task_id
+
+    def test_an_accumulate_agent_is_continued_after_its_producer_left_memory(self, tmp_path: Path) -> None:
+        # 内存只留最近结束的一批任务，重启后已路由的也不恢复：accumulate 的会话靠那一行记的来历核对
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        scout = _accepted(state, _post(app, _dispatch_payload(state, top, "scout.node")))
+        _finish(state, scout)
+        agent_sid = _agent_session(scout)
+        assert _idle(state, agent_sid)
+        handle = format_handle(scout.task_id, agent_sid)
+        with state._lock:
+            state.tasks.pop(scout.task_id)
+
+        again = _accepted(state, _post(app, _dispatch_payload(state, top, "scout.node", continue_from=handle)))
+
+        assert _agent_session(again) == agent_sid
+        assert again.input["_dispatch_origin"]["continue_from"] == handle
+
+    def test_an_accumulate_agent_without_a_recorded_lineage_is_refused_in_its_own_words(self, tmp_path: Path) -> None:
+        state = _state(tmp_path)
+        app = _app(state, tmp_path)
+        top = _inbound(state, _session(state))
+        scout = _accepted(state, _post(app, _dispatch_payload(state, top, "scout.node")))
+        _finish(state, scout)
+        agent_sid = _agent_session(scout)
+        assert _idle(state, agent_sid)
+        handle = format_handle(scout.task_id, agent_sid)
+        with state._lock:
+            state.tasks.pop(scout.task_id)
+        state._session_store.set_entry_field(agent_sid, child_retention.LINEAGE_FIELD, None)
+
+        response = _post(app, _dispatch_payload(state, top, "scout.node", continue_from=handle))
+
+        assert response.status_code == INBOUND_CONFLICT_STATUS
+        assert response.json()["detail"] == continuation.refusal("lineage_unknown")["message"]

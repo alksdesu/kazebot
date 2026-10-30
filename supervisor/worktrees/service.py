@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,13 @@ from typing import Any
 import config_layout
 from engine.dispatch_batch import ISOLATION_WORKTREE, dispatch_isolation, dispatch_repo
 from engine.dispatch_handle import parse_handle
+from engine.isolation_notice import (
+    CARRY_CARRIED,
+    CARRY_COMMITTED,
+    CARRY_FAILED,
+    NOT_ISOLATED_MODE,
+    PREVIOUS_MISSING,
+)
 from engine.project_root import (
     ISOLATION_CONTEXT_KEY,
     PROJECT_ORIGIN_KEY,
@@ -37,6 +44,7 @@ from ..policy import PathScope
 from ..types import Task, TaskStatus
 from . import git
 from .keys import (
+    SESSION_WORKTREE_FIELD,
     WORKTREE_OUTCOME_KEY,
     WORKTREE_OWNER_KEY,
     WORKTREE_PENDING_KEY,
@@ -123,7 +131,10 @@ def _posix(path: Path | str | None) -> str:
 
 @dataclass(frozen=True)
 class IsolationPlan:
-    """一个要派出去的子任务落在哪：不隔离、继承调用方的副本、接着用一个已有的副本、新建一个，或者当场拒绝。"""
+    """一个要派出去的子任务落在哪：不隔离、继承调用方的副本、接着用一个已有的副本、新建一个，或者当场拒绝。
+
+    remind 也是不隔离，只是子任务要接着写的会话之前在副本里做过，task_context 里带一段提醒。
+    """
 
     kind: str = ""
     worktree: str = ""
@@ -345,9 +356,14 @@ class WorktreeService:
         continued_task_id: str = "",
         source: Mapping[str, Any] | None = None,
         requested_by: str = "",
+        session_id: str = "",
     ) -> IsolationPlan:
         """持锁调用。request 是派发项（isolation、repo 两个字段），continued_task_id 是 continue_from 接着的任务，
-        source 是结果回到原会话、自动续跑时要沿用的副本（{"worktree", "owner"}）。"""
+        source 是结果回到原会话、自动续跑时要沿用的副本（{"worktree", "owner"}），
+        session_id 是子任务要接着写的已有子会话（continue_from 接着的、accumulate 沿用的）：
+        accumulate 要求隔离时沿用它上一次的副本，不隔离时带一段提醒。
+
+        本来在副本里做的活，副本在登记里查不到时拒绝，不退回原仓库里做。"""
         wanted = dispatch_isolation(dict(request) if isinstance(request, Mapping) else None) == ISOLATION_WORKTREE
         repo_text = dispatch_repo(dict(request) if isinstance(request, Mapping) else None)
         dispatcher = requested_by or (caller.task_id if caller is not None else "")
@@ -364,19 +380,29 @@ class WorktreeService:
             refusal = self._repo_refusal(repo_text)
             if refusal:
                 return IsolationPlan("refuse", repo=repo_text, error=refusal)
+        last = self._session_isolation_locked(session_id)
         if continued_task_id:
             entry = self.registry.owned_by(continued_task_id)
             if entry is not None:
                 if wanted and repo_text and not self._same_repo(repo_text, entry):
-                    return IsolationPlan("create", repo=repo_text, origin_dir=origin_dir, requested_by=dispatcher)
+                    return self._create_plan_locked(repo_text, origin_dir, dispatcher)
                 return self._reuse_or_recreate_locked(entry, dispatcher=dispatcher, keep_dispatcher=False)
+            used = self._continued_isolation_locked(continued_task_id, last)
+            # 跟着派发方在同一个副本里做的，派发方此刻还在那个副本里时照常继承
+            if used is not None and (used["owner"] or used["worktree"] != caller_worktree):
+                return IsolationPlan("refuse", worktree=used["worktree"], error=self._continued_refusal(used))
         if wanted:
-            return IsolationPlan("create", repo=repo_text, origin_dir=origin_dir, requested_by=dispatcher)
+            if not continued_task_id and last is not None and last["owner"]:
+                return self._accumulate_plan_locked(last, repo_text, origin_dir, dispatcher)
+            return self._create_plan_locked(repo_text, origin_dir, dispatcher)
         if isinstance(source, Mapping) and str(source.get("worktree") or "").strip():
-            entry = self.registry.get(str(source["worktree"]).strip())
+            worktree_id = str(source["worktree"]).strip()
+            entry = self.registry.get(worktree_id)
             if entry is None:
-                log.warning("worktree %s named for a continuation is not registered; running without it", source.get("worktree"))
-                return NO_ISOLATION
+                return IsolationPlan(
+                    "refuse", worktree=worktree_id,
+                    error=f"要接着用的隔离副本 {worktree_id}：{self._missing_reason()}；不会退回原仓库里接着做",
+                )
             if source.get("owner"):
                 return self._reuse_or_recreate_locked(
                     entry, dispatcher=dispatcher, keep_dispatcher=True, share_when_busy=True,
@@ -384,9 +410,100 @@ class WorktreeService:
             if entry.get("state") in REUSABLE_STATES and Path(str(entry.get("path") or "")).is_dir():
                 return self._inherit_entry_plan(entry)
             return self._recreate_plan(entry, dispatcher=dispatcher)
-        if caller is not None and caller.input.get(WORKTREE_KEY):
+        if caller is not None and caller_worktree:
             return self._inherit_caller_plan(caller)
+        if last is not None:
+            return self._reminder_plan_locked(last)
         return NO_ISOLATION
+
+    def _create_plan_locked(self, repo_text: str, origin_dir: str, dispatcher: str) -> IsolationPlan:
+        unreadable = self.registry.unreadable_reason()
+        if unreadable:
+            return IsolationPlan(
+                "refuse", repo=repo_text,
+                error=(
+                    f"隔离副本的登记文件读不出来（{unreadable}），建了副本也记不下来；修好之前不能要求隔离，"
+                    "去掉 isolation 和 repo 就能不隔离地派出"
+                ),
+            )
+        return IsolationPlan("create", repo=repo_text, origin_dir=origin_dir, requested_by=dispatcher)
+
+    def _accumulate_plan_locked(
+        self, last: Mapping[str, Any], repo_text: str, origin_dir: str, dispatcher: str,
+    ) -> IsolationPlan:
+        """accumulate 要求隔离、会话上一次在自己建的副本里做：还能用就沿用，用不了按它重建，登记里查不到就新建并说明。"""
+        entry = self.registry.get(str(last["worktree"]))
+        if entry is not None:
+            if repo_text and not self._same_repo(repo_text, entry):
+                return self._create_plan_locked(repo_text, origin_dir, dispatcher)
+            return self._reuse_or_recreate_locked(entry, dispatcher=dispatcher, keep_dispatcher=False)
+        plan = self._create_plan_locked(repo_text, origin_dir, dispatcher)
+        if plan.refused or repo_text:
+            return plan
+        return replace(plan, previous=str(last["worktree"]), previous_state=PREVIOUS_MISSING)
+
+    def _session_isolation_locked(self, session_id: str) -> dict[str, Any] | None:
+        """子会话那一行记的上一次隔离：{"worktree", "task_id", "owner"}；没记过给 None。"""
+        store = getattr(self.state, "_session_store", None)
+        if not session_id or store is None:
+            return None
+        raw = (store.get_entry(session_id) or {}).get(SESSION_WORKTREE_FIELD)
+        if not isinstance(raw, Mapping):
+            return None
+        worktree_id = str(raw.get("id") or "").strip()
+        if not worktree_id:
+            return None
+        return {"worktree": worktree_id, "task_id": str(raw.get("task_id") or "").strip(), "owner": raw.get("owner") is True}
+
+    def _continued_isolation_locked(
+        self, task_id: str, last: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """被 continue_from 接着的那一程当初在不在隔离副本里：{"worktree", "owner"}；不在、或看不出来给 None。
+
+        任务还在内存里就看它的 input；已经清出内存的，看它的会话记的上一次隔离是不是它。
+        """
+        task = self.state.tasks.get(task_id)
+        if task is not None:
+            worktree_id = str(task.input.get(WORKTREE_KEY) or "").strip()
+            if worktree_id:
+                return {"worktree": worktree_id, "owner": bool(task.input.get(WORKTREE_OWNER_KEY))}
+            if WORKTREE_PENDING_KEY in task.input:
+                return {"worktree": task.task_id, "owner": True}
+            return None
+        if last is not None and last.get("task_id") == task_id:
+            return {"worktree": str(last["worktree"]), "owner": bool(last["owner"])}
+        return None
+
+    def _missing_reason(self) -> str:
+        """登记里查不到一个副本时说为什么：登记文件读不出来、坏过从空表重新开始，还是过了保留期被清掉了。"""
+        unreadable = self.registry.unreadable_reason()
+        if unreadable:
+            return f"隔离副本的登记文件读不出来（{unreadable}），查不到这个副本"
+        if self.registry.load_error:
+            return f"隔离副本的登记文件坏过、已从空表重新开始（{self.registry.load_error}），登记里查不到这个副本了"
+        return "登记里已经查不到这个副本（过了保留期被清掉了）"
+
+    def _continued_refusal(self, used: Mapping[str, Any]) -> str:
+        worktree_id = str(used["worktree"])
+        if not used["owner"]:
+            return (
+                f"continue_from 接着的子任务当初是跟着派它的任务在隔离副本 {worktree_id} 里做的，"
+                "你现在不在那个副本里，接着派就会改到原仓库，没有派出；"
+                "需要的话重新委派（不带 continue_from），或者交给在那个副本里的任务去接着做"
+            )
+        return (
+            f"continue_from 接着的子任务当初在隔离副本 {worktree_id} 里做，{self._missing_reason()}；"
+            "不会退回原仓库里接着做，没有派出。需要的话重新委派（不带 continue_from）："
+            f"要隔离就带 isolation: {ISOLATION_WORKTREE} 另建一个副本，不要隔离就直接派"
+        )
+
+    def _reminder_plan_locked(self, last: Mapping[str, Any]) -> IsolationPlan:
+        entry = self.registry.get(str(last["worktree"]))
+        state = str(entry.get("state") or "") if entry is not None else PREVIOUS_MISSING
+        return IsolationPlan("remind", context={
+            "mode": NOT_ISOLATED_MODE,
+            "previous": {"worktree": str(last["worktree"]), "state": state, "inherited": not last["owner"]},
+        })
 
     def _repo_refusal(self, repo_text: str) -> str:
         """派发时就能看出不行的 repo：目录不存在，或者既不在工作区所在的仓库里、也不在 extra_roots 下。
@@ -522,12 +639,20 @@ class WorktreeService:
         previous = str(entry.get("previous") or "")
         if previous:
             context["previous"] = {"worktree": previous, "state": str(entry.get("previous_state") or "")}
+            carry = entry.get("carry")
+            if isinstance(carry, Mapping) and carry.get("status"):
+                files = carry.get("files")
+                context["previous"]["carry"] = {
+                    "status": str(carry.get("status") or ""),
+                    "count": len(files) if isinstance(files, list) else 0,
+                    "error": str(carry.get("error") or ""),
+                }
         return context
 
     @staticmethod
     def apply_plan(child_input: dict[str, Any], plan: IsolationPlan) -> None:
         """建子任务之前把计划写进它的 input。"""
-        if plan.kind in ("inherit", "reuse"):
+        if plan.kind in ("inherit", "reuse", "remind"):
             child_input.update(plan.keys)
             context = child_input.get("task_context")
             if not isinstance(context, dict):
@@ -544,7 +669,10 @@ class WorktreeService:
             }
 
     def register_child_locked(self, child: Task, plan: IsolationPlan) -> None:
-        """子任务建出来之后：要新建的登记成 creating 交给后台去建，接着用的把它记成主人。"""
+        """子任务建出来之后：要新建的登记成 creating 交给后台去建，接着用的把它记成主人。
+
+        在副本里做的子任务，它的子会话那一行记下这次用的副本：accumulate 再派时沿用，续接时登记查不到也认得出它隔离过。
+        """
         if plan.kind == "create":
             self.registry.put({
                 "id": child.task_id,
@@ -560,12 +688,30 @@ class WorktreeService:
                 "instance": self._recorded_instance(),
             })
             self._enqueue(child.task_id)
-            return
-        if plan.kind == "reuse":
+        elif plan.kind == "reuse":
             fields: dict[str, Any] = {"owners": [child.task_id], "until": None, "finished_at": None}
             if plan.requested_by:
                 fields["requested_by"] = plan.requested_by
             self.registry.transition(plan.worktree, REUSABLE_STATES, READY, **fields)
+        self._remember_session_locked(child, plan)
+
+    def _remember_session_locked(self, child: Task, plan: IsolationPlan) -> None:
+        if plan.kind not in ("create", "reuse", "inherit"):
+            return
+        storage = child_retention.storage_locked(self.state, child)
+        if storage is None:
+            return
+        record = {
+            "id": child.task_id if plan.kind == "create" else plan.worktree,
+            "task_id": child.task_id,
+            "owner": plan.kind != "inherit",
+        }
+        if not record["id"]:
+            return
+        entry = self.state._session_store.get_entry(storage.session_id)
+        if entry is None or entry.get(SESSION_WORKTREE_FIELD) == record:
+            return
+        self.state._session_store.set_entry_field(storage.session_id, SESSION_WORKTREE_FIELD, record)
 
     def provision(self, worktree_id: str) -> None:
         state = self.state
@@ -597,13 +743,15 @@ class WorktreeService:
             origin_dir = _resolved(str(spec.get("origin_dir") or self.workspace_root))
             rel = origin_dir.relative_to(top).as_posix() if _inside(origin_dir, top) and origin_dir != top else ""
             with self._repo_lock(top):
-                base = git.head_commit(top)
+                head = git.head_commit(top)
+                base, carry = self._carried_base(top, head, str(spec.get("previous") or ""))
                 # 先登记位置再动 git：建到一半 supervisor 退出，重启后照登记清掉
                 self.registry.update(
                     worktree_id,
                     repo=top.as_posix(), repo_key=key, workspace_repo=workspace_repo,
                     path=path.as_posix(), patch=path.with_name(f"{worktree_id}.patch").as_posix(),
-                    branch=branch, base=base, root=settings.root.as_posix(),
+                    branch=branch, base=base, head=head, root=settings.root.as_posix(),
+                    **({"carry": carry} if carry else {}),
                 )
                 git.add_worktree(top, path, branch, base)
                 links = self._make_links(top, path, settings.link_dirs)
@@ -613,6 +761,47 @@ class WorktreeService:
             self._provision_failed(worktree_id, message)
             return
         self._finalize(worktree_id, links=links, project_rel=project_rel)
+
+    def _carried_base(self, top: Path, head: str, previous_id: str) -> tuple[str, dict[str, Any]]:
+        """重建副本的基准提交和带进去的文件记录。调用方持着这个仓库的锁，锁外跑 git。
+
+        合回只改原仓库的工作区、不提交：上一个副本合回过的文件（连同它接力带着的）按原仓库工作区里现在的内容
+        做进基准提交，新副本才是在合回之后的代码上接着做。带不进去的照 HEAD 建，并记下原因。
+        """
+        files, problem = self._carried_files(top, previous_id)
+        if not files:
+            return head, ({"files": [], "status": CARRY_FAILED, "error": problem} if problem else {})
+        try:
+            base = git.carried_base(top, head, files, label=previous_id)
+        except (git.GitError, OSError) as exc:
+            message = exc.message if isinstance(exc, git.GitError) else str(exc)
+            log.warning("carrying the merged files of worktree %s into its successor failed: %s", previous_id, message)
+            return head, {"files": files, "status": CARRY_FAILED, "error": message}
+        status = CARRY_CARRIED if base != head else CARRY_COMMITTED
+        return base, {"files": files, "status": status, "error": problem}
+
+    def _carried_files(self, top: Path, previous_id: str) -> tuple[list[str], str]:
+        """上一个副本留给接班副本的文件：它接力带着的，加上它合回过的。(文件, 有一部分认不出来时的原因)。"""
+        entry = self.registry.get(previous_id) if previous_id else None
+        if entry is None:
+            return [], ""
+        if entry.get("repo") and os.path.normcase(str(_resolved(str(entry["repo"])))) != os.path.normcase(str(top)):
+            return [], ""
+        files: list[str] = []
+        carry = entry.get("carry")
+        if isinstance(carry, Mapping) and isinstance(carry.get("files"), list):
+            files.extend(str(item) for item in carry["files"])
+        problem = ""
+        merged = entry.get("merged_files")
+        if isinstance(merged, list):
+            files.extend(str(item) for item in merged)
+        elif entry.get("merged_at") or entry.get("cleanup_reason") == REASON_MERGED:
+            # 合回时还没记文件清单的老登记：从留着的补丁里读改了哪些文件
+            try:
+                files.extend(git.patch_paths(top, Path(str(entry.get("patch") or ""))))
+            except (git.GitError, OSError) as exc:
+                problem = f"读不出它合回过哪些文件（{exc.message if isinstance(exc, git.GitError) else exc}）"
+        return list(dict.fromkeys(item for item in files if item)), problem
 
     def _resolve_repo(self, repo_text: str, settings: WorktreeSettings) -> tuple[Path, bool]:
         """派发项的 repo 落到哪个仓库根，以及它是不是工作区所在的仓库。只认工作区所在仓库和 extra_roots 下的仓库。"""
@@ -781,7 +970,7 @@ class WorktreeService:
             entry = self.registry.get(worktree_id)
         settings = self.settings()
         if entry is None:
-            view = {"id": worktree_id, "state": FINISHED, "error": "登记里没有这个副本了"}
+            view = {"id": worktree_id, "state": FINISHED, "error": self._missing_reason()}
         else:
             view = self._compute_view(entry, settings)
         with self.state._lock:
@@ -935,11 +1124,16 @@ class WorktreeService:
         if isinstance(view, dict) and view.get("id"):
             view = dict(view)
         else:
-            entry = self.registry.get(str(task.input.get(WORKTREE_KEY) or ""))
+            worktree_id = str(task.input.get(WORKTREE_KEY) or "").strip()
+            entry = self.registry.get(worktree_id)
             if entry is None:
-                return {}
-            view = self._base_view(entry)
-            view["error"] = "收尾时没有算出改动；合回时会重新算一遍"
+                # 不说的话父节点看不出子任务是在副本里做的，会以为改动已经在原仓库里
+                if not worktree_id:
+                    return {}
+                view = {"id": worktree_id, "error": self._missing_reason()}
+            else:
+                view = self._base_view(entry)
+                view["error"] = "收尾时没有算出改动；合回时会重新算一遍"
         handle = child_retention.continue_fields_locked(self.state, task).get("handle")
         view["handle"] = str(handle or view.get("id") or "")
         return {"worktree": view}
@@ -965,7 +1159,7 @@ class WorktreeService:
             return PathScope(foreign_root=foreign, mappings=mappings)
         entry = next((item for item in entries if item.get("id") == worktree_id), None)
         if entry is None or entry.get("state") not in REUSABLE_STATES or not entry.get("path") or not entry.get("repo"):
-            state_label = _STATE_LABELS.get(str(entry.get("state")), str(entry.get("state"))) if entry else "没有登记"
+            state_label = _STATE_LABELS.get(str(entry.get("state")), str(entry.get("state"))) if entry else self._missing_reason()
             return PathScope(
                 worktree=worktree_id, foreign_root=foreign, mappings=mappings,
                 invalid=f"这个任务所在的隔离副本 {worktree_id} 用不了（{state_label}），不能再读写文件或跑命令",
@@ -1009,6 +1203,9 @@ class WorktreeService:
         if entry is None:
             entry = self.registry.get(text) or self.registry.owned_by(text)
         if entry is None:
+            unreadable = self.registry.unreadable_reason()
+            if unreadable:
+                return None, f"隔离副本的登记文件读不出来（{unreadable}），找不到 {text} 对应的副本；修好之前合回、放弃都做不了"
             return None, f"找不到 {text} 对应的隔离副本：它没有要求隔离，或者登记已经过期清掉了"
         family = str(entry.get("family_root") or "")
         mine = str(self.state._task_family_root_locked(task) or "")
@@ -1168,7 +1365,7 @@ class WorktreeService:
         if problem:
             return {"ok": False, "reason": "refused", "message": problem}
         if not files:
-            self._mark_merged(worktree_id, task)
+            self._mark_merged(worktree_id, task, [])
             return {"ok": True, **self._merge_listing(entry, summary, files), "merged": [], "message": "副本里没有改动，不用合回；副本会被清理"}
         targets = [Path(str(item["target"])) for item in files]
         journal_hit = [item["path"] for item, target in zip(files, targets) if edit_journal.inside_journal(self.workspace_root, target)]
@@ -1182,7 +1379,7 @@ class WorktreeService:
         finally:
             self._release(task, claimed)
         if outcome.get("ok"):
-            self._mark_merged(worktree_id, task)
+            self._mark_merged(worktree_id, task, [str(item["path"]) for item in files])
         return outcome
 
     def _claim(self, task: Task, files: list[dict[str, Any]], journal_session: str) -> tuple[list[str], str]:
@@ -1311,11 +1508,13 @@ class WorktreeService:
             except OSError:
                 log.exception("rolling back %s after a failed merge failed", target)
 
-    def _mark_merged(self, worktree_id: str, task: Task) -> None:
+    def _mark_merged(self, worktree_id: str, task: Task, merged_files: list[str]) -> None:
+        """记成已合回。合回过的文件记下来：之后接着这个子 agent 另建副本时，要把它们在原仓库工作区里的样子带进去。"""
         with self.state._lock:
             self.registry.transition(
                 worktree_id, {MERGING, FINISHED}, MERGED,
                 cleanup_reason=REASON_MERGED, merged_by=task.task_id, merged_at=now_iso(), merging_task=None,
+                merged_files=list(merged_files),
             )
         self._wake.set()
 

@@ -21,6 +21,7 @@ session 信息仍可从此文件完整恢复。
 - 内存中维护完整 registry 副本，写入时直接序列化内存数据
 - 原子写入：先写临时文件，再 os.replace 覆盖目标文件
 - 线程安全：所有写入方法由调用方在 SupervisorState._lock 内调用
+- 启动时读不出来（OSError）的不写，免得空表盖掉原文件；格式坏的改名留存后从空表开始
 """
 from __future__ import annotations
 
@@ -31,16 +32,25 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from engine.child_session_retention import retention_hold
 from engine.conversation_migration import ConversationRekey, RekeyCount
 
 from ._helpers import SessionInfo, _now
 
 logger = logging.getLogger(__name__)
+
+_ENTRY_BRANCH_NODE = "__entry_branch__"
+_ACCUMULATE = "accumulate"
+
+LoadedRegistry = tuple[
+    dict[str, SessionInfo], dict[str, str], dict[tuple[str, str, str], str], dict[str, set[str]],
+]
 
 
 @dataclass(frozen=True)
@@ -63,51 +73,55 @@ class SessionStore:
         self._registry: dict[str, dict[str, Any]] = {}
         self._generation = 0
         self._flushed_generation = 0
+        # 启动时文件读不出来或格式坏了的原因；读得好好的是空串
+        self.load_error = ""
+        self._writable = True
+        self._write_refusal_logged = False
 
     # ------------------------------------------------------------------ #
     #  启动时加载
     # ------------------------------------------------------------------ #
 
-    def load(self) -> tuple[dict[str, SessionInfo], dict[str, str], dict[tuple[str, str, str], str], dict[str, set[str]]]:
+    def load(self) -> LoadedRegistry:
         """从 sessions.json 加载 session 注册表。
 
         Returns:
             (sessions, conversation_map, child_session_map, parent_children)
             - sessions: session_id -> SessionInfo（仅活跃 session，不含 reset）
             - conversation_map: conversation_key -> session_id
-            - child_session_map: (parent_sid, node_id, context_key) -> child_session_id
+            - child_session_map: (parent_sid, node_id, context_key) -> child_session_id，只有 accumulate 的子会话
             - parent_children: parent_session_id -> set of child_session_ids
 
-        Child Session 隔离（Phase A）：启动时从 is_child=true 的 entry 重建映射。
-        如果文件不存在或损坏，优雅降级为空 dict。
+        文件不在或是空的给四张空表。读不出来时也给空表，但这次运行不再写它：空表写回去就把原来的登记全盖掉了。
+        格式坏的改名留存，从空表开始。这两种都记在 load_error 里。
         """
-        if not self._path.exists():
-            logger.info("sessions.json not found; will be created on first session")
-            # Child Session 隔离（Phase A）：返回 4-tuple 与签名一致
-            return {}, {}, {}, {}
-
+        self.load_error = ""
+        self._writable = True
+        self._write_refusal_logged = False
         try:
-            raw = self._path.read_text(encoding="utf-8").strip()
-            if not raw:
-                return {}, {}, {}, {}
-            data = json.loads(raw)
+            raw = self._path.read_bytes()
+        except FileNotFoundError:
+            logger.info("sessions.json not found; will be created on first session")
+            return {}, {}, {}, {}
+        except OSError as exc:
+            self._refuse_writes(f"{self._path} 读不出来（{exc}），这次运行不写它，会话登记从空表开始；修好后重启")
+            return {}, {}, {}, {}
+        try:
+            text = raw.decode("utf-8").strip()
+            data = json.loads(text) if text else {}
             if not isinstance(data, dict):
-                logger.warning(
-                    "sessions.json: root is %s, expected dict; skipping",
-                    type(data).__name__,
-                )
-                return {}, {}, {}, {}
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("sessions.json: load failed (%s); skipping", exc)
+                raise ValueError(f"顶层是 {type(data).__name__}，应为以 session_id 为键的对象")
+        except ValueError as exc:
+            self._set_aside_corrupt(exc)
             return {}, {}, {}, {}
 
         sessions: dict[str, SessionInfo] = {}
         conv_map: dict[str, str] = {}
-        # Child Session 隔离（Phase A）：重建 child session 映射
-        child_map: dict[tuple[str, str, str], str] = {}
         parent_children: dict[str, set[str]] = {}
+        # 同一个键有几行 accumulate 时取最近活跃的那行，和运行时最后记进映射的一致
+        mapped: dict[tuple[str, str, str], tuple[datetime, int, str]] = {}
 
-        for sid, entry in data.items():
+        for order, (sid, entry) in enumerate(data.items()):
             if not isinstance(entry, dict):
                 continue
             # 无论 reset 与否，都保留到内存 registry（完整镜像）
@@ -117,15 +131,15 @@ class SessionStore:
             if entry.get("reset"):
                 continue
 
-            # Child Session 隔离：重建 child session 映射表
             if entry.get("is_child"):
                 parent_sid = str(entry.get("parent_session_id") or "")
-                node_id = str(entry.get("node_id") or "")
-                ctx_key = str(entry.get("context_key") or "")
                 if parent_sid:
-                    map_key = (parent_sid, node_id, ctx_key)
-                    child_map[map_key] = sid
                     parent_children.setdefault(parent_sid, set()).add(sid)
+                    if _maps_for_accumulate(entry, parent_sid, data.get(parent_sid)):
+                        map_key = (parent_sid, str(entry.get("node_id") or ""), str(entry.get("context_key") or ""))
+                        found = (_last_active_moment(entry), order, sid)
+                        if map_key not in mapped or found > mapped[map_key]:
+                            mapped[map_key] = found
                 continue  # child session 不加入 sessions/conv_map
 
             try:
@@ -164,19 +178,42 @@ class SessionStore:
             except Exception as exc:
                 logger.warning("sessions.json: bad entry %s (%s); skipping", sid, exc)
 
+        child_map = {map_key: found[2] for map_key, found in mapped.items()}
         with self._lock:
             if self._registry:
                 self._generation = 1
                 self._flushed_generation = 1
         logger.info(
-            "sessions.json: loaded %d active sessions, %d child sessions (%d total entries)",
+            "sessions.json: loaded %d active sessions, %d accumulate child sessions (%d total entries)",
             len(sessions),
             len(child_map),
             len(self._registry),
         )
         return sessions, conv_map, child_map, parent_children
 
-    def reload(self) -> tuple[dict[str, SessionInfo], dict[str, str], dict[tuple[str, str, str], str], dict[str, set[str]]]:
+    @property
+    def read_only(self) -> bool:
+        """启动时 sessions.json 读不出来，或格式坏了又没能改名留存：这次运行一概不写它。"""
+        return not self._writable
+
+    def _refuse_writes(self, reason: str) -> None:
+        self._writable = False
+        self.load_error = reason
+        logger.error("%s", reason)
+
+    def _set_aside_corrupt(self, exc: Exception) -> None:
+        aside = self._path.with_name(f"{self._path.name}.corrupt-{int(time.time())}")
+        try:
+            os.replace(self._path, aside)
+        except OSError as move_exc:
+            self._refuse_writes(
+                f"{self._path} 格式不对（{exc}），改名留存也失败了（{move_exc}），这次运行不写它，会话登记从空表开始"
+            )
+            return
+        self.load_error = f"{self._path} 格式不对（{exc}），已改名为 {aside.name} 留存，会话登记从空表开始"
+        logger.error("%s", self.load_error)
+
+    def reload(self) -> LoadedRegistry:
         """丢掉内存副本重读 sessions.json，返回与 load 相同的四元组。
 
         只在离线改动（账号迁移改写 conversation_key）之后调用：内存才是权威，
@@ -367,6 +404,12 @@ class SessionStore:
 
     def flush_snapshot(self, snapshot: RegistrySnapshot) -> bool:
         """Write one immutable generation; stale snapshots never replace newer state."""
+        if not self._writable:
+            if not self._write_refusal_logged:
+                self._write_refusal_logged = True
+                logger.error("sessions.json: not written while it cannot be read: %s", self.load_error)
+            # 这次运行登记只在内存里，不算写失败：按失败报的话，每次分支合并、子会话清理都跟着失败
+            return True
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path: str | None = None
         try:
@@ -410,6 +453,8 @@ class SessionStore:
 
     def rekey_conversations(self, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
         """在线迁移用：直接改内存里的注册表再落盘。先改文件再重读的话，中间任何一次落盘都会拿旧键盖回去。"""
+        if apply and self.read_only:
+            raise OSError(f"sessions.json 这次运行不写，迁移改不了它：{self.load_error}")
         with self._lock:
             registry = self._registry if apply else copy.deepcopy(self._registry)
             count = _rekey_registry(registry, rekey) if rekey else RekeyCount()
@@ -419,6 +464,34 @@ class SessionStore:
         if not self.flush_snapshot(snapshot):
             raise OSError(f"sessions.json: rekeyed registry could not be written to {self._path}")
         return count
+
+
+def _maps_for_accumulate(entry: dict[str, Any], parent_sid: str, parent_row: Any) -> bool:
+    """这一行在不在 accumulate 的映射里：只有 accumulate 的子会话；保留着又已改挂到入口分支以外的不算。
+
+    分支收束时保留着的子会话改挂到用户会话下，运行时就摘了映射；重建出 (用户会话, 节点, key) 会让以后按用户会话找的委派落进它。
+    """
+    if str(entry.get("context_mode") or "").strip() != _ACCUMULATE:
+        return False
+    if retention_hold(entry) is None:
+        return True
+    return parent_sid.startswith("branch_") or (
+        isinstance(parent_row, dict) and parent_row.get("node_id") == _ENTRY_BRANCH_NODE
+    )
+
+
+def _last_active_moment(entry: dict[str, Any]) -> datetime:
+    """子会话这一行最后一次活动的时刻；读不出来的排在最前。"""
+    for key in ("last_active_at", "created_at"):
+        text = entry.get(key)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        try:
+            moment = datetime.fromisoformat(text.strip())
+        except ValueError:
+            continue
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def session_registry_path(workspace_root: Path) -> Path:

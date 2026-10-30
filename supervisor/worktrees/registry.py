@@ -1,6 +1,7 @@
 """隔离副本的登记，落在 data/worktrees.json：每个副本的位置、仓库、基准提交、分支、用它的任务和状态。
 
-只有 supervisor 写。内存里这份是准的，文件在启动时读一次；改动都整份替换写回，写不进去只记日志。
+只有 supervisor 写。内存里这份是准的，文件读一次；改动都整份替换写回，写不进去只记日志。
+文件在却读不出来时登记按空的看、但不写，下次用到再读：整份写回会把读不出来的那份盖掉。
 """
 from __future__ import annotations
 
@@ -73,6 +74,10 @@ def _clean_entry(raw: Any) -> dict[str, Any] | None:
     return entry
 
 
+class RegistryUnreadable(RuntimeError):
+    """登记文件在却读不出来，这时不能往登记里加东西：写回去会把那份文件整份盖掉。"""
+
+
 class WorktreeRegistry:
     """登记表。方法各自持自己的锁，不会回头去拿 supervisor 的锁；调用方可以持着 state._lock 来调。"""
 
@@ -81,22 +86,32 @@ class WorktreeRegistry:
         self._lock = threading.RLock()
         self._entries: dict[str, dict[str, Any]] = {}
         self._loaded = False
+        # 读不出来、或格式坏了从空表重新开始的原因；一直读得好好的是空串
         self.load_error = ""
+        self.unreadable = False
+        self._write_refusal_logged = False
 
     def load(self) -> None:
-        """读一次文件；读不出来时把坏文件改名留着，从空表开始，副本目录留给人手工处理。"""
+        """读一次文件。格式坏的把坏文件改名留着，从空表开始，副本目录留给人手工处理。
+
+        读不出来（OSError）的不算读过：这期间登记按空的看、也不写，下次用到时再读。
+        """
         with self._lock:
             if self._loaded:
                 return
-            self._loaded = True
             try:
                 raw = self.path.read_bytes()
             except FileNotFoundError:
+                self._mark_loaded_locked()
                 return
             except OSError as exc:
-                self.load_error = f"{self.path} 读不出来：{exc}"
-                log.error("%s", self.load_error)
+                message = f"{self.path} 读不出来：{exc}"
+                if not self.unreadable or message != self.load_error:
+                    log.error("%s; the worktree registry reads as empty and is not written until it can be read", message)
+                self.load_error = message
+                self.unreadable = True
                 return
+            self._mark_loaded_locked()
             try:
                 data = json.loads(raw.decode("utf-8"))
                 items = data.get("worktrees") if isinstance(data, dict) else None
@@ -113,7 +128,26 @@ class WorktreeRegistry:
                 if entry is not None and entry["id"] == key:
                     self._entries[key] = entry
 
+    def _mark_loaded_locked(self) -> None:
+        if self.unreadable:
+            log.info("worktree registry %s can be read again", self.path)
+            self.load_error = ""
+        self._loaded = True
+        self.unreadable = False
+        self._write_refusal_logged = False
+
+    def unreadable_reason(self) -> str:
+        """登记文件此刻读不出来的原因；读得出来或还没有这个文件给空串。"""
+        with self._lock:
+            self.load()
+            return self.load_error if self.unreadable else ""
+
     def _save_locked(self) -> None:
+        if self.unreadable:
+            if not self._write_refusal_logged:
+                self._write_refusal_logged = True
+                log.error("not writing the worktree registry %s while it cannot be read: %s", self.path, self.load_error)
+            return
         payload = {"version": VERSION, "worktrees": self._entries}
         data = json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True).encode("utf-8")
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
@@ -157,6 +191,8 @@ class WorktreeRegistry:
             raise ValueError(f"登记项不完整：{entry!r}")
         with self._lock:
             self.load()
+            if self.unreadable:
+                raise RegistryUnreadable(self.load_error)
             cleaned.setdefault("created_at", now_iso())
             cleaned["updated_at"] = now_iso()
             self._entries[cleaned["id"]] = cleaned

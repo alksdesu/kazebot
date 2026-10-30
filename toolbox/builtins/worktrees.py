@@ -195,8 +195,10 @@ def register_tools(registry: Any) -> None:
         "unfinished task is editing make it refuse and name that task. If the original repository changed meanwhile "
         "so the diff does not apply, nothing is changed, the conflicting files and lines are reported and the worktree "
         "is kept. A merge is recorded like an edit and can be undone with undo_edits (the result gives the task_id). "
-        "After merging or abandoning, the worktree and its branch are removed. A task that itself runs in a worktree "
-        "cannot merge.",
+        "Merging only changes files in the original repository's working tree: nothing is staged or committed. "
+        "After merging or abandoning, the worktree and its branch are removed; continuing the sub-agent later "
+        "(continue_from, or accumulate with isolation) gets a new worktree whose base carries the merged files as they "
+        "are in the working tree then. A task that itself runs in a worktree cannot merge.",
         {
             "type": "object",
             "properties": {

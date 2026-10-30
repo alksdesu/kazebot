@@ -17,6 +17,9 @@ WORKTREE_FROM_KEY = "_worktree_from"
 CHILD_WORKTREE_PAYLOAD_KEY = "child_worktree"
 # 收尾算 diff 的路由线程已经起过了
 OUTCOME_WORKER_KEY = "_worktree_outcome_worker_started"
+# 子会话（child_* 或 agent:）在 sessions.json 那一行记的上一次隔离：{"id": 登记号, "task_id": 用它的任务, "owner": 是否主人}
+# accumulate 再派这个会话时按它沿用副本；续接时副本登记查不到，靠它认出那一程是隔离过的
+SESSION_WORKTREE_FIELD = "worktree"
 
 # 副本建好之后才写上、重启回放还要用的键：task_store 瘦身快照时保留
 SNAPSHOT_INPUT_KEYS = (PROJECT_ROOT_KEY, PROJECT_ORIGIN_KEY, WORKTREE_KEY, WORKTREE_OWNER_KEY, WORKTREE_PENDING_KEY)

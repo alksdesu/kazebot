@@ -190,6 +190,8 @@ class TestSessionRegistry:
         store = SessionStore(path)
         _session(store, "s-old", OLD)
         store.on_child_session_created("c-old", "s-old", "helper", "ctx")
+        # 重启时只有 accumulate 的子会话重建进映射
+        store.set_entry_field("c-old", "context_mode", "accumulate")
         _session(store, "s-other", OTHER)
         return store, path
 

@@ -18,6 +18,7 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _worktree_fixture import (  # noqa: E402
+    CONV,
     Env,
     branches,
     close_service,
@@ -35,6 +36,7 @@ from _worktree_fixture import (  # noqa: E402
     write_runtime,
     wt_git,
 )
+from engine.isolation_notice import NOT_ISOLATED_MODE, isolation_parts, task_isolation  # noqa: E402
 from engine.project_root import (  # noqa: E402
     ISOLATION_CONTEXT_KEY,
     PROJECT_ORIGIN_KEY,
@@ -43,15 +45,16 @@ from engine.project_root import (  # noqa: E402
     task_project_root,
 )
 from supervisor.task_requeue import DELEGATE_INTERRUPTED_ERROR  # noqa: E402
-from supervisor.types import TaskStatus  # noqa: E402
+from supervisor.types import Task, TaskStatus  # noqa: E402
 from supervisor.worktrees import service as service_module  # noqa: E402
 from supervisor.worktrees.keys import (  # noqa: E402
     CALLER_WORKTREE_KEY,
+    SESSION_WORKTREE_FIELD,
     WORKTREE_OUTCOME_KEY,
     WORKTREE_OWNER_KEY,
     WORKTREE_PENDING_KEY,
 )
-from supervisor.worktrees.registry import registry_path  # noqa: E402
+from supervisor.worktrees.registry import RegistryUnreadable, registry_path  # noqa: E402
 from supervisor.worktrees.service import WorktreeService  # noqa: E402
 
 pytestmark = requires_git
@@ -463,6 +466,396 @@ class TestContinuation:
         assert second.input["task_context"][ISOLATION_CONTEXT_KEY]["previous"] == {
             "worktree": child.task_id, "state": "removed",
         }
+
+
+def _dispatch_again(env: Env, caller: Task, *items: dict[str, Any]) -> list[Task]:
+    """调用方再派一批，只给这一批新建的子任务。"""
+    before = {task.task_id for task in env.children(caller)}
+    return [task for task in env.wait_batch(caller, *items) if task.task_id not in before]
+
+
+def _merge(env: Env, caller: Task, view: dict[str, Any]) -> None:
+    preview = env.service.preview(task_id=caller.task_id, handle=view["handle"])
+    merged = env.service.merge(task_id=caller.task_id, handle=view["handle"], digest=preview["digest"])
+    assert merged["ok"] is True, merged
+
+
+def _notice(task: Task, env: Env) -> str:
+    [block] = isolation_parts(task.input["task_context"][ISOLATION_CONTEXT_KEY], workspace_root=env.ws)
+    return block
+
+
+class TestContinueAfterMerge:
+    """合回只改原仓库的工作区、不提交：之后接着这个子 agent 另建的副本，带上合回过的文件在工作区里现在的样子。"""
+
+    @staticmethod
+    def _merged_child(env: Env) -> tuple[Task, Task, dict[str, Any]]:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        path = env.worktree_of(child)
+        write(path / "app" / "main.py", "def main():\n    return 2\n")
+        (path / "app" / "old.py").unlink()
+        write(path / "app" / "new.py", "NEW = 1\n")
+        env.fail(child, "ran out of steps")
+        [first] = entries(caller)
+        assert first["continuable"] is True
+        _merge(env, caller, first["worktree"])
+        assert sorted(env.entry(child)["merged_files"]) == ["app/main.py", "app/new.py", "app/old.py"]
+        return caller, child, first
+
+    def test_the_new_worktree_starts_from_the_merged_files_as_they_are_now(self, env: Env) -> None:
+        caller, child, first = self._merged_child(env)
+        # 合回之后原仓库里又有人改了其中一个文件；这些都没提交
+        write(env.ws / "app" / "new.py", "NEW = 2\n")
+        before = head(env.ws)
+
+        [second] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["state"] == "ready" and entry["previous"] == child.task_id
+        assert entry["previous_state"] == "merged"
+        assert entry["head"] == before and entry["base"] != before
+        assert entry["carry"]["status"] == "carried" and entry["carry"]["error"] == ""
+        assert sorted(entry["carry"]["files"]) == ["app/main.py", "app/new.py", "app/old.py"]
+        tree = env.worktree_of(second)
+        assert (tree / "app" / "main.py").read_text(encoding="utf-8") == "def main():\n    return 2\n"
+        assert (tree / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 2\n"
+        assert not (tree / "app" / "old.py").exists()
+        assert (tree / "README.md").read_text(encoding="utf-8") == "hello\n"
+        # 原仓库的分支和索引都不动
+        assert head(env.ws) == before
+        assert git(env.ws, "diff", "--cached", "--name-only").strip() == ""
+        assert second.input["task_context"][ISOLATION_CONTEXT_KEY]["previous"] == {
+            "worktree": child.task_id, "state": "merged", "carry": {"status": "carried", "count": 3, "error": ""},
+        }
+        assert "带进了基准提交" in _notice(second, env)
+
+        write(tree / "app" / "more.py", "MORE = 1\n")
+        env.finish(second)
+
+        # 交回的 diff 只有这一程的改动：带进来的文件已经在基准提交里
+        view = [row for row in entries(caller) if row["child_task_id"] == second.task_id][0]["worktree"]
+        assert {row["path"] for row in view["files"]} == {"app/more.py"}
+
+    def test_merged_files_committed_in_the_original_repo_need_no_carrying(self, env: Env) -> None:
+        caller, _child, first = self._merged_child(env)
+        git(env.ws, "add", "-A")
+        git(env.ws, "commit", "-q", "-m", "take the merge")
+        committed = head(env.ws)
+
+        [second] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["base"] == entry["head"] == committed
+        assert entry["carry"]["status"] == "committed"
+        assert (env.worktree_of(second) / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 1\n"
+        assert second.input["task_context"][ISOLATION_CONTEXT_KEY]["previous"]["carry"] == {
+            "status": "committed", "count": 3, "error": "",
+        }
+
+    def test_when_the_merged_files_cannot_be_carried_it_starts_from_head_and_says_why(
+        self, env: Env, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        caller, _child, first = self._merged_child(env)
+
+        def _broken(*_args: Any, **_kwargs: Any) -> str:
+            raise wt_git.GitError("index.lock exists")
+
+        monkeypatch.setattr(wt_git, "carried_base", _broken)
+        before = head(env.ws)
+
+        [second] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["state"] == "ready" and entry["base"] == before
+        assert entry["carry"]["status"] == "failed" and entry["carry"]["error"] == "index.lock exists"
+        assert sorted(entry["carry"]["files"]) == ["app/main.py", "app/new.py", "app/old.py"]
+        assert (env.worktree_of(second) / "app" / "main.py").read_text(encoding="utf-8") == "def main():\n    return 1\n"
+        assert "没能带进来（index.lock exists）" in _notice(second, env)
+
+    def test_an_entry_merged_before_file_lists_were_kept_is_read_from_its_patch(self, env: Env) -> None:
+        caller, child, first = self._merged_child(env)
+        assert Path(env.entry(child)["patch"]).is_file()
+        env.service.registry.update(child.task_id, merged_files=None)
+
+        [second] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["carry"]["status"] == "carried"
+        assert sorted(entry["carry"]["files"]) == ["app/main.py", "app/new.py", "app/old.py"]
+        assert (env.worktree_of(second) / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 1\n"
+
+    def test_files_carried_into_a_worktree_are_carried_again_by_its_successor(self, env: Env) -> None:
+        caller, child, first = self._merged_child(env)
+        [second] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+        env.wait()
+        write(env.worktree_of(second) / "engine" / "x.py", "X = 2\n")
+        env.fail(second, "ran out of steps again")
+        [again] = [row for row in entries(caller) if row["child_task_id"] == second.task_id]
+        _merge(env, caller, again["worktree"])
+        assert env.entry(second)["merged_files"] == ["engine/x.py"]
+
+        [third] = _dispatch_again(env, caller, item(continue_from=again["handle"]))
+        env.wait()
+
+        entry = env.entry(third)
+        assert entry["previous"] == second.task_id and entry["carry"]["status"] == "carried"
+        assert sorted(entry["carry"]["files"]) == ["app/main.py", "app/new.py", "app/old.py", "engine/x.py"]
+        tree = env.worktree_of(third)
+        assert (tree / "app" / "main.py").read_text(encoding="utf-8") == "def main():\n    return 2\n"
+        assert (tree / "engine" / "x.py").read_text(encoding="utf-8") == "X = 2\n"
+        assert entry["head"] == head(env.ws) and entry["base"] != entry["head"]
+        assert env.entry(child)["state"] == "merged"
+
+
+class TestUnknownWorktree:
+    """本来在副本里做的活，副本在登记里查不到时拒绝，不悄悄落回原仓库。"""
+
+    def test_continue_from_an_isolated_child_whose_entry_is_gone_is_refused(self, env: Env) -> None:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        env.fail(child, "ran out of steps")
+        [first] = entries(caller)
+        env.service.registry.remove(child.task_id)
+
+        [refused] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+
+        assert refused.status == TaskStatus.failed
+        error = refused.result["error"]
+        assert f"隔离副本 {child.task_id}" in error and "登记里已经查不到这个副本" in error
+        assert "不会退回原仓库里接着做" in error and "isolation: worktree" in error
+        for key in (PROJECT_ROOT_KEY, WORKTREE_KEY, WORKTREE_PENDING_KEY):
+            assert key not in refused.input
+        [entry] = entries(caller)
+        assert entry["status"] == "fail" and "不会退回原仓库里接着做" in entry["error"]
+
+    def test_it_is_still_recognised_after_the_continued_task_left_memory(self, env: Env) -> None:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        env.fail(child, "ran out of steps")
+        [first] = entries(caller)
+        session_row = env.state._session_store.get_entry(child.input["child_session_id"])
+        assert session_row[SESSION_WORKTREE_FIELD] == {"id": child.task_id, "task_id": child.task_id, "owner": True}
+        env.service.registry.remove(child.task_id)
+        with env.state._lock:
+            env.state.tasks.pop(child.task_id)
+
+        [refused] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+
+        assert refused.status == TaskStatus.failed
+        assert f"隔离副本 {child.task_id}" in refused.result["error"]
+        assert "不会退回原仓库里接着做" in refused.result["error"]
+
+    def test_a_worktree_named_for_a_result_back_home_that_is_not_registered_is_refused(self, env: Env) -> None:
+        with env.state._lock:
+            plan = env.service.plan_child_locked(caller=None, source={"worktree": "gone-1", "owner": True})
+
+        assert plan.refused and plan.worktree == "gone-1"
+        assert "gone-1" in plan.error and "不会退回原仓库里接着做" in plan.error
+
+    def test_a_child_whose_entry_vanished_says_so_instead_of_handing_back_nothing(self, env: Env) -> None:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        env.service.registry.remove(child.task_id)
+
+        env.finish(child)
+
+        [entry] = entries(caller)
+        assert entry["worktree"]["id"] == child.task_id
+        assert entry["worktree"]["error"] == "登记里已经查不到这个副本（过了保留期被清掉了）"
+
+    def test_a_registry_that_was_reset_says_so(self, env: Env) -> None:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        env.fail(child, "ran out of steps")
+        [first] = entries(caller)
+        path = registry_path(env.ws)
+        close_service(env.state)
+        write(path, "{not json")
+        service = WorktreeService(env.state)
+        env.state.worktrees = service
+
+        [refused] = _dispatch_again(env, caller, item(continue_from=first["handle"]))
+
+        assert "登记文件坏过、已从空表重新开始" in refused.result["error"]
+        assert "不会退回原仓库里接着做" in refused.result["error"]
+
+    def test_while_the_registry_cannot_be_read_nothing_is_isolated_and_the_file_is_kept(
+        self, env: Env, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        caller = env.caller(env.session())
+        child = env.isolated_child(caller)
+        env.fail(child, "ran out of steps")
+        [first] = entries(caller)
+        path = registry_path(env.ws)
+        kept = path.read_bytes()
+        close_service(env.state)
+        real_read_bytes = Path.read_bytes
+        locked = {"on": True}
+
+        def _locked(self: Path) -> bytes:
+            if locked["on"] and self == path:
+                raise PermissionError(13, "the file is locked by another process", str(path))
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", _locked)
+        service = WorktreeService(env.state)
+        env.state.worktrees = service
+
+        [refused, fresh] = _dispatch_again(
+            env, caller, item(continue_from=first["handle"]), item("b.node", isolation="worktree"),
+        )
+        service.recover()
+        service.housekeeping()
+
+        assert "登记文件读不出来" in refused.result["error"] and "不会退回原仓库里接着做" in refused.result["error"]
+        assert fresh.status == TaskStatus.failed and "登记文件读不出来" in fresh.result["error"]
+        assert "去掉 isolation 和 repo" in fresh.result["error"]
+        with pytest.raises(RegistryUnreadable):
+            service.registry.put({"id": "t-new", "state": "creating", "owners": ["t-new"]})
+        assert real_read_bytes(path) == kept
+
+        locked["on"] = False
+
+        assert service.registry.unreadable_reason() == ""
+        assert service.registry.get(child.task_id) is not None
+
+
+class TestAccumulateIsolation:
+    """accumulate 再派同一个会话：要隔离就回到这个会话上一次的副本，不隔离就提醒历史里的副本不是这次的工作目录。"""
+
+    @staticmethod
+    def _first_run(env: Env) -> tuple[Task, Task]:
+        caller = env.caller(env.session())
+        [first] = env.wait_batch(caller, item(context_mode="accumulate", isolation="worktree"))
+        env.wait()
+        write(env.worktree_of(first) / "app" / "new.py", "NEW = 1\n")
+        env.finish(first)
+        assert env.entry(first)["state"] == "finished"
+        return caller, first
+
+    def test_it_goes_back_to_the_worktree_of_the_last_run(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+
+        [second] = _dispatch_again(env, caller, item(context_mode="accumulate", isolation="worktree"))
+
+        assert second.input["child_session_id"] == first.input["child_session_id"]
+        assert second.input[WORKTREE_KEY] == first.task_id and second.input[WORKTREE_OWNER_KEY] is True
+        assert WORKTREE_PENDING_KEY not in second.input
+        assert second.input["task_context"][ISOLATION_CONTEXT_KEY]["reused"] is True
+        assert env.entry(first)["owners"] == [first.task_id, second.task_id]
+        assert (env.worktree_of(second) / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 1\n"
+        row = env.state._session_store.get_entry(first.input["child_session_id"])
+        assert row[SESSION_WORKTREE_FIELD] == {"id": first.task_id, "task_id": second.task_id, "owner": True}
+
+    def test_a_worktree_that_is_gone_is_rebuilt_and_said_so(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+        assert env.service.abandon(task_id=caller.task_id, handle=first.task_id)["ok"] is True
+
+        [second] = _dispatch_again(env, caller, item(context_mode="accumulate", isolation="worktree"))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["state"] == "ready" and entry["previous"] == first.task_id
+        assert entry["previous_state"] == "abandoned"
+        assert "原来的副本 " + first.task_id + " 已经放弃" in _notice(second, env)
+
+    def test_a_merged_worktree_is_rebuilt_with_the_merged_files(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+        [handed] = entries(caller)
+        _merge(env, caller, handed["worktree"])
+
+        [second] = _dispatch_again(env, caller, item(context_mode="accumulate", isolation="worktree"))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["previous"] == first.task_id and entry["carry"]["status"] == "carried"
+        assert (env.worktree_of(second) / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 1\n"
+
+    def test_a_worktree_that_left_the_registry_is_replaced_and_said_so(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+        env.service.registry.remove(first.task_id)
+
+        [second] = _dispatch_again(env, caller, item(context_mode="accumulate", isolation="worktree"))
+        env.wait()
+
+        entry = env.entry(second)
+        assert entry["state"] == "ready" and entry["previous"] == first.task_id
+        assert entry["previous_state"] == "missing"
+        assert second.input["task_context"][ISOLATION_CONTEXT_KEY]["previous"] == {
+            "worktree": first.task_id, "state": "missing",
+        }
+        assert "在登记里已经查不到" in _notice(second, env)
+
+    def test_without_isolation_it_runs_in_the_original_repo_and_is_reminded(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+
+        [second] = _dispatch_again(env, caller, item(context_mode="accumulate"))
+
+        for key in (PROJECT_ROOT_KEY, PROJECT_ORIGIN_KEY, WORKTREE_KEY, WORKTREE_OWNER_KEY, WORKTREE_PENDING_KEY):
+            assert key not in second.input
+        assert task_project_root(second.input, env.ws) == env.ws
+        reminder = second.input["task_context"][ISOLATION_CONTEXT_KEY]
+        assert reminder == {
+            "mode": NOT_ISOLATED_MODE,
+            "previous": {"worktree": first.task_id, "state": "finished", "inherited": False},
+        }
+        assert task_isolation(second.input["task_context"]) == {}
+        assert "你这次不在隔离副本里" in _notice(second, env)
+        assert env.entry(first)["owners"] == [first.task_id]
+
+        # 提醒不改这个会话记的副本：再要求隔离照样回到它
+        env.finish(second)
+        [third] = _dispatch_again(env, caller, item(context_mode="accumulate", isolation="worktree"))
+        assert third.input[WORKTREE_KEY] == first.task_id
+
+    def test_a_single_dispatch_goes_back_to_it_too(self, env: Env) -> None:
+        caller = env.caller(env.session())
+        first = env.dispatch_single(caller, isolation="worktree", context_mode="accumulate")
+        env.wait()
+        env.finish(first)
+
+        env.report(caller, {"action": "dispatch", "target_node": "a.node", "dispatch_input": {
+            "instruction": "do a.node", "isolation": "worktree", "context_mode": "accumulate",
+        }})
+        [second] = [task for task in env.children(caller) if task.task_id != first.task_id]
+
+        assert second.input["child_session_id"] == first.input["child_session_id"]
+        assert second.input[WORKTREE_KEY] == first.task_id and WORKTREE_PENDING_KEY not in second.input
+
+    def test_fresh_dispatches_neither_reuse_nor_mention_the_accumulate_worktree(self, env: Env) -> None:
+        caller, first = self._first_run(env)
+
+        plain, isolated = _dispatch_again(env, caller, item(), item(isolation="worktree"))
+        env.wait()
+
+        assert ISOLATION_CONTEXT_KEY not in (plain.input.get("task_context") or {})
+        entry = env.entry(isolated)
+        assert entry["state"] == "ready" and not entry.get("previous")
+        assert env.entry(first)["owners"] == [first.task_id]
+
+    def test_an_async_accumulate_agent_goes_back_to_its_worktree(self, env: Env) -> None:
+        sid = env.session()
+        caller = env.caller(sid)
+        agent_sid = env.state.get_or_create_session(channel="qq", conversation_key=f"agent:a.node:{CONV}")
+        origin = {
+            "parent_session_id": sid, "caller_node_id": str(caller.node_id or ""), "parent_conversation_key": CONV,
+            "context_mode": "accumulate", "caller_task_id": caller.task_id, "isolation": "worktree",
+        }
+        first = env.inbound(agent_sid, node="a.node", dispatch_context_mode="accumulate", dispatch_origin=dict(origin))
+        env.wait()
+        write(env.worktree_of(first) / "app" / "new.py", "NEW = 1\n")
+        env.finish(first)
+
+        second = env.inbound(agent_sid, node="a.node", dispatch_context_mode="accumulate", dispatch_origin=dict(origin))
+
+        assert second.input[WORKTREE_KEY] == first.task_id and second.input[WORKTREE_OWNER_KEY] is True
+        assert (env.worktree_of(second) / "app" / "new.py").read_text(encoding="utf-8") == "NEW = 1\n"
+        assert env.state._session_store.get_entry(agent_sid)[SESSION_WORKTREE_FIELD]["task_id"] == second.task_id
 
 
 class TestAbandonAndCleanup:

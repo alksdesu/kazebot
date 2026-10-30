@@ -738,6 +738,28 @@ class TestSelfDispatch:
 
         assert entry["context_mode"] == "accumulate"
 
+    def test_a_yaml_id_that_differs_from_the_file_name_does_not_hide_the_node_from_itself(
+        self, workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 委派名单按文件名认节点：节点 id 跟着文件名走，写的 id 只当旧 id，自派照样只给 fresh / fork
+        _write_node(workspace, "lead", delegate_targets=["lead"])
+        path = workspace / "config" / "nodes" / "lead.yaml"
+        path.write_text(path.read_text(encoding="utf-8").replace("id: lead", "id: lead.v2", 1), encoding="utf-8")
+        node = load_node(workspace, "lead")
+        ls = _dispatching(workspace, monkeypatch)
+        ls.node = node
+        ls.allowed_dispatch_targets = set(node.delegate_targets)
+
+        [own] = _dispatch_delegate_specs(node.delegate_targets, [_info("lead")], caller_id=node.id)
+
+        assert node.id == "lead" and "lead.v2" in node.aliases
+        assert own["function"]["parameters"]["properties"]["context_mode"]["enum"] == ["fresh", "fork"]
+        assert _refusal_of_wait(ls, _wait("lead", context_mode="accumulate")).startswith(
+            "没有派出：委派给自己时 context_mode 只能是 fresh 或 fork",
+        )
+        [entry] = _run(ls, _wait("lead")).dispatch_batch
+        assert entry["target"] == "lead" and entry["context_mode"] == "fresh"
+
 
 class TestContinueFrom:
     def test_a_wait_continuation_passes_the_fields_on_for_the_supervisor_to_settle(

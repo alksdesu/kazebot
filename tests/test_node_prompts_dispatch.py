@@ -93,3 +93,13 @@ def test_finish_and_ask_describe_the_same_round_rule_the_same_way() -> None:
     assert "those other tools still run but finish is REJECTED" in finish
     assert "those other tools still run but ask is ignored" in ask
     assert "ALL calls will be REJECTED" not in ask
+
+
+def test_ask_says_what_happens_next_for_each_way_a_node_is_started() -> None:
+    # 子会话只有 continue_from 带着句柄才接得上；说成「上游回答后自动接着做」，上级就会整段重派
+    ask = _ask_spec()["function"]["description"]
+
+    assert "By a user message" in ask
+    assert "context_mode accumulate" in ask and "same context_key" in ask
+    assert "fresh or fork" in ask and "continue_from" in ask and "handle" in ask
+    assert "create a new task for you to continue working" not in ask
