@@ -1041,6 +1041,20 @@ describe('Node and provider table client', () => {
     await expect(getNodes('secret-token')).rejects.toThrow('节点表格式不对：[0].model 不是字符串');
   });
 
+  it('reads selectable as true, false or null and refuses anything else', async () => {
+    const rows = [
+      { id: 'coder', type: 'ai', selectable: true },
+      { id: 'vision', type: 'ai', selectable: false },
+      { id: 'main', type: 'ai', selectable: null },
+      { id: 'old', type: 'ai' },
+    ];
+    stubFetch(rows);
+    await expect(getNodes('secret-token')).resolves.toEqual(rows);
+
+    stubFetch([{ id: 'main', type: 'ai', selectable: 'yes' }]);
+    await expect(getNodes('secret-token')).rejects.toThrow('节点表格式不对：[0].selectable 不是 true 或 false，也不是 null');
+  });
+
   it('refuses a provider table with a missing or mistyped part instead of filling it with nothing', async () => {
     const complete = providerTable({
       providers: { openai: providerBlock({ model: 'gpt-5.4', model_raw: 'gpt-5.4' }) },

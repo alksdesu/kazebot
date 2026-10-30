@@ -29,12 +29,13 @@ from clonoth_runtime import (
 )
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import (
+    declared_selectable,
     declares_internal,
+    delegate_target_ids,
     effective_node_type,
     example_base_name,
     example_node_name,
     known_node_ids,
-    listed_targets,
     node_file,
     read_node_definition,
     template_node_name,
@@ -467,6 +468,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "active": not template_node_name(nid),
                     # 回给程序看的判定值，网页的入口和切换列表跟 switch_node 枚举一样不列它。
                     "internal": declares_internal(data),
+                    # 写了就以它为准列不列进入口下拉，没写是 null，照委派关系推断（engine.node.entry_roots）。
+                    "selectable": declared_selectable(data),
                     # yaml 里写的 id。和文件名不一致时只当旧 id 认（engine 认得的会列在 aliases 里），改了不会换节点。
                     "declared_id": declared if declared and declared != nid else "",
                     # engine 实际认的旧 id：被同名文件或排在前面的节点占掉的不算，模板和示例没有。
@@ -483,7 +486,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "tool_access": ta_raw,
                     "skills": data.get("skills", {}),
                     "description": str(data.get("description") or "").strip(),
-                    "delegate_targets": listed_targets(data.get("delegate_targets")),
+                    # 网页拿它算入口下拉的根节点，得和 engine 一样把旧 id 换成现在的：按 YAML 原文算，委派清单写旧 id 时两边结论不一样。
+                    "delegate_targets": delegate_target_ids(workspace_root, data.get("delegate_targets")),
                     "source": source,
                     "same_as_default": source == "override" and _same_as_default(f),
                     # 不空时 engine 加载它只会落空。只有位置和问题，不带原文。

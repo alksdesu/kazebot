@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol, Sequence, TypeVar
 
 import yaml
 
@@ -65,6 +65,8 @@ class Node:
     # 目的：persistent=true 的节点的 child session 能触发自动上下文压缩，
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
+    # 列不列进入口列表（switch_node、终端界面、网页下拉）；None 是没写，照委派关系推断
+    selectable: bool | None = None
     # [2026-05-27] extra: 收集节点 yaml 中 core 不认识的字段，供插件层零 IO 读取。
     # 为什么：memory_book 等插件业务配置不应定义在 Node dataclass 上，
     # 但插件每次从 yaml 文件读取也浪费 IO。
@@ -318,15 +320,19 @@ def listed_targets(raw: Any) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in raw if isinstance(item, str) and item.strip()))
 
 
+def delegate_target_ids(workspace_root: Path, raw: Any) -> list[str]:
+    """委派清单按引擎的读法：旧 id 换成现在的，模板和示例剔掉，还不存在的节点照留，去重。控制台列节点时给的也是这一份。"""
+    return list(dict.fromkeys(
+        canonical_node_id(workspace_root, name) for name in listed_targets(raw) if not template_node_name(name)
+    ))
+
+
 def _delegate_targets(workspace_root: Path, node_path: Path, raw: Any) -> list[str]:
-    """统一换成现在的 id，派发工具名、白名单、子会话键都按它算；模板和示例剔掉，还不存在的节点照留。"""
-    targets: list[str] = []
+    """派发工具名、白名单、子会话键都按 delegate_target_ids 算；写了模板或示例的记一条警告。"""
     for name in listed_targets(raw):
         if template_node_name(name):
             _warn_template_target(node_path, name)
-        else:
-            targets.append(canonical_node_id(workspace_root, name))
-    return list(dict.fromkeys(targets))
+    return delegate_target_ids(workspace_root, raw)
 
 
 def _warn_template_target(node_path: Path, name: str) -> None:
@@ -475,7 +481,7 @@ def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
         "kind", "id", "type", "name", "description", "model", "api_key",
         "base_url", "prompt", "tool_access", "skills", "memories",
         "tool_mode", "output_mode", "provider", "provider_options",
-        "delegate_targets", "aliases", "persistent",
+        "delegate_targets", "aliases", "persistent", "selectable",
     }
     extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
 
@@ -503,6 +509,7 @@ def load_node_file(workspace_root: Path, node_path: Path) -> Node | None:
         delegate_targets=delegate_targets,
         aliases=list(_effective_aliases(workspace_root, node_path, _old_ids(data, nid))),
         persistent=persistent,
+        selectable=declared_selectable(data),
         extra=extra,
     )
 
@@ -526,3 +533,29 @@ def entry_node_problem(node: Node) -> str:
     if internal_node(node):
         return f"{node.id} 是 internal 节点，回的是给程序看的判定值，不接对话"
     return ""
+
+
+def declared_selectable(data: dict[str, Any]) -> bool | None:
+    """节点定义里 selectable 的读法：写了 true、false 就以它为准，没写或认不出给 None。控制台列节点时照这一条判，和 Node.selectable 同一个值。"""
+    return parse_bool(data.get("selectable"))
+
+
+class _EntryCandidate(Protocol):
+    id: str
+    delegate_targets: list[str]
+    selectable: bool | None
+
+
+_Entry = TypeVar("_Entry", bound=_EntryCandidate)
+
+
+def entry_roots(entries: Sequence[_Entry]) -> list[_Entry]:
+    """入口列表列哪些节点。switch_node 的枚举、终端界面都照这一条，网页的入口下拉在 utils/entryNodes.ts 里照抄。
+
+    entries 是接对话的节点（entry_node_problem 为空）。写了 selectable 的以它为准；没写的，被别的节点委派了就不列，
+    委派给自己不算。一个都没有时列出除写明 false 以外的全部。selectable 只管列不列，能力路由、定时任务点名入口和委派都不看它。
+    """
+    delegated = {target for node in entries for target in node.delegate_targets if target != node.id}
+    offered = [node for node in entries if node.selectable is not False]
+    roots = [node for node in offered if node.selectable or node.id not in delegated]
+    return roots or offered

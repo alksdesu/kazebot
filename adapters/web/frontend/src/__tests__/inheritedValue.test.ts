@@ -203,6 +203,25 @@ describe('根入口', () => {
 
     expect(rootEntryNodes(nodes).map((node) => node.id)).toEqual(['a', 'b']);
   });
+
+  it('写了 selectable 的以它为准：被委派的也能列，没人委派的也能不列，null 照委派关系推断', () => {
+    const nodes = [
+      ai('main', { delegate_targets: ['coder', 'reviewer', 'helper'] }),
+      ai('coder', { selectable: true, delegate_targets: ['reviewer'] }),
+      ai('reviewer'),
+      ai('helper', { selectable: null }),
+      ai('vision', { selectable: false }),
+      ai('search', { selectable: null }),
+    ];
+
+    expect(rootEntryNodes(nodes).map((node) => node.id)).toEqual(['main', 'coder', 'search']);
+  });
+
+  it('一个根都没有时也不列写明 false 的', () => {
+    const nodes = [ai('a', { delegate_targets: ['b'] }), ai('b', { delegate_targets: ['a'] }), ai('vision', { selectable: false })];
+
+    expect(rootEntryNodes(nodes).map((node) => node.id)).toEqual(['a', 'b']);
+  });
 });
 
 describe('替用户挑入口', () => {

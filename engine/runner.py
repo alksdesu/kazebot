@@ -54,7 +54,7 @@ from .inference.pseudo_tools import isolatable_node, plan_delegation, tool_allow
 from .inference.resume_builder import bound_dispatch_text
 from .inference.tool_format import sanitize_control_tool_history
 
-from .node import Node, entry_node_problem, load_node, missing_node_reason, node_file, node_files
+from .node import Node, entry_node_problem, entry_roots, load_node, missing_node_reason, node_file, node_files
 from .tool_reload import ToolReloadFollower, fetch_reload_seqs
 from .tool_outputs import tool_output_limits
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
@@ -312,11 +312,10 @@ def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[s
 
 
 def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> list[dict[str, str]]:
-    """发现可切换的根节点（不被任何其他节点 delegate_targets 引用的节点），排除当前节点。"""
+    """switch_node 能切到的节点：入口列表（规则见 entry_roots）去掉当前节点。"""
     # 示例文件和它对应的真节点常写同一个 id，按文件名排在前面会顶掉真节点的名字和描述，
     # 所以只看能派发到的节点文件。
-    all_nodes: list[dict[str, Any]] = []
-    all_targets: set[str] = set()
+    entries: list[Node] = []
     seen_ids: set[str] = set()
     for path in node_files(workspace_root):
         n = load_node(workspace_root, path.stem)
@@ -327,15 +326,12 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
         if entry_node_problem(n):
             continue
         seen_ids.add(n.id)
-        all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
-        # 委派给自己（coder 拆活给子 coder）不算有上游
-        all_targets.update(target for target in n.delegate_targets if target != n.id)
-    # 根节点 = 不被任何节点 delegate 引用的节点
-    roots = [n for n in all_nodes if n["id"] not in all_targets]
-    if not roots:
-        roots = list(all_nodes)
-    # 排除当前节点自己
-    return [n for n in roots if n["id"] != current_node_id]
+        entries.append(n)
+    return [
+        {"id": n.id, "name": n.name, "description": n.description or n.name}
+        for n in entry_roots(entries)
+        if n.id != current_node_id
+    ]
 
 
 # [2026-05-04] Only currently supported static pseudo tools are listed here.

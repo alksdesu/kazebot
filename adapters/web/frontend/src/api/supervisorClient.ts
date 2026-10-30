@@ -349,6 +349,8 @@ export interface AdminNode extends NodeDef {
   active?: boolean;
   /** true = 回给程序看的判定值，不接用户对话；入口和切换列表不列它。旧后端没有这一项。 */
   internal?: boolean;
+  /** 节点 YAML 写了 selectable 就以它为准列不列进入口下拉，null = 没写，照委派关系推断。旧后端没有这一项。 */
+  selectable?: boolean | null;
   /** yaml 里写的 id，且和文件名不一致。engine 认文件名，这个字段改了不换节点。 */
   declared_id?: string;
   source?: OverlaySource;
@@ -541,6 +543,7 @@ const NODE_ROW = {
   aliases: optional(TEXT_LIST),
   active: optional(BOOLEAN),
   internal: optional(BOOLEAN),
+  selectable: optional(nullable(BOOLEAN)),
   declared_id: optional(TEXT),
   source: optional(oneOf('default', 'override', 'custom', 'system')),
   same_as_default: optional(BOOLEAN),

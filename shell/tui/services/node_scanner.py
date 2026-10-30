@@ -1,10 +1,10 @@
-"""扫描 engine/system_nodes/、config/nodes/ 和仓库默认的 defaults/nodes/ 构建节点图，找出根节点（无上游）。"""
+"""扫描 engine/system_nodes/、config/nodes/ 和仓库默认的 defaults/nodes/，列出能当入口的节点。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from engine.node import entry_node_problem, load_node, node_files
+from engine.node import entry_node_problem, entry_roots, load_node, node_files
 
 
 @dataclass
@@ -15,6 +15,7 @@ class NodeInfo:
     description: str
     node_type: str  # ai | tool
     delegate_targets: list[str] = field(default_factory=list)
+    selectable: bool | None = None
 
 
 def scan_nodes(workspace_root: Path) -> list[NodeInfo]:
@@ -31,17 +32,11 @@ def scan_nodes(workspace_root: Path) -> list[NodeInfo]:
         seen_ids.add(node.id)
         result.append(NodeInfo(
             id=node.id, name=node.name, description=node.description,
-            node_type=node.type, delegate_targets=list(node.delegate_targets),
+            node_type=node.type, delegate_targets=list(node.delegate_targets), selectable=node.selectable,
         ))
     return result
 
 
 def find_root_nodes(nodes: list[NodeInfo]) -> list[NodeInfo]:
-    """找出无上游的根节点（不被任何其他节点 delegate_targets 引用）。"""
-    all_targets: set[str] = set()
-    for n in nodes:
-        # 委派给自己（coder 拆活给子 coder）不算有上游
-        all_targets.update(target for target in n.delegate_targets if target != n.id)
-    roots = [n for n in nodes if n.id not in all_targets]
-    # 如果所有节点都被引用，返回全部作为备选
-    return roots if roots else nodes
+    """入口列表列哪些节点，和 engine 的 switch_node 枚举是同一条规则（entry_roots）。"""
+    return entry_roots(nodes)
