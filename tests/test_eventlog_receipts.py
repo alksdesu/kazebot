@@ -317,3 +317,17 @@ class TestReadingAfterASeq:
         seqs = [event["seq"] for event in log.iter_persisted_events_after(300)]
 
         assert seqs == list(range(301, 401))
+
+
+class TestATornLastLine:
+    def test_the_next_event_starts_on_a_fresh_line(self, tmp_path: Path) -> None:
+        # 上一个进程死在半行：接着写会粘进那一行，新写的这条也跟着读不出来
+        log = _log(tmp_path)
+        _append(log, "note", {"text": "before"})
+        with log.path.open("ab") as stream:
+            stream.write(b'{"seq": 2, "torn')
+        restarted = _log(tmp_path, run_id="after-crash")
+
+        _append(restarted, "note", {"text": "after"})
+
+        assert [event["payload"]["text"] for event in restarted.iter_persisted_events()] == ["before", "after"]

@@ -38,6 +38,7 @@ from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from .task_ending import TaskEnding, clear_stopping, stopping_expired, transit_due
 from engine.compact import COMPACT_SUMMARY_PREFIX
+from engine.eventlog_rotation import append_lines
 from engine.dispatch_batch import (
     AWAITING_INPUT_KEY,
     CONTINUE_FROM_KEY,
@@ -766,20 +767,22 @@ class TaskRouterMixin:
         try:
             with open(branch_path, "r", encoding="utf-8") as bf:
                 lines = bf.readlines()
-            with open(parent_path, "a", encoding="utf-8") as pf:
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        # Rewrite session_id so snip_history and summary write-back
-                        # can find the record under the parent session.
-                        rec["session_id"] = parent_session_id
-                        pf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        count += 1
-                    except json.JSONDecodeError:
-                        continue
+            merged: list[str] = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Rewrite session_id so snip_history and summary write-back
+                # can find the record under the parent session.
+                rec["session_id"] = parent_session_id
+                merged.append(json.dumps(rec, ensure_ascii=False))
+            if merged:
+                append_lines(parent_path, "".join(f"{record}\n" for record in merged).encode("utf-8"))
+            count = len(merged)
             if count:
                 log.info("Merged %d transcript records from %s → %s", count, branch_session_id, parent_session_id[:12])
                 # [2026-05-25] 用后即焚：合并成功后删除 branch transcript 源文件
@@ -998,9 +1001,7 @@ class TaskRouterMixin:
                         additions.append(encoded)
                 if additions:
                     parent_path.parent.mkdir(parents=True, exist_ok=True)
-                    with parent_path.open("a", encoding="utf-8") as stream:
-                        for line in additions:
-                            stream.write(line + "\n")
+                    append_lines(parent_path, "".join(f"{line}\n" for line in additions).encode("utf-8"))
 
         for session_id in plan.cleanup_session_ids:
             self.purge_session_files(session_id)

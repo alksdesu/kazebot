@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from engine.eventlog_rotation import eventlog_file_lock, rotate_event_log_locked
+from engine.eventlog_rotation import append_lines, eventlog_file_lock, rotate_event_log_locked
 
 
 logger = logging.getLogger(__name__)
@@ -410,8 +410,7 @@ class EventLog:
             # cross-process protocol.  Cleanup can never rename between open
             # and write, including on Windows where an open file blocks rename.
             with eventlog_file_lock(self._path):
-                with self._path.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                append_lines(self._path, (line + "\n").encode("utf-8"))
                 self._durable_seq = seq
                 # 落了盘就记下：之后轮转出错抛出去，这一条也已经在盘上，重试时得认得
                 self._remember_receipts_locked(evt)

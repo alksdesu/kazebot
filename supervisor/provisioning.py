@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import config_layout
+from engine.eventlog_rotation import append_lines
 from platforms.descriptor import HOOK_INSTANCE_ENV, PlatformDescriptor
 from platforms.ids import normalize_id
 from platforms.registry import (
@@ -328,14 +329,8 @@ def _append_progress(workspace_root: Path, instance_id: str, line: str) -> None:
     """往进度文件末尾接一行。写不进去只记日志：进度是给人看的，不该因此拦下要做的事。"""
     path = log_path(workspace_root, instance_id)
     try:
-        with path.open("a+b") as stream:
-            size = stream.seek(0, os.SEEK_END)
-            glued = False
-            if size:
-                stream.seek(size - 1)
-                glued = stream.read(1) != b"\n"
-            # 上一次停在半行的话先换行：粘成一行，DONE 开头的旧结果就成了这一次的
-            stream.write((b"\n" if glued else b"") + line.encode("utf-8") + b"\n")
+        # append_lines 遇到上一次停在半行会先换行：粘成一行，DONE 开头的旧结果就成了这一次的
+        append_lines(path, line.encode("utf-8") + b"\n")
     except OSError as error:
         _log.warning("实例 %s 的进度文件 %s 没写进去：%s", instance_id, path, error)
 
