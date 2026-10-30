@@ -2460,11 +2460,16 @@ def create_app(
             )
             # 先占清单再触发：并发两个请求时后来的会看见序号已被占，不会分到同一组端口。
             provisioning.scaffold(plan, st.workspace_root)
-            await provisioning.start_unit(provisioning.CREATE_UNIT.format(instance_id=plan.instance_id))
+            await provisioning.hand_to_root(
+                st.workspace_root, plan.instance_id, provisioning.CREATE_UNIT.format(instance_id=plan.instance_id),
+            )
         except provisioning.RosterUnreadable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except provisioning.ProvisionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except OSError as error:
+            # 建目录、软链、写 .env 失败是服务器上的事：说出哪里没建成，页面上不能只剩一句服务器错误
+            raise HTTPException(status_code=500, detail=f"新实例没建成：{error}") from error
         return {
             "id": plan.instance_id, "label": plan.label, "idx": plan.idx,
             "prefix": plan.prefix, "ports": plan.ports,
@@ -2489,7 +2494,10 @@ def create_app(
             row = provisioning.guard_removable(
                 st.workspace_root, instance_id, current_prefix=url_prefix(),
             )
-            await provisioning.start_unit(provisioning.REMOVE_UNIT.format(instance_id=row["id"]))
+            await provisioning.hand_to_root(
+                st.workspace_root, row["id"], provisioning.REMOVE_UNIT.format(instance_id=row["id"]),
+                opening=provisioning.REMOVAL_REQUESTED,
+            )
         except provisioning.RosterUnreadable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except provisioning.ProvisionError as error:

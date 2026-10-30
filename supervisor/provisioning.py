@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 from dataclasses import dataclass
@@ -54,6 +55,11 @@ _ENV_FILE_MODE = 0o600
 CREATE_UNIT = "kazebot-provision@{instance_id}.service"
 REMOVE_UNIT = "kazebot-deprovision@{instance_id}.service"
 WRITABLE_UNIT = "kazebot-writable@{instance_id}.service"
+
+# 带着「归档」：root 侧接手之前轮询读到的就是这一行，progress 据此认出这是在删
+REMOVAL_REQUESTED = "已发起停用并归档，等 root 侧接手…"
+
+_log = logging.getLogger(__name__)
 
 
 class ProvisionError(RuntimeError):
@@ -306,9 +312,43 @@ async def _systemctl(*args: str) -> tuple[int, str]:
 
 async def start_unit(unit: str) -> None:
     """--no-block：oneshot 单元会跑上一两分钟，不能把请求挂在这里。"""
-    code, out = await _systemctl("start", "--no-block", unit)
+    try:
+        code, out = await _systemctl("start", "--no-block", unit)
+    except OSError as error:
+        raise ProvisionError(f"启动 {unit} 失败，调不起 systemctl：{error}") from error
     if code != 0:
         raise ProvisionError(f"启动 {unit} 失败（polkit 规则和 root 侧脚本是最新的吗？）：{out}")
+
+
+def _append_progress(workspace_root: Path, instance_id: str, line: str) -> None:
+    """往进度文件末尾接一行。写不进去只记日志：进度是给人看的，不该因此拦下要做的事。"""
+    path = log_path(workspace_root, instance_id)
+    try:
+        with path.open("a+b") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            glued = False
+            if size:
+                stream.seek(size - 1)
+                glued = stream.read(1) != b"\n"
+            # 上一次停在半行的话先换行：粘成一行，DONE 开头的旧结果就成了这一次的
+            stream.write((b"\n" if glued else b"") + line.encode("utf-8") + b"\n")
+    except OSError as error:
+        _log.warning("实例 %s 的进度文件 %s 没写进去：%s", instance_id, path, error)
+
+
+async def hand_to_root(workspace_root: Path, instance_id: str, unit: str, *, opening: str = "") -> None:
+    """启动 root 侧单元。root 只往进度文件后面追加，从不截断。
+
+    opening 先接进去：root 接手之前轮询读到的末行就不是上一次留下的 DONE。单元没起来时补一行 DONE fail，
+    控制台不会一直显示「进行中」。
+    """
+    if opening:
+        _append_progress(workspace_root, instance_id, opening)
+    try:
+        await start_unit(unit)
+    except ProvisionError as error:
+        _append_progress(workspace_root, instance_id, f"DONE fail: {error}")
+        raise
 
 
 async def unit_state(unit: str) -> str:
@@ -377,12 +417,14 @@ __all__ = [
     "MAX_INDEX",
     "Plan",
     "ProvisionError",
+    "REMOVAL_REQUESTED",
     "REMOVE_UNIT",
     "RESERVED_IDS",
     "RosterUnreadable",
     "data_root",
     "forget",
     "guard_removable",
+    "hand_to_root",
     "log_path",
     "normalize_account",
     "plan_instance",

@@ -305,6 +305,36 @@ class TestCreate:
 
         assert response.status_code == 400 and units == []
 
+    def test_a_workspace_that_cannot_be_built_says_why_instead_of_a_bare_server_error(
+        self, call, units: list[str], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def scaffold(plan: provisioning.Plan, workspace_root: Path) -> None:
+            raise PermissionError(13, "Permission denied", str(plan.workspace / "web"))
+
+        monkeypatch.setattr(provisioning, "scaffold", scaffold)
+
+        response = call("POST", "/v1/instances", json={"id": "koki"})
+
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail.startswith("新实例没建成：") and "Permission denied" in detail
+        assert units == []
+
+    def test_a_creation_root_never_started_ends_its_progress_with_the_reason(
+        self, call, scaffolded: list[provisioning.Plan], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 清单已经占上了：进度停在「等 root 侧接手」的话，控制台每次打开都接着轮询一个不会来的结果
+        async def refuse(unit: str) -> None:
+            raise provisioning.ProvisionError(f"启动 {unit} 失败：Access denied")
+
+        monkeypatch.setattr(provisioning, "start_unit", refuse)
+
+        assert call("POST", "/v1/instances", json={"id": "koki"}).status_code == 400
+
+        progress = call("GET", "/v1/instances/koki/progress").json()
+        assert progress["finished"] is True and progress["ok"] is False
+        assert progress["detail"] == "启动 kazebot-provision@koki.service 失败：Access denied"
+
     def test_running_out_of_indexes_is_a_refusal_not_a_crash(
         self, call, units: list[str], scaffolded: list[provisioning.Plan], monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -362,6 +392,49 @@ class TestDelete:
         response = call("DELETE", "/v1/instances/koki")
 
         assert response.status_code == 200 and response.json() == {"ok": True, "id": "koki"}
+        assert units == ["kazebot-deprovision@koki.service"]
+
+    @pytest.mark.parametrize("earlier", [
+        "拉起容器\nDONE ok\n",
+        "[10:00:00] 停服务\nDONE fail: 第 180 行执行失败\n",
+    ], ids=["after-creation", "retry-after-failure"])
+    def test_progress_read_before_root_starts_is_not_the_earlier_result(
+        self, call, units: list[str], workspace: Path, earlier: str,
+    ) -> None:
+        # root 只往后追加：接手之前控制台紧跟着读到的，是建实例时的 DONE ok 或上一次删除的 DONE fail
+        save_instance(workspace, instance_id="koki", label="小号", idx=1)
+        provisioning.log_path(workspace, "koki").write_text(earlier, encoding="utf-8")
+
+        assert call("DELETE", "/v1/instances/koki").status_code == 200
+
+        progress = call("GET", "/v1/instances/koki/progress").json()
+        assert progress["finished"] is False
+        assert (progress["state"], progress["action"]) == ("running", "remove")
+        assert progress["lines"][-1] == provisioning.REMOVAL_REQUESTED
+
+    def test_a_removal_root_never_started_ends_its_progress_with_the_reason(
+        self, call, workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        save_instance(workspace, instance_id="koki", label="小号", idx=1)
+
+        async def refuse(unit: str) -> None:
+            raise provisioning.ProvisionError(f"启动 {unit} 失败：Access denied")
+
+        monkeypatch.setattr(provisioning, "start_unit", refuse)
+
+        assert call("DELETE", "/v1/instances/koki").status_code == 400
+
+        progress = call("GET", "/v1/instances/koki/progress").json()
+        assert progress["finished"] is True and progress["ok"] is False
+        assert progress["detail"] == "启动 kazebot-deprovision@koki.service 失败：Access denied"
+
+    def test_a_progress_file_that_cannot_be_written_does_not_stop_the_removal(
+        self, call, units: list[str], workspace: Path,
+    ) -> None:
+        save_instance(workspace, instance_id="koki", label="小号", idx=1)
+        provisioning.log_path(workspace, "koki").mkdir()
+
+        assert call("DELETE", "/v1/instances/koki").status_code == 200
         assert units == ["kazebot-deprovision@koki.service"]
 
     def test_the_entry_stays_until_root_says_it_is_done(self, call, units: list[str], workspace: Path) -> None:

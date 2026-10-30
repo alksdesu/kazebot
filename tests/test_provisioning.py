@@ -752,6 +752,37 @@ def test_a_unit_that_will_not_start_names_the_usual_cause(monkeypatch: pytest.Mo
         asyncio.run(provisioning.start_unit("kazebot-provision@koki.service"))
 
 
+def test_a_host_without_systemctl_is_a_refusal_not_a_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 找不到 systemctl 时 create_subprocess_exec 直接抛 OSError，穿出去页面上只剩一句「服务器错误」
+    async def missing(*_args: str) -> tuple[int, str]:
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(provisioning, "_systemctl", missing)
+    with pytest.raises(provisioning.ProvisionError, match="调不起 systemctl"):
+        asyncio.run(provisioning.start_unit("kazebot-provision@koki.service"))
+
+
+def test_a_line_handed_to_root_never_glues_onto_a_half_written_one(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 上一次停在半行时接着写，「DONE fail: 中断」和这一行粘成一行，读出来还是上一次的失败
+    log = provisioning.log_path(workspace, "koki")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes("[10:00:00] 停服务\nDONE fail: 中断".encode("utf-8"))
+
+    async def accept(_unit: str) -> None:
+        return None
+
+    monkeypatch.setattr(provisioning, "start_unit", accept)
+    asyncio.run(provisioning.hand_to_root(
+        workspace, "koki", "kazebot-deprovision@koki.service", opening=provisioning.REMOVAL_REQUESTED,
+    ))
+
+    state = provisioning.progress(workspace, "koki")
+    assert state["finished"] is False
+    assert state["lines"][-2:] == ["DONE fail: 中断", provisioning.REMOVAL_REQUESTED]
+
+
 # ── root 侧脚本的形状 ──
 # 这些不是风格检查。每一条都对应一个能把 kazebot 变成 root 的具体写法。
 
