@@ -21,6 +21,7 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime  # noqa: E402
+from engine.tool_step import tool_batch_progress, tool_result_progress  # noqa: E402
 
 # 生产日志里的真实进度记录，含搜索的和不含的各取几条。
 _SEARCH_RECORDS = [
@@ -31,6 +32,14 @@ _COMMAND_RECORDS = [
     "[qq.orchestrator] execute_command: 命令完成 (rc=0): python3 -c ...",
     "[qq.orchestrator] 执行 1 个工具：execute_command",
 ]
+# 搜索工具的名字只出现在摘要里：读它的源码、查它的配置项、grep 它，都不是在搜。前两条是生产日志原样。
+_MENTION_ONLY_RECORDS = [
+    "[qq.orchestrator] 执行 1 个工具：read_file",
+    "[qq.orchestrator] read_file: 已读取 tools/web_search.py",
+    '[qq.orchestrator] search_in_files: 搜索 "WEB_SEARCH_PROVIDER" in tools (3 结果)',
+    "[qq.orchestrator] execute_command: 命令完成 (rc=0): grep -n x_search tools/exa_search.py",
+]
+_SEARCH_TOOLS = ("web_search", "native_search", "exa_search", "x_search")
 
 
 @pytest.fixture()
@@ -78,6 +87,17 @@ class TestMentionsSearch:
 
     @pytest.mark.parametrize("record", _COMMAND_RECORDS)
     def test_跑命令的记录不算搜索(self, runtime: Any, record: str) -> None:
+        assert runtime.outbound_attachments._progress_mentions_search(record) is False
+
+    @pytest.mark.parametrize("tool", _SEARCH_TOOLS)
+    def test_每个搜索工具开跑和出结果都认得出来(self, runtime: Any, tool: str) -> None:
+        mentions = runtime.outbound_attachments._progress_mentions_search
+
+        assert mentions(tool_batch_progress("qq.orchestrator", ["read_file", tool], 2)) is True
+        assert mentions(tool_result_progress("qq.orchestrator", tool, "已获得结果: query=今日金价")) is True
+
+    @pytest.mark.parametrize("record", _MENTION_ONLY_RECORDS)
+    def test_名字只出现在摘要里不算搜索(self, runtime: Any, record: str) -> None:
         assert runtime.outbound_attachments._progress_mentions_search(record) is False
 
 
@@ -158,3 +178,6 @@ class TestCurrentStageOnly:
 
     async def test_空记录不误报(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         assert await self._notified(runtime, monkeypatch, []) is False
+
+    async def test_读搜索工具的源码不算在搜(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert await self._notified(runtime, monkeypatch, _MENTION_ONLY_RECORDS[:2]) is False

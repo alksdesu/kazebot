@@ -160,4 +160,4 @@ _SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中（已等 {waited}
 _SEARCH_PROGRESS_STILL_RUNNING_DELAY_SEC = 20.0
 
 
-_SEARCH_PROGRESS_KEYWORDS = ("web_search", "exa_search", "x_search")
+_SEARCH_TOOLS = frozenset({"web_search", "native_search", "exa_search", "x_search"})

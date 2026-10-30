@@ -57,7 +57,14 @@ from .inference.tool_format import sanitize_control_tool_history
 from .node import Node, entry_node_problem, entry_roots, load_node, missing_node_reason, node_file, node_files
 from .tool_reload import ToolReloadFollower, fetch_reload_seqs
 from .tool_outputs import tool_output_limits
-from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
+from .tool_step import (
+    TOOL_CANCELLED,
+    result_to_raw,
+    summarize_result,
+    tool_outcome,
+    tool_result_progress,
+    tool_start_progress,
+)
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
 from .dispatch_results import INBOUND_DELIVERY_NOTE_KEY, INBOUND_RESULTS_KEY
@@ -1680,7 +1687,7 @@ async def _run_tool_task(
     attach_node_scope(kctx, _origin_node, _task_ctx)
 
     await kctx.emit_event("handoff_progress", {
-        "message": f"[tool] 开始执行 {tool_name}",
+        "message": tool_start_progress("tool", tool_name),
         "task_id": task_id, "tool_name": tool_name,
     })
 
@@ -1713,7 +1720,7 @@ async def _run_tool_task(
     raw_inline = raw
 
     await kctx.emit_event("handoff_progress", {
-        "message": f"[tool] {tool_name}: {summary}",
+        "message": tool_result_progress("tool", tool_name, summary),
         "task_id": task_id, "tool_name": tool_name,
     })
 

@@ -83,7 +83,15 @@ from ..protocol import (
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
 )
-from ..tool_step import TOOL_CANCELLED, TOOL_ERROR, result_to_raw, summarize_result, tool_outcome
+from ..tool_step import (
+    TOOL_CANCELLED,
+    TOOL_ERROR,
+    result_to_raw,
+    summarize_result,
+    tool_batch_progress,
+    tool_outcome,
+    tool_result_progress,
+)
 from ..tool_outputs import (
     READ_TOOL_OUTPUT,
     bounded_for_event,
@@ -1309,7 +1317,7 @@ async def _record_tool_result(
         return entry, attachment_result.action, False
 
     await ls.rctx.emit_event("handoff_progress", {
-        "message": f"[{ls.node.id}] {name}: {summary}",
+        "message": tool_result_progress(ls.node.id, name, summary),
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
     })
@@ -1421,7 +1429,7 @@ async def _async_started_entry(
         "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
     })
     await ls.rctx.emit_event("handoff_progress", {
-        "message": f"[{ls.node.id}] {rtc['name']}: {progress}",
+        "message": tool_result_progress(ls.node.id, rtc["name"], progress),
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
     })
@@ -1623,16 +1631,8 @@ async def _execute_real_tools(
     传了 attachment_messages 时，工具产出图片的那条 user 消息放进它里面，由调用方等本轮结果全部补完再写。
     """
     tool_names = [str(call.get("name") or call.get("tool_name") or "").strip() for call in real_tool_calls]
-    tool_names = [name for name in tool_names if name]
-    tool_names_text = "、".join(tool_names[:5])
-    if len(tool_names) > 5:
-        tool_names_text += f" 等 {len(tool_names)} 个工具"
-    progress_message = f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具"
-    if tool_names_text:
-        progress_message += f"：{tool_names_text}"
-
     await ls.rctx.emit_event("handoff_progress", {
-        "message": progress_message,
+        "message": tool_batch_progress(ls.node.id, tool_names, len(real_tool_calls)),
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
     })

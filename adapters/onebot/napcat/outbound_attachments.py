@@ -20,6 +20,7 @@ from adapters._shared.send_guard import (
     SendContractError,
     image_content_identity,
 )
+from engine.tool_step import progress_tool_names
 from ..send_contract import classify_send_exception, make_idempotency_key, protected_claim_send
 
 from . import common, history, identity, media, models, proactive, queueing, routing, sending, state
@@ -700,9 +701,9 @@ async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool)
 
 
 def _progress_mentions_search(record: str) -> bool:
-    """判断进度记录是否与联网搜索工具相关。"""
-    text = str(record or "").lower()
-    return any(keyword in text for keyword in common._SEARCH_PROGRESS_KEYWORDS)
+    """进度记录点到的工具里有没有联网搜索。"""
+    # 只认工具名：读 tools/web_search.py、查 WEB_SEARCH_PROVIDER 时搜索工具的名字只出现在摘要里，不是在搜。
+    return any(name in common._SEARCH_TOOLS for name in progress_tool_names(record))
 
 
 async def _maybe_send_search_progress_notice(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from toolbox.redaction import hides_entry
 
@@ -253,6 +253,53 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
         return _summary_line(f"已列出 {result.get('path', '.')}")
     extra = _brief_args(safe_args)
     return _summary_line(f"已获得结果: {extra}" if extra else "已获得结果")
+
+
+# 进度行写给人看，QQ 适配器还要从里面认出调的是哪个工具：拼法和拆法只在这里写一份。
+_BATCH_NAMES_SHOWN = 5
+_BATCH_NAME_SEPARATOR = "、"
+_PROGRESS_LINE = re.compile(r"\[[^\]\n]*\] (?P<body>.+)")
+_BATCH_BODY = re.compile(r"执行 \d+ 个工具：(?P<names>.+?)(?: 等 \d+ 个工具)?")
+_START_BODY = re.compile(r"开始执行 (?P<name>\S+)")
+# 工具名自己可以带冒号（dispatch:<目标>），名字截到第一个后面是空格或行尾的冒号。
+_RESULT_BODY = re.compile(r"(?P<name>[^\s:：]\S*?):(?: .*)?")
+
+
+def tool_batch_progress(source: str, tool_names: Sequence[str], call_count: int) -> str:
+    """一批真实工具开跑时的进度行：调用数，再列出最多五个工具名。"""
+    names = [name for name in tool_names if name]
+    line = f"[{source}] 执行 {call_count} 个工具"
+    if not names:
+        return line
+    shown = _BATCH_NAME_SEPARATOR.join(names[:_BATCH_NAMES_SHOWN])
+    if len(names) > _BATCH_NAMES_SHOWN:
+        shown += f" 等 {len(names)} 个工具"
+    return f"{line}：{shown}"
+
+
+def tool_start_progress(source: str, tool_name: str) -> str:
+    """单独的工具任务开跑时的进度行。"""
+    return f"[{source}] 开始执行 {tool_name}"
+
+
+def tool_result_progress(source: str, tool_name: str, summary: str) -> str:
+    """一个工具调用有了结果或转到后台时的进度行。"""
+    return f"[{source}] {tool_name}: {summary}"
+
+
+def progress_tool_names(record: str) -> tuple[str, ...]:
+    """进度行点到的工具名，按出现的顺序；摘要里的路径、关键词、命令不算。不是工具进度行时为空。"""
+    line = _PROGRESS_LINE.fullmatch(str(record or "").strip())
+    if line is None:
+        return ()
+    body = line["body"]
+    if batch := _BATCH_BODY.fullmatch(body):
+        return tuple(batch["names"].split(_BATCH_NAME_SEPARATOR))
+    if start := _START_BODY.fullmatch(body):
+        return (start["name"],)
+    if result := _RESULT_BODY.fullmatch(body):
+        return (result["name"],)
+    return ()
 
 
 def format_tool_trace(entries: list[dict[str, Any]]) -> str:

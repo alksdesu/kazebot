@@ -196,11 +196,7 @@ class TangQiuCallbacks:
         sending._mark_qq_reply_finished(trigger.inbound_seq)
 
     async def update_progress(self, trigger: TriggerInfo, state: MainTaskState) -> None:
-        """根据主任务进度切换触发消息上的 React 表情。"""
-        # 2026-05-03 修改原因：EventRouter 不展示 QQ 进度文本，但 QQ 侧需要补齐
-        # React 链中的 LLM 推理和工具阶段。做法是读取 MainTaskState.stream_parts
-        # 与 progress_records：首次流式文本进入 thinking，真实工具执行进度进入 tool；
-        # 目的在于复用 SDK sweep 回调并用阶段元数据避免高频 stream_delta 抖动。
+        """主任务正在调联网搜索工具时，在 QQ 上发低频的搜索进度提示。"""
         platform_data = trigger.platform_data
         event = platform_data.get("event")
         if not event or not hasattr(event, "message_id"):
@@ -209,17 +205,13 @@ class TangQiuCallbacks:
         if not bot:
             return
 
-        target = queueing._target_from_platform_data(platform_data) or queueing._target_from_conversation_key(trigger.conversation_key)
-        has_tool_progress = any("执行" in record and "个工具" in record for record in state.progress_records)
         # 只看最新一条：progress_records 是累积的，用 any() 扫全量的话，搜索工具跑完之后
         # 那条记录还留着，条件就永远成立 —— 后面明明在跑别的命令，报的还是「还在联网搜索中」。
-        has_search_progress = bool(state.progress_records) and outbound_attachments._progress_mentions_search(
-            state.progress_records[-1]
-        )
-        if has_tool_progress or has_search_progress:
-            if has_search_progress and target:
-                await outbound_attachments._maybe_send_search_progress_notice(bot, target, platform_data)
+        if not state.progress_records or not outbound_attachments._progress_mentions_search(state.progress_records[-1]):
             return
+        target = queueing._target_from_platform_data(platform_data) or queueing._target_from_conversation_key(trigger.conversation_key)
+        if target:
+            await outbound_attachments._maybe_send_search_progress_notice(bot, target, platform_data)
 
     async def create_child_progress(
         self,
