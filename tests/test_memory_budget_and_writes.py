@@ -452,6 +452,43 @@ class TestWriteSafety:
 
         assert entered == ["lock"]
 
+    def test_waiting_for_the_write_lock_leaves_the_event_loop_running(self, tmp_path: Path) -> None:
+        """记忆写锁最长等 30 秒：在事件循环上等，同一个 engine 里别的任务连心跳都发不出去。"""
+        from engine.builtin.knowledge_inject import _memory_write_lock
+
+        ctx = _ctx(tmp_path)
+
+        async def save_while_locked() -> dict[str, Any]:
+            with _memory_write_lock(tmp_path):
+                saving = asyncio.create_task(save_memory({"id": "m1", "book": "profile", "content": "内容", "keywords": ["k"]}, ctx))
+                for _ in range(5):
+                    await asyncio.sleep(0.01)
+                assert not saving.done()
+            return await saving
+
+        assert asyncio.run(save_while_locked())["ok"]
+        assert [e["id"] for e in _load_book(self._book(tmp_path))["entries"]] == ["m1"]
+
+    def test_a_catalog_read_overlapping_a_write_stays_out_of_the_cache(self, tmp_path: Path, monkeypatch) -> None:
+        """注入和写入都在线程里跑：一本读到一半时别的任务写进一条，读到的旧内容进了缓存，新条目就被遮住两秒。"""
+        import engine.builtin.knowledge_inject as module
+
+        ctx = _ctx(tmp_path)
+        assert _save(ctx, id="m1")["ok"]
+        namespace = conversation_namespace(_CONV_KEY)
+        real_load = module._load_book
+
+        def read_then_someone_writes(path: Path) -> dict[str, Any]:
+            data = real_load(path)
+            monkeypatch.setattr(module, "_load_book", real_load)
+            assert _save(ctx, id="m2")["ok"]
+            return data
+
+        monkeypatch.setattr(module, "_load_book", read_then_someone_writes)
+
+        assert [e["id"] for e in module.load_memory_catalog(tmp_path, memory_book=namespace)] == ["m1"]
+        assert [e["id"] for e in module.load_memory_catalog(tmp_path, memory_book=namespace)] == ["m1", "m2"]
+
     def test_a_failed_write_leaves_the_old_book_intact(self, tmp_path: Path, monkeypatch) -> None:
         """写一半崩掉留下的半截 YAML 读不出来，那本记忆就再也写不进去。
 

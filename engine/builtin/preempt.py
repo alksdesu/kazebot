@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -102,7 +103,9 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     task_context = dict(getattr(ls.rctx, "task_context", {}) or {})
     if isinstance(memory_hints, dict):
         task_context["memory_hints"] = {
-            "subjects": resolve_load_subjects(ls.rctx.workspace_root, memory_hints.get("subjects")),
+            "subjects": await asyncio.to_thread(
+                resolve_load_subjects, ls.rctx.workspace_root, memory_hints.get("subjects"),
+            ),
         }
     if isinstance(output_guide, dict):
         task_context[OUTPUT_GUIDE_KEY] = output_guide
@@ -116,7 +119,8 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     from engine.inference.message_assembly import _conversational_history
 
     scan_history = _conversational_history(ls.history)
-    skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
+    skill_static, skill_dynamic, memory_static, memory_dynamic = await asyncio.to_thread(
+        build_knowledge_context,
         ls.rctx.workspace_root,
         ls.node,
         new_instruction,

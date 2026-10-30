@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import re
 import shutil
@@ -8,7 +10,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 import yaml
 
@@ -540,6 +542,8 @@ class _MemoryCache:
     # 目的：不同 namespace 各自独立缓存，互不污染。
     _lock = threading.Lock()
     _entries: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+    # 每写一次加一：注入和记忆工具都在线程里跑，读盘读到一半被写过的那份是旧的，不能进缓存遮住刚写的条目
+    _generations: dict[tuple[str, str], int] = {}
     _TTL = 2.0
 
     @classmethod
@@ -555,9 +559,18 @@ class _MemoryCache:
             return items
 
     @classmethod
-    def put(cls, workspace_root: Path, items: list[dict[str, Any]], *, memory_book: str = "") -> None:
+    def generation(cls, workspace_root: Path, *, memory_book: str = "") -> int:
+        """读盘之前取，放回缓存时交给 put 核对。"""
         key = (str(workspace_root), memory_book)
         with cls._lock:
+            return cls._generations.get(key, 0)
+
+    @classmethod
+    def put(cls, workspace_root: Path, items: list[dict[str, Any]], *, memory_book: str = "", generation: int) -> None:
+        key = (str(workspace_root), memory_book)
+        with cls._lock:
+            if cls._generations.get(key, 0) != generation:
+                return
             cls._entries[key] = (time.monotonic(), items)
 
     @classmethod
@@ -565,6 +578,7 @@ class _MemoryCache:
         key = (str(workspace_root), memory_book)
         with cls._lock:
             cls._entries.pop(key, None)
+            cls._generations[key] = cls._generations.get(key, 0) + 1
 
 
 # 记忆条目缺 scan_depth 时的扫描轮数。写入侧和载入侧共用同一个值，否则手工写的
@@ -669,6 +683,7 @@ def load_memory_catalog(
         cached = _MemoryCache.get(workspace_root, memory_book=memory_book)
         if cached is not None:
             return cached
+    generation = _MemoryCache.generation(workspace_root, memory_book=memory_book)
 
     try:
         mem_dir = memory_dir(workspace_root, memory_book)
@@ -727,7 +742,7 @@ def load_memory_catalog(
                 "last_hit_at": str(entry.get("last_hit_at", "")).strip(),
             })
 
-    _MemoryCache.put(workspace_root, items, memory_book=memory_book)
+    _MemoryCache.put(workspace_root, items, memory_book=memory_book, generation=generation)
     return items
 
 
@@ -1551,6 +1566,18 @@ def _tool_err(message: Any, **fields: Any) -> dict[str, Any]:
     return response
 
 
+def _in_thread(
+    tool: Callable[[dict[str, Any], ToolContext], dict[str, Any]],
+) -> Callable[[dict[str, Any], ToolContext], Awaitable[dict[str, Any]]]:
+    """读写记忆本、扫技能目录的工具对外照旧是协程，身子在线程里跑：记忆写锁最长等 30 秒，不能堵 engine 的事件循环。"""
+
+    @functools.wraps(tool)
+    async def run(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+        return await asyncio.to_thread(tool, args, ctx)
+
+    return run
+
+
 _INTEGER_TEXT_RE = re.compile(r"[+-]?[0-9]+")
 
 
@@ -1665,7 +1692,8 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     return _tool_ok(f"Skill written: {path}", path=path, name=name, enabled=enabled)
 
 
-async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+@_in_thread
+def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List local skills under config/skills/*/SKILL.md.
 
     读不了、frontmatter 写坏的也列出来，带着 problem：照默认值列出来的话，模型看到的是一个并不生效的技能。
@@ -1697,7 +1725,7 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if err is not None:
         return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
-    shutil.rmtree(skill_dir)
+    await asyncio.to_thread(shutil.rmtree, skill_dir)
     return _tool_ok(f"Skill deleted: {name}", deleted=True, name=name)
 
 
@@ -1801,7 +1829,8 @@ def _requested_book(args: dict[str, Any], ctx: ToolContext) -> str:
     return node_book if _BOOK_NAME_RE.fullmatch(node_book) else "default"
 
 
-async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+@_in_thread
+def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a memory entry in a book."""
     # Why: memory management tools now live beside memory loading and injection.
     # How: move the old memory-tool implementation here and keep the
@@ -1975,7 +2004,8 @@ def _save_memory_locked(
     return _tool_ok(f"Memory {'updated' if found else 'saved'}: {book}/{mid}", book=book, id=mid, updated=found)
 
 
-async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+@_in_thread
+def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List memory entries, optionally filtered by book."""
     book_filter = str(args.get("book") or "").strip() or None
     # 给了 subject 就列那个人的跨会话档案，否则列本会话的 —— 不认 subject 的话，
@@ -2025,7 +2055,8 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     )
 
 
-async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+@_in_thread
+def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Delete a memory entry from a book."""
     # Why: delete_memory moved into the knowledge plugin with save_memory. How:
     # keep the old constant-memory protection and empty-book removal behavior.
@@ -2265,7 +2296,8 @@ class KnowledgeInjector:
         # boundary. How: delegate to build_knowledge_context after filtering the
         # same conversation history as before. Purpose: remove duplicated builder
         # calls without changing ctx.extra keys or prompt layout.
-        skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
+        skill_static, skill_dynamic, memory_static, memory_dynamic = await asyncio.to_thread(
+            build_knowledge_context,
             ctx.rctx.workspace_root,
             ctx.node,
             instruction_text,

@@ -114,6 +114,38 @@ def test_knowledge_inject_sets_existing_extra_keys_and_rebuilds_prompt(tmp_path:
     assert ctx.extra["is_block_mode"] is expected_block_mode
 
 
+def test_knowledge_is_built_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """技能目录和记忆本是同步读盘：在事件循环上读，同一个 engine 里别的任务连心跳都发不出去。"""
+    import threading
+
+    from engine.builtin import knowledge_inject
+
+    loop_thread = threading.get_ident()
+    built_on: list[int] = []
+    real_build = knowledge_inject.build_knowledge_context
+
+    def build(*args, **kwargs):
+        built_on.append(threading.get_ident())
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge_inject, "build_knowledge_context", build)
+    ctx = SimpleNamespace(
+        node=SimpleNamespace(
+            id="node-a",
+            skill_access=SimpleNamespace(mode="all", allow=None),
+            memory_access=SimpleNamespace(mode="all", allow=None),
+        ),
+        rctx=SimpleNamespace(workspace_root=tmp_path),
+        messages=[],
+        extra={"instruction_text": "hello", "history": []},
+    )
+
+    result = asyncio.run(knowledge_inject.KnowledgeInjector().handle(ctx))
+
+    assert result is not None and result.modified is False
+    assert len(built_on) == 1 and built_on[0] != loop_thread
+
+
 def test_loader_registers_knowledge_tools_from_plugin_meta(tmp_path: Path) -> None:
     """Knowledge tools should be declared by PLUGIN_META and installed by loader."""
     # Why: skill and memory CRUD tools are being removed from registry.py's hard-

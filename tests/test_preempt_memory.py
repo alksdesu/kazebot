@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +94,36 @@ async def test_new_subject_reaches_preempt_prompt_and_history(
     loop.rctx.consume_preempt.assert_awaited_once_with(revision=7)
     assert [message.content for message in loop.rctx.conversation_store.load("child")] == ["now discuss UserB"]
     assert loop.rctx.conversation_store.load("branch") == []
+
+
+@pytest.mark.asyncio
+async def test_subjects_and_knowledge_are_read_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """名册和记忆本都是同步读盘：在事件循环上读，同一个 engine 里别的任务都得停下来等。"""
+    from engine.builtin import preempt
+
+    _archive(tmp_path, "UserA", constant=True)
+    _archive(tmp_path, "UserB")
+    loop = _loop(tmp_path, {"message": "now discuss UserB", "memory_hints": {"subjects": ["UserB"]}})
+    loop_thread = threading.get_ident()
+    read_on: dict[str, int] = {}
+
+    def traced(name: str, real):
+        def call(*args, **kwargs):
+            read_on[name] = threading.get_ident()
+            return real(*args, **kwargs)
+        return call
+
+    monkeypatch.setattr(preempt, "resolve_load_subjects", traced("subjects", preempt.resolve_load_subjects))
+    monkeypatch.setattr(preempt, "build_knowledge_context", traced("knowledge", preempt.build_knowledge_context))
+
+    await _inject_preempt_message(SimpleNamespace(messages=loop.messages, step=0), loop)
+
+    assert set(read_on) == {"subjects", "knowledge"}
+    assert loop_thread not in read_on.values()
+    assert "profile for UserB" in str(loop.messages)
+    assert loop.rctx.task_context["memory_hints"] == {"subjects": ["UserB"]}
 
 
 @pytest.mark.asyncio
