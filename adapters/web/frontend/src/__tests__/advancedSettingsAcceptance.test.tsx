@@ -4,17 +4,21 @@ import { AdvancedSettingsPage } from '../components/settings/pages/AdvancedSetti
 import * as api from '../api/supervisorClient';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
+import yaml from 'js-yaml';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
-  getRuntimeFile: vi.fn(), resetRuntime: vi.fn(), getPolicyRaw: vi.fn(), updateRuntimeRaw: vi.fn(), updatePolicyRaw: vi.fn(),
+  getRuntimeLayers: vi.fn(), resetRuntime: vi.fn(), getPolicyRaw: vi.fn(), updateRuntimeRaw: vi.fn(), updatePolicyRaw: vi.fn(),
 }));
 const runtime = '# keep this comment\nengine:\n  tool_mode: native\n  max_workers: 4\nshell:\n  entry_node_id: entry.original\ncustom:\n  preserved: true\n';
+// 默认那层就是 runtime 这份：本实例有没有自己那份，表单的占位都照它给
 const runtimeFile = (
   content = runtime, source: api.RuntimeFile['source'] = 'override', hash: string | null = 'runtime-1',
-): api.RuntimeFile => ({
+): api.RuntimeLayers => ({
   content, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml',
-});
+  defaults: yaml.load(runtime) as Record<string, unknown>,
+  effective: yaml.load(content) as Record<string, unknown>,
+} as api.RuntimeLayers);
 function deferred<T>() {
   let resolve!: (value: T) => void; let reject!: (error: Error) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
@@ -39,7 +43,7 @@ const saveRuntime = () => fireEvent.click(runtimeSave());
 beforeEach(() => {
   vi.resetAllMocks(); vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'synthetic-auth', isAuthenticated: true });
-  vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile()); vi.mocked(api.getPolicyRaw).mockResolvedValue({ content: 'rules: []\n', hash: 'policy-1' });
+  vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile()); vi.mocked(api.getPolicyRaw).mockResolvedValue({ content: 'rules: []\n', hash: 'policy-1' });
   vi.mocked(api.resetRuntime).mockResolvedValue({ ok: true, restored: true });
   vi.mocked(api.updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
   vi.mocked(api.updatePolicyRaw).mockResolvedValue({ ok: true, hash: 'policy-2' });
@@ -48,13 +52,13 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('高级配置加载与提交边界', () => {
   it('按需加载，读入前及请求期间都不能编辑或重复读取', async () => {
-    const read = deferred<api.RuntimeFile>(); vi.mocked(api.getRuntimeFile).mockReturnValue(read.promise);
+    const read = deferred<api.RuntimeLayers>(); vi.mocked(api.getRuntimeLayers).mockReturnValue(read.promise);
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
-    expect(api.getRuntimeFile).not.toHaveBeenCalled(); expect(screen.getByLabelText('入口节点 ID')).toBeDisabled();
+    expect(api.getRuntimeLayers).not.toHaveBeenCalled(); expect(screen.getByLabelText('入口节点 ID')).toBeDisabled();
     expect(rawEditor()).toHaveAttribute('readonly');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     expect(screen.getByLabelText('工具调用格式')).toBeDisabled(); expect(rawEditor()).toBeDisabled();
-    fireEvent.click(area.getByRole('button', { name: '正在加载…' })); expect(api.getRuntimeFile).toHaveBeenCalledTimes(1);
+    fireEvent.click(area.getByRole('button', { name: '正在加载…' })); expect(api.getRuntimeLayers).toHaveBeenCalledTimes(1);
     await act(async () => read.resolve(runtimeFile()));
     expect(screen.getByLabelText('入口节点 ID')).toBeEnabled(); expect(rawEditor()).not.toHaveAttribute('readonly');
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original');
@@ -100,14 +104,14 @@ describe('高级配置加载与提交边界', () => {
   it('拒绝重新加载和导航时保留未保存草稿，读取失败也不清空它', async () => {
     const area = await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
     vi.mocked(window.confirm).mockReturnValue(false); fireEvent.click(area.getByRole('button', { name: '加载' }));
-    expect(api.getRuntimeFile).toHaveBeenCalledTimes(1); expect(confirmNavigation()).toBe(false);
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(1); expect(confirmNavigation()).toBe(false);
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local');
-    vi.mocked(window.confirm).mockReturnValue(true); vi.mocked(api.getRuntimeFile).mockRejectedValueOnce(Error('网络读取失败'));
+    vi.mocked(window.confirm).mockReturnValue(true); vi.mocked(api.getRuntimeLayers).mockRejectedValueOnce(Error('网络读取失败'));
     fireEvent.click(area.getByRole('button', { name: '加载' })); await screen.findByText('网络读取失败');
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local'); expect((rawEditor() as HTMLTextAreaElement).value).toContain('entry.local');
   });
   it('旧身份的加载结果不能覆盖新身份的配置', async () => {
-    const old = deferred<api.RuntimeFile>(); vi.mocked(api.getRuntimeFile).mockImplementation(async token => token === 'synthetic-auth' ? old.promise : runtimeFile(runtime.replace('entry.original', 'entry.current')));
+    const old = deferred<api.RuntimeLayers>(); vi.mocked(api.getRuntimeLayers).mockImplementation(async token => token === 'synthetic-auth' ? old.promise : runtimeFile(runtime.replace('entry.original', 'entry.current')));
     render(<AdvancedSettingsPage />); let area = openSection('runtime'); fireEvent.click(area.getByRole('button', { name: '加载' }));
     await act(async () => useSettingsStore.setState({ adminToken: 'synthetic-new' }));
     area = within(section('runtime')); fireEvent.click(area.getByRole('button', { name: '加载' }));
@@ -166,7 +170,7 @@ describe('runtime 的来源与恢复默认', () => {
   const RESET_CONFIRM = '删掉本实例的 config/runtime.yaml，全部参数恢复成仓库默认？';
   const overriding = '# instance copy\nengine:\n  tool_mode: json\n  max_workers: 9\nshell:\n  entry_node_id: entry.override\n';
   const resetButton = () => within(section('runtime')).getByRole('button', { name: '恢复默认' });
-  const usingDefaults = () => vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile(runtime, 'default'));
+  const usingDefaults = () => vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile(runtime, 'default'));
 
   it('读回仓库默认时提示按默认那套说，恢复默认点不动', async () => {
     usingDefaults();
@@ -199,13 +203,25 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('读回本实例那份时提示换一套说法，恢复默认可点', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile(overriding, 'override'));
+    vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile(overriding, 'override'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
     expect(screen.getByText(OVERRIDE_HINT)).toBeInTheDocument();
     expect(screen.queryByLabelText('仓库默认 runtime.yaml')).not.toBeInTheDocument();
     expect(resetButton()).toBeEnabled();
+  });
+
+  // 有了本实例那份以后，没写的键照样要说得出跟着默认是多少，不能只剩一句「留空跟随仓库默认」
+  it('有了本实例那份，没写的键照样提示默认那层的值', async () => {
+    vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile('# instance copy\nengine:\n  max_workers: 9\n', 'override'));
+    await loadRuntime();
+    expect(screen.getByText(OVERRIDE_HINT)).toBeInTheDocument();
+    expect(screen.getByLabelText('并发 task 处理数，留空使用默认值')).toHaveValue(9);
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveAttribute('placeholder', '仓库默认 entry.original');
+    expect(screen.getByRole('option', { name: '跟随仓库默认（native）' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('仓库默认 runtime.yaml')).not.toBeInTheDocument();
   });
 
   it('加载之前不摆来源提示', () => {
@@ -224,7 +240,7 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('恢复默认删掉本实例那份并重读，表单回到跟随仓库默认', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
+    vi.mocked(api.getRuntimeLayers).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
@@ -234,7 +250,7 @@ describe('runtime 的来源与恢复默认', () => {
 
     expect(window.confirm).toHaveBeenCalledWith(RESET_CONFIRM);
     expect(api.resetRuntime).toHaveBeenCalledWith('synthetic-auth');
-    expect(api.getRuntimeFile).toHaveBeenCalledTimes(2);
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(2);
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('');
     expect(screen.getByLabelText('入口节点 ID')).toHaveAttribute('placeholder', '仓库默认 entry.original');
     expect(rawEditor()).toHaveValue('');
@@ -245,7 +261,7 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('未保存的草稿会一起丢掉，确认里先说清楚', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
+    vi.mocked(api.getRuntimeLayers).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
@@ -259,7 +275,7 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('确认被拒绝就什么都不删', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile(overriding, 'override'));
+    vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile(overriding, 'override'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
@@ -268,12 +284,12 @@ describe('runtime 的来源与恢复默认', () => {
     fireEvent.click(resetButton());
 
     expect(api.resetRuntime).not.toHaveBeenCalled();
-    expect(api.getRuntimeFile).toHaveBeenCalledTimes(1);
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(1);
     expect(screen.getByText(OVERRIDE_HINT)).toBeInTheDocument();
   });
 
   it('恢复失败保留本实例那份，原因显示出来', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile(overriding, 'override'));
+    vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeFile(overriding, 'override'));
     vi.mocked(api.resetRuntime).mockRejectedValueOnce(Error('409 这份文件不能删'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
@@ -282,7 +298,7 @@ describe('runtime 的来源与恢复默认', () => {
     fireEvent.click(resetButton());
     await screen.findByText('409 这份文件不能删');
 
-    expect(api.getRuntimeFile).toHaveBeenCalledTimes(1);
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override');
     expect(resetButton()).toBeEnabled();
   });

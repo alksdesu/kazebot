@@ -223,7 +223,11 @@ const toolModeText = (value: unknown): EngineToolMode | '' => (
 );
 
 export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
-  const doc = safeLoad(raw);
+  return runtimeConfigOf(safeLoad(raw));
+}
+
+/** 已经读成映射的一层（比如后端给的默认那层）按表单的几项读出来。 */
+export function runtimeConfigOf(doc: Record<string, any>): RuntimeConfigFormState {
   return {
     entry_node_id: str(nested(doc, RUNTIME_ENTRY_NODE_PATH)),
     tool_mode: toolModeText(nested(doc, RUNTIME_TOOL_MODE_PATH)),

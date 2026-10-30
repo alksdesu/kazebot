@@ -71,7 +71,7 @@ function stub({
     }
     if (url.includes('/admin/config/memory/')) return jsonResponse({ removed });
     if (url.includes('/admin/config/runtime/raw')) {
-      return jsonResponse({ content: '', hash: '', source: 'default', path: 'defaults/runtime.yaml' });
+      return jsonResponse({ content: '', hash: '', source: 'default', path: 'defaults/runtime.yaml', defaults: {}, effective: {} });
     }
     if (url.includes('/admin/conversations')) return jsonResponse({ conversations });
     if (url.includes('/platforms/qq/account/scope')) return jsonResponse({ current_scope: '', bot_alive: false });

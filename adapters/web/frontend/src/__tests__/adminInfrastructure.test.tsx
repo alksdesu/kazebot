@@ -19,7 +19,6 @@ import {
   getMcpClientsRaw,
   getNodeRaw,
   getPolicyRaw,
-  getRuntimeRaw,
   getSchedulesRaw,
   getSkillRaw,
   getSkills,
@@ -88,7 +87,6 @@ describe('admin API infrastructure wrappers', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getPolicyRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getSchedulesRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getNodeRaw('admin-token', 'node/a')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });

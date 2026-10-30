@@ -2,7 +2,7 @@
 import { useMemo, useRef, useState } from 'react';
 
 import { errorMessage } from '../../../api/request';
-import { getPolicyRaw, getRuntimeFile, isEditConflict, receipted, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
+import { getPolicyRaw, getRuntimeFile, getRuntimeLayers, isEditConflict, receipted, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile, type RuntimeLayers } from '../../../api/supervisorClient';
 import { runtimeInstanceLayer } from '../../../console/yamlCommit';
 import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
@@ -14,6 +14,7 @@ import { RawFormStatus, RawSourceDetails } from '../RawSourceDetails';
 import {
   hasLikelyYamlSyntaxIssue,
   parseRuntimeConfig,
+  runtimeConfigOf,
   serializeRuntimeConfig,
   type EngineToolMode,
   type RuntimeConfigFormState,
@@ -104,19 +105,15 @@ interface RuntimeFileState {
   loading: boolean;
   base: string | null;
   source: RuntimeFile['source'] | '';
+  /** 本实例没写的键跟着的那一层（代码默认 + 仓库默认），有没有自己那份都读得到。 */
+  defaults: RuntimeLayers['defaults'] | null;
   /** 仓库默认那份原文。本实例还没有自己那份时后端读回来的就是它，有了自己那份就看不到了。 */
-  defaults: string;
+  bundled: string;
   outcome: Outcome;
 }
 
-const RUNTIME_IDLE: RuntimeFileState = { loaded: false, loading: false, base: null, source: '', defaults: '', outcome: NO_OUTCOME };
-
-const parseDefaults = (text: string): RuntimeConfigFormState | null => {
-  try {
-    return parseRuntimeConfig(text);
-  } catch {
-    return null;
-  }
+const RUNTIME_IDLE: RuntimeFileState = {
+  loaded: false, loading: false, base: null, source: '', defaults: null, bundled: '', outcome: NO_OUTCOME,
 };
 
 const RuntimeFileBody = () => {
@@ -127,7 +124,7 @@ const RuntimeFileBody = () => {
   // 同步挡住连点：状态要等下一次渲染才看得到。
   const busy = useRef(false);
   const patch = (next: Partial<RuntimeFileState>) => setFile((current) => ({ ...current, ...next }));
-  const defaults = useMemo(() => (file.defaults ? parseDefaults(file.defaults) : null), [file.defaults]);
+  const defaults = useMemo(() => (file.defaults ? runtimeConfigOf(file.defaults) : null), [file.defaults]);
   const dirty = file.loaded && source.dirty;
   useUnsavedChanges(dirty, '高级配置还有未保存修改，离开会丢失这些草稿。确定继续吗？');
 
@@ -135,9 +132,15 @@ const RuntimeFileBody = () => {
     defaults?.[key] ? `仓库默认 ${defaults[key]}` : '留空跟随仓库默认'
   );
 
-  const adopt = (runtime: RuntimeFile) => {
+  const adopt = (runtime: RuntimeLayers) => {
     reset(runtimeInstanceLayer(runtime));
-    patch({ loaded: true, base: runtime.hash, source: runtime.source, defaults: runtime.source === 'default' ? runtime.content : '' });
+    patch({
+      loaded: true,
+      base: runtime.hash,
+      source: runtime.source,
+      defaults: runtime.defaults,
+      bundled: runtime.source === 'default' ? runtime.content : '',
+    });
   };
 
   const run = async (work: () => Promise<Outcome>) => {
@@ -156,7 +159,7 @@ const RuntimeFileBody = () => {
     if (dirty && !window.confirm('重新加载 runtime.yaml 会丢弃这个文件的未保存修改，确定继续吗？')) return;
     await run(async () => {
       try {
-        adopt(await getRuntimeFile(adminToken));
+        adopt(await getRuntimeLayers(adminToken));
         return NO_OUTCOME;
       } catch (error) {
         return failed(errorMessage(error, '加载失败'));
@@ -199,7 +202,7 @@ const RuntimeFileBody = () => {
     await run(async () => {
       try {
         await resetRuntime(adminToken);
-        adopt(await getRuntimeFile(adminToken));
+        adopt(await getRuntimeLayers(adminToken));
         return { text: '已恢复成仓库默认', failed: false };
       } catch (error) {
         return failed(errorMessage(error, '恢复默认失败'));
@@ -276,11 +279,11 @@ const RuntimeFileBody = () => {
       </fieldset>
       <RawFormStatus source={source} />
       <RawSourceDetails height="18rem" label="runtime.yaml YAML 编辑器" readOnly={!file.loaded || file.loading} source={source} summary="高级 YAML 编辑" />
-      {file.defaults && (
+      {file.bundled && (
         <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
           <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">仓库默认 defaults/runtime.yaml（只读）</summary>
           <div className="mt-3">
-            <YamlEditor aria-label="仓库默认 runtime.yaml" height="18rem" onChange={() => undefined} readOnly value={file.defaults} />
+            <YamlEditor aria-label="仓库默认 runtime.yaml" height="18rem" onChange={() => undefined} readOnly value={file.bundled} />
           </div>
         </details>
       )}

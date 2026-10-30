@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config_layout
-from clonoth_runtime import check_runtime_text
+from clonoth_runtime import check_runtime_text, load_runtime_config, runtime_defaults
 from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import (
     declares_internal,
@@ -624,9 +624,11 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.get("/runtime/raw")
     def get_runtime() -> dict[str, Any]:
         default, own = config_layout.runtime_layers(workspace_root)
+        # 表单按实际生效的值显示、标出哪些跟随默认：两层都照运行时那套合并算好带上，前端不另合一遍
+        layers = {"defaults": runtime_defaults(workspace_root), "effective": load_runtime_config(workspace_root)}
         if own.is_file():
-            return _read_text(own, source="override")
-        return _read_text(default, source="default")
+            return _read_text(own, source="override", **layers)
+        return _read_text(default, source="default", **layers)
 
     @router.put("/runtime/raw")
     def update_runtime(payload: RawContent) -> dict[str, Any]:

@@ -11,26 +11,38 @@ import {
   getNodes,
   getProviderProfiles,
   getProviders,
-  getRuntimeRaw,
+  getRuntimeLayers,
   updateNodeRaw,
   type ProviderOptionsCatalog,
   type ProvidersResponse,
+  type RuntimeLayers,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Empty, ErrorText, Facts, Footnote, Panel, SaveBar, Segmented } from './components';
 import { FallbackChain } from './FallbackChain';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 import { wireOf } from './channelFields';
+import { followsDefault } from './runtimeLayers';
 import { commitRuntimeKeys, commitYamlKeys } from './yamlCommit';
 import { parseYamlMapping, readYamlPath, type YamlKeyEdit } from './yamlRewrite';
-import { savedMessage } from '../utils/sentence';
+import { appendSentence, savedMessage } from '../utils/sentence';
 import { errorMessage } from '../api/request';
 
 const GLOBAL = '__global__';
 
-const readScope = (token: string, scope: string) => (
-  scope === GLOBAL ? getRuntimeRaw(token) : getNodeRaw(token, scope)
-);
+/** 一个作用域读回来的那份。全局还带着 runtime 的两层：参数照实际在用的值显示，并标出哪些跟着默认走。 */
+interface ScopeFile {
+  content: string;
+  layers: RuntimeLayers | null;
+}
+
+const readScope = async (token: string, scope: string): Promise<ScopeFile> => {
+  if (scope === GLOBAL) {
+    const layers = await getRuntimeLayers(token);
+    return { content: layers.content, layers };
+  }
+  return { content: (await getNodeRaw(token, scope)).content, layers: null };
+};
 
 // 全局写 runtime.yaml 本实例那一层；节点写节点文件。两边都只改这次动过的键。
 const commitScope = (token: string, scope: string, edits: readonly YamlKeyEdit[]) => (
@@ -74,7 +86,8 @@ const ModelsPageEditor = () => {
   const [nodesError, setNodesError] = useState('');
   const [scope, setScope] = useState<string>(GLOBAL);
   const [provider, setProvider] = useState('');
-  const [raw, setRaw] = useState('');
+  const [file, setFile] = useState<ScopeFile | null>(null);
+  const raw = file?.content ?? '';
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -116,17 +129,17 @@ const ModelsPageEditor = () => {
     if (!token) return;
     const request = requests.begin('raw');
     setEdits({});
-    setRaw(''); setLoading(true);
+    setFile(null); setLoading(true);
     setMessage('');
     void (async () => {
       try {
-        const file = await readScope(token, scope);
+        const next = await readScope(token, scope);
         if (!request.isCurrent()) return;
-        setRaw(file.content);
+        setFile(next);
         setLoadError('');
       } catch (caught) {
         if (!request.isCurrent()) return;
-        setRaw('');
+        setFile(null);
         setLoadError(errorMessage(caught));
       } finally {
         if (request.isCurrent()) setLoading(false);
@@ -139,7 +152,7 @@ const ModelsPageEditor = () => {
   const activeProvider = providers?.active_provider || 'openai';
   const channels = channelChoices(providers || undefined).channels;
   const activeWire = wireOf(activeProvider, channels);
-  const doc = useMemo(() => (raw ? parseOrNull(raw) : null), [raw]);
+  const doc = useMemo(() => (file?.layers ? file.layers.effective : raw ? parseOrNull(raw) : null), [file, raw]);
 
   const scopeNode = scope === GLOBAL ? undefined : nodes.find((item) => item.id === scope);
   // 节点没写 provider 就跟随全局活跃渠道，和 engine 的解析顺序一致。
@@ -165,6 +178,10 @@ const ModelsPageEditor = () => {
 
   const stored = (key: string): string => shownFromValue(readYamlPath(doc, pathFor(key)));
   const shownOf = (key: string): string => (key in edits ? edits[key] : stored(key));
+  // 全局里本实例没写、值来自默认那层的参数标出来：改了才写进本实例的 runtime.yaml
+  const inherited = (key: string): boolean => Boolean(
+    file?.layers && !(key in edits) && stored(key) && followsDefault(file.layers, pathFor(key)),
+  );
 
   const visible = visibleSpecs(specs, shownOf);
 
@@ -180,12 +197,23 @@ const ModelsPageEditor = () => {
         .filter((spec) => spec.key in edits)
         .map((spec) => ({ path: pathFor(spec.key), value: valueFromShown(spec, edits[spec.key]) ?? undefined }));
       const { content, note: rewriteNote, result, receiptProblem } = await commitScope(token, scope, changes);
-      setRaw(content);
       setEdits({});
+      let rereadProblem = '';
+      if (scope === GLOBAL) {
+        // 删掉的键回到默认那层的值，生效值要照后端合并的结果重读，不在这边自己补
+        try {
+          setFile(await readScope(token, GLOBAL));
+        } catch (caught) {
+          setFile(null);
+          rereadProblem = `没能重新读取现在生效的参数，切换一下作用域再看：${errorMessage(caught)}`;
+        }
+      } else {
+        setFile({ content, layers: null });
+      }
       const saved = scope === GLOBAL
         ? '已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。'
         : '已保存。节点文件每次任务重新读，立刻生效。';
-      setMessage(savedMessage(saved, rewriteNote, result?.warnings), receiptProblem);
+      setMessage(savedMessage(saved, rewriteNote, result?.warnings), appendSentence(receiptProblem, rereadProblem));
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -228,6 +256,7 @@ const ModelsPageEditor = () => {
             {visible.map((spec) => (
               <OptionRow
                 key={spec.key}
+                inherited={inherited(spec.key)}
                 onChange={(next) => setEdits((prev) => ({ ...prev, [spec.key]: next }))}
                 spec={spec}
                 value={shownOf(spec.key)}

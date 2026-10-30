@@ -9,7 +9,7 @@ import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
-  getProviderProfiles: vi.fn(), getProviders: vi.fn(), getNodes: vi.fn(), getRuntimeRaw: vi.fn(), getRuntimeFile: vi.fn(), getNodeRaw: vi.fn(),
+  getProviderProfiles: vi.fn(), getProviders: vi.fn(), getNodes: vi.fn(), getRuntimeLayers: vi.fn(), getRuntimeFile: vi.fn(), getNodeRaw: vi.fn(),
   updateRuntimeRaw: vi.fn(), updateNodeRaw: vi.fn(), upsertProvider: vi.fn(), setActiveProvider: vi.fn(), deleteProvider: vi.fn(),
   getMemoryOverview: vi.fn(), getMemoryEntries: vi.fn(), saveMemoryEntry: vi.fn(), deleteMemoryEntry: vi.fn(), clearMemoryNamespace: vi.fn(),
   getConversations: vi.fn(), getConversationMessages: vi.fn(), resetConversationBySession: vi.fn(), getAccountScope: vi.fn(), migrateAccountScope: vi.fn(),
@@ -40,6 +40,10 @@ const profiles: api.ProviderProfiles = {
   }, wireFormats: { openai: 'openai', anthropic: 'anthropic' }, hostProfiles: {}, defaultVision: {},
 };
 const runtime = 'providers:\n  openai:\n    options:\n      temperature: 0.2\n  anthropic:\n    options:\n      temperature: 0.9\n';
+const runtimeLayers: api.RuntimeLayers = {
+  content: runtime, hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml', defaults: {},
+  effective: { providers: { openai: { options: { temperature: 0.2 } }, anthropic: { options: { temperature: 0.9 } } } },
+};
 const nodeRaw = (id: string, temperature: number) => ({
   content: `id: ${id}\nprovider: relay\nprovider_options:\n  temperature: ${temperature}\n`,
   hash: `${id}-1`,
@@ -68,7 +72,7 @@ beforeEach(() => {
   vi.mocked(api.getProviderProfiles).mockResolvedValue(structuredClone(profiles));
   vi.mocked(api.getProviders).mockResolvedValue(providers());
   vi.mocked(api.getNodes).mockResolvedValue([{ id: 'node.a', provider: 'relay' }, { id: 'node.b', provider: 'relay' }] as api.AdminNode[]);
-  vi.mocked(api.getRuntimeRaw).mockResolvedValue({ content: runtime, hash: 'runtime-1' });
+  vi.mocked(api.getRuntimeLayers).mockResolvedValue(runtimeLayers);
   // 全局参数写的是本实例那一层，保存前现读的就是它。
   vi.mocked(api.getRuntimeFile).mockResolvedValue({ content: runtime, hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml' });
   vi.mocked(api.getNodeRaw).mockImplementation(async (_auth, id) => nodeRaw(id, id === 'node.a' ? 0.4 : 0.7));

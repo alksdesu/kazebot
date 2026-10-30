@@ -10,10 +10,11 @@ import {
   getProviderProfiles,
   getProviders,
   getRuntimeFile,
-  getRuntimeRaw,
+  getRuntimeLayers,
   updateNodeRaw,
   updateRuntimeRaw,
   type RuntimeFile,
+  type RuntimeLayers,
 } from '../api/supervisorClient';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
@@ -29,7 +30,7 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   getProviderProfiles: vi.fn(),
   getProviders: vi.fn(),
   getRuntimeFile: vi.fn(),
-  getRuntimeRaw: vi.fn(),
+  getRuntimeLayers: vi.fn(),
   updateNodeRaw: vi.fn(),
   updateRuntimeRaw: vi.fn(),
 }));
@@ -49,6 +50,11 @@ const NODE_YAML = ['id: qq.vision', 'type: ai', 'provider: gemini', 'model: x', 
 
 // 保存前现读的是本实例那一层：有自己的 config/runtime.yaml 就是它，没有时读到的是仓库默认。
 const instanceLayer = (content: string, hash: string): RuntimeFile => ({ content, hash, source: 'override', path: 'config/runtime.yaml' });
+
+// 全局参数照实际在用的值显示：生效值和默认那层由后端合并好，跟着原文一起读回来。
+const layersOf = (
+  file: RuntimeFile, defaults: Record<string, unknown> = {}, effective = yaml.load(file.content) as Record<string, unknown>,
+): RuntimeLayers => ({ ...file, defaults, effective });
 
 const CATALOG = {
   openai: [
@@ -97,7 +103,7 @@ beforeEach(() => {
   vi.mocked(getProviderProfiles).mockResolvedValue({ options: CATALOG, wireFormats: {}, hostProfiles: {} } as any);
   vi.mocked(getProviders).mockResolvedValue(PROVIDERS as any);
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
-  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: RUNTIME, hash: 'runtime-1' });
+  vi.mocked(getRuntimeLayers).mockResolvedValue(layersOf(instanceLayer(RUNTIME, 'runtime-1')));
   vi.mocked(getRuntimeFile).mockResolvedValue(instanceLayer(RUNTIME, 'runtime-1'));
   vi.mocked(getNodeRaw).mockResolvedValue({ content: NODE_YAML, hash: 'node-1' });
   vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
@@ -184,6 +190,65 @@ describe('模型参数页', () => {
     save();
 
     expect(await screen.findByText('已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。providers.openai.options.foo 没有任何地方读')).toBeTruthy();
+  });
+
+  // 本实例有了自己的 runtime.yaml 以后，仓库默认里写的参数照样在生效，不能显示成空的
+  it('全局参数照实际在用的值显示，本实例没写的标出跟随默认', async () => {
+    const defaults = { providers: { openai: { options: { temperature: 0.3 } } } };
+    vi.mocked(getRuntimeLayers).mockResolvedValue(layersOf(instanceLayer(RUNTIME, 'runtime-1'), defaults, {
+      ...(yaml.load(RUNTIME) as Record<string, unknown>),
+      providers: { openai: { timeout_sec: 600, options: { temperature: 0.3 } } },
+    }));
+    render(<ModelsPage />);
+
+    expect(await screen.findByLabelText('随机度')).toHaveValue('0.3');
+    expect(screen.getByText('跟随默认')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('随机度'), { target: { value: '0.7' } });
+    expect(screen.queryByText('跟随默认')).toBeNull();
+  });
+
+  it('本实例自己写了的参数不标跟随默认', async () => {
+    const OWN = `${RUNTIME}    options:\n      temperature: 0.5\n`;
+    vi.mocked(getRuntimeLayers).mockResolvedValue(layersOf(
+      instanceLayer(OWN, 'runtime-1'), { providers: { openai: { options: { temperature: 0.3 } } } },
+    ));
+    render(<ModelsPage />);
+
+    expect(await screen.findByLabelText('随机度')).toHaveValue('0.5');
+    expect(screen.queryByText('跟随默认')).toBeNull();
+  });
+
+  it('保存后照后端重读生效值：删掉的键回到默认那层的值', async () => {
+    const defaults = { providers: { openai: { options: { temperature: 0.3 } } } };
+    const OWN = `${RUNTIME}    options:\n      temperature: 0.5\n`;
+    vi.mocked(getRuntimeFile).mockResolvedValue(instanceLayer(OWN, 'runtime-1'));
+    vi.mocked(getRuntimeLayers)
+      .mockResolvedValueOnce(layersOf(instanceLayer(OWN, 'runtime-1'), defaults))
+      .mockResolvedValue(layersOf(instanceLayer(RUNTIME, 'runtime-2'), defaults, {
+        ...(yaml.load(RUNTIME) as Record<string, unknown>),
+        providers: { openai: { timeout_sec: 600, options: { temperature: 0.3 } } },
+      }));
+    render(<ModelsPage />);
+    fireEvent.change(await screen.findByLabelText('随机度'), { target: { value: '' } });
+    save();
+
+    await waitFor(() => expect(screen.getByLabelText('随机度')).toHaveValue('0.3'));
+    expect(screen.getByText('跟随默认')).toBeInTheDocument();
+    expect(yaml.load(vi.mocked(updateRuntimeRaw).mock.calls[0][1])).not.toHaveProperty('providers.openai.options');
+  });
+
+  it('保存后重读失败就说出来，不拿旧的生效值顶上', async () => {
+    vi.mocked(getRuntimeLayers)
+      .mockResolvedValueOnce(layersOf(instanceLayer(RUNTIME, 'runtime-1')))
+      .mockRejectedValue(new Error('503 读不了'));
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: '高' }));
+    save();
+
+    expect(await screen.findByText(/没能重新读取现在生效的参数，切换一下作用域再看：503 读不了/)).toBeInTheDocument();
+    expect(updateRuntimeRaw).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole('button', { name: '保存参数' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('节点作用域同样现读现合并', async () => {

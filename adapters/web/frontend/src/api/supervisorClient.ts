@@ -1330,23 +1330,34 @@ export async function clearNodeFallbacks(
   return providersReceipt(`节点 ${nodeId} 已经改回跟随全局链，可回执`, resp);
 }
 
-export function getRuntimeRaw(token: string): Promise<RawText> {
-  return readRawConfig('runtime.yaml 原文', '/admin/config/runtime/raw', token);
-}
-
 export interface RuntimeFile extends RawText {
   /** default：本实例还没改过，显示的是仓库默认；override：本实例有自己的 config/runtime.yaml，逐键盖在默认上面。 */
   source: 'default' | 'override';
   path: string;
 }
 
+/** runtime.yaml 连同表单要显示的两层。两层都由后端照运行时那套合并算好，这边不另合一遍。 */
+export interface RuntimeLayers extends RuntimeFile {
+  /** 本实例没写的键跟着的那一层：代码里的默认值 ← 仓库的 defaults/runtime.yaml。 */
+  defaults: Record<string, unknown>;
+  /** 实际在用的：默认那层上面逐键盖着本实例那份；那份写坏时是还在用的上一份。 */
+  effective: Record<string, unknown>;
+}
+
 // 来源认不出时不能当成仓库默认：结构化表单会从空文档写起，本实例那份里别的键就丢了。
 const RUNTIME_FILE = { ...RAW_TEXT, source: oneOf('default', 'override'), path: TEXT };
+const RUNTIME_LAYERS = { ...RUNTIME_FILE, defaults: OBJECT, effective: OBJECT };
 
 export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
   const resp = await apiFetch('/admin/config/runtime/raw', { token });
   const { content, hash, source, path } = shaped('runtime.yaml 原文', await resp.json(), RUNTIME_FILE);
   return { content, hash, source, path };
+}
+
+export async function getRuntimeLayers(token: string): Promise<RuntimeLayers> {
+  const resp = await apiFetch('/admin/config/runtime/raw', { token });
+  const { content, hash, source, path, defaults, effective } = shaped('runtime.yaml 原文', await resp.json(), RUNTIME_LAYERS);
+  return { content, hash, source, path, defaults, effective };
 }
 
 /** 删掉本实例的 runtime.yaml，全部参数回到仓库默认。 */

@@ -114,10 +114,26 @@ describe('覆盖层接口', () => {
     });
   });
 
-  it('读 runtime 原文的老包装还在，正文连指纹一起给', async () => {
-    stubFetch({ content: 'engine: {}\n', hash: 'runtime-1', source: 'override' });
+  it('表单要显示的两层随 runtime 原文一起读回来', async () => {
+    const layers = {
+      content: 'engine:\n  max_steps: 64\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml',
+      defaults: { engine: { max_steps: 40, tool_mode: 'json' } },
+      effective: { engine: { max_steps: 64, tool_mode: 'json' } },
+    };
+    stubFetch(layers);
 
-    await expect(client.getRuntimeRaw(TOKEN)).resolves.toEqual({ content: 'engine: {}\n', hash: 'runtime-1' });
+    await expect(client.getRuntimeLayers(TOKEN)).resolves.toEqual(layers);
+  });
+
+  // 两层缺了，表单只能拿前端自己的兜底值冒充生效值，正是要避免的那种错
+  it.each([
+    [{ defaults: {} }, '缺 effective'],
+    [{ effective: {} }, '缺 defaults'],
+    [{ defaults: [], effective: {} }, 'defaults 不是 JSON 对象'],
+  ])('两层对不上形状就报格式不对（%j）', async (over, problem) => {
+    stubFetch({ content: 'engine: {}\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml', ...over });
+
+    await expect(client.getRuntimeLayers(TOKEN)).rejects.toThrow(`runtime.yaml 原文格式不对：${problem}`);
   });
 });
 

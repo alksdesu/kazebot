@@ -2,14 +2,18 @@
 // 也不能在回写时把这份文件的其它内容搅乱。
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import yaml from 'js-yaml';
 
-import { ApiError, getRuntimeFile, ReceiptUnreadable, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
+import {
+  ApiError, getRuntimeFile, getRuntimeLayers, ReceiptUnreadable, updateRuntimeRaw, type RuntimeFile,
+} from '../api/supervisorClient';
 import { VisionRouting, normalizeMode } from '../console/VisionRouting';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
   getRuntimeFile: vi.fn(),
+  getRuntimeLayers: vi.fn(),
   updateRuntimeRaw: vi.fn(),
 }));
 
@@ -23,8 +27,15 @@ const RUNTIME = [
   '',
 ].join('\n');
 
-const setRuntime = (text: string, hash: string | null = 'runtime-1', source: RuntimeFile['source'] = 'override') =>
-  vi.mocked(getRuntimeFile).mockResolvedValue({ content: text, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml' });
+// 打开时读两层（生效值不另给就是原文里写的），保存前现读原文：两边都换成这一版
+const setRuntime = (
+  text: string, hash: string | null = 'runtime-1', source: RuntimeFile['source'] = 'override',
+  effective = (yaml.load(text) ?? {}) as Record<string, unknown>,
+) => {
+  const file = { content: text, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml' } as RuntimeFile;
+  vi.mocked(getRuntimeFile).mockResolvedValue(file);
+  vi.mocked(getRuntimeLayers).mockResolvedValue({ ...file, defaults: {}, effective });
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -53,7 +64,7 @@ describe('归一化', () => {
 
 describe('读取', () => {
   it('读取失败时不允许用空配置覆盖 runtime.yaml', async () => {
-    vi.mocked(getRuntimeFile).mockRejectedValue(new Error('synthetic offline'));
+    vi.mocked(getRuntimeLayers).mockRejectedValue(new Error('synthetic offline'));
     render(<VisionRouting />);
     expect(await screen.findByText('synthetic offline')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存路由' })).not.toBeInTheDocument();
@@ -72,11 +83,35 @@ describe('读取', () => {
     expect(picker().value).toBe('true');
   });
 
-  it('没写过这一项就是自动', async () => {
+  it('哪一层都没写过这一项就是自动', async () => {
     setRuntime('shell:\n  entry_node_id: qq.orchestrator\n');
     render(<VisionRouting />);
     await ready();
     expect(picker().value).toBe('auto');
+  });
+
+  // 本实例那份没写这一项时，生效的是默认那层的档位，不能显示成页面自己猜的「自动」
+  it('本实例没写过这一项时显示默认那层实际给的档位，并说明是默认的', async () => {
+    setRuntime('shell:\n  entry_node_id: qq.orchestrator\n', 'runtime-1', 'override', {
+      shell: { entry_node_id: 'qq.orchestrator' }, routing: { vision: { enabled: false } },
+    });
+    render(<VisionRouting />);
+    await ready();
+    expect(picker().value).toBe('false');
+    expect(screen.getByText(/本实例没设过，用的是默认的这一档/)).toBeInTheDocument();
+
+    fireEvent.change(picker(), { target: { value: 'true' } });
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '保存路由' }));
+    await waitFor(() => expect(updateRuntimeRaw).toHaveBeenCalled());
+    fireEvent.change(picker(), { target: { value: 'false' } });
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
+  });
+
+  it('本实例自己写了这一项就不说是默认的', async () => {
+    render(<VisionRouting />);
+    await ready();
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
   });
 
   it('没动过就存不了', async () => {

@@ -1,37 +1,56 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import yaml from 'js-yaml';
-import { getRuntimeFile, isEditConflict, type RuntimeFile } from '../api/supervisorClient';
+import { getRuntimeLayers, isEditConflict, type RuntimeLayers } from '../api/supervisorClient';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, ErrorText, Footnote, Input } from './components';
-import { commitRuntimeKeys, StaleKeysError } from './yamlCommit';
+import { effectiveValue, followsDefault } from './runtimeLayers';
+import { commitRuntimeKeys, runtimeInstanceLayer, StaleKeysError } from './yamlCommit';
+import { parseYamlMapping } from './yamlRewrite';
 import { savedMessage } from '../utils/sentence';
 import { errorMessage } from '../api/request';
 
 const RETENTION_PATH = ['engine', 'context_archive', 'retention_days'];
+// 哪一层都没写时 engine 按 7 天算
 const DEFAULT_RETENTION = 7;
 const MAX_RETENTION = 3650;
 const CONFLICT_MESSAGE = '归档设置已被其他页面修改，未覆盖你的草稿。请核对后重新载入归档设置。';
 
-function retentionDays(content: string): number {
-  let value: unknown = yaml.load(content);
-  for (const key of RETENTION_PATH) {
-    if (value === undefined || value === null) return DEFAULT_RETENTION;
-    if (typeof value !== 'object' || Array.isArray(value)) throw new Error('归档配置格式不正确，请在运行时配置中检查。');
-    value = (value as Record<string, unknown>)[key];
-  }
+function retentionDays(value: unknown): number {
   if (value === undefined) return DEFAULT_RETENTION;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_RETENTION) throw new Error('归档保留天数须为 1～3650 的整数，请检查运行时配置。');
   return value;
 }
 
-function readSnapshot(file: RuntimeFile) {
-  if (typeof file.hash !== 'string') throw new Error('服务端未返回配置版本，无法安全保存，请更新服务后重试。');
-  return { ...file, days: retentionDays(file.content) };
+/** 本实例那份在这条路上写坏了（该是一段配置的地方写成了别的）就不让在这里改：写回会把那一段整个换掉。 */
+function assertOwnSections(file: RuntimeLayers): void {
+  let section: unknown = parseYamlMapping(runtimeInstanceLayer(file));
+  for (const key of RETENTION_PATH.slice(0, -1)) {
+    section = (section as Record<string, unknown>)[key];
+    if (section === undefined || section === null) return;
+    if (typeof section !== 'object' || Array.isArray(section)) throw new Error('归档配置格式不正确，请在运行时配置中检查。');
+  }
 }
 
-type Snapshot = ReturnType<typeof readSnapshot>;
+interface Snapshot {
+  /** 读到的那一版原文，保存前逐键核对它在那之后有没有被别处改过。 */
+  content: string;
+  hash: string;
+  days: number;
+  /** 本实例没写这一项，天数是默认那层的。 */
+  inherited: boolean;
+}
+
+function readSnapshot(file: RuntimeLayers): Snapshot {
+  if (typeof file.hash !== 'string') throw new Error('服务端未返回配置版本，无法安全保存，请更新服务后重试。');
+  assertOwnSections(file);
+  return {
+    content: file.content,
+    hash: file.hash,
+    days: retentionDays(effectiveValue(file, RETENTION_PATH)),
+    inherited: followsDefault(file, RETENTION_PATH),
+  };
+}
 
 export function ContextArchiveSettings() {
   const token = useSettingsStore(state => state.adminToken);
@@ -55,7 +74,7 @@ export function ContextArchiveSettings() {
     const request = requests.begin('archive');
     setLoading(true); setError(''); setNotice('');
     try {
-      const file = await getRuntimeFile(token);
+      const file = await getRuntimeLayers(token);
       if (!request.isCurrent()) return;
       const next = readSnapshot(file);
       setSnapshot({ key: requests.key, value: next });
@@ -88,7 +107,7 @@ export function ContextArchiveSettings() {
       if (!request.isCurrent()) return;
       if (result && !result.ok) throw new Error('未能确认保存版本，请重新载入归档设置核对；草稿已保留。');
       // 回执没读懂时指纹照旧：下一次保存先读最新一版、按原文逐键核对，不靠这里的指纹。
-      setSnapshot({ key: requests.key, value: { ...baseline, content, hash: result?.hash ?? baseline.hash, source: 'override', days } });
+      setSnapshot({ key: requests.key, value: { content, hash: result?.hash ?? baseline.hash, days, inherited: false } });
       setDraft(String(days)); setNotice(savedMessage('归档保留设置已保存。', '', result?.warnings)); setError(receiptProblem);
     } catch (reason) {
       if (request.isCurrent()) {
@@ -113,6 +132,7 @@ export function ContextArchiveSettings() {
       <Button disabled={!baseline || !valid || !dirty || loading || conflict} loading={saving} onClick={() => void save()}>保存归档设置</Button>
       <Button tone="quiet" disabled={!token || saving} loading={loading} onClick={() => { if (confirmDiscard()) void load(); }}>重新载入归档设置</Button>
     </div>
+    {baseline?.inherited && !dirty && <p className="mt-2 text-xs text-[var(--duties-secondary)]">本实例没设过，显示的是默认值；保存后写进本实例的 runtime.yaml。</p>}
     <Footnote>默认 7 天，可设置 1～3650 天。保留期从每份归档创建时开始计算；过期只清理归档，不删除当前会话或压缩摘要。此前未归档的已丢失原文无法恢复。</Footnote>
     {baseline && !valid && <ErrorText role="alert">归档保留天数须为 1～3650 的整数。</ErrorText>}
     {error && <ErrorText role="alert">{error}</ErrorText>}

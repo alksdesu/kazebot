@@ -1,22 +1,19 @@
 // 带图消息交给主模型还是绕去视觉入口节点。写的是 runtime.yaml，不走顶部那条 qq.yaml 状态条。
 import { useEffect, useState } from 'react';
 
-import { getRuntimeFile } from '../api/supervisorClient';
+import { getRuntimeLayers } from '../api/supervisorClient';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Desc, Empty, ErrorText, Facts, Field, SaveBar, Select } from './components';
+import { effectiveValue, followsDefault } from './runtimeLayers';
 import { commitRuntimeKeys } from './yamlCommit';
-import { parseYamlMapping, readYamlPath } from './yamlRewrite';
 import { savedMessage } from '../utils/sentence';
 import { errorMessage } from '../api/request';
 
 const PATH = ['routing', 'vision', 'enabled'];
 
-const readMode = (content: string): string => {
-  const value = readYamlPath(parseYamlMapping(content), PATH);
-  return normalizeMode(value === undefined || value === null ? '' : String(value));
-};
+const modeOf = (value: unknown): string => normalizeMode(value === undefined || value === null ? '' : String(value));
 
 // 「自动」是字符串，另两档写成布尔，和手写 yaml 的读法一致。
 const yamlValueOf = (mode: string): boolean | string => (mode === 'true' ? true : mode === 'false' ? false : 'auto');
@@ -46,6 +43,8 @@ export const VisionRouting = () => {
   const [raw, setRaw] = useState<string | null>(null);
   const [mode, setMode] = useState('auto');
   const [saved, setSaved] = useState('auto');
+  // 本实例没写这一项，显示的是默认那层的这一档
+  const [inherited, setInherited] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
@@ -56,10 +55,11 @@ export const VisionRouting = () => {
     if (!token) return;
     const request = requests.begin('runtime');
     setRaw(null);
-    void getRuntimeFile(token).then(({ content: text }) => {
+    void getRuntimeLayers(token).then((layers) => {
       if (!request.isCurrent()) return;
-      const current = readMode(text);
-      setRaw(text);
+      const current = modeOf(effectiveValue(layers, PATH));
+      setRaw(layers.content);
+      setInherited(followsDefault(layers, PATH));
       setMode(current);
       setSaved(current);
     }).catch((caught) => {
@@ -78,6 +78,7 @@ export const VisionRouting = () => {
       const { content, note: rewriteNote, result, receiptProblem } = await commitRuntimeKeys(token, [{ path: PATH, value: yamlValueOf(mode) }]);
       setRaw(content);
       setSaved(mode);
+      setInherited(false);
       const saved = rewriteNote ? `已保存。${rewriteNote}。下一条带图消息就按新规矩走。` : '已保存。下一条带图消息就按新规矩走。';
       setNote(savedMessage(saved, '', result?.warnings));
       setError(receiptProblem);
@@ -103,6 +104,7 @@ export const VisionRouting = () => {
         </Select>
       </Field>
       <Desc indent={false}>{NOTES[mode]}</Desc>
+      {inherited && mode === saved && <Desc indent={false}>本实例没设过，用的是默认的这一档；保存后写进本实例的 runtime.yaml。</Desc>}
       {mode === 'auto' && (
         <Facts>
           按上面每个渠道的「带图消息」判定。绕过去还有一个前提：视觉入口节点得有自己的

@@ -185,7 +185,12 @@ describe('P0 settings pages', () => {
       const url = String(input);
       if (init?.method === 'PUT') return jsonResponse({ ok: true, hash: 'saved-1' });
       // The instance already has its own config/runtime.yaml, so the form and the raw editor edit that layer.
-      if (url.endsWith('/v1/admin/config/runtime/raw')) return jsonResponse({ content: 'engine:\n  tool_mode: json\n  max_workers: 4\nshell:\n  entry_node_id: ereuna_main\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml' });
+      if (url.endsWith('/v1/admin/config/runtime/raw')) {
+        return jsonResponse({
+          content: 'engine:\n  tool_mode: json\n  max_workers: 4\nshell:\n  entry_node_id: ereuna_main\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml',
+          defaults: {}, effective: { engine: { tool_mode: 'json', max_workers: 4 }, shell: { entry_node_id: 'ereuna_main' } },
+        });
+      }
       if (url.endsWith('/v1/admin/config/policy/raw')) return jsonResponse({ content: 'rules: []\n', hash: 'policy-1', path: 'config/policy.yaml' });
       if (url.endsWith('/v1/admin/config/schedules/raw')) return textResponse('schedules: []\n');
       return jsonResponse({});

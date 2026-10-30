@@ -296,6 +296,12 @@ def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
     return copy.deepcopy(merged)
 
 
+def runtime_defaults(workspace_root: Path) -> dict[str, Any]:
+    """实例那份没写的键跟着的一层：代码里的默认值 ← 仓库的 defaults/runtime.yaml，和 load_runtime_config 同一套合并。"""
+    default_path, _own_path = config_layout.runtime_layers(workspace_root)
+    return _instance_shape(_runtime_layer(default_path, DEFAULT_RUNTIME_CONFIG))
+
+
 def runtime_config_error(workspace_root: Path) -> str:
     """runtime 哪一层现在用不了、在用的是什么；空串表示两层都按文件里写的在跑。健康检查报这个。"""
     problems: list[str] = []

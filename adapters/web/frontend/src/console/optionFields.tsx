@@ -80,11 +80,13 @@ const EnumControl = ({
 };
 
 export const OptionRow = ({
-  spec, value, onChange,
+  spec, value, onChange, inherited = false,
 }: {
   spec: ProviderOptionSpec;
   value: string;
   onChange: (next: string) => void;
+  /** 这个值是默认那层的，本实例没写过。 */
+  inherited?: boolean;
 }) => (
   <div className="min-w-0 space-y-1">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -92,6 +94,7 @@ export const OptionRow = ({
       <code className="border border-[var(--duties-live)] px-1.5 text-mini text-[var(--duties-live)]">
         {spec.key}
       </code>
+      {inherited && <span className="text-mini text-[var(--duties-tertiary)]">跟随默认</span>}
       <span className="flex-1" />
       {spec.kind === 'bool' && <BoolControl label={spec.label} onChange={onChange} value={value} />}
       {spec.kind === 'enum' && <EnumControl onChange={onChange} spec={spec} value={value} />}

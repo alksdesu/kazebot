@@ -863,6 +863,44 @@ class TestTheRuntimeEndpoint:
 
         assert admin("DELETE", "/runtime/raw").json() == {"ok": True, "restored": False}
 
+    def test_the_default_layer_and_what_is_in_effect_come_with_the_instance_file(
+        self, admin, ws: Path, code_root: Path,
+    ) -> None:
+        # 实例那份只写了一个键：表单要能显示其余键实际在用的值，也要知道没写的键跟着默认是多少
+        _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n  context_archive:\n    retention_days: 7\n")
+        _write(config_layout.runtime_path(ws), "engine:\n  max_steps: 64\n")
+
+        body = admin("GET", "/runtime/raw").json()
+
+        assert (body["content"], body["source"]) == ("engine:\n  max_steps: 64\n", "override")
+        assert body["defaults"]["engine"]["max_steps"] == 40
+        assert body["effective"]["engine"]["max_steps"] == 64
+        assert body["defaults"]["engine"]["context_archive"] == body["effective"]["engine"]["context_archive"] == {
+            "retention_days": 7,
+        }
+        assert body["effective"] == clonoth_runtime.load_runtime_config(ws)
+        assert body["defaults"] == clonoth_runtime.runtime_defaults(ws)
+
+    def test_keys_only_the_code_knows_are_in_both_layers(self, admin, ws: Path, code_root: Path) -> None:
+        _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n")
+
+        body = admin("GET", "/runtime/raw").json()
+
+        assert body["source"] == "default"
+        assert body["effective"] == body["defaults"]
+        assert body["defaults"]["engine"]["max_steps"] == 40
+        assert set(clonoth_runtime.DEFAULT_RUNTIME_CONFIG) <= set(body["defaults"])
+
+    def test_a_broken_instance_file_shows_what_is_still_in_effect(self, admin, ws: Path, code_root: Path) -> None:
+        _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n")
+        _write(config_layout.runtime_path(ws), "engine: [\n")
+
+        body = admin("GET", "/runtime/raw").json()
+
+        # 原文照实给编辑器修；生效值是运行时这一刻用着的，坏的那份按没写算
+        assert body["content"] == "engine: [\n"
+        assert body["effective"]["engine"]["max_steps"] == 40
+
 
 class TestTheOtherRawEndpoints:
     def test_the_model_channels_endpoint_reads_the_new_location(self, admin, ws: Path, code_root: Path) -> None:

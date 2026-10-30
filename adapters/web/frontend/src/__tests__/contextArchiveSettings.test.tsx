@@ -1,12 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import yaml from 'js-yaml';
 import * as api from '../api/supervisorClient';
 import { ContextArchiveSettings } from '../console/ContextArchiveSettings';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async original => ({
   ...await original<typeof import('../api/supervisorClient')>(),
-  getRuntimeFile: vi.fn(), updateRuntimeRaw: vi.fn(),
+  getRuntimeFile: vi.fn(), getRuntimeLayers: vi.fn(), updateRuntimeRaw: vi.fn(),
 }));
 
 const layer = (content: string, hash: string | null): api.RuntimeFile => ({ content, hash, source: 'override', path: 'config/runtime.yaml' });
@@ -20,6 +21,16 @@ const DEFAULTS: api.RuntimeFile = {
   source: 'default',
   path: 'defaults/runtime.yaml',
 };
+const DEFAULT_LAYER = { engine: { context_archive: { retention_days: 7 } } };
+// 页面按后端合并好的生效值显示；不另给时，原文里写的就是生效的
+const layersOf = (
+  file: api.RuntimeFile, effective = yaml.load(file.content) as Record<string, unknown>,
+): api.RuntimeLayers => ({ ...file, defaults: DEFAULT_LAYER, effective });
+// 打开、重新载入读两层，保存前现读的是原文：两边都换成这一版
+function serve(file: api.RuntimeFile, effective?: Record<string, unknown>) {
+  vi.mocked(api.getRuntimeFile).mockResolvedValue(file);
+  vi.mocked(api.getRuntimeLayers).mockResolvedValue(layersOf(file, effective));
+}
 const input = () => screen.getByLabelText('归档保留天数');
 const save = () => screen.getByRole('button', { name: '保存归档设置' });
 const reload = () => screen.getByRole('button', { name: '重新载入归档设置' });
@@ -38,16 +49,17 @@ beforeEach(() => {
   vi.resetAllMocks();
   vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'archive-admin', isAuthenticated: true });
-  vi.mocked(api.getRuntimeFile).mockResolvedValue(raw());
+  serve(raw());
   vi.mocked(api.updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'version-2' });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('压缩上下文归档保留设置', () => {
   it('未配置字段时显示七天，说明消息时间和归档清理范围', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(layer('providers:\n  enabled: true\n', 'layer-1'));
+    serve(layer('providers:\n  enabled: true\n', 'layer-1'), { providers: { enabled: true }, ...DEFAULT_LAYER });
     await open();
     expect(save()).toBeDisabled();
+    expect(screen.getByText(/本实例没设过，显示的是默认值/)).toBeInTheDocument();
     expect(screen.getByText(/保留原始消息时间/)).toBeInTheDocument();
     expect(screen.getByText(/从每份归档创建时开始计算/)).toHaveTextContent('不删除当前会话或压缩摘要');
     change('14'); fireEvent.click(save());
@@ -56,8 +68,25 @@ describe('压缩上下文归档保留设置', () => {
   });
 
   // 还没有本实例那份时读到的是仓库默认：只写改的这一个键，不能把默认全文抄成本实例的一份。
+  // 本实例那份没写保留天数时，生效的是默认那层的天数，不是页面自己记着的 7
+  it('本实例有自己的 runtime.yaml 但没写天数时，显示默认那层实际给的天数', async () => {
+    serve(layer('providers:\n  enabled: true\n', 'layer-1'), { providers: { enabled: true }, engine: { context_archive: { retention_days: 30 } } });
+    await open('30');
+    expect(screen.getByText(/本实例没设过，显示的是默认值/)).toBeInTheDocument();
+    change('45');
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
+    fireEvent.click(save()); await screen.findByText('归档保留设置已保存。');
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('archive-admin', 'providers:\n  enabled: true\nengine:\n  context_archive:\n    retention_days: 45\n', 'layer-1');
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
+  });
+
+  it('本实例自己写了天数就不说跟随默认', async () => {
+    await open();
+    expect(screen.queryByText(/本实例没设过/)).toBeNull();
+  });
+
   it('本实例还没有自己的 runtime.yaml 时，保存只落这一个键', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(DEFAULTS);
+    serve(DEFAULTS);
     await open();
     change('30'); fireEvent.click(save());
     await screen.findByText('归档保留设置已保存。');
@@ -65,7 +94,7 @@ describe('压缩上下文归档保留设置', () => {
   });
 
   it('落成本实例那份之后再改，就在那一份上改', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(DEFAULTS);
+    serve(DEFAULTS);
     await open();
     change('30'); fireEvent.click(save());
     await screen.findByText('归档保留设置已保存。');
@@ -101,7 +130,7 @@ describe('压缩上下文归档保留设置', () => {
 
   it('同字段变化保留草稿，不写入；重新载入需要确认丢弃', async () => {
     await open(); change('30');
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(raw(14, 'other-edit'));
+    serve(raw(14, 'other-edit'));
     fireEvent.click(save()); await screen.findByText(/归档设置已被其他页面修改/);
     expect(input()).toHaveValue('30'); expect(save()).toBeDisabled();
     expect(api.updateRuntimeRaw).not.toHaveBeenCalled();
@@ -159,7 +188,7 @@ describe('压缩上下文归档保留设置', () => {
   });
 
   it('加载失败可重试，不提供伪造默认值保存', async () => {
-    vi.mocked(api.getRuntimeFile).mockRejectedValueOnce(new api.ApiError(503, 'unavailable'));
+    vi.mocked(api.getRuntimeLayers).mockRejectedValueOnce(new api.ApiError(503, 'unavailable'));
     render(<ContextArchiveSettings />); await screen.findByText('503 unavailable');
     expect(input()).toBeDisabled(); expect(save()).toBeDisabled();
     fireEvent.click(reload()); await waitFor(() => expect(input()).toHaveValue('7'));
@@ -171,7 +200,7 @@ describe('压缩上下文归档保留设置', () => {
     layer('engine:\n  context_archive:\n    retention_days: null\n', 'bad'),
     layer('engine:\n  context_archive: invalid\n', 'bad'),
   ])('非法配置或缺少版本不启用编辑 %#', async value => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValue(value);
+    serve(value);
     render(<ContextArchiveSettings />); await screen.findByRole('alert');
     expect(input()).toBeDisabled(); expect(save()).toBeDisabled();
   });
@@ -189,7 +218,9 @@ describe('压缩上下文归档保留设置', () => {
     const pending = deferred<api.RuntimeFile>();
     vi.mocked(api.getRuntimeFile).mockReturnValue(pending.promise);
     fireEvent.click(save()); fireEvent.click(save());
-    expect(api.getRuntimeFile).toHaveBeenCalledTimes(2);
+    // 打开时读的是两层，保存前现读原文只读了一次
+    expect(api.getRuntimeLayers).toHaveBeenCalledTimes(1);
+    expect(api.getRuntimeFile).toHaveBeenCalledTimes(1);
     expect(input()).toBeDisabled();
     await act(async () => pending.resolve(raw()));
     await screen.findByText('归档保留设置已保存。');

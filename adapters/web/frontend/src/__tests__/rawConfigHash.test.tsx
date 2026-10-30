@@ -2,6 +2,7 @@
 // 自己记的：漏带就变成整份覆盖，串了别人的就更糟 —— 共享组里两个实例互相盖掉配置，界面一声不吭。
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import yaml from 'js-yaml';
 
 import * as api from '../api/supervisorClient';
 import { AdvancedSettingsPage } from '../components/settings/pages/AdvancedSettingsPage';
@@ -77,7 +78,8 @@ describe('读回来的原文带着指纹', () => {
 
   it('报错说的是哪一份文件', async () => {
     const cases: Array<[string, () => Promise<unknown>, string]> = [
-      [RUNTIME, () => api.getRuntimeRaw(TOKEN), 'runtime.yaml 原文'],
+      [RUNTIME, () => api.getRuntimeFile(TOKEN), 'runtime.yaml 原文'],
+      [RUNTIME, () => api.getRuntimeLayers(TOKEN), 'runtime.yaml 原文'],
       ['/admin/config/policy/raw', () => api.getPolicyRaw(TOKEN), 'policy.yaml 原文'],
       ['/admin/config/schedules/raw', () => api.getSchedulesRaw(TOKEN), 'schedules.yaml 原文'],
       ['/admin/config/mcp-clients/raw', () => api.getMcpClientsRaw(TOKEN), 'mcp.yaml 原文'],
@@ -416,7 +418,7 @@ const jsonReply = (body: unknown, status = 200): Response => new Response(JSON.s
 });
 
 /**
- * 真后端那套：保存时指纹对不上就 409，一个字节都不写，存一次指纹换一版。
+ * 真后端那套：保存时指纹对不上就 409，一个字节都不写，存一次指纹换一版；读的时候连着默认那层和生效值一起回。
  * receipt 给了就拿它当存完的回执；rereadFails 时存过之后再读 runtime 都回 500。
  */
 const serveRuntime = ({ receipt, rereadFails = false }: { receipt?: unknown; rereadFails?: boolean } = {}) => {
@@ -436,7 +438,9 @@ const serveRuntime = ({ receipt, rereadFails = false }: { receipt?: unknown; rer
     }
     if (url.endsWith(`/v1${RUNTIME}`)) {
       if (rereadFails && version > 1) return jsonReply({ detail: '磁盘忙' }, 500);
-      return jsonReply({ content, hash, source: 'override', path: 'config/runtime.yaml' });
+      return jsonReply({
+        content, hash, source: 'override', path: 'config/runtime.yaml', defaults: {}, effective: yaml.load(content) ?? {},
+      });
     }
     return jsonReply({});
   }));

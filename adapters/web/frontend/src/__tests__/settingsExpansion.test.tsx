@@ -15,7 +15,6 @@ import {
   getMcpClientsRaw,
   getNodeRaw,
   getPolicyRaw,
-  getRuntimeRaw,
   getSchedulesRaw,
   getSkillRaw,
   getToolRaw,
@@ -136,7 +135,6 @@ describe('expanded settings API wrappers', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getPolicyRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getSchedulesRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
     await expect(getMcpClientsRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: 'h1' });
