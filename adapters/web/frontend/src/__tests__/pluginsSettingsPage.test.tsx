@@ -2,7 +2,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AdminPlugin, PluginsResponse } from '../api/supervisorClient';
-import { installPluginPackage } from '../api/supervisorClient';
+import {
+  applyPlugins, getPluginSource, getPlugins, installPlugin, installPluginPackage, ReceiptUnreadable,
+  updatePluginConfig, updatePluginSource,
+} from '../api/supervisorClient';
 import { PluginsSettingsPage } from '../components/settings/pages/PluginsSettingsPage';
 import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { useSettingsStore } from '../store/settingsStore';
@@ -461,5 +464,158 @@ describe('插件设置导航与编辑', () => {
     await act(async () => { render(<PluginsSettingsPage />); });
     await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
     expect(fetcher.mock.calls.filter(([url]) => String(url) === '/v1/admin/plugins')).toHaveLength(1);
+  });
+});
+
+describe('插件读写的回执和读取格式', () => {
+  const configCalls = (fetcher: ReturnType<typeof stubApi>) => fetcher.mock.calls.filter(([input]) => String(input).endsWith('/config'));
+  const catalogReads = (fetcher: ReturnType<typeof stubApi>) => fetcher.mock.calls.filter(([input, init]) => String(input) === '/v1/admin/plugins' && !init?.method).length;
+
+  it('写操作做完了、回执读不懂时报 ReceiptUnreadable，打头说清已经做完', async () => {
+    stubApi(catalog(), (url, init) => {
+      if (url.endsWith('/config')) return response({ ...plugin(), desired_hash: undefined });
+      if (url.endsWith('/source') && init?.method === 'PUT') return response({ ...plugin(), selectors: { nodes: [] } });
+      if (url === '/v1/admin/plugins' && init?.method === 'POST') return new Response('not json', { status: 200 });
+      if (url.endsWith('/apply')) return response({ generation: 'generation-2', message: '已应用' });
+      return undefined;
+    });
+    const selectors = { nodes: [], channels: [], providers: [], purposes: [] };
+    const config = updatePluginConfig('token-a', 'request_filter', { enabled: false, config: {}, selectors, base_hash: 'desired-1' });
+    await expect(config).rejects.toBeInstanceOf(ReceiptUnreadable);
+    await expect(config).rejects.toThrow('插件 request_filter 的配置已经存上，可回执格式不对：缺 desired_hash');
+    await expect(updatePluginSource('token-a', 'request_filter', 'PLUGIN_META = {}', 'source-1')).rejects.toThrow('插件 request_filter 的源码已经存上，可回执格式不对：缺 selectors.channels');
+    await expect(installPlugin('token-a', 'my.py', 'PLUGIN_META = {}')).rejects.toThrow('插件 my.py 已经导入，可回执不是 JSON');
+    await expect(applyPlugins('token-a')).rejects.toThrow('插件配置已经应用，可回执格式不对：缺 runtime');
+  });
+
+  it('读回来的形状对不上就报格式不对，不补成空表或空指纹', async () => {
+    let body: unknown = { content: 'PLUGIN_META = {}\n' };
+    stubApi(catalog(), (url, init) => (url === '/v1/admin/plugins' && !init?.method) || url.endsWith('/source') ? response(body) : undefined);
+    await expect(getPluginSource('token-a', 'request_filter')).rejects.toThrow('插件 request_filter 的源码格式不对：缺 hash');
+    body = { ...catalog(), plugins: [{ ...plugin(), desired_hash: undefined }] };
+    await expect(getPlugins('token-a')).rejects.toThrow('插件列表格式不对：缺 plugins[0].desired_hash');
+    body = { ...catalog(), plugins: [{ ...plugin(), files: { path: 'frontend.js' } }] };
+    await expect(getPlugins('token-a')).rejects.toThrow('插件列表格式不对：plugins[0].files 不是数组');
+    const runtime = catalog();
+    body = { ...runtime, runtime: [{ ...runtime.runtime[0], plugins: { request_filter: 'loaded' } }] };
+    await expect(getPlugins('token-a')).rejects.toThrow('插件列表格式不对：runtime[0].plugins 不是数组');
+  });
+
+  it('配置存上了、回执读不懂时重读列表拿新指纹，下一次保存带的是它', async () => {
+    let saved = false;
+    const fetcher = stubApi(catalog(), (url, init) => {
+      if (url.endsWith('/config')) { saved = true; return response({ ...plugin(), desired_hash: undefined }); }
+      if (url === '/v1/admin/plugins' && !init?.method && saved) return response(catalog([plugin({ desired_hash: 'desired-2', config: { ...plugin().config, prefix: 'changed' } })]));
+      return undefined;
+    });
+    await openPage();
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'changed' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    await screen.findByText(/配置已保存，运行进程会自动更新/);
+    expect(screen.getByText('插件 request_filter 的配置已经存上，可回执格式不对：缺 desired_hash')).toBeInTheDocument();
+    expect(screen.queryByText(/再存会被当成冲突拒掉/)).toBeNull();
+    expect(screen.getByLabelText('前缀')).toHaveValue('changed');
+    expect(screen.getByRole('button', { name: '保存配置' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'again' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    await waitFor(() => expect(configCalls(fetcher)).toHaveLength(2));
+    expect(JSON.parse(String(configCalls(fetcher)[1][1]?.body)).base_hash).toBe('desired-2');
+  });
+
+  it('重读也没成时把草稿算作已存、提示先刷新列表，下一次保存仍带旧指纹', async () => {
+    let saved = false;
+    const fetcher = stubApi(catalog(), (url, init) => {
+      if (url.endsWith('/config')) { saved = true; return response({ ok: true }); }
+      if (url === '/v1/admin/plugins' && !init?.method && saved) return response({ detail: '列表暂时读不了' }, 500);
+      return undefined;
+    });
+    await openPage();
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'changed' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    await screen.findByText(/配置已保存，运行进程会自动更新/);
+    expect(screen.getByText(/再存会被当成冲突拒掉/)).toHaveTextContent(/^插件 request_filter 的配置已经存上，可回执格式不对：缺 id。点「刷新列表」读入最新内容再改，不然再存会被当成冲突拒掉。刚才重新读取也没成：.*列表暂时读不了$/);
+    expect(screen.getByRole('button', { name: '保存配置' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'again' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    await waitFor(() => expect(configCalls(fetcher)).toHaveLength(2));
+    expect(JSON.parse(String(configCalls(fetcher)[1][1]?.body)).base_hash).toBe('desired-1');
+  });
+
+  it('源码存上了、回执读不懂时重读列表拿新源码指纹', async () => {
+    let saved = false;
+    const fetcher = stubApi(catalog(), (url, init) => {
+      if (url.endsWith('/source') && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        saved = true;
+        return response(body.base_hash === 'source-1' ? { ok: true } : plugin({ source_hash: 'source-3', desired_hash: 'desired-3' }));
+      }
+      if (url === '/v1/admin/plugins' && !init?.method && saved) return response(catalog([plugin({ source_hash: 'source-2', desired_hash: 'desired-2' })]));
+      return undefined;
+    });
+    await openPage();
+    fireEvent.change(screen.getByLabelText('插件 Python 源码'), { target: { value: 'PLUGIN_META = {"name": "changed"}' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存源码' }));
+    await screen.findByText('插件 request_filter 的源码已经存上，可回执格式不对：缺 id');
+    expect(screen.getByText(/源码已保存，运行进程会自动更新/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存源码' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('插件 Python 源码'), { target: { value: 'PLUGIN_META = {"name": "again"}' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存源码' }));
+    await waitFor(() => expect(fetcher.mock.calls.filter(([input, init]) => String(input).endsWith('/source') && init?.method === 'PUT')).toHaveLength(2));
+    const puts = fetcher.mock.calls.filter(([input, init]) => String(input).endsWith('/source') && init?.method === 'PUT');
+    expect(JSON.parse(String(puts[1][1]?.body)).base_hash).toBe('source-2');
+  });
+
+  it('导入成功、回执读不懂时重读列表，让人在列表里选中它', async () => {
+    let installed = false;
+    const fetcher = stubApi(catalog([]), (url, init) => {
+      if (url === '/v1/admin/plugins' && init?.method === 'POST') { installed = true; return response({ ok: true }); }
+      if (url === '/v1/admin/plugins' && !init?.method && installed) return response(catalog([plugin()]));
+      return undefined;
+    });
+    render(<PluginsSettingsPage />);
+    await screen.findByText('尚无插件，请导入 .py 文件');
+    const file = new File(['contents'], 'new_plugin.py', { type: 'text/x-python' });
+    Object.defineProperty(file, 'text', { value: () => Promise.resolve('PLUGIN_META = {}') });
+    fireEvent.change(screen.getByLabelText('导入插件文件'), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole('button', { name: '导入插件' }));
+    await screen.findByText(/插件已导入，默认停用/);
+    expect(screen.getByText('插件 new_plugin.py 已经导入，可回执格式不对：缺 id。在下面的列表里选中它再改')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /请求过滤/ })).toBeInTheDocument();
+    expect(catalogReads(fetcher)).toBe(2);
+  });
+
+  it('应用做完、回执读不懂时重读列表并单独交代回执', async () => {
+    const fetcher = stubApi(catalog(), (url) => url.endsWith('/apply') ? response({ message: '已发出刷新请求' }) : undefined);
+    await openPage();
+    const before = catalogReads(fetcher);
+    fireEvent.click(screen.getByRole('button', { name: '应用已保存的更改' }));
+    await screen.findByText('已发出应用请求，请刷新进程状态确认结果。');
+    expect(screen.getByText('插件配置已经应用，可回执格式不对：缺 generation')).toBeInTheDocument();
+    expect(catalogReads(fetcher)).toBe(before + 1);
+  });
+
+  it('源码缺指纹时报格式不对并给重试，不摆出空文件', async () => {
+    stubApi(catalog(), (url, init) => url.endsWith('/source') && !init?.method ? response({ content: 'PLUGIN_META = {}\n' }) : undefined);
+    render(<PluginsSettingsPage />);
+    await screen.findByText('插件 request_filter 的源码格式不对：缺 hash');
+    expect(screen.getByRole('button', { name: '重试读取源码' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('插件 Python 源码')).toBeNull();
+  });
+
+  it('列表形状不对时报格式不对，不说成尚无插件或 0 个插件', async () => {
+    stubApi({ ...catalog(), plugins: [{ ...plugin(), desired_hash: undefined }] } as unknown as PluginsResponse);
+    render(<PluginsSettingsPage />);
+    await screen.findByText('插件列表格式不对：缺 plugins[0].desired_hash');
+    expect(screen.getByText('插件列表没读成')).toBeInTheDocument();
+    expect(screen.queryByText('尚无插件，请导入 .py 文件')).toBeNull();
+    expect(screen.queryByText('0 个插件')).toBeNull();
+  });
+
+  it('作用范围候选项形状不对时说没读成，读成了的那张表照常给候选', async () => {
+    stubApi(catalog(), (url) => url.endsWith('/nodes') ? response({ nodes: [{ id: 'main' }] }) : undefined);
+    await openPage();
+    await screen.findByText('部分作用范围候选项加载失败，可手动输入标识。');
+    expect(within(screen.getByLabelText('节点')).queryByText('main')).toBeNull();
+    expect(within(screen.getByLabelText('模型渠道')).getByText('my_channel')).toBeInTheDocument();
   });
 });

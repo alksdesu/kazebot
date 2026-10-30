@@ -2822,14 +2822,63 @@ export interface PluginsResponse {
   runtime: PluginRuntimeProcess[];
 }
 
+// 插件页拿来渲染、拿来当下一次保存基准的几项；其余字段照原样留着。
+const PLUGIN_ROW = {
+  id: NON_EMPTY_TEXT,
+  name: TEXT,
+  version: TEXT,
+  description: TEXT,
+  author: TEXT,
+  filename: TEXT,
+  source: oneOf('custom', 'bundled'),
+  kind: optional(oneOf('module', 'package')),
+  source_hash: TEXT,
+  desired_hash: NON_EMPTY_TEXT,
+  enabled: BOOLEAN,
+  config: OBJECT,
+  selectors: OBJECT,
+  metadata: OBJECT,
+  error: nullable(TEXT),
+};
+const PLUGIN_SELECTORS = { nodes: TEXT_LIST, channels: TEXT_LIST, providers: TEXT_LIST, purposes: TEXT_LIST };
+// 进程状态只核页面拿来定位、比较的几项：错误详情是各进程报上来的原样，核严了，一个进程报得怪整页就读不出来。
+const PLUGIN_PROCESS = { pid: NUMBER, process: TEXT, alive: BOOLEAN };
+const PROCESS_PLUGIN = { id: NON_EMPTY_TEXT, desired_hash: TEXT, status: TEXT };
+const PACKAGE_FILE = { path: TEXT, size: NUMBER };
+
+function pluginRow(what: string, value: unknown, path = ''): AdminPlugin {
+  const row = shaped(what, value, PLUGIN_ROW, path);
+  shaped(what, row.selectors, PLUGIN_SELECTORS, at(path, 'selectors'));
+  shapedRows(what, row.params_schema, {}, at(path, 'params_schema'));
+  if (row.files !== undefined) shapedRows(what, row.files, PACKAGE_FILE, at(path, 'files'));
+  return row as unknown as AdminPlugin;
+}
+
+function pluginProcesses(what: string, value: unknown, path: string): PluginRuntimeProcess[] {
+  return shapedRows(what, value, PLUGIN_PROCESS, path).map((process, index) => {
+    shapedRows(what, process.plugins, PROCESS_PLUGIN, at(at(path, index), 'plugins'));
+    return process as unknown as PluginRuntimeProcess;
+  });
+}
+
+const importedReceipt = (what: string): string => nameWith(what, '已经导入，可回执');
+
+// 读不懂就抛：补成空表，页面会说「尚无插件」；缺了指纹，保存按钮一声不响地点不了，或者保存被拒。
 export async function getPlugins(token: string, signal?: AbortSignal): Promise<PluginsResponse> {
+  const what = '插件列表';
   const resp = await apiFetch('/admin/plugins', { token, signal });
-  return resp.json();
+  const body = shaped(what, await resp.json(), { generation: TEXT, shared_group: nullable(TEXT) });
+  return {
+    ...body,
+    plugins: shapedRows(what, body.plugins, {}, 'plugins').map((row, index) => pluginRow(what, row, at('plugins', index))),
+    runtime: pluginProcesses(what, body.runtime, 'runtime'),
+  } as unknown as PluginsResponse;
 }
 
 export async function getPluginSource(token: string, id: string): Promise<{ content: string; hash: string }> {
   const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, { token });
-  return resp.json();
+  const { content, hash } = shaped(`插件 ${id} 的源码`, await resp.json(), RAW_TEXT);
+  return { content, hash };
 }
 
 export async function installPlugin(token: string, filename: string, content: string): Promise<AdminPlugin> {
@@ -2837,7 +2886,8 @@ export async function installPlugin(token: string, filename: string, content: st
     method: 'POST', token,
     json: { filename, content },
   });
-  return resp.json();
+  const receipt = importedReceipt(`插件 ${filename}`);
+  return receiptOf(receipt, resp, (body) => pluginRow(receipt, body));
 }
 
 export async function installPluginPackage(token: string, file: File, baseHash?: string, current: () => boolean = () => true): Promise<AdminPlugin> {
@@ -2851,7 +2901,8 @@ export async function installPluginPackage(token: string, file: File, baseHash?:
     method: 'POST', token,
     json: { filename: file.name, content_base64: btoa(binary), ...(baseHash ? { base_hash: baseHash } : {}) },
   });
-  return resp.json();
+  const receipt = importedReceipt(`插件包 ${file.name}`);
+  return receiptOf(receipt, resp, (body) => pluginRow(receipt, body));
 }
 
 export async function updatePluginSource(token: string, id: string, content: string, baseHash: string): Promise<AdminPlugin> {
@@ -2859,7 +2910,8 @@ export async function updatePluginSource(token: string, id: string, content: str
     method: 'PUT', token,
     json: { content, base_hash: baseHash },
   });
-  return resp.json();
+  const receipt = savedReceipt(`插件 ${id} 的源码`);
+  return receiptOf(receipt, resp, (body) => pluginRow(receipt, body));
 }
 
 export async function updatePluginConfig(
@@ -2870,7 +2922,8 @@ export async function updatePluginConfig(
     method: 'PUT', token,
     json: config,
   });
-  return resp.json();
+  const receipt = savedReceipt(`插件 ${id} 的配置`);
+  return receiptOf(receipt, resp, (body) => pluginRow(receipt, body));
 }
 
 export async function deletePlugin(token: string, id: string, baseHash: string): Promise<void> {
@@ -2881,5 +2934,9 @@ export async function deletePlugin(token: string, id: string, baseHash: string):
 
 export async function applyPlugins(token: string): Promise<Pick<PluginsResponse, 'generation' | 'runtime'> & { message: string }> {
   const resp = await apiFetch('/admin/plugins/apply', { method: 'POST', token });
-  return resp.json();
+  const receipt = '插件配置已经应用，可回执';
+  return receiptOf(receipt, resp, (body) => {
+    const { generation, message, runtime } = shaped(receipt, body, { generation: TEXT, message: TEXT });
+    return { generation, message, runtime: pluginProcesses(receipt, runtime, 'runtime') };
+  });
 }

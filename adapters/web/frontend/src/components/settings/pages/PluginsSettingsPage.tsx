@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 
 import {
   applyPlugins, deletePlugin, getNodes, getPluginSource, getPlugins, getProviders,
-  installPlugin, installPluginPackage, isEditConflict, updatePluginConfig, updatePluginSource,
-  type AdminPlugin, type PluginParamSchema, type PluginRuntimeProcess,
-  type PluginSelectors, type PluginsResponse,
+  installPlugin, installPluginPackage, isEditConflict, receipted, updatePluginConfig, updatePluginSource,
+  type AdminNode, type AdminPlugin, type PluginParamSchema, type PluginRuntimeProcess,
+  type PluginSelectors, type PluginsResponse, type ProvidersResponse,
 } from '../../../api/supervisorClient';
 import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 import { usePageNotice } from '../../../hooks/usePageNotice';
@@ -18,15 +18,23 @@ import {
   ReadOnlyRow, Select, StatusBar, Tag, Textarea,
 } from './settingsControls';
 import { errorMessage } from '../../../api/request';
+import { appendSentence, reloadBeforeEditing } from '../../../utils/sentence';
 
 type Choices = Record<keyof PluginSelectors, string[]>;
 type Action = (action: () => Promise<void>) => Promise<void>;
 const EMPTY_CHOICES: Choices = { nodes: [], channels: [], providers: [], purposes: [] };
+const PURPOSES = ['inference', 'system', 'fallback', 'diagnostic'];
 const SELECTOR_LABELS: Record<keyof PluginSelectors, string> = {
   nodes: '节点', channels: '模型渠道', providers: 'Provider', purposes: '请求用途',
 };
 const STATUS_LABELS = { loaded: '已加载', disabled: '已停用', error: '运行异常', retiring: '等待在途请求结束', stopped: '进程已离线', not_applicable: '不在此进程运行' };
 const json = (value: unknown) => JSON.stringify(value, null, 2);
+
+/** 存上了、回执没读懂时交代的那半句。重读也没成（problem 非空）时手上还是存之前的指纹，得先刷新再改。 */
+function unreadReceipt(receiptProblem: string, problem: string): string {
+  if (!problem) return receiptProblem;
+  return appendSentence(reloadBeforeEditing(receiptProblem, '点「刷新列表」读入最新内容'), `刚才重新读取也没成：${problem}`);
+}
 
 function configObject(text: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text);
@@ -98,6 +106,17 @@ function BrowserStatus({ plugin }: { plugin: AdminPlugin }) {
     {entry?.errors.map((error, index) => <Pre key={index}>{error}</Pre>)}
     {browser.error && <Pre>{browser.error}</Pre>}
   </Block>;
+}
+
+/** 作用范围的候选项。读回来的不是节点列表、不是渠道表也算没读成：当成空的，下拉看着像一个候选都没有。 */
+function selectorChoices(nodes: PromiseSettledResult<AdminNode[]>, providers: PromiseSettledResult<ProvidersResponse>): { choices: Choices; complete: boolean } {
+  const nodeIds = nodes.status === 'fulfilled' && Array.isArray(nodes.value) ? nodes.value.map((node) => node.id) : null;
+  const table = providers.status === 'fulfilled' && typeof providers.value?.providers === 'object' && providers.value.providers !== null
+    && Array.isArray(providers.value.registered) ? providers.value : null;
+  return {
+    choices: { nodes: nodeIds ?? [], channels: table ? Object.keys(table.providers) : [], providers: table ? table.registered : [], purposes: PURPOSES },
+    complete: nodeIds !== null && table !== null,
+  };
 }
 
 function changedPluginIds(before: AdminPlugin[], after: AdminPlugin[]): string[] {
@@ -190,6 +209,16 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
     return () => { requests.drop('source'); };
   }, [requests, token, plugin.id, plugin.kind, sourceAttempt]);
 
+  // 存上了、回执没读懂：重读列表，拿落盘的那一版顶替回执。
+  const reread = async (): Promise<{ row: AdminPlugin | null; problem: string }> => {
+    try {
+      const row = (await getPlugins(token)).plugins.find((item) => item.id === plugin.id) ?? null;
+      return { row, problem: row ? '' : '列表里已经没有这个插件' };
+    } catch (caught) {
+      return { row: null, problem: errorMessage(caught) };
+    }
+  };
+
   let parsed: Record<string, unknown> | null = null;
   let validation = '';
   try { parsed = configObject(config); validation = enabled ? validateParams(parsed, plugin.params_schema) : ''; } catch (caught) { validation = errorMessage(caught); }
@@ -199,15 +228,18 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
   const saveConfig = () => run(async () => {
     if (!parsed || validation || !current()) return;
     try {
-      const result = await updatePluginConfig(token, plugin.id, { enabled, config: parsed, selectors, base_hash: configHash });
+      const { result, receiptProblem } = await receipted(updatePluginConfig(token, plugin.id, { enabled, config: parsed, selectors, base_hash: configHash }));
+      const { row, problem } = result ? { row: result, problem: '' } : await reread();
       if (!current()) return;
-      onUpdate(result);
-      setEnabled(result.enabled);
-      setConfig(json(result.config));
-      setSelectors(result.selectors);
-      setConfigHash(result.desired_hash);
-      setSavedConfig(json({ enabled: result.enabled, config: json(result.config), selectors: result.selectors }));
-      setMessage('配置已保存，运行进程会自动更新；可立即应用并查看状态。');
+      if (row) {
+        onUpdate(row);
+        setEnabled(row.enabled);
+        setConfig(json(row.config));
+        setSelectors(row.selectors);
+        setConfigHash(row.desired_hash);
+        setSavedConfig(json({ enabled: row.enabled, config: json(row.config), selectors: row.selectors }));
+      } else setSavedConfig(json({ enabled, config, selectors }));
+      setMessage('配置已保存，运行进程会自动更新；可立即应用并查看状态。', result ? '' : unreadReceipt(receiptProblem, problem));
       void refreshFrontendPlugins();
     } catch (caught) {
       if (current()) setError(isEditConflict(caught) ? '插件已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(caught));
@@ -216,23 +248,29 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
   const saveSource = () => run(async () => {
     if (!current()) return;
     try {
-      const result = await updatePluginSource(token, plugin.id, source, sourceHash);
+      const { result, receiptProblem } = await receipted(updatePluginSource(token, plugin.id, source, sourceHash));
+      const { row, problem } = result ? { row: result, problem: '' } : await reread();
       if (!current()) return;
-      onUpdate(result);
       setSavedSource(source);
-      setSourceHash(result.source_hash);
       setSourceReadable(true);
-      const nextConfig = json({ enabled: result.enabled, config: json(result.config), selectors: result.selectors });
+      const receiptNote = result ? '' : unreadReceipt(receiptProblem, problem);
+      if (!row) {
+        setMessage('源码已保存，运行进程会自动更新；可立即应用并查看状态。', receiptNote);
+        return;
+      }
+      onUpdate(row);
+      setSourceHash(row.source_hash);
+      const nextConfig = json({ enabled: row.enabled, config: json(row.config), selectors: row.selectors });
       if (!configDirty) {
-        setEnabled(result.enabled);
-        setConfig(json(result.config));
-        setSelectors(result.selectors);
+        setEnabled(row.enabled);
+        setConfig(json(row.config));
+        setSelectors(row.selectors);
         setSavedConfig(nextConfig);
-        setConfigHash(result.desired_hash);
-      } else if (nextConfig === savedConfig) setConfigHash(result.desired_hash);
+        setConfigHash(row.desired_hash);
+      } else if (nextConfig === savedConfig) setConfigHash(row.desired_hash);
       setMessage(configDirty && nextConfig !== savedConfig
         ? '源码已保存，但参数定义或配置已变化。运行进程会自动更新；配置草稿已保留，请复制后刷新并核对，再保存配置。'
-        : '源码已保存，运行进程会自动更新；可立即应用并查看状态。');
+        : '源码已保存，运行进程会自动更新；可立即应用并查看状态。', receiptNote);
     } catch (caught) {
       if (current()) setError(isEditConflict(caught) ? '源码已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(caught));
     }
@@ -254,13 +292,17 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
       if (!/\.zip$/i.test(file.name)) { setError('请选择 .zip 插件包'); return; }
       if (!current() || !confirmNavigation()) return;
       try {
-        const result = await installPluginPackage(token, file, configHash, current);
+        const { result, receiptProblem } = await receipted(installPluginPackage(token, file, configHash, current));
         if (!current()) return;
-        if (result.id !== plugin.id) throw new Error('替换包的插件标识与当前插件不同');
-        onUpdate(result); setConfigHash(result.desired_hash);
-        setEnabled(result.enabled); setConfig(json(result.config)); setSelectors(result.selectors);
-        setSavedConfig(json({ enabled: result.enabled, config: json(result.config), selectors: result.selectors }));
-        setMessage('插件包已替换，浏览器和运行进程会分别应用新版本。');
+        if (result && result.id !== plugin.id) throw new Error('替换包的插件标识与当前插件不同');
+        const { row, problem } = result ? { row: result, problem: '' } : await reread();
+        if (!current()) return;
+        if (row) {
+          onUpdate(row); setConfigHash(row.desired_hash);
+          setEnabled(row.enabled); setConfig(json(row.config)); setSelectors(row.selectors);
+          setSavedConfig(json({ enabled: row.enabled, config: json(row.config), selectors: row.selectors }));
+        }
+        setMessage('插件包已替换，浏览器和运行进程会分别应用新版本。', result ? '' : unreadReceipt(receiptProblem, problem));
         void refreshFrontendPlugins();
       } catch (caught) { if (current()) setError(errorMessage(caught)); }
     });
@@ -376,7 +418,8 @@ function PluginsWorkspace({ token }: { token: string }) {
   const [detailVersion, setDetailVersion] = useState(0);
   const [choices, setChoices] = useState<Choices>(EMPTY_CHOICES);
   const [changedPlugins, setChangedPlugins] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
+  // 第一次读取挂载后才发出：起步就算正在读取，免得状态栏先闪一下「没读成」。
+  const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -409,14 +452,9 @@ function PluginsWorkspace({ token }: { token: string }) {
     const request = requests.begin('choices');
     void Promise.allSettled([getNodes(token), getProviders(token)]).then(([nodes, providers]) => {
       if (!request.isCurrent()) return;
-      setChoices({
-        nodes: nodes.status === 'fulfilled' ? nodes.value.map((node) => node.id) : [],
-        channels: providers.status === 'fulfilled' ? Object.keys(providers.value.providers || {}) : [],
-        providers: providers.status === 'fulfilled' ? providers.value.registered || [] : [],
-        purposes: ['inference', 'system', 'fallback', 'diagnostic'],
-      });
-      const failures = [nodes, providers].filter((result) => result.status === 'rejected');
-      if (failures.length) setLoadError('部分作用范围候选项加载失败，可手动输入标识。', 'choices');
+      const { choices: next, complete } = selectorChoices(nodes, providers);
+      setChoices(next);
+      if (!complete) setLoadError('部分作用范围候选项加载失败，可手动输入标识。', 'choices');
     });
   }, [requests, token]);
 
@@ -449,13 +487,17 @@ function PluginsWorkspace({ token }: { token: string }) {
     try {
       const content = /\.py$/i.test(file.name) ? await file.text() : '';
       if (!requests.isCurrent()) return;
-      const result = /\.zip$/i.test(file.name) ? await installPluginPackage(token, file, undefined, requests.isCurrent) : await installPlugin(token, file.name, content);
+      const { result, receiptProblem } = await receipted(/\.zip$/i.test(file.name) ? installPluginPackage(token, file, undefined, requests.isCurrent) : installPlugin(token, file.name, content));
       if (!requests.isCurrent()) return;
-      update(result);
-      setSelectedId(result.id);
       setFile(null);
       if (fileInput.current) fileInput.current.value = '';
-      setMessage('插件已导入，默认停用。检查参数和作用范围后启用并保存，运行进程会自动更新。');
+      if (result) {
+        update(result);
+        setSelectedId(result.id);
+      } else await load();
+      if (!requests.isCurrent()) return;
+      // 回执读不懂时不知道导进来的是哪个插件：标识由后端按文件名或 plugin.json 定，前端不猜。
+      setMessage('插件已导入，默认停用。检查参数和作用范围后启用并保存，运行进程会自动更新。', result ? '' : appendSentence(receiptProblem, '在下面的列表里选中它再改'));
     } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); }
   });
   const remove = (plugin: AdminPlugin) => run(async () => {
@@ -473,10 +515,12 @@ function PluginsWorkspace({ token }: { token: string }) {
   const apply = () => run(async () => {
     if (!requests.isCurrent()) return;
     try {
-      const result = await applyPlugins(token);
+      const { result, receiptProblem } = await receipted(applyPlugins(token));
       if (!requests.isCurrent()) return;
-      setData((previous) => previous ? { ...previous, generation: result.generation, runtime: result.runtime } : previous);
-      setMessage(result.message || '已发出应用请求，请刷新进程状态确认结果。');
+      if (result) setData((previous) => previous ? { ...previous, generation: result.generation, runtime: result.runtime } : previous);
+      else await load();
+      if (!requests.isCurrent()) return;
+      setMessage(result?.message || '已发出应用请求，请刷新进程状态确认结果。', receiptProblem);
       void refreshFrontendPlugins();
     } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); }
   });
@@ -497,7 +541,7 @@ function PluginsWorkspace({ token }: { token: string }) {
   const locked = busy || loading;
   return (
     <PageShell title="插件" description="导入 Python 插件或系统插件包，设置参数与作用范围，查看各进程和浏览器实际加载的版本。" error={error} notice={notice} bar={
-      <StatusBar status={busy ? '正在处理…' : loading ? '正在读取…' : `${data?.plugins.length || 0} 个插件`} tone={data ? 'live' : 'idle'}>
+      <StatusBar status={busy ? '正在处理…' : loading ? '正在读取…' : data ? `${data.plugins.length} 个插件` : '插件列表没读成'} tone={data ? 'live' : 'idle'}>
         <Button disabled={locked} onClick={() => void refreshRuntime()} size="sm" tone="quiet">刷新进程状态</Button>
         <Button disabled={locked || !data} onClick={() => void apply()} size="sm">应用已保存的更改</Button>
       </StatusBar>
@@ -515,7 +559,7 @@ function PluginsWorkspace({ token }: { token: string }) {
           <Input aria-label="筛选插件" onChange={(event) => setQuery(event.target.value)} placeholder="名称、描述或文件名" value={query} width="flex" />
           <Button disabled={locked} onClick={() => { if (confirmNavigation()) { clearNotice(); void run(() => load(true)); } }} tone="quiet">刷新列表</Button>
         </div>
-        {!loading && !visible.length && <Empty>{data?.plugins.length ? '没有匹配的插件' : '尚无插件，请导入 .py 文件'}</Empty>}
+        {!loading && data && !visible.length && <Empty>{data.plugins.length ? '没有匹配的插件' : '尚无插件，请导入 .py 文件'}</Empty>}
         <div className="grid gap-2 sm:grid-cols-2">
           {visible.map((plugin) => (
             <button aria-pressed={selectedId === plugin.id} className={`min-w-0 space-y-2 border p-3 text-left ${selectedId === plugin.id ? 'border-[var(--duties-text)] bg-[var(--duties-muted)]' : 'border-[var(--duties-border)] bg-[var(--duties-panel)]'}`} disabled={locked} key={plugin.id} onClick={() => { if (selectedId !== plugin.id && confirmNavigation()) setSelectedId(plugin.id); }} type="button">

@@ -209,13 +209,21 @@ describe('browser module lifecycle', () => {
 
   it('keeps management and authentication usable when a middleware invocation throws', async () => {
     updateBrowserPlugin('broken', { generation: '1', status: 'loaded' });
-    vi.stubGlobal('fetch', vi.fn(async () => response({ ok: true, plugins: [] })));
+    const row = {
+      id: 'broken', name: 'broken', version: '1', description: '', author: '', filename: 'broken.py', source: 'custom',
+      source_hash: hash('broken'), desired_hash: hash('broken-config'), enabled: false, config: {},
+      selectors: { nodes: [], channels: [], providers: [], purposes: [] }, params_schema: [], metadata: {}, error: null,
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).endsWith('/admin/plugins') ? response({ plugins: [], generation: '1', shared_group: null, runtime: [] })
+        : String(input).endsWith('/broken/config') ? response(row) : response({ ok: true })
+    )));
     const broken = extensions.transaction('broken', '1');
     broken.wrap('transport', 'request', () => async () => { throw new Error('middleware failed'); }); broken.commit();
     await expect(fetchWithDeadline('/v1/features/materials')).rejects.toThrow('middleware failed');
     expect(browserPluginState().plugins.find((item) => item.id === 'broken')?.errors).toContain('middleware failed');
     await expect(getPlugins('token-a')).resolves.toMatchObject({ plugins: [] });
-    await expect(updatePluginConfig('token-a', 'broken', { enabled: false, config: {}, selectors: { nodes: [], channels: [], providers: [], purposes: [] }, base_hash: 'old' })).resolves.toEqual({ ok: true, plugins: [] });
+    await expect(updatePluginConfig('token-a', 'broken', { enabled: false, config: {}, selectors: { nodes: [], channels: [], providers: [], purposes: [] }, base_hash: 'old' })).resolves.toEqual(row);
     await expect(checkAdminAuth('token-a')).resolves.toBeTruthy();
     await expect(fetchWithDeadline('/i/example/v1/admin/runtime/status')).resolves.toBeInstanceOf(Response);
   });
