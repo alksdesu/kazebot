@@ -100,7 +100,7 @@ export function ContextArchiveSettings() {
     try {
       const days = Number(draft);
       // 只写这一个键，落在本实例那层；读回来时这个键已被别处改过就不覆盖。
-      const { content, result, receiptProblem } = await commitRuntimeKeys(token, [{ path: RETENTION_PATH, value: days }], {
+      const { content, note, result, receiptProblem } = await commitRuntimeKeys(token, [{ path: RETENTION_PATH, value: days }], {
         loaded: baseline.content,
         proceed: request.isCurrent,
       });
@@ -108,7 +108,7 @@ export function ContextArchiveSettings() {
       if (result && !result.ok) throw new Error('未能确认保存版本，请重新载入归档设置核对；草稿已保留。');
       // 回执没读懂时指纹照旧：下一次保存先读最新一版、按原文逐键核对，不靠这里的指纹。
       setSnapshot({ key: requests.key, value: { content, hash: result?.hash ?? baseline.hash, days, inherited: false } });
-      setDraft(String(days)); setNotice(savedMessage('归档保留设置已保存。', '', result?.warnings)); setError(receiptProblem);
+      setDraft(String(days)); setNotice(savedMessage('归档保留设置已保存。', note, result?.warnings)); setError(receiptProblem);
     } catch (reason) {
       if (request.isCurrent()) {
         if (reason instanceof StaleKeysError) {

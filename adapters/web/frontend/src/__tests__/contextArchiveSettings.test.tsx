@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import yaml from 'js-yaml';
 import * as api from '../api/supervisorClient';
 import { ContextArchiveSettings } from '../console/ContextArchiveSettings';
+import { WHOLE_FILE_REWRITTEN } from '../console/yamlRewrite';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async original => ({
@@ -162,6 +163,13 @@ describe('压缩上下文归档保留设置', () => {
     vi.mocked(api.updateRuntimeRaw).mockRejectedValueOnce(new api.ApiError(400, 'engine.context_archive.retention_days 要写成整数'));
     fireEvent.click(save()); await screen.findByText('400 engine.context_archive.retention_days 要写成整数');
     expect(input()).toHaveValue('21'); expect(save()).toBeEnabled();
+  });
+
+  it('原文只能整份重写、注释没保住时，结果里如实交代', async () => {
+    serve(layer('# 会丢的注释\nengine: {context_archive: {retention_days: 7}}\n', 'flow-1'));
+    await open(); change('30'); fireEvent.click(save());
+    expect(await screen.findByRole('status')).toHaveTextContent(`归档保留设置已保存。${WHOLE_FILE_REWRITTEN}。`);
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('archive-admin', 'engine:\n  context_archive:\n    retention_days: 30\n', 'flow-1');
   });
 
   it('保存通过但带着提醒时，每条都接在结果后面', async () => {
