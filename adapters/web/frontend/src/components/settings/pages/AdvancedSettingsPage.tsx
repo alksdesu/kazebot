@@ -41,10 +41,6 @@ const EMPTY_RUNTIME_CONFIG_FORM: RuntimeConfigFormState = {
   entry_node_id: '',
   tool_mode: '',
   max_workers: '',
-  compact_threshold_tokens: '',
-  compact_hard_threshold_tokens: '',
-  compact_keep_recent_tokens: '',
-  compact_keep_recent: '',
 };
 
 const RUNTIME_CODEC: RawFormCodec<RuntimeConfigFormState> = { parse: parseRuntimeConfig, serialize: serializeRuntimeConfig };
@@ -83,21 +79,6 @@ async function reloadAfterUnreadReceipt(receiptProblem: string, reload: () => Pr
 
 const DirtyMark = ({ dirty }: { dirty: boolean }) => (
   dirty ? <p role="status" className="text-sm text-[var(--duties-secondary)]">有未保存修改</p> : null
-);
-
-const CompactNumberField = ({ hint, label, min, onChange, placeholder, value }: {
-  hint: string;
-  label: string;
-  min: string;
-  onChange: (value: string) => void;
-  placeholder: string;
-  value: string;
-}) => (
-  <label className="block">
-    <span className={STRUCTURED_LABEL_CLASS}>{label}</span>
-    <input className={STRUCTURED_INPUT_CLASS} min={min} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} type="number" value={value} />
-    <span className="mt-1 block text-mini leading-4 text-[var(--duties-tertiary)]">{hint}</span>
-  </label>
 );
 
 interface RuntimeFileState {
@@ -242,42 +223,6 @@ const RuntimeFileBody = () => {
           <span className={STRUCTURED_LABEL_CLASS}>并发 task 处理数，留空使用默认值</span>
           <input className={STRUCTURED_INPUT_CLASS} min="1" onChange={(event) => update({ max_workers: event.target.value })} placeholder={placeholder('max_workers')} type="number" value={form.max_workers} />
         </label>
-        <div className="space-y-3 border-t border-[var(--duties-border)] pt-3">
-          <p className="font-mono text-mini font-semibold text-[var(--duties-text)]">上下文压缩</p>
-          <p className="text-mini leading-4 text-[var(--duties-tertiary)]">对话超过阈值后自动摘要历史。改完下一个任务就生效，不用重启。全部留空则使用代码默认值。</p>
-          <CompactNumberField
-            hint="超过就在后台静默压缩，当轮回复照常进行。填 0 关闭自动压缩。"
-            label="软阈值（token）"
-            min="0"
-            onChange={(value) => update({ compact_threshold_tokens: value })}
-            placeholder={placeholder('compact_threshold_tokens')}
-            value={form.compact_threshold_tokens}
-          />
-          <CompactNumberField
-            hint="超过则挂起当轮同步压缩，用户会多等一次调用。填 0 表示取软阈值的 1.25 倍。"
-            label="硬阈值（token）"
-            min="0"
-            onChange={(value) => update({ compact_hard_threshold_tokens: value })}
-            placeholder={placeholder('compact_hard_threshold_tokens')}
-            value={form.compact_hard_threshold_tokens}
-          />
-          <CompactNumberField
-            hint="压缩时保留多少最新原文，更早的压成摘要。填 0 则改按下面的段数保留。"
-            label="保留原文（token）"
-            min="0"
-            onChange={(value) => update({ compact_keep_recent_tokens: value })}
-            placeholder={placeholder('compact_keep_recent_tokens')}
-            value={form.compact_keep_recent_tokens}
-          />
-          <CompactNumberField
-            hint="仅在上一项为 0 时生效：保留最近几个完整任务段。最小 2。"
-            label="保留段数"
-            min="2"
-            onChange={(value) => update({ compact_keep_recent: value })}
-            placeholder={placeholder('compact_keep_recent')}
-            value={form.compact_keep_recent}
-          />
-        </div>
       </fieldset>
       <RawFormStatus source={source} />
       <RawSourceDetails height="18rem" label="runtime.yaml YAML 编辑器" readOnly={!file.loaded || file.loading} source={source} summary="高级 YAML 编辑" />
@@ -388,7 +333,7 @@ export const AdvancedSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { setAdvancedFile } = useSettingsSelectionStore();
   return (
-    <PageShell authed={isAuthenticated} description="运行时配置使用结构化表单编辑，安全策略保留在高级 YAML 折叠区内编辑。定时任务请在自动化页面管理。" title="高级配置">
+    <PageShell authed={isAuthenticated} description="运行时配置使用结构化表单编辑，安全策略保留在高级 YAML 折叠区内编辑。定时任务请在自动化页面管理，上下文压缩请在记忆页面设置。" title="高级配置">
       <div className="space-y-4">
         {FILES.map((file) => (
           <Block frame="boxed" hint={file.description} key={file.key}>

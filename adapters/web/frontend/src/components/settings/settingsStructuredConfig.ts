@@ -80,10 +80,6 @@ export interface RuntimeConfigFormState {
   /** 空串：本实例这层没写，跟随仓库默认。 */
   tool_mode: EngineToolMode | '';
   max_workers: string;
-  compact_threshold_tokens: string;
-  compact_hard_threshold_tokens: string;
-  compact_keep_recent_tokens: string;
-  compact_keep_recent: string;
 }
 
 const safeLoad = (raw: string): Record<string, any> => parseYamlMapping(raw) as Record<string, any>;
@@ -192,10 +188,6 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): Yam
 const RUNTIME_ENTRY_NODE_PATH = ['shell', 'entry_node_id'] as const;
 const RUNTIME_TOOL_MODE_PATH = ['engine', 'tool_mode'] as const;
 const RUNTIME_MAX_WORKERS_PATH = ['engine', 'max_workers'] as const;
-const RUNTIME_COMPACT_THRESHOLD_PATH = ['engine', 'compact', 'threshold_tokens'] as const;
-const RUNTIME_COMPACT_HARD_THRESHOLD_PATH = ['engine', 'compact', 'hard_threshold_tokens'] as const;
-const RUNTIME_COMPACT_KEEP_TOKENS_PATH = ['engine', 'compact', 'keep_recent_tokens'] as const;
-const RUNTIME_COMPACT_KEEP_SEGMENTS_PATH = ['engine', 'compact', 'keep_recent'] as const;
 
 /** 数字键读成输入框文本。缺键读空串，表示本实例不覆盖、跟随仓库默认。 */
 function numText(doc: Record<string, any>, path: readonly string[]): string {
@@ -223,10 +215,6 @@ export function runtimeConfigOf(doc: Record<string, any>): RuntimeConfigFormStat
     entry_node_id: str(nested(doc, RUNTIME_ENTRY_NODE_PATH)),
     tool_mode: toolModeText(nested(doc, RUNTIME_TOOL_MODE_PATH)),
     max_workers: numText(doc, RUNTIME_MAX_WORKERS_PATH),
-    compact_threshold_tokens: numText(doc, RUNTIME_COMPACT_THRESHOLD_PATH),
-    compact_hard_threshold_tokens: numText(doc, RUNTIME_COMPACT_HARD_THRESHOLD_PATH),
-    compact_keep_recent_tokens: numText(doc, RUNTIME_COMPACT_KEEP_TOKENS_PATH),
-    compact_keep_recent: numText(doc, RUNTIME_COMPACT_KEEP_SEGMENTS_PATH),
   };
 }
 
@@ -241,18 +229,9 @@ export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState
   if (entryNode !== current.entry_node_id) edits.push({ path: RUNTIME_ENTRY_NODE_PATH, value: entryNode || undefined });
   const toolMode = toolModeText(form.tool_mode);
   if (toolMode !== current.tool_mode) edits.push({ path: RUNTIME_TOOL_MODE_PATH, value: toolMode || undefined });
-  const numbers: Array<[keyof RuntimeConfigFormState, readonly string[], number]> = [
-    // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
-    ['max_workers', RUNTIME_MAX_WORKERS_PATH, 1],
-    // 0 各有含义：软阈值 0 关掉自动压缩，硬阈值 0 取软阈值的 1.25 倍，保留量 0 改按段数算。
-    ['compact_threshold_tokens', RUNTIME_COMPACT_THRESHOLD_PATH, 0],
-    ['compact_hard_threshold_tokens', RUNTIME_COMPACT_HARD_THRESHOLD_PATH, 0],
-    ['compact_keep_recent_tokens', RUNTIME_COMPACT_KEEP_TOKENS_PATH, 0],
-    ['compact_keep_recent', RUNTIME_COMPACT_KEEP_SEGMENTS_PATH, 2],
-  ];
-  for (const [field, path, min] of numbers) {
-    if (form[field].trim() !== current[field]) edits.push({ path, value: intValue(form[field], min) });
-  }
+  const maxWorkers = form.max_workers.trim();
+  // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
+  if (maxWorkers !== current.max_workers) edits.push({ path: RUNTIME_MAX_WORKERS_PATH, value: intValue(maxWorkers, 1) });
   return editYamlKeys(raw, edits);
 }
 

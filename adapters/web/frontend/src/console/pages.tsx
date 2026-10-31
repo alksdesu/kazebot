@@ -71,7 +71,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     label: '记忆',
     icon: 'psychology',
     Page: MemoryPage,
-    note: 'bot 记住了什么、每个会话攒了多少上下文。改动立即写入。',
+    note: 'bot 记住了什么、每个会话攒了多少上下文，以及攒到多长开始压缩。记忆和会话的改动立即写入，压缩和归档设置点保存后写入。',
   },
   {
     id: 'stickers',

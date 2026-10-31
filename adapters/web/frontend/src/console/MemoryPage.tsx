@@ -26,6 +26,7 @@ import { useConversationDirectory } from '../features/useConversationDirectory';
 import { useConversationNames } from '../features/useConversationNames';
 import { scopeIdentity } from '../features/conversationNames';
 import { ContextArchiveSettings } from './ContextArchiveSettings';
+import { ContextCompactSettings } from './ContextCompactSettings';
 import { errorMessage } from '../api/request';
 import { KEYWORD_INPUT_HINT, splitKeywords } from '../utils/keywords';
 import { appendSentence } from '../utils/sentence';
@@ -540,6 +541,7 @@ export const MemoryPage = () => {
   if (identity.current.token !== token) identity.current = { token, generation: identity.current.generation + 1 };
   return <Fragment key={identity.current.generation}>
     <MemoryBlock />
+    <ContextCompactSettings />
     <ContextArchiveSettings />
     <ContextBlock />
   </Fragment>;

@@ -100,10 +100,6 @@ describe('runtime config key paths', () => {
     entry_node_id: '',
     tool_mode: '',
     max_workers: '',
-    compact_threshold_tokens: '',
-    compact_hard_threshold_tokens: '',
-    compact_keep_recent_tokens: '',
-    compact_keep_recent: '',
     ...over,
   });
 
@@ -214,89 +210,22 @@ describe('runtime config key paths', () => {
     expect(parseRuntimeConfig(saved).max_workers).toBe('2');
   });
 
-  // engine.compact 决定何时压缩历史，之前只能手写 YAML。
-  describe('compact thresholds', () => {
-    const COMMENTED = [
-      '# Clonoth runtime tuning config',
-      'version: 1',
-      '',
+  // 压缩那几项归记忆页按键写：这张表单以前清空就删键，现在一个字都不该碰它们。
+  it('leaves engine.compact alone, comments included', () => {
+    const commented = [
       'engine:',
-      '  max_steps: 64            # 单轮最多几步',
-      '',
+      '  max_workers: 4',
       '  compact:',
-      '    threshold_tokens: 256000   # 软阈值：超过此值在后台静默压缩',
-      '    hard_threshold_tokens: 0   # 0 = 取软阈值的 1.25 倍',
-      '    keep_recent_tokens: 30000  # 压缩时保留的原文 token 量',
-      '    keep_recent: 6             # keep_recent_tokens 为 0 时生效',
-      '',
+      '    threshold_tokens: 256000   # 软阈值',
+      '    keep_recent: 6             # 段数',
       'shell:',
       '  entry_node_id: bootstrap.shell_orchestrator',
       '',
     ].join('\n');
 
-    it('reads every compact key', () => {
-      const parsed = parseRuntimeConfig(COMMENTED);
+    const { content: saved } = serializeRuntimeConfig(commented, { ...parseRuntimeConfig(commented), entry_node_id: 'qq.orchestrator' });
 
-      expect(parsed.compact_threshold_tokens).toBe('256000');
-      expect(parsed.compact_hard_threshold_tokens).toBe('0');
-      expect(parsed.compact_keep_recent_tokens).toBe('30000');
-      expect(parsed.compact_keep_recent).toBe('6');
-    });
-
-    it('writes new values back into the nested keys', () => {
-      const { content: saved } = serializeRuntimeConfig(COMMENTED, form({
-        entry_node_id: 'bootstrap.shell_orchestrator',
-        compact_threshold_tokens: '120000',
-        compact_hard_threshold_tokens: '150000',
-        compact_keep_recent_tokens: '20000',
-        compact_keep_recent: '4',
-      }));
-
-      const parsed = parseRuntimeConfig(saved);
-      expect(parsed.compact_threshold_tokens).toBe('120000');
-      expect(parsed.compact_hard_threshold_tokens).toBe('150000');
-      expect(parsed.compact_keep_recent_tokens).toBe('20000');
-      expect(parsed.compact_keep_recent).toBe('4');
-    });
-
-    // load/dump 一轮会把整份文件的注释抹掉，等于每存一次就吃掉一次文档。
-    it('keeps both standalone and trailing comments', () => {
-      const { content: saved } = serializeRuntimeConfig(COMMENTED, {
-        ...parseRuntimeConfig(COMMENTED),
-        compact_threshold_tokens: '120000',
-      });
-
-      expect(saved).toContain('# Clonoth runtime tuning config');
-      expect(saved).toContain('max_steps: 64            # 单轮最多几步');
-      expect(saved).toContain('threshold_tokens: 120000   # 软阈值：超过此值在后台静默压缩');
-    });
-
-    it('keeps 0 rather than treating it as unset', () => {
-      const { content: saved } = serializeRuntimeConfig(COMMENTED, {
-        ...parseRuntimeConfig(COMMENTED),
-        compact_threshold_tokens: '0',
-      });
-
-      expect(parseRuntimeConfig(saved).compact_threshold_tokens).toBe('0');
-    });
-
-    it('builds the compact block when runtime.yaml has none', () => {
-      const { content: saved } = serializeRuntimeConfig('engine:\n  max_steps: 64\n', form({
-        compact_threshold_tokens: '90000',
-      }));
-
-      expect(parseRuntimeConfig(saved).compact_threshold_tokens).toBe('90000');
-      expect(saved).toContain('max_steps: 64');
-    });
-
-    it('drops the key when the field is cleared', () => {
-      const { content: saved } = serializeRuntimeConfig(COMMENTED, form({
-        entry_node_id: 'bootstrap.shell_orchestrator',
-      }));
-
-      expect(saved).not.toContain('threshold_tokens');
-      expect(saved).toContain('# Clonoth runtime tuning config');
-    });
+    expect(saved).toBe(commented.replace('bootstrap.shell_orchestrator', 'qq.orchestrator'));
   });
 });
 
