@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from .conversation_store import MessageType
@@ -91,3 +92,12 @@ def concise_text(text: str, limit: int = SHORT_REPLY_MAX_CHARS) -> str:
     prefix = text[:limit - 1]
     boundary = max(prefix.rfind(mark) for mark in ("。", "！", "？", "\n", ". ", "! ", "? "))
     return prefix[:boundary + 1] if boundary >= limit // 2 else prefix.rstrip() + "…"
+
+
+_TERMINAL_PLACEHOLDER_RE = re.compile(r"<[A-Za-z0-9_]{2,}>")
+
+
+def is_void_terminal_text(text: str) -> bool:
+    # finish/ask 的正文空到不该发给用户：空白、纯标点省略号、或整段只是个 <OCCUPY> 式占位符
+    stripped = _TERMINAL_PLACEHOLDER_RE.sub("", text or "")
+    return not re.sub(r"[\s\W_]+", "", stripped)

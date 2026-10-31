@@ -251,7 +251,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     返回 None 表示已处理完毕，调用方判断是否继续。
     """
     args = pseudo_call.arguments or {}
-    from ..conversation_routing import concise_text, short_reply
+    from ..conversation_routing import concise_text, is_void_terminal_text, short_reply
     if short_reply(getattr(ls.rctx, "task_context", {}) or {}):
         # 短答只给 finish，不发言除外：插话的短答本来就可以选择不接。
         if pseudo_call.name == STAY_SILENT_TOOL_NAME:
@@ -338,13 +338,13 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         terminal_name = str(pseudo_call.name or "").strip()
         result_text = str(args.get("text") or "").strip()
 
-        if not result_text:
+        if is_void_terminal_text(result_text):
             _emit_pseudo_tool_result(
                 ls, pseudo_call,
-                f'❌ REJECTED: {terminal_name}() called with empty text. Your visible content MUST go '
-                f'in the {terminal_name} tool\'s `text` parameter, NOT in free prose outside tool calls. '
-                'Free prose is never delivered to the user. Put your actual answer/question/data '
-                f'in text and call {terminal_name} again.',
+                f'❌ REJECTED: {terminal_name}() called with empty, punctuation-only, or placeholder text '
+                f'(e.g. "...", "<YOUR_RESPONSE>"). That is never delivered to the user. Your visible content '
+                f'MUST go in the {terminal_name} tool\'s `text` parameter, NOT in free prose outside tool calls. '
+                f'Put your actual answer/question/data in text and call {terminal_name} again.',
             )
             return None
 
