@@ -1182,7 +1182,8 @@ class ToolRegistry:
             (
                 "cancel_active_tasks",
                 "Cancel all active downstream tasks in the current session. "
-                "Use when the user's new message makes the previous task unnecessary.",
+                "Use when the user's new message makes the previous task unnecessary. "
+                "In a group chat, members who are not admins only cancel the tasks they started themselves.",
                 {"type": "object", "properties": {
                     "node_id": {
                         "type": "string",

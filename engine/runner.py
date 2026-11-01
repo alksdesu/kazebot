@@ -33,6 +33,7 @@ from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
 from .attachments import abuild_multimodal_content, payload_attachments, screen_attachments
+from . import concurrent_tasks
 from .context import RunContext, TaskLease
 from .model import (
     create_llm_http_client,
@@ -1002,6 +1003,7 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     inbound_attachments = input_data.get("attachments")
     if isinstance(inbound_attachments, list) and inbound_attachments:
         ctx["inbound_attachments"] = list(inbound_attachments)
+    ctx.update(concurrent_tasks.bridge_input(input_data))
     return ctx
 
 

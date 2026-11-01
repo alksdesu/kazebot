@@ -128,6 +128,9 @@ class InboundMessageIn(BaseModel):
     # 与 platform_auth 分开：后者参与鉴权，不该混入非鉴权字段。
     memory_hints: dict[str, Any] = Field(default_factory=dict)
     output_guide: OutputGuide | None = None
+    # 平台把用户原话和群聊记录、身份块拼成 text 时另给的原话（已匿名）：同一段对话里并发的轮次和控制台拿它当预览，
+    # 不进提示词正文；超长只截不拒
+    request_text: str | None = None
     # 没收到应答时调用方带着同一个 id 重发（异步委派就是这样）：同一段对话里收下过的不再建第二份，回第一次的应答
     delivery_id: str | None = Field(default=None, max_length=128)
 

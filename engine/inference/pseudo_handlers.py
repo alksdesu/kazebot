@@ -528,7 +528,7 @@ async def _preempt_in_family(ls: _LoopState, ref: str, message: str) -> str:
         if found.status_code == 404:
             return (
                 f"这段对话和它派出去的任务里没有能插话的 '{ref}'："
-                "不存在、已结束、正挂起等子任务，或者是工具任务、系统任务"
+                "不存在、已结束、正挂起等子任务，是工具任务、系统任务，或者是群聊里别人发起的"
             )
         if found.status_code == 409:
             return _ambiguous_preempt_target(ref, found)

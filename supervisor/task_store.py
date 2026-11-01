@@ -27,7 +27,7 @@ from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
-from . import child_retention, dispatch_fork, stopped_batch
+from . import active_tasks, child_retention, dispatch_fork, stopped_batch
 from ._helpers import _now
 from .auto_continue import chain_input
 from .context_calibration import calibrated_chars_per_token
@@ -816,11 +816,12 @@ class TaskStoreMixin:
         branch_base_count = int(fork_meta.get("base_count") or 0)
         _branch_error = str(fork_meta.get("error") or "")
         self._cancelled_sessions.discard(branch_session_id)
-        # 收集当前活跃 task 摘要，注入给入口节点 AI 判断
-        active_tasks_summary = self._active_tasks_summary_locked(session_id)
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
         use_context = bool(payload.get("use_context", True))
         platform_auth = dict(payload.get("platform_auth") or {}) if isinstance(payload.get("platform_auth"), dict) else {}
+        # 发消息的人看得到的、这段对话里还在跑的任务，engine 并进这一轮的动态区
+        active_summary = active_tasks.summary_input_locked(self, session_id, payload, platform_auth)
+        request_text = active_tasks.request_text_of(payload)
         route_hints = dict(payload.get("route_hints") or {}) if isinstance(payload.get("route_hints"), dict) else {}
         memory_hints = dict(payload.get("memory_hints") or {}) if isinstance(payload.get("memory_hints"), dict) else {}
         output_guide = output_guide_payload(payload.get(OUTPUT_GUIDE_KEY))
@@ -897,7 +898,8 @@ class TaskStoreMixin:
             "use_context": use_context,
             "_system_task": bool(payload.get("_system_task", False)),
             "schedule_id": str(payload.get("schedule_id") or ""),
-            "active_tasks_summary": active_tasks_summary,
+            **active_summary,
+            **({active_tasks.REQUEST_TEXT_KEY: request_text} if request_text else {}),
             "attachments": attachments or [],
             "parent_session_id": session_id,
             "branch_session_id": branch_session_id,
@@ -1119,38 +1121,12 @@ class TaskStoreMixin:
         needed |= self._async_result_chains_needed_locked()
         return needed
 
-    def _active_tasks_summary_locked(self, session_id: str) -> list[dict[str, Any]]:
-        """返回当前 session 中活跃（pending/running）task 的摘要列表。"""
-        result: list[dict[str, Any]] = []
-        session_ids = {session_id, *self._entry_branch_ids_for_parent_locked(session_id)}
-        for task in self.tasks.values():
-            if task.session_id not in session_ids:
-                continue
-            if self._task_terminal(task):
-                continue
-            result.append({
-                "task_id": task.task_id,
-                "kind": task.kind.value,
-                "node_id": task.node_id or "",
-                "tool_name": task.tool_name or "",
-                "status": task.status.value,
-                "instruction": str(task.input.get("instruction") or "")[:200],
-                "created_at": task.created_at.isoformat() if task.created_at else "",
-                # [Fork/Merge 2026-05-12] 摘要暴露分支来源。
-                # 原因：主 session 可能同时有多个 branch 任务，入口节点需要区分它们。
-                # 做法：优先读取 task.input.branch_session_id，否则用 task.session_id。
-                # 目的：保留旧摘要字段的同时支持并发分支可观测性。
-                "branch_session_id": str(task.input.get("branch_session_id") or (task.session_id if task.session_id != session_id else "")),
-                "parent_session_id": str(task.input.get("parent_session_id") or session_id),
-                "source_inbound_seq": task.source_inbound_seq,
-            })
-        return result
-
     # [2026-05-28] 新增可选 node_id 参数：只取消指定节点的活跃任务。
     # 为什么：原本 cancel_active_tasks 会取消 session 内所有任务，粒度太粗。
     # 怎么改：传入 node_id 时，跳过不匹配的任务。
     # 目的：允许调用方按节点粒度管理任务生命周期。
     def cancel_active_tasks(self, session_id: str, *, exclude_task_id: str | None = None, node_id: str | None = None) -> dict[str, Any]:
+        """exclude_task_id 是发起取消的任务（engine 的工具传自己）：它和它的派发链不取消，群聊里普通成员只取消自己发起的。"""
         sid = (session_id or "").strip()
         if not sid:
             return {"ok": False}
@@ -1160,6 +1136,7 @@ class TaskStoreMixin:
         with self._lock:
             keep_ids: set[str] = set()
             tid = (exclude_task_id or "").strip()
+            caller = self.tasks.get(tid) if tid else None
             while tid and tid not in keep_ids:
                 keep_ids.add(tid)
                 t = self.tasks.get(tid)
@@ -1177,6 +1154,8 @@ class TaskStoreMixin:
                 session_ids |= self._session_tree_locked(sid, info.conversation_key)
             for task in list(self.tasks.values()):
                 if task.session_id not in session_ids or task.task_id in keep_ids:
+                    continue
+                if caller is not None and not self._caller_may_touch_locked(caller, task):
                     continue
                 # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
                 if _filter_node and task.node_id not in _filter_ids:

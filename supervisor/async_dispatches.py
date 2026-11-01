@@ -32,6 +32,7 @@ from . import child_retention
 from ._helpers import _now
 from .eventlog import INBOUND_DELIVERY
 from .task_ending import TaskEnding
+from .task_owners import may_touch
 from .task_store import CancelEffect
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
@@ -110,6 +111,7 @@ class SettledDispatch:
     hold 说明为什么留（await 过它，或落点节点那一轮还没做完）。
 
     callback_task_id 是作为新消息交回时接它的那一轮；refs_session 是它引用的超长输出眼下复制到了哪个会话。
+    owner 是结束时沿派发链找到的发起人身份：派它的任务清出内存后，群聊里还靠它认是谁的。
     """
 
     task: Task
@@ -122,6 +124,7 @@ class SettledDispatch:
     hold: str = ""
     callback_task_id: str = ""
     refs_session: str = ""
+    owner: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,7 @@ def _record_locked(
             family_root=state._task_family_root_locked(task),
             settled_at=now,
             fallback_result=dict(fallback_result) if isinstance(fallback_result, dict) else None,
+            owner=state._platform_auth_origin_locked(task)[1],
         )
         registry.ledger[task.task_id] = record
         _trim_ledger_locked(registry, now)
@@ -677,12 +681,18 @@ def _dispatch_chain_ids(state: "SupervisorState", task: Task) -> set[str]:
         current = parent
 
 
+def _owner_locked(state: "SupervisorState", task: Task, record: SettledDispatch | None) -> dict[str, Any]:
+    """委派是谁发起的：结束了的用结束时记下的，还没结束的沿派发链现找。"""
+    return record.owner if record is not None else state._platform_auth_origin_locked(task)[1]
+
+
 def _task_for_handle_locked(
     state: "SupervisorState", registry: AsyncDispatchRegistry, caller: Task, text: str, *, purpose: str,
 ) -> tuple[Task | None, str]:
     """句柄对应的异步委派任务，以及认不出时给模型看的原因。
 
-    先核会话和家族，家族外的一律和不存在一样；家族里的同步委派按 purpose（await 或 cancel）和它结束没有照实说明。
+    先核会话、家族和发起人，家族外的、群聊里别人发起的一律和不存在一样；家族里的同步委派按 purpose（await 或 cancel）
+    和它结束没有照实说明。
     """
     handle = parse_handle(text)
     if handle is None:
@@ -696,6 +706,8 @@ def _task_for_handle_locked(
     caller_root = state._task_family_root_locked(caller)
     task_root = record.family_root if record is not None else state._task_family_root_locked(task)
     if not caller_root or caller_root != task_root:
+        return None, _NOT_FOUND
+    if not may_touch(state._platform_auth_origin_locked(caller)[1], _owner_locked(state, task, record)):
         return None, _NOT_FOUND
     if not is_async_dispatch(task):
         if not (task.caller_task_id or "").strip():
@@ -1196,7 +1208,9 @@ def _finished_item_locked(
 
 
 def list_locked(state: "SupervisorState", caller_task_id: str) -> dict[str, Any] | None:
-    """调用方会话家族里的异步委派：还没结束的全部（最早的在前），加上最近结束的几个。调用方不在或已结束给 None。"""
+    """调用方会话家族里的异步委派：还没结束的全部（最早的在前），加上最近结束的几个；群聊里普通成员只列自己发起的。
+    调用方不在或已结束给 None。
+    """
     caller = _caller_locked(state, caller_task_id)
     if caller is None:
         return None
@@ -1205,6 +1219,7 @@ def list_locked(state: "SupervisorState", caller_task_id: str) -> dict[str, Any]
     root = state._task_family_root_locked(caller)
     if not root:
         return {"ok": True, "active": [], "finished": [], "active_total": 0, "finished_total": 0}
+    caller_auth = state._platform_auth_origin_locked(caller)[1]
     active = [
         task for task in state.tasks.values()
         if is_async_dispatch(task)
@@ -1212,9 +1227,13 @@ def list_locked(state: "SupervisorState", caller_task_id: str) -> dict[str, Any]
         and task.task_id not in registry.ledger
         and not (state._task_terminal(task) and task.route_status == RouteStatus.routed)
         and state._task_family_root_locked(task) == root
+        and may_touch(caller_auth, _owner_locked(state, task, None))
     ]
     active.sort(key=lambda task: task.created_at)
-    finished = [record for record in reversed(registry.ledger.values()) if record.family_root == root]
+    finished = [
+        record for record in reversed(registry.ledger.values())
+        if record.family_root == root and may_touch(caller_auth, record.owner)
+    ]
     return {
         "ok": True,
         "active": [_active_item_locked(state, registry, caller, task, now) for task in active[:LIST_ACTIVE_LIMIT]],

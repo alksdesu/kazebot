@@ -2382,6 +2382,7 @@ async def _rebuild_prompt_messages(ctx: Any) -> None:
     call in the unified module and read the unchanged ctx.extra key names.
     Purpose: preserve the existing prompt layout while removing the old modules.
     """
+    from engine.concurrent_tasks import CONCURRENT_CONTEXT_KEY
     from engine.conversation_routing import turn_input_meta
     from engine.inference.message_assembly import assemble_messages_with_injections
     from engine.output_guide import OUTPUT_GUIDE_KEY
@@ -2403,6 +2404,7 @@ async def _rebuild_prompt_messages(ctx: Any) -> None:
         output_guide=task_context.get(OUTPUT_GUIDE_KEY),
         turn_meta=turn_input_meta(task_context),
         isolation=task_context.get(ISOLATION_CONTEXT_KEY),
+        concurrent=task_context.get(CONCURRENT_CONTEXT_KEY),
     )
     ctx.messages[:] = rebuilt
     ctx.extra["is_block_mode"] = is_block_mode

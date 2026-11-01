@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..attachments import build_multimodal_content
+from ..concurrent_tasks import CONCURRENT_CONTEXT_KEY, concurrent_parts
 from ..conversation_routing import render_history_inputs, render_user_input, turn_input_meta
 from ..isolation_notice import isolation_parts
 from ..node import Node
@@ -69,6 +70,7 @@ def assemble_messages_with_injections(
     output_guide: dict[str, Any] | None = None,
     turn_meta: dict[str, Any] | None = None,
     isolation: Any = None,
+    concurrent: Any = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Lay out prompt messages using precomputed skill and memory injections.
 
@@ -83,6 +85,7 @@ def assemble_messages_with_injections(
     当轮输入按它渲染，同一条输入当轮发出去的和之后重载的才一字不差。
     isolation 是 task_context 里的隔离说明：隔离副本里的任务在动态区多一段 [ISOLATION]，排在技能和记忆之前；
     其余任务的提示词一字不变。
+    concurrent 是 task_context 里这一轮消息进来时还在跑的任务，紧接在隔离说明之后；没有时提示词一字不变。
     带文本附件时要读盘，协程里放到线程里调。
     """
     skill_static = list(skill_static or [])
@@ -91,7 +94,7 @@ def assemble_messages_with_injections(
     memory_dynamic = list(memory_dynamic or [])
     guide_static = static_guide_messages(output_guide)
     guide_turn = turn_guide_parts(output_guide)
-    isolation_turn = isolation_parts(isolation, workspace_root=workspace_root)
+    situation_turn = [*isolation_parts(isolation, workspace_root=workspace_root), *concurrent_parts(concurrent)]
     rendered_history = render_history_inputs(history)
 
     # ---- Prompt cache friendly layout ----
@@ -153,7 +156,7 @@ def assemble_messages_with_injections(
             messages.pop()
 
         # --- Dynamic (在 instruction 之前) ---
-        _dynamic_parts: list[str] = list(isolation_turn)
+        _dynamic_parts: list[str] = list(situation_turn)
         for _dm in skill_dynamic:
             if _dm.get("content"):
                 _dynamic_parts.append(_dm["content"])
@@ -223,7 +226,7 @@ def assemble_messages_with_injections(
         _dynamic_parts_s: list[str] = []
         if len(system_prompt) >= 2 and system_prompt[1].get("content"):
             _dynamic_parts_s.append(system_prompt[1]["content"])
-        _dynamic_parts_s.extend(isolation_turn)
+        _dynamic_parts_s.extend(situation_turn)
         for _dm in skill_dynamic:
             if _dm.get("content"):
                 _dynamic_parts_s.append(_dm["content"])
@@ -284,5 +287,6 @@ def assemble_initial_messages(
         output_guide=(task_context or {}).get(OUTPUT_GUIDE_KEY),
         turn_meta=turn_input_meta(task_context),
         isolation=(task_context or {}).get(ISOLATION_CONTEXT_KEY),
+        concurrent=(task_context or {}).get(CONCURRENT_CONTEXT_KEY),
     )
     return messages, is_block_mode, system_prompt

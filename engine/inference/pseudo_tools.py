@@ -384,7 +384,8 @@ def _await_dispatches_spec(timeouts: DispatchTimeouts | None = None) -> dict:
                 "会注明，不要重复汇报。\n"
                 "- 等到时还没做完的标成「还在运行」，它的结果留给你：之后再调用本工具收取；"
                 "本任务结束时还没收取的，会和其他留着的结果合成一条消息交回。\n"
-                "- 句柄写错、或者不属于这段对话的，会注明拿不到结果，不影响其余的。\n"
+                "- 句柄写错、不属于这段对话、或者是群聊里别人发起的（不是管理员的成员只能等自己发起的），"
+                "会注明拿不到结果，不影响其余的。\n"
                 "- 本工具当轮只返回「正在等待」。和它同一轮调用的 finish/ask 不会执行；"
                 "也不能和 wait=true 的委派放在同一轮，同一轮只能调用一次。"
             ),
@@ -430,7 +431,8 @@ def _list_dispatches_spec() -> dict:
             "description": (
                 "列出这段对话里异步（wait=false）委派出去的子任务：还没结束的（排队、运行中、正在等它自己的子任务）"
                 "全部列出，再加上最近结束的几个。每项给出句柄、目标节点、状态、指令摘要和已经过了多久；"
-                "结束的还给出结局、摘要，以及结果交到了哪里。只查看，不改变任何东西。"
+                "结束的还给出结局、摘要，以及结果交到了哪里。群聊里不是管理员的成员只看得到自己发起的。"
+                "只查看，不改变任何东西。"
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -446,7 +448,8 @@ def _cancel_dispatch_spec() -> dict:
             "description": (
                 "取消一个还在运行的异步（wait=false）委派，连同它派出去的全部子任务。正在执行的会在当前这一步做完后停下，"
                 f"被取消的委派不再交回结果，正在用 {AWAIT_DISPATCHES_TOOL_NAME} 等它的会收到「已取消」。"
-                "已经结束的委派不用取消。只能取消这段对话里的委派，不能取消自己或派出自己的任务。"
+                "已经结束的委派不用取消。只能取消这段对话里的委派（群聊里不是管理员的成员只能取消自己发起的），"
+                "不能取消自己或派出自己的任务。"
             ),
             "parameters": {
                 "type": "object",
@@ -666,19 +669,23 @@ def _preempt_task_spec() -> dict:
         "function": {
             "name": "preempt_task",
             "description": (
-                "Inject an additional instruction into a running child task. The child task will "
-                "finish its current atomic operation (e.g. tool call), receive your message as a new "
-                "user instruction, and continue working with the updated direction.\n\n"
+                "Inject an additional instruction into a running task: a child you dispatched, or another turn of "
+                "this conversation that is still running (the dynamic context lists those as running tasks). The task "
+                "will finish its current atomic operation (e.g. tool call), receive your message as a new user "
+                "instruction, and continue working with the updated direction.\n\n"
                 "This is NOT for cancelling tasks — use cancel_active_tasks for that.\n\n"
                 "Use cases:\n"
                 "- You need to add corrections or supplementary instructions to a running child.\n"
-                "- The user provided new information that the child task needs to incorporate.\n"
+                "- The user provided new information that the running task needs to incorporate.\n"
+                "- The user's new message adds to work another turn is still doing: pass it on instead of starting "
+                "that work over.\n"
                 "- You want to steer an ongoing task in a different direction without restarting it.\n\n"
                 "This is non-terminating — your node keeps running after the call. "
-                "The child task continues with the injected message and returns results via the normal dispatch callback.\n\n"
+                "The task continues with the injected message and delivers its result the way it would have anyway.\n\n"
                 "Reachable tasks: those of the conversation this turn belongs to (entry branches included) and every "
                 "task dispatched from it, directly or through other children, including persistent agents running in "
-                "their own agent: sessions. Tasks of other conversations are never found. Tool tasks, system tasks and "
+                "their own agent: sessions. Tasks of other conversations are never found. In a group chat, members "
+                "who are not admins only reach the tasks they started themselves. Tool tasks, system tasks and "
                 "tasks suspended while waiting for their own children cannot be steered."
             ),
             "parameters": {
@@ -687,7 +694,8 @@ def _preempt_task_spec() -> dict:
                     "task_id": {
                         "type": "string",
                         "description": (
-                            "要追加指令的任务：一般填子节点名（如 bob），也可以填完整任务 ID 或至少 8 位的 ID 前缀。"
+                            "要追加指令的任务：一般填子节点名（如 bob），也可以填完整任务 ID 或至少 8 位的 ID 前缀；"
+                            "追加给这段对话里还在跑的另一轮时，填动态区给它列的编号。"
                             "节点名对上多个任务时优先选你自己派出去的那个；仍分不出来、或 ID 前缀对上多个时会报错并列出"
                             "候选 ID 前缀，换成其中一个再调用。"
                         ),

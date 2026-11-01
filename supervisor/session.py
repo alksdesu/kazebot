@@ -10,6 +10,7 @@ from typing import Any
 from toolbox.reload_seqs import ReloadSeqs
 
 from ._helpers import SessionInfo, _now
+from .task_owners import may_touch
 from .types import ApprovalStatus, RouteStatus, Task, TaskKind, TaskStatus
 
 
@@ -1283,19 +1284,26 @@ class SessionMixin:
         root = self._task_family_root_locked(caller)
         return bool(root) and root == self._task_family_root_locked(task)
 
+    def _caller_may_touch_locked(self, caller: Task, task: Task) -> bool:
+        """群聊里普通成员只能碰自己发起的任务。两边的身份都沿派发链取最初那一轮的，派出去的子任务算发起人的。"""
+        return may_touch(self._platform_auth_origin_locked(caller)[1], self._platform_auth_origin_locked(task)[1])
+
     def _family_target_locked(self, caller_task_id: str, task: Task) -> bool:
-        """模型经 engine 能打断的目标：调用方以外、能插话的节点任务，且和还在跑的调用方同属一个会话家族。"""
+        """模型经 engine 能打断的目标：调用方以外、能插话的节点任务，和还在跑的调用方同属一个会话家族，群聊里还得是同一个发起人。"""
         caller_id = str(caller_task_id or "").strip()
+        caller = self.tasks.get(caller_id)
         return (
-            task.task_id != caller_id
+            caller is not None
+            and task.task_id != caller_id
             and self._family_preemptable(task)
             and self._in_caller_family_locked(caller_id, task)
+            and self._caller_may_touch_locked(caller, task)
         )
 
     def resolve_family_task(self, caller_task_id: str, ref: str) -> dict[str, Any]:
         """在调用方任务的会话家族里，按完整 id、id 前缀或节点名找一个能打断的节点任务。
 
-        能打断指 running / pending 的节点任务，系统任务和调用方自己除外。家族外的任务一律当作不存在。
+        能打断指 running / pending 的节点任务，系统任务和调用方自己除外。家族外的任务、群聊里别人发起的任务一律当作不存在。
         节点名对上多个时只看调用方自己派出去的那些；前缀或节点名最后仍对上多个，就返回候选，不替调用方挑。
         """
         from engine.node import known_node_ids
@@ -1317,7 +1325,7 @@ class SessionMixin:
                 return {"found": False, "reason": "not_found"}
 
             def in_family(task: Task) -> bool:
-                return self._task_family_root_locked(task) == root
+                return self._task_family_root_locked(task) == root and self._caller_may_touch_locked(caller, task)
 
             exact = self.tasks.get(text)
             if exact is not None and exact.task_id != caller.task_id and in_family(exact):

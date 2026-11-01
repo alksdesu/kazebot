@@ -183,6 +183,7 @@ class ClonothClient:
         route_hints: dict[str, Any] | None = None,
         memory_hints: dict[str, Any] | None = None,
         output_guide: dict[str, Any] | None = None,
+        request_text: str | None = None,
     ) -> InboundResult:
         """提交用户消息到 Supervisor。
 
@@ -203,6 +204,8 @@ class ClonothClient:
                 混入非鉴权字段会让 is_admin 的判断面变大。
             output_guide: 平台输出说明（{"version": 1, "sections": [{"key", "text", "volatile"}]}），
                 按平台能力声明生成。引擎只把它放进这一轮的提示词，不写进对话历史，所以别再拼进 text。
+            request_text: text 里用户自己说的那段（已匿名）。text 拼了群聊记录、身份块时另给一份，
+                同一段对话里并发的轮次列在跑的任务、控制台列活跃任务时拿它当预览；不给就用 text。
 
         Returns:
             InboundResult 包含 session_id 和 inbound_seq
@@ -231,6 +234,8 @@ class ClonothClient:
             payload["memory_hints"] = dict(memory_hints)
         if output_guide:
             payload["output_guide"] = dict(output_guide)
+        if request_text:
+            payload["request_text"] = request_text
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()

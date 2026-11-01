@@ -28,6 +28,7 @@ from platforms.registry import conversation_key_prefix, features_module
 from real_paths import real_path
 
 from . import async_dispatches, continuation, dispatch_fork, provisioning, session_reuse, share_groups
+from .active_tasks import REQUEST_TEXT_KEY
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .eventlog import REPLY_DELIVERY, DeliveryIdTaken
@@ -1745,7 +1746,8 @@ def create_app(
                 # large or sensitive. How: extract only text/instruction, normalize it
                 # to a trimmed string, and cap it at 200 characters. Purpose: the
                 # active-task API supports a safe human-readable input preview.
-                input_text = str(t.input.get("text") or t.input.get("instruction") or "").strip()
+                # QQ 那一轮的指令开头是群聊记录和身份块，有原话先用原话
+                input_text = str(t.input.get(REQUEST_TEXT_KEY) or t.input.get("text") or t.input.get("instruction") or "").strip()
                 result.append({
                     "task_id": t.task_id,
                     "session_id": t.session_id,

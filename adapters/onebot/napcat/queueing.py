@@ -202,6 +202,7 @@ async def _submit_or_preempt_inbound(
         },
         memory_hints=get_memory_hints(),
         output_guide=guide,
+        request_text=inbound._request_text(event, user_text),
     )
     if not result.session_id or not result.accepted:
         return False

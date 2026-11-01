@@ -139,7 +139,8 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     dynamic_parts: list[str] = []
     if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
         dynamic_parts.append(ls.system_prompt[1]["content"])
-    # 和初次组装排在同一个位置：节点自己的动态段之后、技能和记忆之前
+    # 和初次组装排在同一个位置：节点自己的动态段之后、技能和记忆之前。
+    # 在跑任务的列表是这一轮消息进来那一刻的，插进新消息后已经过时，不再带
     dynamic_parts.extend(isolation_parts(
         task_context.get(ISOLATION_CONTEXT_KEY), workspace_root=ls.rctx.workspace_root,
     ))

@@ -591,6 +591,22 @@ def _quote_block(reply_context: str) -> List[str]:
     return ["【当前消息引用】", reply_context] if reply_context else []
 
 
+def _request_line(name: str, user: str, text: str) -> str:
+    """【当前用户指令】里的那一行：显示名（别名）: 原话，三样都已匿名。"""
+    return f"{name}（{user}）: {text}"
+
+
+def _request_text(event: Event, user_text: str) -> str:
+    """提交时另给 supervisor 的这一轮原话，和指令行同一个样子；同一段对话里并发的轮次、控制台拿它当预览。原话为空给空串。"""
+    text = (user_text or "").strip()
+    if not text:
+        return ""
+    # 先登记发送者再替换，名片里带着自己号的也不会漏出去
+    user = identity._event_user_alias(event)
+    name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
+    return _request_line(name, user, anonymize._anonymize_text_for_ai(text))
+
+
 def _merge_text(quote: List[str], instruction: str) -> str:
     """排队合并时追加的那段：这条自己的引用块和指令行。"""
     return "\n".join([*quote, *([""] if quote else []), instruction])
@@ -641,7 +657,7 @@ async def _build_inbound_text(
     if quote:
         parts.extend(["", *quote])
 
-    instruction = f"{current_name}（{current_user}）: {anonymize._anonymize_text_for_ai(user_text)}"
+    instruction = _request_line(current_name, current_user, anonymize._anonymize_text_for_ai(user_text))
     parts.extend([
         "",
         f"当前时间: {now}",
@@ -676,7 +692,7 @@ async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: b
     user = identity._event_user_alias(event)
     name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     target = "私聊" if is_dm else "群聊"
-    request = f"{name}（{user}）: {anonymize._anonymize_text_for_ai(user_text)}"
+    request = _request_line(name, user, anonymize._anonymize_text_for_ai(user_text))
     return models.InboundText("\n".join([
         f"当前时间: {now}",
         f"来源: QQ{target} / /生图 直达命令",
@@ -707,7 +723,7 @@ async def _build_private_inbound_text(
     quote = _quote_block(reply_context)
     if quote:
         parts.extend(["", *quote])
-    instruction = f"{name}（{user}）: {text}"
+    instruction = _request_line(name, user, text)
     parts.extend([
         "",
         "【当前用户身份】",

@@ -152,6 +152,16 @@ class TestSubmission:
 
         assert list(_sections(core.submitted[0]["output_guide"])) == [SECTION_SPLIT, SECTION_NATIVE_EMOJI]
 
+    @pytest.mark.parametrize("private", [False, True], ids=["group", "private"])
+    def test_the_users_own_words_go_along_anonymized_for_the_preview(self, runtime: Any, private: bool) -> None:
+        core = _Core()
+
+        _submit(runtime, core, private=private)
+
+        [call] = core.submitted
+        assert call["request_text"].startswith("某人（") and call["request_text"].endswith("）: 在吗")
+        assert str(_USER_QQ) not in call["request_text"]
+
     def test_a_draw_turn_only_teaches_splitting_and_rolls_no_stickers(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
