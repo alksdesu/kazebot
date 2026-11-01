@@ -46,6 +46,8 @@ class TaskAction:
 
     # fail 时填写
     error: str = ""
+    # 模型调用失败时 provider 判的类别（network、timeout、rate_limit…）；别的失败为空
+    error_kind: str = ""
 
     # 通用
     context_ref: str = ""  # 当前节点的上下文快照引用
@@ -84,4 +86,6 @@ class TaskAction:
             d["result"] = dict(self.result)
         elif self.action == ACTION_FAIL:
             d["error"] = self.error
+            if self.error_kind:
+                d["error_kind"] = self.error_kind
         return d

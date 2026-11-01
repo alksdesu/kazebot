@@ -650,6 +650,8 @@ def _build_failure_action(ls: _LoopState, resp, step: int, retry_attempt: int = 
     return TaskAction(
         action=ACTION_FAIL, node_id=ls.node.id,
         error=_fail_msg,
+        # 旧 provider 不报类别：照样是模型调用失败，只是说不出是哪一种
+        error_kind=error_kind(resp) or "unknown",
         context_ref=ctx_ref,
         summary=_short(_fail_msg, 240),
     )

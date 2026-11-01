@@ -304,7 +304,7 @@ class TestRefusals:
             f"同步委派被拒绝：一次最多派出 {MAX_DISPATCH_BATCH_ITEMS} 个子任务，这次有 {MAX_DISPATCH_BATCH_ITEMS + 1} 个。"
         )
         assert caller.result["error"] == expected
-        assert f"[错误] {expected}" in _outbound_texts(state)
+        assert f"这条没能回复：{expected}" in _outbound_texts(state)
 
     def test_the_limit_itself_is_allowed(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -338,7 +338,7 @@ class TestRefusals:
         assert entry["status"] == "fail"
         assert entry["error"].startswith("同步委派被拒绝：一次最多派出")
         assert entry["call_id"] == "w1"
-        assert not any(text.startswith("[错误] 同步委派被拒绝") for text in _outbound_texts(state))
+        assert not any("同步委派被拒绝" in text for text in _outbound_texts(state))
 
 
 class TestResumeEntries:
@@ -423,7 +423,7 @@ class TestDispatchFailingHalfway:
         assert withdrawn.status == TaskStatus.cancelled and withdrawn.result["error"] == "这一批没有派完，已撤回"
         assert caller.status == TaskStatus.failed
         assert caller.result["error"].startswith("派出子任务时出错（RuntimeError: disk full）")
-        assert any(text.startswith("[错误] 派出子任务时出错（RuntimeError: disk full）") for text in _outbound_texts(state))
+        assert any(text.startswith("这条没能回复：派出子任务时出错（RuntimeError: disk full）") for text in _outbound_texts(state))
 
         state.complete_task(task_id=caller.task_id, worker_id="worker-1", result=result)
 

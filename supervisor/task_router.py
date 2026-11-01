@@ -29,6 +29,7 @@ from . import (
     dispatch_limits,
     session_reuse,
     stopped_batch,
+    turn_notes,
 )
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
@@ -219,6 +220,8 @@ class BranchFinalizePlan:
     cleanup_session_ids: tuple[str, ...]
     # 分支派生、还在保留期里的子会话：不删，改挂到父会话下
     retained_session_ids: tuple[str, ...] = ()
+    # 用户那一轮失败时接在尾段末尾的说明，空串不接
+    failure_notice: str = ""
 
 
 def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
@@ -912,6 +915,7 @@ class TaskRouterMixin:
             merge=merge,
             cleanup_session_ids=tuple(cleanup_ids),
             retained_session_ids=tuple(retained_ids),
+            failure_notice=turn_notes.failure_notice(task, self._task_outcome_action(task)) if merge else "",
         )
         self.eventlog.append(
             session_id=parent,
@@ -959,6 +963,7 @@ class TaskRouterMixin:
         """Idempotently merge and delete branch files without Supervisor._lock."""
         from engine.branch_history import branch_base_count
         from engine.conversation_store import ConversationStore
+        from engine.memory_expiry import memory_timezone
 
         merged_count = 0
         store = ConversationStore(self.workspace_root / "data" / "conversations")
@@ -970,8 +975,17 @@ class TaskRouterMixin:
         if plan.merge and not session_reset:
             branch_messages = list(store.load(plan.branch_session_id))
             base_count = branch_base_count(branch_messages, plan.branch_session_id, plan.base_count)
-            tail = branch_messages[base_count:]
-            parent_ids = {str(getattr(message, "id", "") or "") for message in store.load(plan.parent_session_id)}
+            parent_messages = list(store.load(plan.parent_session_id))
+            now = datetime.now(timezone.utc)
+            # 历史按做完的先后排，比它晚开始的先合并了，就在它开头标出起止时间
+            tail = turn_notes.mark_late_merge(
+                branch_messages[base_count:], parent_messages, zone=memory_timezone(self.workspace_root), now=now,
+            )
+            tail = turn_notes.with_failure_notice(
+                tail, plan.failure_notice, identity=plan.identity, task_id=plan.task_id,
+                node_id=str(task.node_id or "") if task is not None else "", now=now,
+            )
+            parent_ids = {str(getattr(message, "id", "") or "") for message in parent_messages}
             missing = [
                 message for message in tail
                 if not str(getattr(message, "id", "") or "")
@@ -2152,7 +2166,10 @@ class TaskRouterMixin:
             "error": error,
             **child_retention.continue_fields_locked(self, task),
             **worktree_service_of(self).result_fields_locked(task),
-        }, {"text": f"[错误] {error}"}, action_type="fail")
+        }, {"text": f"[错误] {error}"}, action_type="fail", user_result=(
+            {"text": "", OUTBOUND_NO_REPLY: True} if turn_notes.silent_failure(task)
+            else {"text": turn_notes.failure_reply(task, action)}
+        ))
 
     # ------------------------------------------------------------------ #
     #  子任务结算：唤醒在等它的调用方
@@ -2412,8 +2429,12 @@ class TaskRouterMixin:
         fallback_result: dict[str, Any],
         *,
         action_type: str = "",
+        user_result: dict[str, Any] | None = None,
     ) -> None:
-        """有 caller 的子任务交给 caller 结算；没有 caller 的把 fallback_result 输出给用户。"""
+        """有 caller 的子任务交给 caller 结算；没有 caller 的把 fallback_result 输出给用户。
+
+        user_result 是直接发给用户时换用的那份：失败的报错给模型看的和给人看的不是一句话。
+        """
         if (task.caller_task_id or "").strip():
             self._settle_child_locked(task, resume_data, action_type=action_type)
             return
@@ -2425,6 +2446,8 @@ class TaskRouterMixin:
         # 系统内部任务（如记忆提取）静默完成，不输出给用户
         if task.input.get("_system_task"):
             return
+        if user_result is not None:
+            fallback_result = user_result
         if not isinstance(fallback_result, dict):
             fallback_result = {}
         text = str(fallback_result.get("text") or fallback_result.get("summary") or "").strip()

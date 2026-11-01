@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, tzinfo
 from typing import Any, Mapping
 
 from .conversation_store import MessageType
@@ -12,6 +13,8 @@ SHORT_REPLY_HINT = (
     f"（本轮是简短回应：要说就只接一句自然的话，最多 {SHORT_REPLY_MAX_CHARS} 字，直接用 finish 给出；"
     "不展开任务，不调用工具查资料，不委派，也不连续发消息。）"
 )
+# 分支合并时记在晚合并那一轮开头输入的 meta 上：{"started_at": "00:07", "finished_at": "00:10"}，按显示时区写好
+LATE_MERGE_KEY = "late_merge"
 
 
 def routing_meta(context: dict[str, Any]) -> dict[str, Any]:
@@ -67,13 +70,45 @@ def with_short_reply_hint(content: Any) -> Any:
     return content
 
 
+def late_merge_meta(started: datetime, finished: datetime, zone: tzinfo) -> dict[str, str]:
+    """晚合并那一轮的起止时间按显示时区写好；跨天带上日期。"""
+    start, end = started.astimezone(zone), finished.astimezone(zone)
+    pattern = "%H:%M" if start.date() == end.date() else "%m-%d %H:%M"
+    return {"started_at": start.strftime(pattern), "finished_at": end.strftime(pattern)}
+
+
+def late_merge_note(meta: Any) -> str:
+    """历史按做完的先后排：比它晚开始的轮先做完排在了它前面，开头标出它自己的起止时间，模型才读得懂先后。"""
+    mark = meta.get(LATE_MERGE_KEY) if isinstance(meta, Mapping) else None
+    if not isinstance(mark, Mapping):
+        return ""
+    started, finished = str(mark.get("started_at") or "").strip(), str(mark.get("finished_at") or "").strip()
+    if not started or not finished:
+        return ""
+    return f"[这一轮 {started} 开始、{finished} 做完；上面有几轮比它开始得晚，先做完排在了前面]"
+
+
+def with_leading_note(content: Any, note: str) -> Any:
+    """在正文开头接上一行说明；已经接过的原样返回。"""
+    if isinstance(content, str):
+        return content if content.startswith(note) else f"{note}\n{content}"
+    if isinstance(content, list):
+        first = content[0] if content else None
+        if isinstance(first, dict) and first.get("type") == "text" and first.get("text") == note:
+            return content
+        return [{"type": "text", "text": note}, *content]
+    return content
+
+
 def render_user_input(content: Any, meta: Any) -> Any:
     """用户输入发给模型的样子只由正文和它落盘的 meta 决定：当轮发出去的和之后从存储重载的逐字相同。"""
-    return with_short_reply_hint(content) if is_short_reply_input(meta) else content
+    shown = with_short_reply_hint(content) if is_short_reply_input(meta) else content
+    note = late_merge_note(meta)
+    return with_leading_note(shown, note) if note else shown
 
 
 def render_history_inputs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按各自的 meta 渲染历史里的用户输入；要改的换成浅拷贝，传进来的消息不动。"""
+    """按各自的 meta 渲染历史里的用户消息（轮摘要顶替的那条也带着原输入的 meta）；要改的换成浅拷贝，传进来的消息不动。"""
     rendered: list[dict[str, Any]] = []
     for message in history:
         if isinstance(message, dict) and message.get("role") == "user":

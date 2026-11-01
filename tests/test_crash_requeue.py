@@ -257,7 +257,7 @@ class TestWorkerRestart:
 
         assert result["orphans_requeued"] == 0 and result["orphans_failed"] == 1 and result["orphans_cancelled"] == 1
         assert task.status == TaskStatus.failed and child.status == TaskStatus.cancelled
-        assert f"[错误] {USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
+        assert f"这条没能回复：{USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
 
     def test_without_the_conversation_store_nothing_is_requeued(self, workspace: Path) -> None:
         # 旧快照模式下中断前做的事没落盘，从存储接着跑会丢掉它们
@@ -428,7 +428,7 @@ class TestGracefulShutdown:
         assert task.result["error"] == USER_INTERRUPTED_ERROR and task.result["interrupted"] == "engine_shutdown"
         assert REQUEUE_MARK not in task.input
         assert completed == [task.task_id]
-        assert f"[错误] {USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
+        assert f"这条没能回复：{USER_INTERRUPTED_ERROR}" in _outbound_texts(state)
 
     def test_an_interjection_nobody_asked_for_is_still_cancelled_quietly(
         self, workspace: Path, monkeypatch: pytest.MonkeyPatch,
