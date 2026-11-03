@@ -2470,6 +2470,7 @@ class TaskRouterMixin:
             return
         self.append_outbound_message(
             session_id=_route_sid, text=text,
+            task_id=task.task_id,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
             # engine 的不发言结果只有这个标记，出站消息照它标出来，适配层据此什么也不发
@@ -2508,6 +2509,7 @@ class TaskRouterMixin:
             "action_type": "dispatch_attachment",
             "child_task_id": task.task_id,
             "child_node_id": node_id,
+            "task_id": task.task_id,
         }
         hints = (task.input.get("task_context") or {}).get("route_hints") or {}
         for key in ("delivery_purpose", "reply_message_id"):

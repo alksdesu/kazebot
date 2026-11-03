@@ -27,7 +27,6 @@ from ..send_contract import (
     is_at_uid_failure,
     is_temp_file_missing,
     make_idempotency_key,
-    protected_claim_send,
     target_identity,
     validate_send_request,
 )
@@ -447,6 +446,7 @@ async def _send_qq_message(
     sticker_delivery_id: str = "",
 ) -> str:
     """Send with an explicit contract and pending/sent two-phase idempotency."""
+    from . import task_receipts
     validate_send_request(bot, target)
     context = send_context or OutboundSendContext(
         conversation_key=str(target.get("conversation_key") or "")
@@ -470,6 +470,7 @@ async def _send_qq_message(
     )
     if not claim.acquired:
         common.logger.info("onebot_send_duplicate", extra={**fields, "claim_state": claim.state})
+        await task_receipts.report(context, target, "message", key, "sent" if claim.state == "sent" else "unknown")
         platform_message_id = await state._adapter.outbound_idempotency.sent_message_id(key)
         if sticker_delivery_id:
             await emotes._reconcile_sticker_receipts(sticker_delivery_id)
@@ -485,10 +486,11 @@ async def _send_qq_message(
         return result
 
     async with _claim_heartbeat(claim):
-        platform_message_id = await protected_claim_send(
+        platform_message_id = await task_receipts.claimed_send(
             state._adapter.outbound_idempotency,
             claim,
             send_once,
+            context=context, target=target, kind="message",
             sent_ttl=_sent_ttl_for_context(context),
             message_id_getter=lambda result: str(result or ""),
         )

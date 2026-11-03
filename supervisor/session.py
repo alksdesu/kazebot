@@ -666,6 +666,7 @@ class SessionMixin:
         llm_request_id: str | None = None,
         delivery_id: str | None = None,
         route_hints: dict[str, Any] | None = None,
+        task_id: str = "",
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
@@ -727,6 +728,8 @@ class SessionMixin:
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if task_id:
+                payload["task_id"] = task_id
             if isinstance(route_hints, dict):
                 for key in ("delivery_purpose", "response_action", "reply_message_id", "source_message_refs"):
                     if key in route_hints:

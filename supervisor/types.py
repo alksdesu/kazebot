@@ -205,6 +205,10 @@ class Task(BaseModel):
     # approval_*) arrive. Read by GET /v1/admin/tasks/active.
     current_phase: str = ""
     current_detail: str = ""
+    last_tool: dict[str, Any] = Field(default_factory=dict)
+    active_tool_calls: dict[str, str] = Field(default_factory=dict)
+    delivery_receipts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    delivery_records_omitted: bool = False
 
     @model_validator(mode="before")
     @classmethod

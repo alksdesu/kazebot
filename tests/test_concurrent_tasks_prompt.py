@@ -79,7 +79,7 @@ class TestBridge:
     def test_listed_tasks_and_the_count_left_out_are_carried(self) -> None:
         raw = {ACTIVE_TASKS_INPUT_KEY: [_item(), "junk", {"node_id": "no id"}], ACTIVE_TASKS_OMITTED_INPUT_KEY: 3}
 
-        assert bridge_input(raw) == {CONCURRENT_CONTEXT_KEY: _value(_item(), omitted=3)}
+        assert bridge_input(raw) == {CONCURRENT_CONTEXT_KEY: {"count": 4}}
 
     def test_a_resumed_run_gets_no_stale_list(self) -> None:
         raw = {ACTIVE_TASKS_INPUT_KEY: [_item()], "resume_data": {"type": "child_result"}}
@@ -89,53 +89,16 @@ class TestBridge:
     def test_the_runner_puts_it_into_the_task_context(self) -> None:
         context = _build_task_context({ACTIVE_TASKS_INPUT_KEY: [_item()], "task_context": {"channel": "qq_group"}})
 
-        assert context[CONCURRENT_CONTEXT_KEY] == _value(_item())
+        assert context[CONCURRENT_CONTEXT_KEY] == {"count": 1}
         assert context["channel"] == "qq_group"
 
 
 class TestRendering:
-    def test_a_running_round_says_what_it_is_doing_and_how_to_steer_it(self) -> None:
-        block = _block(_value(_item(instruction="小明（UserA）: 查天气", phase="tool_call", detail="web_search")))
-
-        assert block.startswith(f"{CONCURRENT_OPEN}\n")
-        assert block.endswith(CONCURRENT_CLOSE)
-        assert f"- 「小明（UserA）: 查天气」｜qq.orchestrator｜在调用工具 web_search｜已跑 2 分 5 秒｜可追加，编号 {_ROUND}" in block
-        assert "preempt_task" in block
-
-    @pytest.mark.parametrize("fields, shown", [
-        ({"status": "pending", "steerable": True, "age_sec": 3}, "qq.orchestrator｜排队中｜已等 3 秒"),
-        ({"status": "suspended", "steerable": False, "phase": "tool_call"}, "qq.orchestrator｜挂起等子任务｜已跑 2 分 5 秒"),
-        ({"phase": "thinking", "detail": "ignored"}, "qq.orchestrator｜在思考｜已跑"),
-        ({"phase": "awaiting_approval", "detail": "write_file"}, "在等审批 write_file"),
-        ({"age_sec": 3661, "steerable": False}, "已跑 1 小时 1 分"),
-        ({"mine": False}, "｜不是你发起的｜"),
-    ], ids=["pending", "suspended", "thinking", "approval", "hours", "not-mine"])
-    def test_each_state_reads_naturally(self, fields: dict[str, Any], shown: str) -> None:
-        block = _block(_value(_item(**fields)))
-
-        assert shown in block
-        if fields.get("steerable") is False:
-            assert "可追加，编号" not in block
-
-    def test_children_hang_under_the_round_that_sent_them(self) -> None:
-        orphan = _item("6f1c2d3e-0000-4000-8000-000000000003", node_id="carol", parent_task_id="gone")
-        block = _block(_value(_item(), orphan, _item(_CHILD, node_id="bob", parent_task_id=_ROUND)))
-
-        lines = block.splitlines()
-        assert lines[1].startswith("- qq.orchestrator")
-        assert lines[2].startswith("  - bob")
-        assert lines[3].startswith("- carol")
-
-    def test_a_parent_loop_does_not_lose_anything(self) -> None:
-        looped = [_item(_ROUND, parent_task_id=_CHILD), _item(_CHILD, node_id="bob", parent_task_id=_ROUND)]
-
-        block = _block(_value(*looped))
-
-        assert block.count("可追加，编号") == 2
-        assert _ROUND in block and _CHILD in block
-
-    def test_the_count_left_out_is_said(self) -> None:
-        assert "（还有 2 个没列出来）" in _block(_value(_item(), omitted=2))
+    def test_greetings_are_not_given_stale_task_details(self) -> None:
+        block = _block(_value(_item(instruction="send private document", node_id="coder")))
+        assert "get_task_status" in block
+        assert _ROUND not in block and "send private document" not in block and "coder" not in block
+        assert "不主动汇报" in block
 
     @pytest.mark.parametrize("value", [None, {}, {"tasks": []}, {"tasks": [{"node_id": "x"}]}, "tasks"])
     def test_nothing_to_list_renders_nothing(self, value: Any) -> None:

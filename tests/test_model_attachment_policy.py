@@ -604,11 +604,11 @@ def test_finish_with_every_named_path_refused_sends_no_attachment_at_all(
 
     action = _handle(ls, _call_with("finish", text="done", attachment_paths=[".env"]))
 
-    assert action.result["attachments"] == []
-    assert emitted == [("finish", "ok\n以下附件没有发出：.env（user denied approval）")]
+    assert action is None
+    assert "finish 尚未执行" in emitted[-1][1] and ".env（user denied approval）" in emitted[-1][1]
 
 
-def test_finish_keeps_the_allowed_half_of_a_mixed_selection(
+def test_finish_requests_correction_before_sending_a_partial_selection(
     tmp_path: Path, emitted: list, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _file(tmp_path, ".env", "sk-real")
@@ -622,7 +622,10 @@ def test_finish_keeps_the_allowed_half_of_a_mixed_selection(
 
     action = _handle(ls, _call_with("finish", text="done", attachment_paths=["data/a.png", ".env"]))
 
-    assert action.result["attachments"] == [{"path": "data/a.png", "type": "image"}]
+    assert action is None
+    assert "本次所有附件都未发送" in emitted[-1][1]
+    corrected = _handle(ls, _call_with("finish", text="only the allowed file", attachment_paths=["data/a.png"]))
+    assert corrected.result["attachments"] == [{"path": "data/a.png", "type": "image"}]
 
 
 def test_finish_without_named_paths_still_forwards_tool_output(
@@ -669,7 +672,7 @@ def test_finish_on_an_already_sent_dispatch_result_sends_nothing_and_asks_nothin
 
 
 def test_a_short_reply_turn_screens_nothing(tmp_path: Path, emitted: list, guard: _Guard) -> None:
-    ls = _loop_state(tmp_path, task_context={"short_reply": True})
+    ls = _loop_state(tmp_path, task_context={"route_hints": {"response_action": "short_reply"}})
 
     action = _handle(ls, _call_with("finish", text="嗯", attachment_paths=["data/a.png"]))
 

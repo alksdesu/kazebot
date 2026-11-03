@@ -17,7 +17,7 @@ from adapters._shared import capability
 from ..live_config import live
 from .. import local_source
 from adapters._shared.send_guard import IdempotencyClaim, OutboundSendContext
-from ..send_contract import make_idempotency_key, protected_claim_send
+from ..send_contract import make_idempotency_key
 
 from . import anonymize, common, identity, media, message_text, models, outbound_attachments, permissions, sending, state
 
@@ -479,6 +479,7 @@ async def _send_forward_nodes(
     send_context: OutboundSendContext | None = None,
     image_attachments: list[Any] | None = None,
 ) -> None:
+    from . import task_receipts
     target_dict = _target_to_send_dict(target)
     await state._adapter.features.check_send(bot, target_dict)
     identity = "forward-nodes:" + hashlib.sha256(
@@ -496,6 +497,7 @@ async def _send_forward_nodes(
             if resolved is None else IdempotencyClaim(key, False, resolved)
         )
     if not claim.acquired:
+        await task_receipts.report(context, target_dict, "message", key, "sent" if claim.state == "sent" else "unknown")
         return
 
     async def send_forward() -> Any:
@@ -509,10 +511,11 @@ async def _send_forward_nodes(
         )
 
     async with sending._claim_heartbeat(claim):
-        result = await protected_claim_send(
+        result = await task_receipts.claimed_send(
             state._adapter.outbound_idempotency,
             claim,
             send_forward,
+            context=context, target=target_dict, kind="message",
             sent_ttl=sending._sent_ttl_for_context(context),
             message_id_getter=sending._extract_sent_message_id,
         )

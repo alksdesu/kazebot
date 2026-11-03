@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from toolbox.tool_names import DISPATCH_TOOL_PREFIX
+from clonoth_sdk.task_status import MAX_STATUS_TASKS, STATUS_QUERY, STATUS_TOOL
 
 from ..dispatch_batch import (
     AWAIT_ALL,
@@ -507,6 +508,11 @@ def _finish_spec() -> dict:
                 "- text: The actual deliverable content, or a question if you need more info.\n"
                 "- summary: Brief summary (optional) for the upstream node.\n"
                 "- attachment_paths: File paths to attach (optional).\n\n"
+                "For an existing file requested in this conversation, attach it here with a brief message; "
+                "do not send it with qq_forward first and then run another turn just to announce that send. "
+                "Use qq_forward for a different recipient or a necessary early delivery. "
+                "For a progress report, set status_query_id to the latest get_task_status query_id; "
+                "the report is checked before delivery. Omit it for unrelated replies or steering confirmations.\n\n"
                 "Do not include internal protocol markers or debug info in text."
             ),
             "parameters": {
@@ -523,8 +529,9 @@ def _finish_spec() -> dict:
                     "attachment_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "附带的文件路径列表（可选，仅在有图片等附件时使用）。",
+                        "description": "发给当前会话的文件路径。单纯发送现成文件优先用这里，无需先调 qq_forward。",
                     },
+                    STATUS_QUERY: {"type": "string", "description": "仅汇报任务进度时填写 get_task_status 返回的 query_id。"},
                 },
                 "required": ["text"],
             },
@@ -610,6 +617,7 @@ def _reply_spec() -> dict:
                 "only reply() and finish() reach the user.\n\n"
                 "When to use:\n"
                 "- You have a partial result or progress update to share, but more work remains.\n"
+                "- When quoting get_task_status, include its query_id as status_query_id so the progress is checked before sending.\n"
                 "- The user asked for multiple things and you want to respond to one "
                 "while continuing to work on the rest.\n\n"
                 "When NOT to use:\n"
@@ -628,6 +636,7 @@ def _reply_spec() -> dict:
                         "items": {"type": "string"},
                         "description": "Optional attachment paths produced by previous tools to send with this interim reply.",
                     },
+                    STATUS_QUERY: {"type": "string", "description": "Query id from get_task_status, only when reporting that progress."},
                 },
                 "required": ["text"],
             },
@@ -670,7 +679,7 @@ def _preempt_task_spec() -> dict:
             "name": "preempt_task",
             "description": (
                 "Inject an additional instruction into a running task: a child you dispatched, or another turn of "
-                "this conversation that is still running (the dynamic context lists those as running tasks). The task "
+                "this conversation that is still running (get_task_status lists those tasks). The task "
                 "will finish its current atomic operation (e.g. tool call), receive your message as a new user "
                 "instruction, and continue working with the updated direction.\n\n"
                 "This is NOT for cancelling tasks — use cancel_active_tasks for that.\n\n"
@@ -695,7 +704,7 @@ def _preempt_task_spec() -> dict:
                         "type": "string",
                         "description": (
                             "要追加指令的任务：一般填子节点名（如 bob），也可以填完整任务 ID 或至少 8 位的 ID 前缀；"
-                            "追加给这段对话里还在跑的另一轮时，填动态区给它列的编号。"
+                            "追加给这段对话里还在跑的另一轮时，先用 get_task_status 查询，再填返回的编号。"
                             "节点名对上多个任务时优先选你自己派出去的那个；仍分不出来、或 ID 前缀对上多个时会报错并列出"
                             "候选 ID 前缀，换成其中一个再调用。"
                         ),
@@ -707,6 +716,26 @@ def _preempt_task_spec() -> dict:
                 },
                 "required": ["task_id", "message"],
             },
+        },
+    }
+
+
+def _task_status_spec() -> dict:
+    return {
+        "type": "function", "function": {
+            "name": STATUS_TOOL,
+            "description": (
+                "查询本对话当前有权查看的任务、子任务及近期已结束任务。只有用户问进度、问是否已发送，"
+                "或要给正在执行的任务追加要求时才调用；闲聊和问候直接回答，不主动播报后台任务。"
+                "任务状态和投递状态分开：sent 是发送端确认，不代表用户已读；unknown 不能当成没发送。"
+                "返回 query_id。汇报进度时把它填进 finish.status_query_id，发送前会复核；"
+                "追加要求时使用返回的 task_id 调 preempt_task，多个目标不明确时先问用户。"
+                "群聊普通成员只能查看自己发起的任务，其他会话不可见。"
+            ),
+            "parameters": {"type": "object", "properties": {
+                "task_ids": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_STATUS_TASKS,
+                             "description": "省略则列出活跃和近期结束任务；给出完整任务编号则查询指定任务。"},
+            }},
         },
     }
 

@@ -29,6 +29,8 @@ from real_paths import real_path
 
 from . import async_dispatches, continuation, dispatch_fork, provisioning, session_reuse, share_groups
 from .active_tasks import REQUEST_TEXT_KEY
+from .task_progress_api import create_task_progress_router
+from . import task_progress
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .eventlog import REPLY_DELIVERY, DeliveryIdTaken
@@ -1312,6 +1314,7 @@ def create_app(
                     elif _ev_type == "approval_decided":
                         _evt_task.current_phase = ""
                         _evt_task.current_detail = ""
+                    task_progress.activity(_evt_task, _ev_type, _payload)
         return answer
 
     @app.get("/v1/sessions")
@@ -2313,6 +2316,7 @@ def create_app(
     app.include_router(admin_router, prefix="/v1/admin/config")
     app.include_router(create_plugin_router(state.workspace_root), prefix="/v1/admin/plugins")
     app.include_router(create_usage_router(state.workspace_root), prefix="/v1/admin/usage")
+    app.include_router(create_task_progress_router())
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
     app.include_router(create_platform_account_router(state, app.state.platform_accounts), prefix="/v1/platforms")
     app.include_router(create_legacy_qq_account_router(state, app.state.platform_accounts))

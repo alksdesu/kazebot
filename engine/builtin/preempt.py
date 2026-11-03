@@ -97,6 +97,8 @@ class PreemptChecker:
 async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     """把待注入的抢占消息接进本轮：换掉旧的动态上下文，追加用户新消息并落盘，再回执 supervisor。"""
     new_instruction = ls.preempt_inject_info.get("message", "")
+    ls.status_snapshot = None
+    ls.status_refresh_count = 0
     new_attachments = ls.preempt_inject_info.get("attachments", [])
     memory_hints = ls.preempt_inject_info.get("memory_hints")
     output_guide = ls.preempt_inject_info.get(OUTPUT_GUIDE_KEY)

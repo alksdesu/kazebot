@@ -26,6 +26,7 @@ from .pseudo_tools import (
     _reply_spec,
     _compact_context_spec,
     _preempt_task_spec,
+    _task_status_spec,
     _stay_silent_spec,
     _switch_node_spec,
     _update_todos_spec,
@@ -459,6 +460,7 @@ async def _handle_tool_calls(
     more_steps 为真时这一步之后还有下一步：短答里只调了被拒工具的这一轮不当场收尾，留给下一步改用 finish。
     """
     ls.last_round_blocked = False
+    ls.status_can_refresh = more_steps and not final_step
     _short_reply_turn = short_reply(getattr(ls.rctx, "task_context", {}) or {})
     # 【方案 A 重构】伪工具改为列表按序执行，不再是 last-wins
     # 原本单标量 `pseudo_call = tc` 会导致同轮多伪工具只有最后一个生效，
@@ -2357,6 +2359,8 @@ async def run_ai_node(
     openai_tools.append(_reply_spec())
     openai_tools.append(_compact_context_spec())
     openai_tools.append(_preempt_task_spec())
+    if not _is_system_task:
+        openai_tools.append(_task_status_spec())
     _todo_enabled = not _is_system_task and bool(parse_bool((getattr(node, "extra", None) or {}).get("todo"), False))
     if _todo_enabled:
         openai_tools.append(_update_todos_spec())

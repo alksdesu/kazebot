@@ -15,6 +15,8 @@ from typing import Any
 
 from clonoth_runtime import SwitchValueError, parse_bool, switch_arg, switch_refusal
 from clonoth_sdk.refusals import refusal_reason
+from clonoth_sdk.task_status import STATUS_QUERY, STATUS_TOOL
+from .task_progress import prepare_progress_reply, query_status
 
 from .resume_builder import _select_attachments
 from .async_delivery import RetriedPost, post_until_answered
@@ -283,6 +285,11 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                     workspace_root=ls.rctx.workspace_root,
                     session_id=ls.rctx.session_id,
                 )
+        if reply_text and STATUS_QUERY in args:
+            reply_text, progress_error = await prepare_progress_reply(ls, args[STATUS_QUERY], reply_text)
+            if progress_error:
+                _emit_pseudo_tool_result(ls, pseudo_call, progress_error)
+                return None
         if reply_text or selected_atts:
             delivered = await ls.rctx.emit_event("intermediate_reply", {
                 "node_id": ls.node.id,
@@ -318,6 +325,10 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     if pseudo_call.name == LIST_DISPATCHES_TOOL_NAME:
         return await _handle_pseudo_list_dispatches(ls, pseudo_call)
+
+    if pseudo_call.name == STATUS_TOOL:
+        _emit_pseudo_tool_result(ls, pseudo_call, await query_status(ls, args))
+        return None
 
     if pseudo_call.name == CANCEL_DISPATCH_TOOL_NAME:
         return await _handle_pseudo_cancel_dispatch(ls, pseudo_call, args)
@@ -365,10 +376,11 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 _selected_paths = _reject_already_sent_dispatch_paths(ls, _named_paths)
                 if _selected_paths:
                     explicit_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, _selected_paths)
-        _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
-
-        ctx_ref = _persist_ctx(ls, step + 1)
-        summary_text = str(args.get("summary") or "").strip()
+                    if refused:
+                        _emit_pseudo_tool_result(ls, pseudo_call,
+                            "finish 尚未执行，本次所有附件都未发送。" + _refusal_note(refused)
+                            + "。修正附件路径后再交付；如果只能报告失败，请去掉无效附件并如实说明。")
+                        return None
         final_atts = []
         if terminal_name == "finish":
             if explicit_paths is not None:
@@ -379,6 +391,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                         workspace_root=ls.rctx.workspace_root,
                         session_id=ls.rctx.session_id,
                     )
+                    if len(final_atts) < len(set(explicit_paths)):
+                        _emit_pseudo_tool_result(ls, pseudo_call, "finish 尚未执行：部分附件已不存在或无法读取，本次没有交付。请核对后再发送。")
+                        return None
             elif ls.tool_produced_attachments:
                 final_atts = list(ls.tool_produced_attachments)
             else:
@@ -392,6 +407,14 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 final_atts = _dispatch_result_input_attachments(ls)
         if short_reply(getattr(ls.rctx, "task_context", {}) or {}):
             final_atts = []
+        if terminal_name == "finish" and STATUS_QUERY in args:
+            result_text, progress_error = await prepare_progress_reply(ls, args[STATUS_QUERY], result_text)
+            if progress_error:
+                _emit_pseudo_tool_result(ls, pseudo_call, progress_error)
+                return None
+        _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
+        ctx_ref = _persist_ctx(ls, step + 1)
+        summary_text = str(args.get("summary") or "").strip()
         result_payload = {
             "summary": summary_text,
             "text": result_text,

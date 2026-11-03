@@ -164,6 +164,15 @@ class ClonothClient:
         response.raise_for_status()
         return response.json()
 
+    async def report_task_delivery(self, task_id: str, receipt: dict[str, Any]) -> None:
+        response = await self._http().post(
+            f"{self._base_url}/v1/tasks/{_path_id(task_id)}/deliveries", json=receipt, timeout=2,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            raise ValueError("投递回执未确认")
+
     # ================================================================
     #  Inbound — 提交用户消息
     # ================================================================

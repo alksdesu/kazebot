@@ -21,7 +21,7 @@ from adapters._shared.send_guard import (
     image_content_identity,
 )
 from engine.tool_step import progress_tool_names
-from ..send_contract import classify_send_exception, make_idempotency_key, protected_claim_send
+from ..send_contract import classify_send_exception, make_idempotency_key
 
 from . import common, history, identity, media, models, proactive, queueing, routing, sending, state
 
@@ -95,9 +95,12 @@ async def _send_attachment_path(
     send_context: OutboundSendContext | None = None,
 ) -> str:
     """Send one attachment under one persistent logical owner claim."""
+    from . import task_receipts
     await state._adapter.features.check_send(bot, target)
     display_name = filename or path.name
     if not path.exists():
+        if send_context is not None:
+            await task_receipts.report(send_context, target, "file", f"{send_context.idempotency_key}:missing:{path}", "failed")
         raise SendContractError(f"attachment does not exist: {path}")
     is_image = path.suffix.lower() in common._IMAGE_SUFFIXES
     raw_bytes, identity = await asyncio.to_thread(_read_attachment, path, is_image)
@@ -118,6 +121,7 @@ async def _send_attachment_path(
                 if resolved is None else IdempotencyClaim(key, False, resolved)
             )
         if not claim.acquired:
+            await task_receipts.report(context, target, "file", key, "sent" if claim.state == "sent" else "unknown")
             return f"idempotent:{key}"
         errors: list[BaseException] = []
         file_path = str(path.resolve())
@@ -153,10 +157,11 @@ async def _send_attachment_path(
             raise failure
 
         async with sending._claim_heartbeat(claim):
-            message_id = await protected_claim_send(
+            message_id = await task_receipts.claimed_send(
                 state._adapter.outbound_idempotency,
                 claim,
                 send_image,
+                context=context, target=target, kind="file",
                 sent_ttl=sending._sent_ttl_for_context(context),
                 message_id_getter=lambda result: str(result or ""),
             )
@@ -181,6 +186,7 @@ async def _send_attachment_path(
             if resolved is None else IdempotencyClaim(key, False, resolved)
         )
     if not claim.acquired:
+        await task_receipts.report(context, target, "file", key, "sent" if claim.state == "sent" else "unknown")
         return f"idempotent:{key}"
     file_str = await asyncio.to_thread(sending._base64_source, raw_bytes)
 
@@ -199,10 +205,11 @@ async def _send_attachment_path(
         raise SendContractError(f"attachment target is invalid: {target!r}")
 
     async with sending._claim_heartbeat(claim):
-        result = await protected_claim_send(
+        result = await task_receipts.claimed_send(
             state._adapter.outbound_idempotency,
             claim,
             upload_file,
+            context=context, target=target, kind="file",
             sent_ttl=sending._sent_ttl_for_context(context),
             message_id_getter=sending._extract_sent_message_id,
         )
@@ -251,6 +258,7 @@ async def _try_send_images_as_forward(
     返回 True 表示已通过合并转发发出；歧义 ack（可能已送达）抛出，交由既有
     ambiguous claim 机制处理；其余失败返回 False，由调用方回退到逐张直发。
     """
+    from . import task_receipts
     kind = _target_forward_kind(target)
     if kind is None:
         return False
@@ -287,6 +295,7 @@ async def _try_send_images_as_forward(
         else:
             claim = IdempotencyClaim(key, False, resolved)
     if not claim.acquired:
+        await task_receipts.report(context, target, "file", key, "sent" if claim.state == "sent" else "unknown", len(nodes))
         return True
     call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
 
@@ -302,10 +311,11 @@ async def _try_send_images_as_forward(
 
     try:
         async with sending._claim_heartbeat(claim):
-            result = await protected_claim_send(
+            result = await task_receipts.claimed_send(
                 state._adapter.outbound_idempotency,
                 claim,
                 send_forward,
+                context=context, target=target, kind="file", count=len(nodes),
                 sent_ttl=sending._sent_ttl_for_context(context),
                 message_id_getter=sending._extract_sent_message_id,
             )

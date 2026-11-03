@@ -1,6 +1,8 @@
 """qq_forward 工具用的本地 HTTP 转发桥。"""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import logging
 import contextlib
 import hmac
@@ -643,6 +645,7 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     send_context = proactive._request_send_context(
         "qq_forward", request_identity, conversation_key,
     )
+    send_context = replace(send_context, task_id=str(payload.get("task_id") or ""))
 
     # 纯提醒/通知：不涉及历史挑选，直接发一段文本。
     if action == "remind":
@@ -680,6 +683,9 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
                 [att.get("path") for att in recent_atts],
                 [att.get("name") for att in recent_atts],
             )[0]
+        if file_errors:
+            from . import task_receipts
+            await task_receipts.report(send_context, send_target, "file", f"{request_identity}:unresolved", "failed", len(file_errors))
         if not attachments:
             hint = "；".join(file_errors) if file_errors else "请在 file_paths 里给出工作区内的文件路径，或用 use_recent 发送最近生成的图片。"
             return {"ok": False, "error": f"没有可发送的文件：{hint}"}

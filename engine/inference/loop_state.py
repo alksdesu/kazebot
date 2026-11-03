@@ -132,6 +132,9 @@ class _LoopState:
     resume_data: dict[str, Any] | None = None
     last_prompt_tokens: int | None = None
     last_usage: dict | None = None  # 最近一次 LLM resp.usage，用于写入 assistant 消息 meta
+    status_snapshot: dict[str, Any] | None = None
+    status_refresh_count: int = 0
+    status_can_refresh: bool = True
 
     # ---- LLM 重试 ----
     retry_max: int = 3

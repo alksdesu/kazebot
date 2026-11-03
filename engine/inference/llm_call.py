@@ -467,6 +467,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     while True:
         # 每次真正发请求都换 request id，这一次的流式块在前端共用一张卡片
         request_id = ls.rctx.begin_llm_request()
+        await ls.rctx.emit_event("model_request_started", {"task_id": ls.rctx.task_id})
         # 思考计时只属于这一次请求：不流式或没有思考的那次，不能沿用上一次留下的值
         ls._reasoning_started_iso = ""
         ls._reasoning_ended_iso = ""
@@ -555,6 +556,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 _emit_call_end(cancelled=True)
                 return cancelled_action(ls)
 
+        await ls.rctx.emit_event("model_request_ended", {"task_id": ls.rctx.task_id})
         await record_response_usage(ls, resp, llm_messages, tools_arg)
 
         # ---- 重试判定 ----

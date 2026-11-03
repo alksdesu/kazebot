@@ -29,6 +29,8 @@ SPEC = {
         "指定 QQ 私聊/群聊，或发送一条提醒通知。适用于用户说“把上面聊到的关于 xxx 的消息私发"
         "给我”“把上面会议内容和文件合并发送到群 xxx”“转发这图片给 xx”“提醒 xx 明天带笔记本”"
         "等请求。\n\n"
+        "如果只是把现成文件发到当前聊天，优先用 finish 的 attachment_paths 一次交付文件和说明；"
+        "跨会话发送或需要提前交付时才用本工具。\n\n"
         "先用 op=list 查看当前群最近消息（返回带 ref 标识、preview 预览、has_image/has_file"
         "标记的列表），再用 op=forward 或 op=send 转发/发送，用 message_refs 挑选 ref 或 query"
         "关键词筛选消息；纯提醒用 op=remind 加 text。\n\n"
