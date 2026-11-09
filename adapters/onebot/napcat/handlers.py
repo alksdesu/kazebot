@@ -392,7 +392,11 @@ async def _process_group_message(
     group_id = int(event.group_id)
     real_conversation_key = f"qq_group:{group_id}"
     stable_conversation_key = routing._stable_conversation_key(real_conversation_key)
-    raw_user_text = (await message_text._event_text_with_forward(bot, event)).strip() or "你好"
+    raw_user_text = (await message_text._event_text_with_forward(bot, event)).strip() or inbound._bare_mention_text(event, bot)
+    if not raw_user_text:
+        inbound._log_empty_event(event)
+        inbound._refund_proactive(group_id, proactive_stamp)
+        await matcher.finish()
     # 前缀判定必须在剥前缀之前做，否则 all 模式下所有人都会被当成主动找 bot。
     direct_interaction = inbound._is_direct_bot_interaction(event, bot, raw_user_text)
     source = trigger_source or inbound._group_trigger_source(event, bot, raw_user_text)
@@ -710,7 +714,10 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     message_text._remember_message_for_reply_context(event)
     user_id = int(event.user_id)
-    user_text = (await message_text._event_text_with_forward(bot, event)).strip() or "你好"
+    user_text = (await message_text._event_text_with_forward(bot, event)).strip()
+    if not user_text:
+        inbound._log_empty_event(event)
+        await _private_matcher.finish()
 
     # 裸发“同意”不是审批意图：必须引用 bot 发出的审批卡片才认。
     reply_intent = parse_reply_decision(user_text)

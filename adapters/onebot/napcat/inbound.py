@@ -189,6 +189,27 @@ def _event_segments(event: Any) -> List[tuple[str, Dict[str, Any]]]:
         return []
 
 
+_BARE_MENTION_TEXT = "（只 @ 了你，没说别的）"
+
+
+def _bare_mention_text(event: GroupMessageEvent, bot: Bot) -> str:
+    """群消息正文为空时的读法：只 @ 了 bot 的照实写明，别的给空串。
+
+    私聊别用：NoneBot 给私聊一律置 to_me，空事件也会被当成 @ 了 bot。
+    """
+    return _BARE_MENTION_TEXT if _event_at_mentions_bot(event, bot) else ""
+
+
+def _log_empty_event(event: Any) -> None:
+    """没有内容的事件不进 bot，只记下消息段类型。"""
+    # NapCat 在私聊发完文件后会推来不带任何消息段的事件；补成一句话就成了替人说话。
+    common.logger.info(
+        "QQ message event without content ignored: kind=%s message_id=%s segments=%s",
+        "group" if getattr(event, "group_id", None) is not None else "private",
+        getattr(event, "message_id", None), [seg_type for seg_type, _ in _event_segments(event)],
+    )
+
+
 def _event_sender_role(event: Any) -> str:
     sender = getattr(event, "sender", None)
     role = sender.get("role", "") if isinstance(sender, dict) else getattr(sender, "role", "")
@@ -711,9 +732,8 @@ async def _build_private_inbound_text(
     event: PrivateMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]],
 ) -> models.InboundText:
     """组装提交给 tangqiu_main 的私聊 inbound 文本，并匿名化 QQ 用户号。"""
-    fallback_text = await message_text._event_text_with_forward(bot, event)
     user = identity._event_user_alias(event)
-    text = anonymize._anonymize_text_for_ai((user_text or fallback_text).strip() or "你好")
+    text = anonymize._anonymize_text_for_ai(user_text.strip())
     name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")
     parts: List[str] = [f"当前时间: {now}"]
