@@ -57,14 +57,41 @@ def _message(message_id: str, task_id: str, at: str, *, role: str = "user", kind
 class TestWhatTheUserIsTold:
     @pytest.mark.parametrize("kind, reply", [
         ("network", "这条没能回复：连不上模型服务，稍后再发一次试试。"),
-        ("Rate_Limit", "这条没能回复：模型服务的额度或频率到了上限，过一会儿再试。"),
-        ("context_length", "这条没能回复：对话太长，模型装不下了，压缩或重置会话后再试。"),
-        ("unknown", "这条没能回复：调用模型时出错了，稍后再发一次试试。"),
+        ("Timeout", "这条没能回复：模型服务迟迟没有回应，稍后再发一次试试。"),
+        ("incomplete", "这条没能回复：模型的回复中途断了，再发一次试试。"),
     ])
-    def test_a_model_failure_is_told_by_its_kind_never_by_the_raw_error(self, kind: str, reply: str) -> None:
+    def test_a_transport_failure_is_told_by_its_kind_never_by_the_raw_error(self, kind: str, reply: str) -> None:
         result = {"error": "PluginTransportError: Provider transport failed (ConnectError) (已重试 3 次)", "error_kind": kind}
 
         assert turn_notes.failure_reply(_task(), result) == reply
+
+    @pytest.mark.parametrize("kind, lead", [
+        ("Rate_Limit", "模型服务的额度或频率到了上限"),
+        ("context_length", "对话太长，模型装不下了"),
+        ("unknown", "调用模型时出错了"),
+    ])
+    def test_what_the_upstream_said_is_passed_on_with_the_kind(self, kind: str, lead: str) -> None:
+        result = {"error": "Your billing account has exceeded its monthly spending cap.", "error_kind": kind}
+
+        reply = turn_notes.failure_reply(_task(), result)
+
+        assert lead in reply
+        assert "（Your billing account has exceeded its monthly spending cap.）" in reply
+
+    def test_an_auth_failure_never_carries_the_upstream_text(self) -> None:
+        result = {"error": "Incorrect API key provided: sk-abc123", "error_kind": "auth"}
+
+        assert turn_notes.failure_reply(_task(), result) == "这条没能回复：模型服务不认这个渠道的密钥，需要管理员检查渠道配置。"
+
+    def test_an_error_that_merely_repeats_the_kind_is_not_echoed(self) -> None:
+        result = {"error": "rate_limit", "error_kind": "rate_limit"}
+
+        assert turn_notes.failure_reply(_task(), result) == "这条没能回复：模型服务的额度或频率到了上限，过一会儿再试。"
+
+    def test_a_long_upstream_answer_is_cut(self) -> None:
+        reply = turn_notes.failure_reply(_task(), {"error": "x" * 400, "error_kind": "server"})
+
+        assert reply == "这条没能回复：模型服务出错了（" + "x" * 159 + "…），稍后再发一次试试。"
 
     def test_a_reason_written_for_people_is_passed_on(self) -> None:
         assert turn_notes.failure_reply(_task(), {"error": USER_INTERRUPTED_ERROR}) == f"这条没能回复：{USER_INTERRUPTED_ERROR}"

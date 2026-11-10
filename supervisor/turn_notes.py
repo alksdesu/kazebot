@@ -17,6 +17,13 @@ from .types import Task
 FAILED_TURN_MARK_KEY = "turn_failed"
 FAILED_TURN_NOTICE = "[SYSTEM] 这一轮没做完，没有给出回复（{cause}）；用户那边只收到一句报错。"
 _CAUSE_CHARS = 200
+_DETAIL_CHARS = 160
+# 这些类别的 error 是上游 API 答的话，原文带给用户；network/timeout/incomplete 的是本地传输层的英文，
+# auth 的可能带密钥片段（群里人人看得到），都只说人话。
+_DETAIL_KINDS = frozenset({
+    "rate_limit", "overloaded", "server", "content_filter",
+    "context_length", "bad_request", "invalid_response", "unknown",
+})
 # 模型调用失败按 provider 判的类别说：起因，和给用户的下一步
 _KIND_TEXTS = {
     "network": ("连不上模型服务", "稍后再发一次试试"),
@@ -35,16 +42,23 @@ _KIND_TEXTS = {
 _FALLBACK_CAUSE = "处理时出了问题"
 
 
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _cause_and_advice(result: Mapping[str, Any] | None) -> tuple[str, str]:
-    """模型调用失败按类别说；别的失败用任务自己写的原因（supervisor 和 engine 写给人看的那句），太长截断。"""
+    """模型调用失败按类别说，上游答了话的类别把原话附在后面；别的失败用任务自己写的原因，太长截断。"""
     result = result if isinstance(result, Mapping) else {}
     kind = str(result.get("error_kind") or "").strip().lower()
-    if kind in _KIND_TEXTS:
-        return _KIND_TEXTS[kind]
     error = " ".join(str(result.get("error") or "").split())
+    if kind in _KIND_TEXTS:
+        cause, advice = _KIND_TEXTS[kind]
+        if kind in _DETAIL_KINDS and error and error.lower() != kind:
+            cause = f"{cause}（{_cut(error, _DETAIL_CHARS)}）"
+        return cause, advice
     if not error:
         return _FALLBACK_CAUSE, "稍后再发一次试试"
-    return (error if len(error) <= _CAUSE_CHARS else error[: _CAUSE_CHARS - 1] + "…"), ""
+    return _cut(error, _CAUSE_CHARS), ""
 
 
 def failure_cause(result: Mapping[str, Any] | None) -> str:
