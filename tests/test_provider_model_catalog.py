@@ -50,6 +50,13 @@ class TestTheEndpointIsBuiltPerFamily:
     def test_a_trailing_slash_does_not_double_up(self) -> None:
         assert "//models" not in _req("anthropic", "https://relay.test/")[0]
 
+    def test_a_vertex_gemini_address_keeps_its_own_version_segment(self) -> None:
+        # Vertex 的地址自带 /v1 和项目段，再拼 /v1beta 上游回 404；鉴权头照官方域名发。
+        base = "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google"
+        url, headers = _req("gemini", base)
+        assert url == base + "/models"
+        assert headers["x-goog-api-key"] == _KEY
+
 
 class TestTheKeyTravelsInHeadersOnly:
     @pytest.mark.parametrize("name", ["openai", "deepseek", "anthropic", "gemini", "openai-responses"])

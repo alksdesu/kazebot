@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from plugin_sdk import PluginExecutionError
-from tools._wire import WIRE_GEMINI, headers as wire_headers
+from tools._wire import WIRE_GEMINI, gemini_version_path, headers as wire_headers
 
 from .assembly import ToolCallAssembler, conclude, int_field, parse_tool_arguments, usage_dict
 from .base import (
@@ -143,17 +143,17 @@ def _gemini_response(
 
 
 class GeminiProvider(BaseProvider):
-    """Provider for Google Gemini (generativelanguage.googleapis.com)."""
+    """Provider for Google Gemini: AI Studio（generativelanguage）和 Vertex AI（aiplatform）两种地址都收。"""
 
     provider_name = "gemini"
-    official_hosts = ("generativelanguage.googleapis.com",)
+    official_hosts = ("generativelanguage.googleapis.com", "aiplatform.googleapis.com")
     default_base_url = "https://generativelanguage.googleapis.com"
 
     @classmethod
     def catalog_request(cls, *, base_url: str, api_key: str):
         base = cls.resolve_base_url(base_url)
         # 鉴权头和 _headers() 同一份判定，否则拉得到列表却聊不了天。
-        return f"{base}/v1beta/models", wire_headers(WIRE_GEMINI, base, api_key)
+        return f"{base}{gemini_version_path(base)}/models", wire_headers(WIRE_GEMINI, base, api_key)
 
     @staticmethod
     def parse_catalog(payload):
@@ -271,7 +271,7 @@ class GeminiProvider(BaseProvider):
     def _endpoint(self, stream: bool = False) -> str:
         """Build the request URL for generateContent / streamGenerateContent."""
         action = "streamGenerateContent?alt=sse" if stream else "generateContent"
-        return f"{self._base_url}/v1beta/models/{self.model}:{action}"
+        return f"{self._base_url}{gemini_version_path(self._base_url)}/models/{self.model}:{action}"
 
     def _headers(self) -> dict[str, str]:
         """Official googleapis.com takes x-goog-api-key; reverse proxies take a Bearer token."""

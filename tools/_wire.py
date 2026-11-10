@@ -33,6 +33,7 @@ _WIRE_FAMILIES: dict[str, str] = {
 
 _ANTHROPIC_DOMAIN = "api.anthropic.com"
 _GEMINI_DOMAIN = "googleapis.com"
+_VERTEX_DOMAIN = "aiplatform.googleapis.com"
 
 # 各家的官方根，和 providers/*.py 的 default_base_url 同值。
 _DEFAULT_URLS: dict[str, str] = {
@@ -80,7 +81,7 @@ def normalize_base_url(wire: str, base_url: str) -> str:
 def endpoint(wire: str, base_url: str, model: str) -> str:
     base = str(base_url or "").rstrip("/")
     if wire == WIRE_GEMINI:
-        return base + "/v1beta/models/" + str(model or "") + ":generateContent"
+        return base + gemini_version_path(base) + "/models/" + str(model or "") + ":generateContent"
     if wire == WIRE_ANTHROPIC:
         return base + "/v1/messages"
     if wire == WIRE_OPENAI_RESPONSES:
@@ -98,6 +99,11 @@ def _on_official_host(base_url: str, domain: str) -> bool:
     except ValueError:
         return False
     return host == domain or host.endswith("." + domain)
+
+
+def gemini_version_path(base_url: str) -> str:
+    """Gemini 端点的版本段。Vertex 的地址自带版本和项目段（/v1/projects/…/publishers/google），再拼一个就 404。"""
+    return "" if _on_official_host(base_url, _VERTEX_DOMAIN) else "/v1beta"
 
 
 def headers(wire: str, base_url: str, api_key: str) -> dict[str, str]:

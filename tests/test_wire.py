@@ -141,6 +141,23 @@ def test_gemini_endpoint_carries_the_model() -> None:
     )
 
 
+_VERTEX_BASE = "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google"
+
+
+def test_a_vertex_gemini_endpoint_keeps_its_own_version_segment() -> None:
+    # Vertex 的地址自带 /v1 和项目段，再拼 /v1beta 上游回 404。
+    assert vw.normalize_base_url("gemini", _VERTEX_BASE) == _VERTEX_BASE
+    assert _build("gemini", base_url=_VERTEX_BASE, model="flash").url == (
+        _VERTEX_BASE + "/models/flash:generateContent"
+    )
+
+
+def test_a_vertex_gemini_address_uses_the_google_key_header() -> None:
+    headers = vw.headers("gemini", _VERTEX_BASE, "sk-x")
+    assert headers["x-goog-api-key"] == "sk-x"
+    assert "Authorization" not in headers
+
+
 # ── 鉴权头 ──
 
 def test_official_gemini_uses_its_own_key_header() -> None:
