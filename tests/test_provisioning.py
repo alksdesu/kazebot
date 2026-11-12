@@ -51,6 +51,11 @@ POLKIT = REPO_ROOT / "deploy" / "polkit" / "49-kazebot-provision.rules"
 INSTALL_DOC = REPO_ROOT / "deploy" / "INSTALL.md"
 MULTI_ACCOUNT_DOC = REPO_ROOT / "deploy" / "MULTI-ACCOUNT.md"
 BOOTSTRAP = REPO_ROOT / "deploy" / "bootstrap.sh"
+DEPLOY = REPO_ROOT / "deploy" / "deploy.sh"
+IMAGE_DIR = REPO_ROOT / "deploy" / "napcat-image"
+IMAGE_ENV = IMAGE_DIR / "image.env"
+BUILD_IMAGE = IMAGE_DIR / "build.sh"
+ONEBOT_README = REPO_ROOT / "adapters" / "onebot" / "README.md"
 README = REPO_ROOT / "README.md"
 README_EN = REPO_ROOT / "README.en.md"
 
@@ -1089,3 +1094,150 @@ def test_code_write_unit_runs_only_the_root_owned_helper() -> None:
     assert "Type=oneshot" in body
     assert "ExecStart=/usr/local/lib/kazebot/enable_instance_writable.sh %i" in body
     assert "/opt/kazebot/deploy" not in body
+
+
+@pytest.mark.parametrize("unit, argument", [("napcat-account.service", ""), ("napcat-account@.service", " %i")])
+def test_account_action_units_run_only_the_root_owned_runner(unit: str, argument: str) -> None:
+    lines = _script_code(UNIT_DIR / unit).splitlines()
+    assert "Type=oneshot" in lines
+    # 系统解释器加 -I：工作区里的解释器和模块都归 kazebot，root 不能碰。
+    assert f"ExecStart=/usr/bin/python3 -I /usr/local/lib/kazebot/napcat_account_runner.py{argument}" in lines
+    assert not any("/opt/kazebot" in line for line in lines)
+
+
+def test_each_instance_watches_its_own_account_request() -> None:
+    main = (UNIT_DIR / "napcat-account.path").read_text(encoding="utf-8").splitlines()
+    assert "PathExists=/opt/kazebot/data/napcat-account.request" in main
+    assert "Unit=napcat-account.service" in main
+    template = (UNIT_DIR / "napcat-account@.path").read_text(encoding="utf-8").splitlines()
+    # 多开实例的请求落在自己的工作区；盯着主实例那个路径的话，按钮只会等到超时。
+    assert "PathExists=/opt/kazebot-data/%i/data/napcat-account.request" in template
+    assert "Unit=napcat-account@%i.service" in template
+
+
+def test_the_account_trigger_follows_an_instance_through_its_life() -> None:
+    script = _script_code(SCRIPT)
+    assert '"$UNITS"/napcat-account@.path "$UNITS"/napcat-account@.service /etc/systemd/system/' in script
+    create, remove = script.split("do_remove() {", 1)
+    assert '"napcat-account@$INSTANCE.path"' in create.split("systemctl enable --now", 1)[1].split("\n\n", 1)[0]
+    assert '"napcat-account@$INSTANCE.path"' in remove.split("systemctl disable --now", 1)[1].split("\n\n", 1)[0]
+
+
+@pytest.mark.parametrize("script", [INSTALLER, BOOTSTRAP], ids=["install_provision.sh", "bootstrap.sh"])
+def test_the_account_runner_is_installed_where_the_agent_cannot_write(script: Path) -> None:
+    body = _script_code(script)
+    assert '"$REPO/deploy/napcat_account_runner.py" "$LIB/napcat_account_runner.py"' in body
+    assert "systemctl enable --now napcat-account.path" in body
+
+
+def test_instances_made_before_the_account_trigger_get_it_on_reinstall() -> None:
+    body = _script_code(INSTALLER)
+    assert "/etc/systemd/system/multi-user.target.wants/kazebot@*.service" in body
+    assert 'systemctl enable --now "napcat-account@$existing.path"' in body
+    # 清单归 kazebot 写，照它启用单元等于让 agent 指定 root 盯哪个目录。
+    assert "instances.yaml" not in body.split("启用账号动作触发", 1)[1].split("把主实例登记进清单", 1)[0]
+
+
+def _image_tag() -> str:
+    line = next(l for l in IMAGE_ENV.read_text(encoding="utf-8").splitlines() if l.startswith("NAPCAT_IMAGE="))
+    return line.split("=", 1)[1]
+
+
+class TestSelfBuiltImage:
+    """上游镜像仓库和 QQ 的 deb 下载都没了，镜像只能本机自建；起容器的几处要认同一个标签。"""
+
+    def test_the_tag_is_declared_once_and_every_consumer_reads_it(self) -> None:
+        tag = _image_tag()
+        assert tag.startswith("kazebot/napcat:")
+        bootstrap = _script_code(BOOTSTRAP)
+        assert '. "$REPO/deploy/napcat-image/image.env"' in bootstrap
+        assert 'IMAGE="${KAZEBOT_NAPCAT_IMAGE:-$NAPCAT_IMAGE}"' in bootstrap
+        assert '. "$HERE/image.env"' in _script_code(BUILD_IMAGE)
+        for path in (BOOTSTRAP, SCRIPT, INSTALLER, DEPLOY, BUILD_IMAGE, INSTALL_DOC, ONEBOT_README, README, README_EN):
+            assert "mlikiowa" not in path.read_text(encoding="utf-8"), path.name
+
+    def test_bootstrap_refuses_to_run_a_container_from_an_image_that_is_not_there(self) -> None:
+        body = _script_code(BOOTSTRAP)
+        assert 'docker image inspect "$IMAGE"' in body
+        assert "deploy/napcat-image/build.sh" in body
+        assert "docker pull" not in body
+
+    def test_provisioning_follows_a_running_container_then_the_installed_tag(self) -> None:
+        # root 跑的脚本只认 /usr/local/lib 里的副本；/opt/kazebot 归 kazebot，读那边等于让 agent 定镜像。
+        body = _script_code(SCRIPT)
+        assert "docker ps --filter 'name=^napcat' --format '{{.Image}}'" in body
+        assert "/usr/local/lib/kazebot/image.env" in body
+        assert "docker inspect napcat --format" not in body
+        assert "/opt/kazebot/deploy/napcat-image" not in body
+        for path in (INSTALLER, BOOTSTRAP):
+            assert '"$REPO/deploy/napcat-image/image.env" "$LIB/image.env"' in _script_code(path), path.name
+        assert "/usr/local/lib/kazebot/image.env" in _script_code(DEPLOY)
+
+    def test_the_dockerfile_keeps_the_device_identity_and_the_postinst_steps(self) -> None:
+        body = (IMAGE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        assert "ARG MACHINE_ID=" in body and '> /etc/machine-id' in body
+        assert "chmod 4755 /opt/QQ/chrome-sandbox" in body
+        assert "ln -sf /opt/QQ/qq /usr/bin/qq" in body
+        assert 'VOLUME ["/app/napcat/config", "/app/.config/QQ"]' in body
+        assert body.rstrip().endswith('ENTRYPOINT ["bash", "entrypoint.sh"]')
+        assert "localhost" not in (IMAGE_DIR / "entrypoint.sh").read_text(encoding="utf-8").split("fake_file /etc/hosts", 1)[0]
+
+    @pytest.fixture
+    def qq_tree(self, tmp_path: Path) -> Path:
+        app = tmp_path / "qq" / "opt" / "QQ" / "resources" / "app"
+        app.mkdir(parents=True)
+        (tmp_path / "qq" / "usr" / "share" / "applications").mkdir(parents=True)
+        (tmp_path / "qq" / "usr" / "share" / "applications" / "qq.desktop").write_text("desktop", encoding="utf-8")
+        binary = tmp_path / "qq" / "opt" / "QQ" / "qq"
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (tmp_path / "qq" / "opt" / "QQ" / "chrome-sandbox").write_bytes(b"sandbox")
+        (tmp_path / "qq" / "opt" / "QQ" / "._junk").write_bytes(b"apple")
+        (app / "wrapper.node").write_bytes(b"node")
+        (app / "package.json").write_text('{\n  "name": "QQ",\n  "version": "3.2.34-53644",\n  "main": "./x.js"\n}\n', encoding="utf-8")
+        return tmp_path / "qq"
+
+    def _shell_zip(self, tmp_path: Path, *, with_core: bool = True) -> Path:
+        import zipfile
+
+        path = tmp_path / "NapCat.Shell.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            if with_core:
+                zf.writestr("napcat.mjs", 'const v="4.18.42";console.log("NapCat.Core Version: "+v)')
+            zf.writestr("config/napcat.json", "{}")
+        return path
+
+    def _build(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(BUILD_IMAGE), *args], capture_output=True, text=True, encoding="utf-8", timeout=120,
+            env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        )
+
+    def test_the_context_is_assembled_from_an_unpacked_tree(self, tmp_path: Path, qq_tree: Path) -> None:
+        context = tmp_path / "ctx"
+        done = self._build(
+            "--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path)),
+            "--machine-id", "8e1509f19f844df08b0c4497e27dcc37", "--context-only", str(context),
+        )
+        assert done.returncode == 0, done.stderr
+        assert (context / "Dockerfile").read_bytes() == (IMAGE_DIR / "Dockerfile").read_bytes()
+        assert (context / "entrypoint.sh").read_bytes() == (IMAGE_DIR / "entrypoint.sh").read_bytes()
+        assert (context / "NapCat.Shell.zip").exists()
+        assert (context / "qq" / "opt" / "QQ" / "resources" / "app" / "wrapper.node").exists()
+        assert (context / "qq" / "usr" / "share" / "applications" / "qq.desktop").exists()
+        # macOS 打包带进来的 AppleDouble 文件不进镜像
+        assert not (context / "qq" / "opt" / "QQ" / "._junk").exists()
+        args = dict(l.split("=", 1) for l in (context / "build.args").read_text(encoding="utf-8").splitlines())
+        assert args == {
+            "MACHINE_ID": "8e1509f19f844df08b0c4497e27dcc37", "TAG": _image_tag(),
+            "QQ_VERSION": "3.2.34-53644", "NAPCAT_VERSION": "4.18.42",
+        }
+
+    def test_a_zip_without_the_core_and_a_broken_tree_are_refused(self, tmp_path: Path, qq_tree: Path) -> None:
+        bad_zip = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path, with_core=False)), "--context-only", str(tmp_path / "a"))
+        assert bad_zip.returncode == 1 and "napcat.mjs" in bad_zip.stderr
+        (qq_tree / "opt" / "QQ" / "resources" / "app" / "wrapper.node").unlink()
+        broken = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path)), "--context-only", str(tmp_path / "b"))
+        assert broken.returncode == 1 and "wrapper.node" in broken.stderr
+        bad_id = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path)), "--machine-id", "nope", "--context-only", str(tmp_path / "c"))
+        assert bad_id.returncode == 1 and "machine-id" in bad_id.stderr

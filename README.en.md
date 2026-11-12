@@ -103,10 +103,11 @@ On a fresh Debian 12 / Ubuntu server, use the deployment script. The system's `p
 
 ```bash
 sudo git clone https://github.com/alksdesu/kazebot.git /opt/kazebot
+sudo /opt/kazebot/deploy/napcat-image/build.sh --qq linuxqq_3.2.34-53644_amd64.deb --shell NapCat.Shell.zip
 sudo /opt/kazebot/deploy/bootstrap.sh
 ```
 
-The script installs dependencies, builds the frontend, and configures NapCat and systemd. Open the console link it prints when finished. For remote access, first create an SSH tunnel:
+The NapCat image is built locally; bring your own Linux QQ package and `NapCat.Shell.zip` (see [deploy/napcat-image/README.md](deploy/napcat-image/README.md)). The script installs dependencies, builds the frontend, and configures NapCat and systemd. Open the console link it prints when finished. For remote access, first create an SSH tunnel:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 <user>@<server-ip>

@@ -77,9 +77,13 @@ do_create() {
 
   say "实例 $INSTANCE：supervisor $sup_port / bot $bot_port / napcat $napcat_port"
 
-  # 版本跟现役容器走，避免新实例悄悄用上另一个 NapCat。
-  image="$(docker inspect napcat --format '{{.Config.Image}}' 2>/dev/null || true)"
-  [ -n "$image" ] || fail "读不到现有 napcat 容器的镜像，先确认它在跑"
+  # 版本跟在跑的容器走，避免新实例悄悄用上另一个 NapCat；一个都没在跑就用装机时定的那份。
+  image="$(docker ps --filter 'name=^napcat' --format '{{.Image}}' 2>/dev/null | head -1 || true)"
+  if [ -z "$image" ] && [ -f /usr/local/lib/kazebot/image.env ]; then
+    image="$(sed -n 's/^NAPCAT_IMAGE=//p' /usr/local/lib/kazebot/image.env | head -1)"
+  fi
+  [ -n "$image" ] || fail "定不下 NapCat 镜像：没有在跑的 napcat 容器，也没有 /usr/local/lib/kazebot/image.env"
+  docker image inspect "$image" >/dev/null 2>&1 || fail "本机没有镜像 $image，先用 deploy/napcat-image/build.sh 构建"
 
   if docker inspect "napcat-$INSTANCE" >/dev/null 2>&1; then
     say "容器 napcat-$INSTANCE 已存在，跳过创建"
@@ -105,8 +109,17 @@ json.dump({
     "musicSignUrl": "", "enableLocalFile2Url": False, "parseMultMsg": True,
 }, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
+    # QQ 把容器 hostname 当设备名上报；默认的随机容器 ID 一眼就是容器，按实例派生一个像主机名的值，
+    # 重建容器也不变。要指定的话写 .env 的 NAPCAT_HOSTNAME。
+    napcat_hostname="$(sed -n 's/^NAPCAT_HOSTNAME=//p' "$WS/.env" | head -1 | tr -d '\r"')"
+    if [ -n "$napcat_hostname" ]; then
+      [[ "$napcat_hostname" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || fail "$WS/.env 里 NAPCAT_HOSTNAME 的值不合形状"
+    else
+      napcat_hostname="desktop-$(printf '%s' "$INSTANCE" | sha256sum | cut -c1-6)"
+    fi
     # 序号 0 那个跑 --network host，第二个 host 容器会抢 6099 和 QQ NT 占的 4001/4301。
     docker run -d --name "napcat-$INSTANCE" --restart always \
+      --hostname "$napcat_hostname" \
       -p "127.0.0.1:$napcat_port:6099" \
       --add-host "host.docker.internal:host-gateway" \
       -e NAPCAT_UID=0 -e NAPCAT_GID=0 -e TZ=Asia/Shanghai \

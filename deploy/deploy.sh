@@ -80,6 +80,19 @@ if [[ -f "$HOST_CLEANUP" ]] && ! cmp -s "$ROOT/adapters/onebot/qq_cache.py" "$HO
   echo "[deploy] 宿主清理脚本有更新，已同步"
 fi
 
+# 同理：账号动作执行器也是 root 跑的副本。
+ACCOUNT_RUNNER=/usr/local/lib/kazebot/napcat_account_runner.py
+if [[ -f "$ACCOUNT_RUNNER" ]] && ! cmp -s "$ROOT/deploy/napcat_account_runner.py" "$ACCOUNT_RUNNER"; then
+  install -m 0644 -o root -g root "$ROOT/deploy/napcat_account_runner.py" "$ACCOUNT_RUNNER"
+  echo "[deploy] 账号动作执行器有更新，已同步"
+fi
+
+IMAGE_ENV=/usr/local/lib/kazebot/image.env
+if [[ -f "$IMAGE_ENV" ]] && ! cmp -s "$ROOT/deploy/napcat-image/image.env" "$IMAGE_ENV"; then
+  install -m 0644 -o root -g root "$ROOT/deploy/napcat-image/image.env" "$IMAGE_ENV"
+  echo "[deploy] NapCat 镜像标签有更新，已同步（现有容器不受影响，重建时才用新标签）"
+fi
+
 # 兜底：谁手敲过一条 root 命令都能在这里改回来。
 STRAY=$(find "$ROOT" ! -user "$OWNER" -print -quit 2>/dev/null || true)
 if [[ -n "$STRAY" ]]; then

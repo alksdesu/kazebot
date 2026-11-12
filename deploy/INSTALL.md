@@ -4,8 +4,11 @@
 
 ```bash
 git clone <仓库地址> /opt/kazebot
+sudo /opt/kazebot/deploy/napcat-image/build.sh --qq linuxqq_3.2.34-53644_amd64.deb --shell NapCat.Shell.zip
 sudo /opt/kazebot/deploy/bootstrap.sh
 ```
+
+NapCat 镜像要先在本机构建：上游镜像仓库已经没了，QQ 安装包和 `NapCat.Shell.zip` 自备，见 [napcat-image/README.md](napcat-image/README.md)。
 
 路径必须是 `/opt/kazebot` —— systemd 单元和建号脚本里都写死了这个位置，脚本检测到别的地方会直接拒绝跑。
 
@@ -20,8 +23,8 @@ sudo /opt/kazebot/deploy/bootstrap.sh
 4  写 .env           只放机器相关的：端口、随机生成的 Bridge token 和会话摘要盐
 5  铺配置模板        data/config.yaml、data/policy.yaml、config/qq.yaml，都是空的等你填
 6  编前端            npm ci && npm run build，控制台就是配置入口
-7  起 NapCat         docker 容器 + 反向 WS 指向 127.0.0.1:8080
-8  装 root 侧组件    deploy.sh、宿主清理脚本放进 /usr/local/lib/kazebot，归 root
+7  起 NapCat         本机自建镜像起 docker 容器，设备名 desktop-xxxxxx，反向 WS 指向 127.0.0.1:8080
+8  装 root 侧组件    deploy.sh、宿主清理脚本、账号动作执行器、镜像标签放进 /usr/local/lib/kazebot，归 root
 9  装 systemd        kazebot.service、kazebot-qq.service、宿主清理的 timer
 10 启动并验证        health → engine → 8080 监听 → NapCat 通道
 ```
@@ -57,10 +60,10 @@ ssh -L 8765:127.0.0.1:8765 <你的用户>@<服务器>
 sudo /usr/local/lib/kazebot/deploy.sh
 ```
 
-唯一能调的是 NapCat 镜像版本：
+能调的只有两项：NapCat 镜像标签（默认取 `deploy/napcat-image/image.env`）和容器的设备名（默认按宿主 machine-id 派生）：
 
 ```bash
-sudo KAZEBOT_NAPCAT_IMAGE=mlikiowa/napcat-docker:v4.18.5 /opt/kazebot/deploy/bootstrap.sh
+sudo KAZEBOT_NAPCAT_IMAGE=kazebot/napcat:4.18.42-qq3.2.34 KAZEBOT_NAPCAT_HOSTNAME=desktop-ab12cd /opt/kazebot/deploy/bootstrap.sh
 ```
 
 ## 出问题了

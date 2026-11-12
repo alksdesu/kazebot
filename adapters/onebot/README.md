@@ -114,26 +114,25 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 
 1. 安装 NapCat 并登录 QQ 账号。
 2. 配置反向 WebSocket 连接地址，指向 NoneBot2 监听端口（默认 `ws://127.0.0.1:8080/onebot/v11/ws`）。
-3. 如果使用 Docker 部署 NapCat，创建容器时需要把 Clonoth 附件目录以**相同绝对路径**挂载进容器，便于 `收藏表情` 调用 `add_custom_face` 时让 NapCat 读取本地图片文件。例如 Clonoth 部署在 `/opt/Clonoth`：
+3. 如果使用 Docker 部署 NapCat，镜像按 [deploy/napcat-image/README.md](../../deploy/napcat-image/README.md) 自建；创建容器时需要把 Clonoth 附件目录以**相同绝对路径**挂载进容器，便于 `收藏表情` 调用 `add_custom_face` 时让 NapCat 读取本地图片文件。例如 Clonoth 部署在 `/opt/Clonoth`：
 
    ```bash
    mkdir -p /opt/napcat/config /opt/napcat/qq /opt/Clonoth/data/attachments
 
    docker run -d \
      --name napcat \
+     --hostname desktop-ab12cd \
      --restart always \
-     -e ACCOUNT=0 \
-     -e WSR_ENABLE=true \
      -e NAPCAT_UID=0 \
      -e NAPCAT_GID=0 \
      -e TZ=Asia/Shanghai \
      -v /opt/napcat/config:/app/napcat/config \
      -v /opt/napcat/qq:/app/.config/QQ \
      -v /opt/Clonoth/data/attachments:/opt/Clonoth/data/attachments:ro \
-     mlikiowa/napcat-docker:v4.18.5
+     kazebot/napcat:4.18.42-qq3.2.34
    ```
 
-   关键点：容器内路径必须仍是 `/opt/Clonoth/data/attachments`，不能改挂到 `/app/...`；因为 Clonoth 传给 NapCat 的 `file` 就是宿主机上的绝对路径。创建容器时指定该挂载后，后续普通 `docker restart napcat` 会保留挂载。
+   关键点：容器内路径必须仍是 `/opt/Clonoth/data/attachments`，不能改挂到 `/app/...`；因为 Clonoth 传给 NapCat 的 `file` 就是宿主机上的绝对路径。创建容器时指定该挂载后，后续普通 `docker restart napcat` 会保留挂载。`--hostname` 是 QQ 上报的设备名，随机容器 ID 一眼就是容器，给一个像普通主机的名字并在重建容器时沿用。
 4. 确认连接建立后 NoneBot2 能收到消息事件。
 
 ### 2. 配置 NoneBot2 项目

@@ -103,10 +103,11 @@ flowchart TB
 
 ```bash
 sudo git clone https://github.com/alksdesu/kazebot.git /opt/kazebot
+sudo /opt/kazebot/deploy/napcat-image/build.sh --qq linuxqq_3.2.34-53644_amd64.deb --shell NapCat.Shell.zip
 sudo /opt/kazebot/deploy/bootstrap.sh
 ```
 
-脚本安装依赖、构建前端并配置 NapCat 与 systemd。装完按输出链接进入控制台；远程访问可先建立 SSH 隧道：
+NapCat 镜像需在本机构建，Linux QQ 安装包与 `NapCat.Shell.zip` 自备（见 [deploy/napcat-image/README.md](deploy/napcat-image/README.md)）。脚本安装依赖、构建前端并配置 NapCat 与 systemd。装完按输出链接进入控制台；远程访问可先建立 SSH 隧道：
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 <用户>@<服务器IP>

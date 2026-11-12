@@ -37,11 +37,17 @@ install -m 0755 -o root -g root "$REPO/deploy/cloudflared_ingress.py" "$LIB/clou
 install -m 0755 -o root -g root "$REPO/deploy/deploy.sh" "$LIB/deploy.sh"
 # 宿主清理以 root 跑这一份；之后 deploy.sh 每次更新会顺带同步它。
 install -m 0644 -o root -g root "$REPO/adapters/onebot/qq_cache.py" "$LIB/qq_cache.py"
+# 账号动作以 root 跑这一份；之后 deploy.sh 每次更新会顺带同步它。
+install -m 0644 -o root -g root "$REPO/deploy/napcat_account_runner.py" "$LIB/napcat_account_runner.py"
+# 新实例没有在跑的容器可参照时按这份定镜像；root 只认这里的副本。
+install -m 0644 -o root -g root "$REPO/deploy/napcat-image/image.env" "$LIB/image.env"
 install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot@.service" \
   "$REPO/deploy/systemd/kazebot-qq@.service" \
   "$REPO/deploy/systemd/kazebot-cleanup@.service" \
   "$REPO/deploy/systemd/kazebot-cleanup@.timer" \
+  "$REPO/deploy/systemd/napcat-account@.path" \
+  "$REPO/deploy/systemd/napcat-account@.service" \
   "$LIB/units/"
 
 echo "==> 装触发单元、宿主清理与 polkit 规则"

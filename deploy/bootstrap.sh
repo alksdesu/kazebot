@@ -13,7 +13,11 @@ DATA_ROOT=/opt/kazebot-data
 LIB=/usr/local/lib/kazebot
 NAPCAT_HOME=/opt/napcat
 OWNER=kazebot
-IMAGE="${KAZEBOT_NAPCAT_IMAGE:-mlikiowa/napcat-docker:v4.18.5}"
+# shellcheck source=napcat-image/image.env
+. "$REPO/deploy/napcat-image/image.env"
+IMAGE="${KAZEBOT_NAPCAT_IMAGE:-$NAPCAT_IMAGE}"
+# QQ 把容器 hostname 当设备名上报，随机容器 ID 一眼就是容器。不指定就按宿主 machine-id 派生一个固定值。
+NAPCAT_HOSTNAME="${KAZEBOT_NAPCAT_HOSTNAME:-desktop-$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-6)}"
 
 # 必须逐字等于 supervisor/instances.py 里 ports_for(0)，否则以后多开会重新分配端口
 SUP_PORT=8765
@@ -278,10 +282,14 @@ EOF
   if docker inspect napcat >/dev/null 2>&1; then
     skip "容器 napcat 已存在（重建会丢登录态，跳过）"
   else
+    # 上游镜像仓库已经没了，镜像只能本机自建。
+    docker image inspect "$IMAGE" >/dev/null 2>&1 \
+      || fail "本机没有镜像 $IMAGE：先 sudo $REPO/deploy/napcat-image/build.sh --qq <linuxqq deb> --shell <NapCat.Shell.zip>"
     # 第一个号用 --network host。附件要以同一个绝对路径挂进容器，NapCat 是在自己的
     # 文件系统里 open() 那个路径的；挂载只能在 docker run 时定，忘了就得重建 + 重扫码。
     docker run -d \
       --name napcat \
+      --hostname "$NAPCAT_HOSTNAME" \
       --restart always \
       --network host \
       -e WSR_ENABLE=true \
@@ -291,7 +299,7 @@ EOF
       -v "$NAPCAT_HOME/logs:/app/napcat/logs" \
       -v "$REPO/data/attachments:$REPO/data/attachments:ro" \
       "$IMAGE" >/dev/null
-    info "容器起来了（$IMAGE）"
+    info "容器起来了（$IMAGE，设备名 $NAPCAT_HOSTNAME）"
   fi
 
   info "等 WebUI 写出 token…"
@@ -347,7 +355,9 @@ install_root_side() {
   install -d -m 0755 -o root -g root "$LIB"
   install -m 0755 -o root -g root "$REPO/deploy/deploy.sh" "$LIB/deploy.sh"
   install -m 0644 -o root -g root "$REPO/adapters/onebot/qq_cache.py" "$LIB/qq_cache.py"
-  info "$LIB/deploy.sh / $LIB/qq_cache.py"
+  install -m 0644 -o root -g root "$REPO/deploy/napcat_account_runner.py" "$LIB/napcat_account_runner.py"
+  install -m 0644 -o root -g root "$REPO/deploy/napcat-image/image.env" "$LIB/image.env"
+  info "$LIB/deploy.sh / $LIB/qq_cache.py / $LIB/napcat_account_runner.py / $LIB/image.env"
 }
 
 install_units() {
