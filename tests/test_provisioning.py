@@ -1146,9 +1146,9 @@ def _image_tag() -> str:
 class TestSelfBuiltImage:
     """上游镜像仓库和 QQ 的 deb 下载都没了，镜像只能本机自建；起容器的几处要认同一个标签。"""
 
-    def test_the_tag_is_declared_once_and_every_consumer_reads_it(self) -> None:
-        tag = _image_tag()
-        assert tag.startswith("kazebot/napcat:")
+    def test_the_alias_is_declared_once_and_every_consumer_reads_it(self) -> None:
+        # 别名不带版本：朋友拿官网当天的 QQ 构建出来也能直接被 bootstrap 认到，版本号在镜像自己的 tag 里。
+        assert _image_tag() == "kazebot/napcat:current"
         bootstrap = _script_code(BOOTSTRAP)
         assert '. "$REPO/deploy/napcat-image/image.env"' in bootstrap
         assert 'IMAGE="${KAZEBOT_NAPCAT_IMAGE:-$NAPCAT_IMAGE}"' in bootstrap
@@ -1229,9 +1229,10 @@ class TestSelfBuiltImage:
         assert not (context / "qq" / "opt" / "QQ" / "._junk").exists()
         args = dict(l.split("=", 1) for l in (context / "build.args").read_text(encoding="utf-8").splitlines())
         assert args == {
-            "MACHINE_ID": "8e1509f19f844df08b0c4497e27dcc37", "TAG": _image_tag(),
-            "QQ_VERSION": "3.2.34-53644", "NAPCAT_VERSION": "4.18.42",
+            "MACHINE_ID": "8e1509f19f844df08b0c4497e27dcc37", "TAG": "kazebot/napcat:4.18.42-qq3.2.34",
+            "ALIAS": _image_tag(), "QQ_VERSION": "3.2.34-53644", "NAPCAT_VERSION": "4.18.42",
         }
+        assert '-t "$TAG" -t "$NAPCAT_IMAGE"' in _script_code(BUILD_IMAGE)
 
     def test_a_zip_without_the_core_and_a_broken_tree_are_refused(self, tmp_path: Path, qq_tree: Path) -> None:
         bad_zip = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path, with_core=False)), "--context-only", str(tmp_path / "a"))
@@ -1241,3 +1242,9 @@ class TestSelfBuiltImage:
         assert broken.returncode == 1 and "wrapper.node" in broken.stderr
         bad_id = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path)), "--machine-id", "nope", "--context-only", str(tmp_path / "c"))
         assert bad_id.returncode == 1 and "machine-id" in bad_id.stderr
+
+    def test_an_explicit_tag_wins_over_the_derived_one(self, tmp_path: Path, qq_tree: Path) -> None:
+        context = tmp_path / "ctx"
+        done = self._build("--qq", str(qq_tree), "--shell", str(self._shell_zip(tmp_path)), "--tag", "kazebot/napcat:trial", "--context-only", str(context))
+        assert done.returncode == 0, done.stderr
+        assert "TAG=kazebot/napcat:trial" in (context / "build.args").read_text(encoding="utf-8")

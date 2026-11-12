@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# 自建 NapCat Shell + Linux QQ 镜像。腾讯撤了旧版 deb、上游镜像仓库也没了，QQ 安装包和 NapCat.Shell.zip 自备。
+# 自建 NapCat Shell + Linux QQ 镜像。上游镜像仓库已没了；QQ 安装包从官网下（CDN 只对大陆 IP 开放），NapCat.Shell.zip 自备。
 #
 # 用法: build.sh --qq <linuxqq_*.deb、已解包目录或其 tar 包> --shell <NapCat.Shell.zip>
 #              [--machine-id <32 位十六进制>] [--tag <repo:tag>] [--context-only <目录>]
+#
+# 镜像按实际版本打 tag（kazebot/napcat:<NapCat>-qq<QQ>），再指上 image.env 里的别名。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=image.env
 . "$HERE/image.env"
 
-QQ="" SHELL_ZIP="" MACHINE_ID="" TAG="$NAPCAT_IMAGE" CONTEXT_ONLY=""
-usage() { sed -n '2,6p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+QQ="" SHELL_ZIP="" MACHINE_ID="" TAG="" CONTEXT_ONLY=""
+usage() { sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --qq) QQ="${2:-}"; shift 2 ;;
@@ -70,8 +72,10 @@ QQ_VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$APP/package.json" | 
 echo "==> 准备 NapCat"
 cp "$SHELL_ZIP" "$CONTEXT/NapCat.Shell.zip"
 cp "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$CONTEXT/"
-NAPCAT_VERSION="$(unzip -p "$CONTEXT/NapCat.Shell.zip" napcat.mjs 2>/dev/null | grep -oE 'NapCat\.Core Version: [^"]*"\+"[0-9.]+|"4\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 unzip -l "$CONTEXT/NapCat.Shell.zip" napcat.mjs >/dev/null 2>&1 || { echo "zip 里没有 napcat.mjs，不是 NapCat.Shell.zip" >&2; exit 1; }
+NAPCAT_VERSION="$(unzip -p "$CONTEXT/NapCat.Shell.zip" napcat.mjs 2>/dev/null | grep -oE 'NapCat\.Core Version: [^"]*"\+"[0-9.]+|"4\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+[ -n "$QQ_VERSION" ] && [ -n "$NAPCAT_VERSION" ] || { echo "读不出版本号（QQ '$QQ_VERSION' / NapCat '$NAPCAT_VERSION'），不打 tag" >&2; exit 1; }
+[ -n "$TAG" ] || TAG="kazebot/napcat:${NAPCAT_VERSION}-qq${QQ_VERSION%%-*}"
 
 # 不指定就沿用现役容器的，重建容器时 QQ 看到的机器不变。
 if [ -z "$MACHINE_ID" ] && command -v docker >/dev/null 2>&1; then
@@ -82,13 +86,13 @@ if [ -z "$MACHINE_ID" ] && command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-echo "    QQ $QQ_VERSION / NapCat ${NAPCAT_VERSION:-?} / machine-id ${MACHINE_ID:-基础镜像自带} / 标签 $TAG"
+echo "    QQ $QQ_VERSION / NapCat $NAPCAT_VERSION / machine-id ${MACHINE_ID:-基础镜像自带} / 标签 $TAG → $NAPCAT_IMAGE"
 if [ -n "$CONTEXT_ONLY" ]; then
-  printf 'MACHINE_ID=%s\nTAG=%s\nQQ_VERSION=%s\nNAPCAT_VERSION=%s\n' "$MACHINE_ID" "$TAG" "$QQ_VERSION" "$NAPCAT_VERSION" > "$CONTEXT/build.args"
+  printf 'MACHINE_ID=%s\nTAG=%s\nALIAS=%s\nQQ_VERSION=%s\nNAPCAT_VERSION=%s\n' "$MACHINE_ID" "$TAG" "$NAPCAT_IMAGE" "$QQ_VERSION" "$NAPCAT_VERSION" > "$CONTEXT/build.args"
   echo "==> 构建上下文已放在 $CONTEXT"
   exit 0
 fi
 
 echo "==> docker build $TAG"
-docker build --build-arg "MACHINE_ID=$MACHINE_ID" -t "$TAG" "$CONTEXT"
-echo "==> 好了：$TAG"
+docker build --build-arg "MACHINE_ID=$MACHINE_ID" -t "$TAG" -t "$NAPCAT_IMAGE" "$CONTEXT"
+echo "==> 好了：$TAG（别名 $NAPCAT_IMAGE）"

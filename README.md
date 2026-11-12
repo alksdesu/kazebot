@@ -103,7 +103,7 @@ flowchart TB
 
 ```bash
 sudo git clone https://github.com/alksdesu/kazebot.git /opt/kazebot
-sudo /opt/kazebot/deploy/napcat-image/build.sh --qq linuxqq_3.2.34-53644_amd64.deb --shell NapCat.Shell.zip
+sudo /opt/kazebot/deploy/napcat-image/build.sh --qq QQ_3.2.33_260902_amd64_01.deb --shell NapCat.Shell.zip
 sudo /opt/kazebot/deploy/bootstrap.sh
 ```
 

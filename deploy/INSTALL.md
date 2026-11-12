@@ -4,11 +4,11 @@
 
 ```bash
 git clone <仓库地址> /opt/kazebot
-sudo /opt/kazebot/deploy/napcat-image/build.sh --qq linuxqq_3.2.34-53644_amd64.deb --shell NapCat.Shell.zip
+sudo /opt/kazebot/deploy/napcat-image/build.sh --qq QQ_3.2.33_260902_amd64_01.deb --shell NapCat.Shell.zip
 sudo /opt/kazebot/deploy/bootstrap.sh
 ```
 
-NapCat 镜像要先在本机构建：上游镜像仓库已经没了，QQ 安装包和 `NapCat.Shell.zip` 自备，见 [napcat-image/README.md](napcat-image/README.md)。
+NapCat 镜像要先在本机构建：上游镜像仓库已经没了，QQ 安装包从官网下（CDN 只对大陆 IP 开放）、`NapCat.Shell.zip` 自备，见 [napcat-image/README.md](napcat-image/README.md)。
 
 路径必须是 `/opt/kazebot` —— systemd 单元和建号脚本里都写死了这个位置，脚本检测到别的地方会直接拒绝跑。
 
@@ -63,7 +63,7 @@ sudo /usr/local/lib/kazebot/deploy.sh
 能调的只有两项：NapCat 镜像标签（默认取 `deploy/napcat-image/image.env`）和容器的设备名（默认按宿主 machine-id 派生）：
 
 ```bash
-sudo KAZEBOT_NAPCAT_IMAGE=kazebot/napcat:4.18.42-qq3.2.34 KAZEBOT_NAPCAT_HOSTNAME=desktop-ab12cd /opt/kazebot/deploy/bootstrap.sh
+sudo KAZEBOT_NAPCAT_IMAGE=kazebot/napcat:4.18.42-qq3.2.33 KAZEBOT_NAPCAT_HOSTNAME=desktop-ab12cd /opt/kazebot/deploy/bootstrap.sh
 ```
 
 ## 出问题了

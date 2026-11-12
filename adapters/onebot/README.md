@@ -129,7 +129,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
      -v /opt/napcat/config:/app/napcat/config \
      -v /opt/napcat/qq:/app/.config/QQ \
      -v /opt/Clonoth/data/attachments:/opt/Clonoth/data/attachments:ro \
-     kazebot/napcat:4.18.42-qq3.2.34
+     kazebot/napcat:current
    ```
 
    关键点：容器内路径必须仍是 `/opt/Clonoth/data/attachments`，不能改挂到 `/app/...`；因为 Clonoth 传给 NapCat 的 `file` 就是宿主机上的绝对路径。创建容器时指定该挂载后，后续普通 `docker restart napcat` 会保留挂载。`--hostname` 是 QQ 上报的设备名，随机容器 ID 一眼就是容器，给一个像普通主机的名字并在重建容器时沿用。
