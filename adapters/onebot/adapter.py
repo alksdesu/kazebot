@@ -105,6 +105,9 @@ class OneBotAdapter:
         self.live_reconcile_task: Optional[asyncio.Task] = None
         self.attachment_cleanup_task: Optional[asyncio.Task] = None
         self.last_bot: Any = None
+        # 掉线分类与自动重登；启动时装上，心跳看门狗是它的后台任务。
+        self.recovery: Any = None
+        self.recovery_task: Optional[asyncio.Task] = None
 
         # ---- 群历史与水位 ----
         # 群聊上下文只保留最近 N 条：给入口节点社交语境，又不让每次 inbound 带过长历史。

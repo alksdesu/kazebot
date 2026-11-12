@@ -48,6 +48,7 @@ async def feature_lifespan(app):
     worktree_service = getattr(state, "worktrees", None)
     started = []
     worktrees_started = False
+    accounts = None
     try:
         for service in services:
             service.start()
@@ -58,8 +59,13 @@ async def feature_lifespan(app):
         if worktree_service is not None:
             await asyncio.to_thread(worktree_service.start)
             worktrees_started = True
+        accounts = getattr(app.state, "platform_accounts", None)
+        if accounts is not None:
+            accounts.start()
         yield
     finally:
+        if accounts is not None:
+            await accounts.stop()
         if worktrees_started:
             try:
                 await asyncio.to_thread(worktree_service.close)

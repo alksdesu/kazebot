@@ -54,6 +54,34 @@ systemctl list-timers kazebot-host-cleanup.timer
 journalctl -u kazebot-host-cleanup.service -n 100 --no-pager
 ```
 
+## NapCat account actions
+
+Switching accounts, pinning auto-login and "log in another account" need root: `webui.json` belongs to root and the container has to be restarted, while the supervisor runs as `kazebot` with `NoNewPrivileges`. The supervisor writes `data/napcat-account.request` into its own workspace. A path unit picks the file up and runs `/usr/local/lib/kazebot/napcat_account_runner.py` with `/usr/bin/python3 -I` as root; the runner checks the admin token in the request against that workspace's `data/.admin_token`, applies one of `set-auto`, `clear-auto` or `restart`, and answers in `data/napcat-account.result`.
+
+| | path unit | workspace | container | `webui.json` |
+|---|---|---|---|---|
+| main instance | `napcat-account.path` | `/opt/kazebot` | `napcat` | `/opt/napcat/config/` |
+| instance `<id>` | `napcat-account@<id>.path` | `/opt/kazebot-data/<id>` | `napcat-<id>` | `/opt/napcat-<id>/config/` |
+
+The runner derives all three from the unit's instance name and never reads the instance roster, which `kazebot` can write. It does not follow symbolic links in the workspace.
+
+`bootstrap.sh` installs the runner and enables `napcat-account.path`. `provision_instance.sh` enables `napcat-account@<id>.path` for each instance it creates and disables it on removal. `deploy.sh` refreshes the runner copy on every update. Instances created before these units existed get theirs by re-running `install_provision.sh`, or by hand:
+
+```bash
+install -m 0644 -o root -g root /opt/kazebot/deploy/napcat_account_runner.py /usr/local/lib/kazebot/napcat_account_runner.py
+install -m 0644 -o root -g root /opt/kazebot/deploy/systemd/napcat-account@.path \
+  /opt/kazebot/deploy/systemd/napcat-account@.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now napcat-account@<id>.path
+```
+
+Without the unit the console buttons wait 150 seconds and fail with `等待账号操作超时`. Status and logs:
+
+```bash
+systemctl list-units 'napcat-account*.path'
+journalctl -u 'napcat-account*' -n 50 --no-pager
+```
+
 ## Data cleanup timer
 
 `clonoth-data-cleanup.timer` runs `engine.data_cleanup` periodically. The cleanup script rotates large event logs and removes expired temporary files, artifacts, child-session files, node-context files, and files under `data/attachments/`.

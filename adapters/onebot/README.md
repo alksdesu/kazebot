@@ -31,6 +31,7 @@ adapters/onebot/
 │   ├── callbacks.py             # AdapterCallbacks 的 QQ 实现
 │   ├── forward_bridge.py        # qq_forward 工具用的本地 HTTP 转发桥
 │   ├── lifecycle.py             # 热载对齐、live state 发布、启动与关闭
+│   ├── recovery.py              # 掉线分类、登录动作预算、自动重登状态机
 │   └── handlers.py              # matcher 与背后的处理函数
 ├── adapter.py                   # OneBotAdapter：全部进程内状态
 ├── account_ops.py               # 账号运维：经 NapCat WebUI 查询、切换、扫码登录，supervisor 按平台钩子加载
@@ -294,7 +295,7 @@ QQ 适配器不会再自动放行 `approval_requested`。当 Clonoth 触发需�
 
 ## Docker 注意事项
 
-- NapCat 容器重启后会丢失 QQ 登录 session，需要用手机重新扫码登录。**不要随意重启 NapCat 容器**。
+- `docker restart` 保留容器文件系统与挂载卷，QQ 的登录凭据和设备 GUID 都在卷里，重启后 NapCat 会按 `webui.json` 的 `autoLoginAccount` 自动快速登录。真正会丢登录态的是服务端注销（提示「登录已失效」）或换卷重建容器。频繁登录本身是风控信号，重启仍要节制。
 - 如果需要使用 QQ 收藏表情的 `收藏表情` 命令，`CLONOTH_WORKSPACE/data/attachments` 必须在创建 NapCat 容器时以相同绝对路径挂载进容器；已创建容器不能动态增加 volume，只能重建容器。
 - `CLONOTH_WORKSPACE` 指向的路径需要在容器内可访问（挂载为卷或与 Supervisor 共享卷）。
 - NoneBot2 与 NapCat 之间的 WebSocket 连接需在容器网络中可达。

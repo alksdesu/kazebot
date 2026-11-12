@@ -49,6 +49,10 @@ install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot-provision@.service" \
   "$REPO/deploy/systemd/kazebot-deprovision@.service" \
   "$REPO/deploy/systemd/kazebot-writable@.service" \
+  "$REPO/deploy/systemd/napcat-account.path" \
+  "$REPO/deploy/systemd/napcat-account.service" \
+  "$REPO/deploy/systemd/napcat-account@.path" \
+  "$REPO/deploy/systemd/napcat-account@.service" \
   "$REPO/deploy/systemd/kazebot-host-cleanup.service" \
   "$REPO/deploy/systemd/kazebot-host-cleanup.timer" \
   /etc/systemd/system/
@@ -107,6 +111,19 @@ systemctl daemon-reload
 echo "==> 启用宿主清理"
 systemctl enable --now kazebot-host-cleanup.timer
 
+echo "==> 启用账号动作触发"
+systemctl enable --now napcat-account.path
+# 这套触发出现之前建的实例没有它，换号按钮只会等到超时。
+# 按 systemd 里已启用的实例认，不读 kazebot 可写的清单。
+for link in /etc/systemd/system/multi-user.target.wants/kazebot@*.service; do
+  [ -e "$link" ] || continue
+  existing="${link##*/kazebot@}"
+  existing="${existing%.service}"
+  [[ "$existing" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || continue
+  systemctl enable --now "napcat-account@$existing.path"
+  echo "    napcat-account@$existing.path"
+done
+
 echo "==> 把主实例登记进清单"
 sudo -u "$OWNER" CLONOTH_INSTANCES_FILE="$DATA_ROOT/instances.yaml" \
   "$REPO/.venv/bin/python" - "$REPO" "$MAIN" "$MAIN_QQ" <<'PY'
@@ -142,4 +159,5 @@ cat <<EOF
   sudo -u $OWNER systemctl start kazebot-provision@$MAIN   # 应当被 polkit 放行（会报工作区已存在）
   sudo -u $OWNER systemctl start sshd                          # 应当被拒绝
   systemctl list-timers kazebot-host-cleanup.timer             # 应当排着下一次宿主清理
+  systemctl list-units 'napcat-account*.path'                  # 主实例和每个实例各一条，都在 waiting
 EOF

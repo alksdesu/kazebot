@@ -2186,11 +2186,12 @@
           "id": "link",
           "label": "链路",
           "icon": "lan",
-          "note": "队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，以及固定配置与危险操作。",
+          "note": "队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，掉线后怎么自动登回去，以及固定配置与危险操作。",
           "paths": [
             "queue",
             "history",
-            "forward_bridge"
+            "forward_bridge",
+            "recovery"
           ],
           "nodes": [
             {
@@ -2300,6 +2301,44 @@
                 {
                   "kind": "custom",
                   "name": "bridgeFacts"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "掉线恢复",
+              "hint": "QQ 登录态被服务端注销时自动用快速登录登回去，次数受预算约束",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "recovery_enabled",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "recovery_daily_limit"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "recovery_min_interval_sec"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "recovery_login_mode_on_failure"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "recovery_notify_admins"
+                    }
+                  ]
+                },
+                {
+                  "kind": "custom",
+                  "name": "linkFacts"
                 }
               ]
             },
@@ -3307,6 +3346,57 @@
             "platform"
           ],
           "default": 30
+        },
+        "recovery_enabled": {
+          "kind": "bool",
+          "label": "掉线后自动登回",
+          "desc": "登录态失效时在预算内用快速登录登回去；手机踢下线、改密码这类人为下线不会自动顶回去。",
+          "path": "recovery.enabled",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "recovery_daily_limit": {
+          "kind": "number",
+          "label": "24 小时内最多",
+          "unit": "次",
+          "path": "recovery.daily_limit",
+          "layers": [
+            "platform"
+          ],
+          "default": 3
+        },
+        "recovery_min_interval_sec": {
+          "kind": "number",
+          "label": "两次至少隔",
+          "unit": "秒",
+          "step": 60,
+          "path": "recovery.min_interval_sec",
+          "layers": [
+            "platform"
+          ],
+          "default": 600
+        },
+        "recovery_login_mode_on_failure": {
+          "kind": "bool",
+          "label": "登不回去就进扫码态",
+          "desc": "快速登录被 QQ 拒绝时重启 NapCat 停在等扫码，控制台能直接出码；关着就只通知，由人点「换个号登录」。",
+          "path": "recovery.login_mode_on_failure",
+          "layers": [
+            "platform"
+          ],
+          "default": false
+        },
+        "recovery_notify_admins": {
+          "kind": "bool",
+          "label": "私聊管理员",
+          "desc": "恢复成功或放弃时私聊管理员名单一句话；掉线期间发不出去的，链路回来再补。",
+          "path": "recovery.notify_admins",
+          "layers": [
+            "platform"
+          ],
+          "default": true
         }
       }
     }

@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ import httpx
 
 import config_layout
 from clonoth_runtime import platform_secret, read_admin_token
+from platforms import live as platform_live
 from platforms.account_ops import (
     AccountConflict,
     AccountOpsError,
@@ -50,6 +52,15 @@ _ACTION_TIMEOUT_SEC = 150.0
 # 容器重启到 QQ 核心能应答通常十几秒，留足余量。
 _READY_TIMEOUT_SEC = 90.0
 _READY_POLL_SEC = 1.5
+# RefreshQRcode 立刻返回，新码稍后才由登录监听回填，通常一秒内到。
+_QRCODE_REFRESH_TIMEOUT_SEC = 5.0
+_QRCODE_REFRESH_POLL_SEC = 0.3
+# SetQuickLogin 立刻返回，登录态要等 QQ 核心和服务端走完注册才真的在；SsoInfoSync 一般几秒内到。
+_QUICK_RELOGIN_TIMEOUT_SEC = 60.0
+_QUICK_RELOGIN_POLL_SEC = 2.0
+# QQ 密码/快速登录在新设备或异常设备上要求验证时的返回码；这两种人不来扫码就过不去。
+_NEEDS_VERIFY_CODES = ("140022010", "140022011")
+_SESSION_LOST_HINT = "NapCat 在这个状态下发不出新二维码，点「换个号登录」重启它再扫"
 
 
 class NapCatError(AccountOpsError):
@@ -87,6 +98,44 @@ def _quick_login_target(item: Any) -> QuickLoginTarget | None:
     return {"account": uin, "nick": nick, "avatar": avatar, "available": available}
 
 
+def _qrcode_text(data: Any) -> str:
+    payload = data if isinstance(data, dict) else {}
+    return str(payload.get("qrcode") or payload.get("qrcodeurl") or "")
+
+
+@dataclass(frozen=True)
+class _LoginState:
+    """GetQQLoginInfo 与 CheckLoginStatus 合起来的登录处境。"""
+
+    uin: str
+    nick: str
+    is_login: bool
+    is_offline: bool
+    login_error: str
+    qrcode: str
+    # CheckLoginStatus 没答上时上面几项都是缺省值，不能拿来下结论。
+    checked: bool
+
+    @property
+    def session_lost(self) -> bool:
+        """登录过的号被踢或登录态失效。NapCat 这时不再出码，只有重启才回到等扫码。"""
+        return self.checked and bool(self.uin) and not self.is_login and not self.is_offline
+
+    @property
+    def visible_error(self) -> str:
+        # NapCat 登录成功后不清扫码流程的残留，loginError 会一直留着上一轮的值。
+        if self.is_login:
+            return ""
+        if self.session_lost:
+            return "；".join(part for part in (self.login_error, _SESSION_LOST_HINT) if part)
+        return self.login_error
+
+    @property
+    def visible_qrcode(self) -> str:
+        # 只有还没登录过任何号时 qrcodeurl 才是眼下能扫的；登录过以后它留的是上一轮扫码的旧码。
+        return "" if self.is_login or self.uin else self.qrcode
+
+
 def _read_dead_logins(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -99,7 +148,8 @@ class NapCatClient:
     """带凭证缓存的最小 WebUI 客户端。"""
 
     def __init__(self, workspace_root: Path, *, base_url: str = "") -> None:
-        self._env_path = Path(workspace_root) / ".env"
+        self.workspace_root = Path(workspace_root)
+        self._env_path = self.workspace_root / ".env"
         # 与 token 读同一份 .env：多开时每个实例连自己那个容器，地址和令牌必须成对，
         # 分成两个来源迟早会拿甲的令牌敲乙的容器。
         resolved = base_url or _read_env_value(self._env_path, _URL_KEY) or _BASE_URL
@@ -212,7 +262,10 @@ class NapCatClient:
             return
         with contextlib.suppress(OSError):
             request.unlink()
-        raise NapCatError("等待账号操作超时，确认 napcat-account.path 已启用")
+        raise NapCatError(
+            "等待账号操作超时：root 侧没有接走请求，确认 napcat-account 路径单元已启用"
+            "（主实例是 napcat-account.path，多开实例是 napcat-account@<实例名>.path）"
+        )
 
     async def set_auto_login(self, uin: str) -> None:
         """让容器重启后自己登回来。不设的话 NapCat 起来只会停在等扫码。"""
@@ -290,23 +343,35 @@ class NapCatAccountOps:
     def configured(self) -> bool:
         return self.client.configured
 
-    async def status(self) -> AccountStatus:
-        """任一子查询失败都不该让整页打不开。"""
+    async def _login_state(self) -> _LoginState:
         client = self.client
         current = await client.call("GetQQLoginInfo") or {}
         try:
             login = await client.call("CheckLoginStatus") or {}
+            checked = True
         except NapCatError:
-            login = {}
+            login, checked = {}, False
+        return _LoginState(
+            uin=str(current.get("uin") or ""),
+            nick=str(current.get("nick") or ""),
+            is_login=bool(login.get("isLogin", False)),
+            is_offline=bool(login.get("isOffline", False)),
+            login_error=str(login.get("loginError") or ""),
+            qrcode=str(login.get("qrcodeurl") or ""),
+            checked=checked,
+        )
+
+    async def status(self) -> AccountStatus:
+        """任一子查询失败都不该让整页打不开。"""
+        client = self.client
+        state = await self._login_state()
         try:
             quick = await client.call("GetQuickLoginListNew") or []
         except NapCatError:
             quick = []
-        is_login = bool(login.get("isLogin", False))
-        uin = str(current.get("uin") or "")
         # 扫码登回来了就撤掉死号标记，否则一次失效会永久跟着这个号。
-        if is_login and uin:
-            client.clear_login_dead(uin)
+        if state.is_login and state.uin:
+            client.clear_login_dead(state.uin)
         dead = client.dead_logins()
         targets: list[QuickLoginTarget] = []
         for item in quick:
@@ -319,16 +384,24 @@ class NapCatAccountOps:
                 target["dead_reason"] = str(note.get("reason") or "")
             targets.append(target)
         return {
-            "account": uin,
-            "nick": str(current.get("nick") or ""),
+            "account": state.uin,
+            "nick": state.nick,
             # GetQQLoginInfo 不返回在线状态，只有 CheckLoginStatus 有；用它推会恒为「不在线」。
-            "online": is_login and not bool(login.get("isOffline", False)),
-            "is_login": is_login,
-            # NapCat 登录成功后不清扫码流程的残留，loginError 和 qrcodeurl 会一直留着
-            # 上一轮的值 —— 照搬就成了「在线 — 二维码已过期」。登录上了就没有这两样。
-            "login_error": "" if is_login else str(login.get("loginError") or ""),
-            "qrcode": "" if is_login else str(login.get("qrcodeurl") or ""),
+            "online": state.is_login and not state.is_offline,
+            "is_login": state.is_login,
+            "login_error": state.visible_error,
+            "qrcode": state.visible_qrcode,
             "quick_login": targets,
+            **self._link_facts(),
+        }
+
+    def _link_facts(self) -> dict[str, Any]:
+        """bot 进程公布的掉线原因与恢复处境。bot 没在跑时这几项是空的，不去猜。"""
+        status = platform_live.read_live_status(QQ_NAPCAT, self.client.workspace_root)
+        return {
+            "offline_reason": status.offline_reason if status.fresh else "",
+            "last_offline_at": status.last_offline_at or 0.0,
+            "recovery": dict(status.recovery) if status.fresh and status.recovery is not None else {},
         }
 
     async def switch(self, account: str) -> SwitchResult:
@@ -353,13 +426,76 @@ class NapCatAccountOps:
         return {"ok": True, "account": uin, "pinned": True, "pin_error": ""}
 
     async def login_qrcode(self) -> str:
-        data = await self.client.call("GetQQLoginQrcode")
-        payload = data if isinstance(data, dict) else {}
-        return str(payload.get("qrcode") or payload.get("qrcodeurl") or "")
+        client = self.client
+        if (await self._login_state()).session_lost:
+            return ""
+        before = _qrcode_text(await client.call("GetQQLoginQrcode"))
+        try:
+            await client.call("RefreshQRcode")
+        except NapCatError:
+            # 没有这个接口的老版本 NapCat 只在过期时自己换码，读到的就是当前这张。
+            return before
+        return await self._await_new_qrcode(before)
+
+    async def _await_new_qrcode(self, before: str) -> str:
+        deadline = time.monotonic() + _QRCODE_REFRESH_TIMEOUT_SEC
+        while True:
+            current = _qrcode_text(await self.client.call("GetQQLoginQrcode"))
+            if current != before or time.monotonic() >= deadline:
+                return current
+            await asyncio.sleep(_QRCODE_REFRESH_POLL_SEC)
 
     async def relogin(self) -> None:
         # NapCat 在已登录状态下拒发二维码，且不提供登出，只能重启进等扫码状态。
         await self.client.enter_login_mode()
+
+    async def login_state(self) -> dict[str, Any]:
+        """掉线恢复要的那几项登录处境，不带可切换的号。"""
+        state = await self._login_state()
+        return {
+            "account": state.uin, "is_login": state.is_login, "is_offline": state.is_offline,
+            "login_error": state.login_error, "session_lost": state.session_lost, "checked": state.checked,
+        }
+
+    async def enter_login_mode(self) -> None:
+        await self.client.enter_login_mode()
+
+    async def quick_relogin(self, uin: str) -> dict[str, Any]:
+        """不重启容器，直接让 NapCat 用本地凭据把这个号登回去。
+
+        被服务端注销登录态时本地快速登录凭据多半还在，这一步能省掉一次重启和扫码；
+        被拒才记死号，连不上不算。返回里的 needs_verify 表示 QQ 要人验证设备，自动化到此为止。
+        """
+        account = str(uin or "").strip()
+        if not account.isdigit():
+            raise AccountRequestInvalid("QQ 号必须是数字")
+        before = await self._login_state()
+        if before.is_login and not before.is_offline and before.uin == account:
+            return {"ok": True, "account": account, "message": "登录态仍在", "needs_verify": False}
+        try:
+            await self.client.call("SetQuickLogin", {"uin": account})
+        except NapCatUnreachable:
+            raise
+        except NapCatError as exc:
+            message = str(exc)
+            needs_verify = any(code in message for code in _NEEDS_VERIFY_CODES)
+            self.client.mark_login_dead(account, message)
+            return {"ok": False, "account": account, "message": message, "needs_verify": needs_verify}
+        deadline = time.monotonic() + _QUICK_RELOGIN_TIMEOUT_SEC
+        while True:
+            state = await self._login_state()
+            if state.is_login and not state.is_offline:
+                self.client.clear_login_dead(account)
+                return {"ok": True, "account": account, "message": "", "needs_verify": False}
+            if state.checked and not state.is_login and state.login_error and state.login_error != before.login_error:
+                # 登录监听回了新的错误而不是还在等：不必耗完超时。
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_QUICK_RELOGIN_POLL_SEC)
+        message = state.login_error or "快速登录后登录态一直没有建立"
+        self.client.mark_login_dead(account, message)
+        return {"ok": False, "account": account, "message": message, "needs_verify": any(code in message for code in _NEEDS_VERIFY_CODES)}
 
     async def pin(self) -> str:
         uin = (await self.status()).get("account", "")

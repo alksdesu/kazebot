@@ -355,12 +355,16 @@ install_units() {
   install -m 0644 -o root -g root \
     "$REPO/deploy/systemd/kazebot.service" \
     "$REPO/deploy/systemd/kazebot-qq.service" \
+    "$REPO/deploy/systemd/napcat-account.path" \
+    "$REPO/deploy/systemd/napcat-account.service" \
     "$REPO/deploy/systemd/kazebot-host-cleanup.service" \
     "$REPO/deploy/systemd/kazebot-host-cleanup.timer" \
     /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable --now kazebot-host-cleanup.timer >/dev/null 2>&1
-  info "kazebot.service / kazebot-qq.service / kazebot-host-cleanup.timer"
+  # 控制台的换号、钉自动登录靠它把请求交给 root；不启用的话那几个按钮只会等到超时。
+  systemctl enable --now napcat-account.path >/dev/null 2>&1
+  info "kazebot.service / kazebot-qq.service / kazebot-host-cleanup.timer / napcat-account.path"
 }
 
 start_and_verify() {

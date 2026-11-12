@@ -36,6 +36,7 @@ from .napcat import (  # noqa: E402,F401  # sys.path 必须先插入工作区。
     commands,
     callbacks,
     forward_bridge,
+    recovery,
     lifecycle,
     handlers,
     state,

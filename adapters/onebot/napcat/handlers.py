@@ -5,12 +5,13 @@ import logging
 import asyncio
 import time
 from typing import Any, Dict, List
-from nonebot import on_message, on_notice
+from nonebot import on_message, on_metaevent, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
     GroupMessageEvent,
     GroupUploadNoticeEvent,
+    HeartbeatMetaEvent,
     Message,
     MessageSegment,
     PrivateMessageEvent,
@@ -23,7 +24,7 @@ from ..echo_rules import QQ_ECHO_RULES
 from ..live_config import live, refresh as refresh_live_config
 from clonoth_sdk import IntentVerdict
 
-from . import approval, commands, common, emotes, history, identity, inbound, media, message_text, models, outbound_attachments, permissions, proactive, queueing, routing, sending, state
+from . import approval, commands, common, emotes, history, identity, inbound, media, message_text, models, outbound_attachments, permissions, proactive, queueing, recovery, routing, sending, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -89,6 +90,36 @@ async def _handle_community_notice(bot: Bot, event: Event) -> None:
         "notice_type": "group_increase", "member_id": str(getattr(event, "user_id", "")),
         "timestamp": getattr(event, "time", time.time()), "display_name": identity._event_display_name(event),
     })
+
+
+# NapCat 自定义的掉线通知。NoneBot 不认识这个 notice_type，只会给基类事件，字段要自己从额外属性里取。
+_bot_offline_matcher = on_notice(priority=1, block=False)
+
+
+@_bot_offline_matcher.handle()
+async def _handle_bot_offline(bot: Bot, event: Event) -> None:
+    if getattr(event, "notice_type", "") != "bot_offline" or state._adapter.recovery is None:
+        return
+    fields = recovery.notice_fields(event)
+    self_id = str(getattr(event, "self_id", "") or getattr(bot, "self_id", "") or "")
+    offline = state._adapter.recovery.on_notice(fields)
+    common.logger.error("QQ bot offline: account=%s %s", self_id, offline.summary())
+
+
+# 心跳是 WS 还挂着时唯一的活性信号；NapCat 在登录态没了之后 status.online 会变假。
+_heartbeat_matcher = on_metaevent(priority=1, block=False)
+
+
+@_heartbeat_matcher.handle()
+async def _handle_heartbeat(event: HeartbeatMetaEvent) -> None:
+    if state._adapter.recovery is None:
+        return
+    status = getattr(event, "status", None)
+    online = getattr(status, "online", None) if status is not None else None
+    state._adapter.recovery.on_heartbeat(
+        online=online if isinstance(online, bool) else None,
+        interval_ms=getattr(event, "interval", None),
+    )
 
 
 # 普通群消息记录器。priority 较低且 block=False，只负责维护上下文缓存。

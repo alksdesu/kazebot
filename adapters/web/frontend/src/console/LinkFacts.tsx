@@ -62,6 +62,52 @@ export const BridgeFacts = () => {
   );
 };
 
+const RECOVERY_STATES: Record<string, string> = {
+  idle: '空闲',
+  waiting: '等链路恢复',
+  relogin: '正在快速登录',
+  login_mode: '已进扫码态',
+  exhausted: '预算用完，等人处理',
+  manual: '不自动处理',
+};
+
+const OFFLINE_REASONS: Record<string, string> = {
+  session_invalid: '登录态被服务端注销',
+  other_device: '在别的设备上被踢',
+  password_changed: '密码已改',
+  low_version: '版本过低',
+  link_down: '链路断开',
+  unknown: '原因不明',
+};
+
+const clock = (stamp: number) => new Date(stamp * 1000).toLocaleString();
+
+export const RecoveryFacts = () => {
+  const link = useLinkFacts();
+  const enabled = useLiveValue<boolean>('recovery_enabled', true);
+  const limit = useLiveValue<number>('recovery_daily_limit', 0);
+  const { recovery } = link;
+  if (!link.connected) return <Facts>还没连上 NapCat。</Facts>;
+  const budget = `24 小时内已用 ${recovery.actions_used_24h}/${limit} 次自动登录`;
+  if (link.online) {
+    return (
+      <Facts>
+        登录态在线。{enabled ? budget : '自动恢复已关闭'}
+        {link.last_offline_at > 0 && `；上次掉线 ${clock(link.last_offline_at)}`}
+        {recovery.note && `，${recovery.note}`}。
+      </Facts>
+    );
+  }
+  return (
+    <Facts>
+      <strong>离线</strong>：{OFFLINE_REASONS[link.offline_reason] || link.offline_reason || '原因未知'}
+      {link.last_offline_at > 0 && `（${clock(link.last_offline_at)}）`}
+      ，恢复状态 {RECOVERY_STATES[recovery.state] || recovery.state || '未知'}
+      {recovery.note && `：${recovery.note}`}。{enabled ? budget : '自动恢复已关闭'}。
+    </Facts>
+  );
+};
+
 export const Environment = () => {
   const runtime = useRuntime();
   const env = runtime.environment || {};

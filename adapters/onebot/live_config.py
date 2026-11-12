@@ -356,6 +356,35 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_FORWARD_BRIDGE_MAX_MESSAGES",),
         ui=number("单次最多", unit="条"),
     ),
+    # 掉线恢复
+    LiveKey(
+        "recovery_enabled", "recovery.enabled", BOOL, True,
+        env=("ONEBOT_RECOVERY_ENABLED",),
+        note="关掉后掉线只记录、不自动登录",
+        ui=toggle("掉线后自动登回", "登录态失效时在预算内用快速登录登回去；手机踢下线、改密码这类人为下线不会自动顶回去。"),
+    ),
+    LiveKey(
+        "recovery_daily_limit", "recovery.daily_limit", int_in(min_value=0, max_value=20), 3,
+        env=("ONEBOT_RECOVERY_DAILY_LIMIT",),
+        note="24 小时滚动窗口内的自动登录动作上限，超了只记录。登录太频繁本身就是风控信号",
+        ui=number("24 小时内最多", unit="次"),
+    ),
+    LiveKey(
+        "recovery_min_interval_sec", "recovery.min_interval_sec", int_in(min_value=0, max_value=86400), 600,
+        env=("ONEBOT_RECOVERY_MIN_INTERVAL_SEC",),
+        ui=number("两次至少隔", step=60, unit="秒"),
+    ),
+    LiveKey(
+        "recovery_login_mode_on_failure", "recovery.login_mode_on_failure", BOOL, False,
+        env=("ONEBOT_RECOVERY_LOGIN_MODE_ON_FAILURE",),
+        note="快速登录被拒后重启 NapCat 进扫码态，控制台才拿得到二维码；也算一次动作。默认关：被拒说明凭据已作废，重启只省一次点击",
+        ui=toggle("登不回去就进扫码态", "快速登录被 QQ 拒绝时重启 NapCat 停在等扫码，控制台能直接出码；关着就只通知，由人点「换个号登录」。"),
+    ),
+    LiveKey(
+        "recovery_notify_admins", "recovery.notify_admins", BOOL, True,
+        env=("ONEBOT_RECOVERY_NOTIFY_ADMINS",),
+        ui=toggle("私聊管理员", "恢复成功或放弃时私聊管理员名单一句话；掉线期间发不出去的，链路回来再补。"),
+    ),
 )
 
 # / 与 ／ 只参与触发判定不参与剥离：/draw、/nai 等命令正则要求字面斜杠，剥掉会失配，

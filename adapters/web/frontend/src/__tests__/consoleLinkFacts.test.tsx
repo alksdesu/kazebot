@@ -7,7 +7,7 @@ import type { ConfigLiveState } from '../api/supervisorClient';
 import { ConnectionCard } from '../console/ConnectionCard';
 import { platformConsoleStore, readLinkFacts, type ConsoleState } from '../console/consoleStore';
 import { joinNotes, nameBetween, nameWith } from '../console/format';
-import { QueueFacts } from '../console/LinkFacts';
+import { QueueFacts, RecoveryFacts } from '../console/LinkFacts';
 import { PlatformProvider } from '../console/platformContext';
 import { AccountSummary } from '../console/sectionSummaries';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
@@ -370,22 +370,91 @@ describe('队列实况', () => {
   });
 });
 
+describe('掉线恢复实况', () => {
+  it('在线时报预算用量', () => {
+    seed(live({
+      connected: true, online: true, account: '10001',
+      values: { recovery_enabled: true, recovery_daily_limit: 3 },
+      recovery: { state: 'idle', note: '', last_action: '', last_action_at: 0, actions_used_24h: 1 },
+    }));
+    inQq(<RecoveryFacts />);
+
+    expect(screen.getByText(/登录态在线。24 小时内已用 1\/3 次自动登录/)).toBeTruthy();
+  });
+
+  it('离线时说出原因、恢复状态和备注', () => {
+    seed(live({
+      connected: true, online: false, account: '10001', offline_reason: 'session_invalid',
+      values: { recovery_enabled: true, recovery_daily_limit: 3 },
+      recovery: { state: 'exhausted', note: '24 小时内已自动登录 3 次，到预算上限 3', last_action: 'quick_relogin', last_action_at: 1, actions_used_24h: 3 },
+    }));
+    inQq(<RecoveryFacts />);
+
+    expect(screen.getByText(/登录态被服务端注销/)).toBeTruthy();
+    expect(screen.getByText(/预算用完，等人处理：24 小时内已自动登录 3 次/)).toBeTruthy();
+  });
+
+  it('自动恢复关着时不报预算', () => {
+    seed(live({
+      connected: true, online: true, account: '10001',
+      values: { recovery_enabled: false, recovery_daily_limit: 3 },
+    }));
+    inQq(<RecoveryFacts />);
+
+    expect(screen.getByText(/自动恢复已关闭/)).toBeTruthy();
+  });
+
+  it('没连上 NapCat 时只说没连上', () => {
+    seed(live({ connected: false }));
+    inQq(<RecoveryFacts />);
+
+    expect(screen.getByText('还没连上 NapCat。')).toBeTruthy();
+  });
+});
+
 describe('readLinkFacts', () => {
   const read = (state: NonNullable<ConfigLiveState['state']>) =>
     readLinkFacts({ live: live(state) } as unknown as ConsoleState);
+  const empty = {
+    connected: false, online: false, offline_reason: '', last_offline_at: 0,
+    recovery: { state: '', note: '', last_action: '', last_action_at: 0, actions_used_24h: 0 },
+    account: '', backlog: 0,
+  };
 
-  it('读出三项', () => {
-    expect(read({ connected: true, account: '10001', backlog: 4 })).toEqual({ connected: true, account: '10001', backlog: 4 });
+  it('读出链路三项，没公布 online 的旧 bot 按 connected 算', () => {
+    expect(read({ connected: true, account: '10001', backlog: 4 })).toEqual({
+      ...empty, connected: true, online: true, account: '10001', backlog: 4,
+    });
+  });
+
+  it('连着 OneBot 但登录态不在时 online 为假，并带出原因与恢复处境', () => {
+    expect(read({
+      connected: true, online: false, offline_reason: 'session_invalid', last_offline_at: 1700000000,
+      recovery: { state: 'relogin', note: '正在快速登录 10001', last_action: 'quick_relogin', last_action_at: 1700000005, actions_used_24h: 1 },
+      account: '10001', backlog: 0,
+    })).toEqual({
+      ...empty, connected: true, online: false, offline_reason: 'session_invalid', last_offline_at: 1700000000,
+      recovery: { state: 'relogin', note: '正在快速登录 10001', last_action: 'quick_relogin', last_action_at: 1700000005, actions_used_24h: 1 },
+      account: '10001',
+    });
+  });
+
+  it('没连上时 online 一定为假', () => {
+    expect(read({ connected: false, online: true }).online).toBe(false);
   });
 
   it('形状不对的值当没有', () => {
-    const odd = { connected: 'yes', account: 10001, backlog: -2 } as unknown as NonNullable<ConfigLiveState['state']>;
-    expect(read(odd)).toEqual({ connected: false, account: '', backlog: 0 });
-    const junk = { backlog: 'many' } as unknown as NonNullable<ConfigLiveState['state']>;
+    const odd = {
+      connected: 'yes', account: 10001, backlog: -2, online: 'true', offline_reason: 7, last_offline_at: 'now',
+      recovery: { state: 1, actions_used_24h: 'two' },
+    } as unknown as NonNullable<ConfigLiveState['state']>;
+    expect(read(odd)).toEqual(empty);
+    const junk = { backlog: 'many', recovery: 'nope' } as unknown as NonNullable<ConfigLiveState['state']>;
     expect(read(junk).backlog).toBe(0);
+    expect(read(junk).recovery).toEqual(empty.recovery);
   });
 
   it('bot 没公布时全是空的', () => {
-    expect(readLinkFacts({ live: null } as unknown as ConsoleState)).toEqual({ connected: false, account: '', backlog: 0 });
+    expect(readLinkFacts({ live: null } as unknown as ConsoleState)).toEqual(empty);
   });
 });

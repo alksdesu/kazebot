@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import adapters.onebot.account_ops as napcat_module  # noqa: E402
 from adapters.onebot.account_ops import (  # noqa: E402
     NapCatAccountOps,
     NapCatClient,
@@ -33,6 +34,16 @@ _OTHER = "10000002"
 _WEBUI_ENV = "NAPCAT_WEBUI_TOKEN"
 
 
+class _Each:
+    """同一个端点先后几次的回答，最后一个一直用下去。"""
+
+    def __init__(self, *answers: Any) -> None:
+        self._answers = list(answers)
+
+    def take(self) -> Any:
+        return self._answers.pop(0) if len(self._answers) > 1 else self._answers[0]
+
+
 class _Endpoints:
     """按端点名给回答，值是异常就抛；记下调用顺序和参数。"""
 
@@ -43,6 +54,8 @@ class _Endpoints:
     async def __call__(self, endpoint: str, payload: dict[str, Any] | None = None) -> Any:
         self.seen.append((endpoint, dict(payload or {})))
         answer = self._answers.get(endpoint)
+        if isinstance(answer, _Each):
+            answer = answer.take()
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -82,6 +95,10 @@ def _write_dead(workspace: Path, reasons: dict[str, str]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+# bot 没在跑时 live state 不存在，掉线原因与恢复处境都是缺省。
+_LINK = {"offline_reason": "", "last_offline_at": 0.0, "recovery": {}}
+
+
 def _status(ops: NapCatAccountOps) -> dict[str, Any]:
     return dict(asyncio.run(ops.status()))
 
@@ -95,7 +112,7 @@ class TestStatus:
             GetQuickLoginListNew=[],
         )
 
-        assert _status(ops) == {
+        assert _status(ops) == _LINK | {
             "account": _UIN, "nick": "咪啪", "online": True, "is_login": True,
             "login_error": "", "qrcode": "", "quick_login": [],
         }
@@ -135,10 +152,62 @@ class TestStatus:
             CheckLoginStatus={"isLogin": False, "loginError": "请扫码", "qrcodeurl": "qrcode://now"},
         )
 
-        assert _status(ops) == {
+        assert _status(ops) == _LINK | {
             "account": "", "nick": "", "online": False, "is_login": False,
             "login_error": "请扫码", "qrcode": "qrcode://now", "quick_login": [],
         }
+
+    def test_a_kicked_account_hides_the_stale_qrcode_and_says_what_to_do(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN, "nick": "咪啪"},
+            CheckLoginStatus={"isLogin": False, "loginError": "登录已失效", "qrcodeurl": "qrcode://stale"},
+        )
+
+        status = _status(ops)
+
+        assert (status["account"], status["is_login"], status["qrcode"]) == (_UIN, False, "")
+        assert status["login_error"].startswith("登录已失效；")
+        assert "换个号登录" in status["login_error"]
+
+    def test_a_kicked_account_without_a_reason_still_says_what_to_do(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus={"isLogin": False, "qrcodeurl": "qrcode://stale"},
+        )
+
+        status = _status(ops)
+
+        assert status["login_error"] == napcat_module._SESSION_LOST_HINT
+
+    def test_a_dropped_connection_is_not_told_to_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus={"isLogin": False, "isOffline": True, "loginError": "网络断开", "qrcodeurl": "qrcode://stale"},
+        )
+
+        status = _status(ops)
+
+        assert (status["login_error"], status["qrcode"]) == ("网络断开", "")
+
+    def test_a_failing_login_check_is_not_read_as_a_kicked_account(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus=NapCatError("CheckLoginStatus 返回错误"),
+        )
+
+        assert _status(ops)["login_error"] == ""
 
     def test_a_failing_login_check_still_renders_the_page(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -173,7 +242,7 @@ class TestStatus:
     def test_empty_answers_are_an_empty_account(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ops, _ = _ops(tmp_path, monkeypatch)
 
-        assert _status(ops) == {
+        assert _status(ops) == _LINK | {
             "account": "", "nick": "", "online": False, "is_login": False,
             "login_error": "", "qrcode": "", "quick_login": [],
         }
@@ -355,6 +424,10 @@ class TestSwitch:
 
 
 class TestLoginQrcode:
+    @pytest.fixture(autouse=True)
+    def _no_pause_between_reads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(napcat_module, "_QRCODE_REFRESH_POLL_SEC", 0.0)
+
     @pytest.mark.parametrize(
         "data, qrcode",
         [
@@ -368,13 +441,61 @@ class TestLoginQrcode:
             ([{"qrcode": "qrcode://a"}], ""),
         ],
     )
-    def test_either_field_is_accepted_and_nothing_readable_is_empty(
+    def test_a_napcat_without_the_refresh_endpoint_serves_the_code_it_has(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: Any, qrcode: str,
     ) -> None:
-        ops, calls = _ops(tmp_path, monkeypatch, GetQQLoginQrcode=data)
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginQrcode=data, RefreshQRcode=NapCatUnreachable("RefreshQRcode 调用失败"),
+        )
 
         assert asyncio.run(ops.login_qrcode()) == qrcode
-        assert calls.endpoints == ["GetQQLoginQrcode"]
+        assert calls.endpoints == ["GetQQLoginInfo", "CheckLoginStatus", "GetQQLoginQrcode", "RefreshQRcode"]
+
+    def test_a_refresh_waits_for_the_new_code(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginQrcode=_Each({"qrcode": "qrcode://old"}, {"qrcode": "qrcode://old"}, {"qrcode": "qrcode://new"}),
+        )
+
+        assert asyncio.run(ops.login_qrcode()) == "qrcode://new"
+        assert calls.endpoints == [
+            "GetQQLoginInfo", "CheckLoginStatus",
+            "GetQQLoginQrcode", "RefreshQRcode", "GetQQLoginQrcode", "GetQQLoginQrcode",
+        ]
+
+    def test_a_code_that_never_changes_is_served_once_the_wait_is_over(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(napcat_module, "_QRCODE_REFRESH_TIMEOUT_SEC", 0.0)
+        ops, calls = _ops(tmp_path, monkeypatch, GetQQLoginQrcode={"qrcode": "qrcode://same"})
+
+        assert asyncio.run(ops.login_qrcode()) == "qrcode://same"
+        assert calls.endpoints[-2:] == ["RefreshQRcode", "GetQQLoginQrcode"]
+
+    def test_a_kicked_account_has_no_code_to_hand_out(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus={"isLogin": False, "qrcodeurl": "qrcode://stale"},
+            GetQQLoginQrcode={"qrcode": "qrcode://stale"},
+        )
+
+        assert asyncio.run(ops.login_qrcode()) == ""
+        assert calls.endpoints == ["GetQQLoginInfo", "CheckLoginStatus"]
+
+    def test_a_refusal_to_hand_out_a_code_is_passed_on(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus={"isLogin": True},
+            GetQQLoginQrcode=NapCatError("GetQQLoginQrcode 返回错误：QQ Is Logined"),
+        )
+
+        with pytest.raises(NapCatError, match="QQ Is Logined"):
+            asyncio.run(ops.login_qrcode())
+
+        assert "RefreshQRcode" not in calls.endpoints
 
 
 class TestRelogin:
@@ -448,3 +569,123 @@ class TestHookFactory:
         (tmp_path / ".env").write_text(f"{_WEBUI_ENV}=backfilled\n", encoding="utf-8")
 
         assert ops.configured is True
+
+
+class TestQuickRelogin:
+    """登录态被服务端注销后，不重启容器直接用本地凭据登回去。"""
+
+    def test_a_live_session_needs_no_action(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN}, CheckLoginStatus={"isLogin": True, "isOffline": False},
+        )
+
+        result = asyncio.run(ops.quick_relogin(_UIN))
+
+        assert result == {"ok": True, "account": _UIN, "message": "登录态仍在", "needs_verify": False}
+        assert "SetQuickLogin" not in calls.endpoints
+
+    def test_success_is_confirmed_by_the_login_status_coming_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(napcat_module, "_QUICK_RELOGIN_POLL_SEC", 0.0)
+        _write_dead(tmp_path, {_UIN: "登录态失效"})
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus=_Each({"isLogin": False, "isOffline": False}, {"isLogin": False, "isOffline": False}, {"isLogin": True}),
+            SetQuickLogin={},
+        )
+
+        result = asyncio.run(ops.quick_relogin(_UIN))
+
+        assert result == {"ok": True, "account": _UIN, "message": "", "needs_verify": False}
+        assert calls.endpoints.count("SetQuickLogin") == 1
+        assert ops.client.dead_logins() == {}
+
+    def test_a_refusal_marks_the_login_dead_and_flags_device_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN}, CheckLoginStatus={"isLogin": False, "isOffline": False},
+            SetQuickLogin=NapCatError("SetQuickLogin 返回错误：140022011 异常设备需要验证"),
+        )
+
+        result = asyncio.run(ops.quick_relogin(_UIN))
+
+        assert result["ok"] is False and result["needs_verify"] is True
+        assert "140022011" in result["message"]
+        assert _UIN in ops.client.dead_logins()
+
+    def test_an_unreachable_webui_is_not_a_dead_login(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN}, CheckLoginStatus={"isLogin": False, "isOffline": False},
+            SetQuickLogin=NapCatUnreachable("连不上"),
+        )
+
+        with pytest.raises(NapCatUnreachable):
+            asyncio.run(ops.quick_relogin(_UIN))
+        assert ops.client.dead_logins() == {}
+
+    def test_a_new_login_error_ends_the_wait_early(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(napcat_module, "_QUICK_RELOGIN_POLL_SEC", 0.0)
+        ops, calls = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN},
+            CheckLoginStatus=_Each({"isLogin": False, "isOffline": False}, {"isLogin": False, "isOffline": False, "loginError": "快速登录失败，错误码: 1"}),
+            SetQuickLogin={},
+        )
+
+        result = asyncio.run(ops.quick_relogin(_UIN))
+
+        assert result == {"ok": False, "account": _UIN, "message": "快速登录失败，错误码: 1", "needs_verify": False}
+        assert calls.endpoints.count("CheckLoginStatus") == 2
+
+    def test_the_account_must_be_numeric(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ops, _ = _ops(tmp_path, monkeypatch)
+
+        with pytest.raises(AccountRequestInvalid):
+            asyncio.run(ops.quick_relogin("abc"))
+
+
+class TestLinkFacts:
+    """status() 带出 bot 进程公布的掉线原因与恢复处境，bot 失联时不猜。"""
+
+    def test_fresh_live_state_is_merged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        from platforms import live as platform_live
+        from platforms.builtin import QQ_NAPCAT
+
+        platform_live.write_live_state(platform_live.live_state_path(QQ_NAPCAT, tmp_path), {
+            "published_at": time.time(), "connected": True, "online": False,
+            "offline_reason": "session_invalid", "last_offline_at": 1_700_000_000.0,
+            "recovery": {"state": "exhausted", "note": "到预算上限"},
+        })
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN}, CheckLoginStatus={"isLogin": False, "isOffline": False}, GetQuickLoginListNew=[],
+        )
+
+        status = _status(ops)
+
+        assert status["offline_reason"] == "session_invalid"
+        assert status["last_offline_at"] == 1_700_000_000.0
+        assert status["recovery"] == {"state": "exhausted", "note": "到预算上限"}
+
+    def test_a_stale_live_state_is_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from platforms import live as platform_live
+        from platforms.builtin import QQ_NAPCAT
+
+        platform_live.write_live_state(platform_live.live_state_path(QQ_NAPCAT, tmp_path), {
+            "published_at": 1.0, "connected": True, "online": False, "offline_reason": "session_invalid",
+            "recovery": {"state": "manual"},
+        })
+        ops, _ = _ops(
+            tmp_path, monkeypatch,
+            GetQQLoginInfo={"uin": _UIN}, CheckLoginStatus={"isLogin": True}, GetQuickLoginListNew=[],
+        )
+
+        assert {k: _status(ops)[k] for k in _LINK} == {"offline_reason": "", "last_offline_at": 0.0, "recovery": {}}

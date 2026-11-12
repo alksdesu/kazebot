@@ -67,6 +67,7 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
             self.startup_hooks = []
             self.shutdown_hooks = []
             self.bot_connect_hooks = []
+            self.bot_disconnect_hooks = []
 
         @staticmethod
         def _register(hooks, func):
@@ -85,12 +86,16 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         def on_bot_connect(self, func=None):
             return self._register(self.bot_connect_hooks, func)
 
+        def on_bot_disconnect(self, func=None):
+            return self._register(self.bot_disconnect_hooks, func)
+
     driver = Driver()
     nonebot = types.ModuleType("nonebot")
     nonebot.get_bot = lambda *a, **k: None
     nonebot.get_driver = lambda: driver
     nonebot.on_message = lambda *a, **k: Matcher()
     nonebot.on_notice = lambda *a, **k: Matcher()
+    nonebot.on_metaevent = lambda *a, **k: Matcher()
 
     class Segment(dict):
         @classmethod
@@ -135,6 +140,7 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in {
         "Bot": object, "Event": object, "GroupMessageEvent": object,
         "GroupUploadNoticeEvent": object, "PrivateMessageEvent": object,
+        "HeartbeatMetaEvent": object, "MetaEvent": object, "NoticeEvent": object,
         "Message": Message, "MessageSegment": Segment,
     }.items():
         setattr(v11, name, value)

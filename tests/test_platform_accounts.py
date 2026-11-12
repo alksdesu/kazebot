@@ -71,6 +71,8 @@ _LEGACY_ROUTES = (
     ("GET", "/v1/admin/qq/scope"),
     ("POST", "/v1/admin/qq/scope/migrate"),
 )
+# 兜底轮询还没查过时 /account 带出来的观察记录。
+_FRESH_WATCH = {"last_checked_at": 0.0, "online": None, "offline_since": 0.0, "error": ""}
 
 
 class _FakeOps:
@@ -303,12 +305,12 @@ class TestAccountStatus:
         response = call("GET", "/v1/platforms/qq/account")
 
         assert response.status_code == 200
-        assert response.json() == {"configured": True, "reachable": True, **_STATUS}
+        assert response.json() == {"configured": True, "reachable": True, **_STATUS, "watch": _FRESH_WATCH}
 
     def test_an_unconfigured_platform_is_not_contacted(self, call, ops: _FakeOps) -> None:
         ops.configured = False
 
-        assert call("GET", "/v1/platforms/qq/account").json() == {"configured": False}
+        assert call("GET", "/v1/platforms/qq/account").json() == {"configured": False, "watch": _FRESH_WATCH}
         assert ops.calls == []
 
     def test_a_platform_that_has_not_answered_yet_is_not_an_error(self, call, ops: _FakeOps) -> None:
@@ -318,7 +320,7 @@ class TestAccountStatus:
         response = call("GET", "/v1/platforms/qq/account")
 
         assert response.status_code == 200
-        assert response.json() == {"configured": True, "reachable": False, "reason": "连不上 NapCat WebUI"}
+        assert response.json() == {"configured": True, "reachable": False, "reason": "连不上 NapCat WebUI", "watch": _FRESH_WATCH}
 
     def test_any_other_failure_is_a_bad_gateway(self, call, ops: _FakeOps) -> None:
         ops.outcomes["status"] = AccountOpsError("NapCat 拒绝了 token")
@@ -527,18 +529,19 @@ class TestLegacyQqRoutes:
             "quick_login": [
                 {"uin": _OTHER, "nick": "小号", "avatar": "http://face/2", "available": False, "dead_reason": "登录态失效"},
             ],
+            "watch": _FRESH_WATCH,
         }
 
     def test_an_unconfigured_platform_answers_the_same_as_before(self, call, ops: _FakeOps) -> None:
         ops.configured = False
 
-        assert call("GET", "/v1/qq/account").json() == {"configured": False}
+        assert call("GET", "/v1/qq/account").json() == {"configured": False, "watch": _FRESH_WATCH}
 
     def test_an_unreachable_platform_answers_the_same_as_before(self, call, ops: _FakeOps) -> None:
         ops.outcomes["status"] = AccountUnreachable("连不上 NapCat WebUI")
 
         assert call("GET", "/v1/qq/account").json() == {
-            "configured": True, "reachable": False, "reason": "连不上 NapCat WebUI",
+            "configured": True, "reachable": False, "reason": "连不上 NapCat WebUI", "watch": _FRESH_WATCH,
         }
 
     def test_quick_login_takes_a_uin_and_answers_with_one(self, call, ops: _FakeOps, tmp_path: Path) -> None:
@@ -616,3 +619,102 @@ class TestScopeMigrationModule:
             platform_accounts.scope_migration()
 
         assert platform_accounts._MIGRATION_MODULE not in sys.modules
+
+
+class TestAccountWatch:
+    """supervisor 的兜底轮询：bot 进程没报掉线时也把号不在线记进审计，连续两轮才算。"""
+
+    def _state(self, tmp_path: Path) -> SupervisorState:
+        return SupervisorState(
+            workspace_root=tmp_path,
+            eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="run-watch"),
+            policy=PolicyEngine(workspace_root=tmp_path),
+        )
+
+    def test_one_offline_round_is_not_reported(self, tmp_path: Path, hook: _Hook, ops: _FakeOps) -> None:
+        ops.outcomes["status"] = {**_STATUS, "online": False, "offline_reason": "session_invalid"}
+        accounts = PlatformAccounts(tmp_path, state=self._state(tmp_path))
+
+        first = asyncio.run(accounts.check_once(QQ_NAPCAT, now=1000.0))
+        second = asyncio.run(accounts.check_once(QQ_NAPCAT, now=1060.0))
+        third = asyncio.run(accounts.check_once(QQ_NAPCAT, now=1120.0))
+
+        assert (first, second, third) == ("", "platform_account_offline", "")
+        offline = _events(tmp_path, "platform_account_offline")
+        assert len(offline) == 1
+        assert offline[0]["payload"]["platform"] == QQ_NAPCAT.id
+        assert offline[0]["payload"]["offline_since"] == 1000.0
+        assert offline[0]["payload"]["offline_reason"] == "session_invalid"
+        assert accounts.watch(QQ_NAPCAT).payload() == {
+            "last_checked_at": 1120.0, "online": False, "offline_since": 1000.0, "error": "",
+        }
+
+    def test_coming_back_online_is_reported_once(self, tmp_path: Path, hook: _Hook, ops: _FakeOps) -> None:
+        accounts = PlatformAccounts(tmp_path, state=self._state(tmp_path))
+        ops.outcomes["status"] = {**_STATUS, "online": False}
+        asyncio.run(accounts.check_once(QQ_NAPCAT, now=1.0))
+        asyncio.run(accounts.check_once(QQ_NAPCAT, now=2.0))
+        ops.outcomes["status"] = dict(_STATUS)
+
+        back = asyncio.run(accounts.check_once(QQ_NAPCAT, now=3.0))
+        again = asyncio.run(accounts.check_once(QQ_NAPCAT, now=4.0))
+
+        assert (back, again) == ("platform_account_online", "")
+        assert accounts.watch(QQ_NAPCAT).payload()["offline_since"] == 0.0
+
+    def test_an_unreachable_platform_is_neither_online_nor_offline(
+        self, tmp_path: Path, hook: _Hook, ops: _FakeOps,
+    ) -> None:
+        ops.outcomes["status"] = AccountUnreachable("NapCat 正在重启")
+        accounts = PlatformAccounts(tmp_path, state=self._state(tmp_path))
+
+        for stamp in (1.0, 2.0, 3.0):
+            assert asyncio.run(accounts.check_once(QQ_NAPCAT, now=stamp)) == ""
+
+        assert accounts.watch(QQ_NAPCAT).payload() == {
+            "last_checked_at": 3.0, "online": None, "offline_since": 0.0, "error": "NapCat 正在重启",
+        }
+        assert _events(tmp_path, "platform_account_offline") == []
+
+    def test_an_unconfigured_platform_is_skipped(self, tmp_path: Path, hook: _Hook, ops: _FakeOps) -> None:
+        ops.configured = False
+        accounts = PlatformAccounts(tmp_path, state=self._state(tmp_path))
+
+        assert asyncio.run(accounts.check_once(QQ_NAPCAT, now=1.0)) == ""
+        assert ops.calls == []
+
+    def test_only_platforms_with_account_ops_are_watched(self, hook: _Hook, tmp_path: Path) -> None:
+        accounts = PlatformAccounts(tmp_path)
+
+        assert [platform.id for platform in accounts.watched_platforms()] == [QQ_NAPCAT.id]
+
+    def test_without_state_the_watch_loop_does_not_start(self, tmp_path: Path) -> None:
+        accounts = PlatformAccounts(tmp_path)
+
+        async def run() -> None:
+            accounts.start()
+            assert accounts._watch_task is None
+            await accounts.stop()
+
+        asyncio.run(run())
+
+    def test_the_watch_loop_starts_and_stops_with_state(self, tmp_path: Path, hook: _Hook) -> None:
+        accounts = PlatformAccounts(tmp_path, state=self._state(tmp_path))
+
+        async def run() -> None:
+            accounts.start()
+            task = accounts._watch_task
+            assert task is not None and not task.done()
+            accounts.start()
+            assert accounts._watch_task is task
+            await accounts.stop()
+            assert task.cancelled() and accounts._watch_task is None
+
+        asyncio.run(run())
+
+    def test_the_status_endpoint_carries_the_watch(self, call, tmp_path: Path) -> None:
+        payload = call("GET", "/v1/platforms/qq/account").json()
+
+        assert payload["watch"] == {"last_checked_at": 0.0, "online": None, "offline_since": 0.0, "error": ""}
+        legacy = call("GET", "/v1/qq/account").json()
+        assert legacy["watch"] == payload["watch"]

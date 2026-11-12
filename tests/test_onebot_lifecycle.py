@@ -58,6 +58,7 @@ def test_registered_callbacks_restore_state_and_manage_tasks(
     driver = runtime.common.driver
     assert driver.startup_hooks == [runtime.lifecycle._startup]
     assert driver.bot_connect_hooks == [runtime.lifecycle._on_bot_connect]
+    assert driver.bot_disconnect_hooks == [runtime.lifecycle._on_bot_disconnect]
     assert driver.shutdown_hooks == [runtime.lifecycle._shutdown]
 
     async def wait_until_cancelled(*args, **kwargs):
@@ -70,6 +71,7 @@ def test_registered_callbacks_restore_state_and_manage_tasks(
         (runtime.lifecycle, "_live_config_reconcile_forever"),
         (runtime.lifecycle, "_attachment_cleanup_forever"),
         (runtime.state._adapter.features, "poll"),
+        (runtime.recovery.Recovery, "watch_forever"),
     ):
         background[name] = AsyncMock(side_effect=wait_until_cancelled)
         monkeypatch.setattr(owner, name, background[name])
@@ -100,9 +102,11 @@ def test_registered_callbacks_restore_state_and_manage_tasks(
             monkeypatch.setattr(client, "close", close_client)
             tasks = [
                 adapter.router_task, adapter.live_reconcile_task, adapter.attachment_cleanup_task,
-                adapter.sticker_receipt_task, adapter.features.poll_task, *adapter.qq_queue_tasks.values(),
+                adapter.sticker_receipt_task, adapter.features.poll_task, adapter.recovery_task,
+                *adapter.qq_queue_tasks.values(),
             ]
-            assert len(tasks) == 6 and all(task is not None and not task.done() for task in tasks)
+            assert len(tasks) == 7 and all(task is not None and not task.done() for task in tasks)
+            assert isinstance(adapter.recovery, runtime.recovery.Recovery)
             for mock in background.values():
                 mock.assert_awaited_once()
 
@@ -116,6 +120,11 @@ def test_registered_callbacks_restore_state_and_manage_tasks(
             for callback in driver.bot_connect_hooks:
                 await callback(SimpleNamespace(self_id="12345"))
             assert adapter.active_bot_scope == "12345"
+            assert adapter.recovery.state.online is True
+            for callback in driver.bot_disconnect_hooks:
+                await callback(SimpleNamespace(self_id="12345"))
+            assert adapter.recovery.state.online is False
+            assert adapter.recovery.state.offline_reason == runtime.recovery.REASON_LINK_DOWN
             assert adapter.reply_attachment_cache == cached
             await runtime.routing._save_reply_attachment_cache()
             assert json.loads(cache_path.read_text(encoding="utf-8"))["reply_attachments"] == cached
@@ -133,5 +142,6 @@ def test_registered_callbacks_restore_state_and_manage_tasks(
         assert adapter.router_task is None and adapter.live_reconcile_task is None
         assert adapter.attachment_cleanup_task is None and adapter.sticker_receipt_task is None
         assert adapter.features.poll_task is None and not adapter.qq_queue_tasks
+        assert adapter.recovery_task is None and adapter.recovery is None
 
     asyncio.run(exercise())

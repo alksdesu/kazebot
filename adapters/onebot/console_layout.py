@@ -219,6 +219,16 @@ SECTIONS = (
             custom("bridgeFacts"),
             hint="本地 HTTP 口子，供别的进程借 bot 发消息",
         ),
+        block(
+            "掉线恢复",
+            grid(
+                field("recovery_enabled", field("recovery_daily_limit"), field("recovery_min_interval_sec")),
+                field("recovery_login_mode_on_failure"),
+                field("recovery_notify_admins"),
+            ),
+            custom("linkFacts"),
+            hint="QQ 登录态被服务端注销时自动用快速登录登回去，次数受预算约束",
+        ),
         block("固定配置", custom("environment"), hint="改这些要重启进程，控制台只读"),
         block("危险操作", custom("restartEngine"), hint="唯一会中断正在进行的工作的操作"),
         note(
@@ -226,8 +236,8 @@ SECTIONS = (
             "监听端口，不需要重启。上面那个重启按钮是给 engine worker 卡住时用的。"
         ),
         icon="lan",
-        note="队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，以及固定配置与危险操作。",
-        paths=("queue", "history", "forward_bridge"),
+        note="队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，掉线后怎么自动登回去，以及固定配置与危险操作。",
+        paths=("queue", "history", "forward_bridge", "recovery"),
     ),
 )
 

@@ -29,7 +29,8 @@ from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
 from platforms import live as platform_live
 from platforms.builtin import QQ_NAPCAT
 
-from . import anonymize, callbacks, common, emotes, forward_bridge, identity, inbound, media, models, proactive, queueing, routing, state
+from ..account_ops import NapCatAccountOps
+from . import anonymize, callbacks, common, emotes, forward_bridge, identity, inbound, media, models, proactive, queueing, recovery, routing, sending, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -103,12 +104,18 @@ def _live_link_facts() -> Dict[str, Any]:
         connected = get_bot() is not None
     except Exception:
         connected = False
-    return {
+    facts: Dict[str, Any] = {
         platform_live.CONNECTED: connected,
         # 迁移功能靠它认「当前号」。空串 = 还没连上过任何账号，此时全部会话键都没作用域。
         platform_live.ACCOUNT: routing._active_bot_scope(),
         platform_live.BACKLOG: len(state._adapter.qq_queue),
     }
+    link = state._adapter.recovery
+    if link is not None:
+        # 连着 OneBot 不等于登录态还在：踢线之后 WS 照样挂着。
+        facts.update(link.state.facts())
+        facts[platform_live.ONLINE] = connected and link.state.online
+    return facts
 
 
 def _live_runtime_facts() -> Dict[str, Any]:
@@ -293,6 +300,34 @@ def _reload_user_profiles_if_changed() -> bool:
     return True
 
 
+async def _notify_admins(text: str) -> bool:
+    """掉线恢复的那一句话私发给管理员名单。没连上 bot 时发不出去，交回去等链路恢复再补。"""
+    bot = queueing._get_fallback_bot()
+    if bot is None or not live.admin_users:
+        return False
+    delivered = False
+    for admin_id in live.admin_users:
+        try:
+            await sending._send_qq_message(
+                bot, {"type": "private", "user_id": int(admin_id)}, text,
+                send_context=proactive._request_send_context("recovery-admin", f"{int(time.time())}:{admin_id}", ""),
+            )
+            delivered = True
+        except Exception:
+            common.logger.debug("recovery notice to admin %s failed", admin_id, exc_info=True)
+    return delivered
+
+
+def _build_recovery() -> recovery.Recovery:
+    return recovery.Recovery(
+        workspace=Path(CLONOTH_WORKSPACE),
+        settings=recovery.RecoverySettings(live),
+        gateway=NapCatAccountOps(Path(CLONOTH_WORKSPACE)),
+        notifier=_notify_admins,
+        current_account=routing._active_bot_scope,
+    )
+
+
 @common.driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
@@ -371,6 +406,8 @@ async def _startup() -> None:
     state._adapter.live_reconcile_task = asyncio.create_task(_live_config_reconcile_forever())
     state._adapter.attachment_cleanup_task = asyncio.create_task(_attachment_cleanup_forever())
     state._adapter.features.poll_task = asyncio.create_task(state._adapter.features.poll())
+    state._adapter.recovery = _build_recovery()
+    state._adapter.recovery_task = asyncio.create_task(state._adapter.recovery.watch_forever())
     common.logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
@@ -378,12 +415,25 @@ async def _startup() -> None:
 async def _on_bot_connect(bot: Bot) -> None:
     """连上就认账号。等第一条消息再认的话，那条消息本身还是按上一个号算键。"""
     routing._adopt_bot_scope(bot)
+    if state._adapter.recovery is not None:
+        state._adapter.recovery.on_connect()
+    _publish_live_state(force=True)
+
+
+@common.driver.on_bot_disconnect
+async def _on_bot_disconnect(bot: Bot) -> None:
+    """OneBot 断开。可能只是网络抖动，也可能是踢线之后 NapCat 收口；交给恢复流程等一等再判。"""
+    if state._adapter.recovery is not None:
+        state._adapter.recovery.on_disconnect()
     _publish_live_state(force=True)
 
 
 @common.driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
+    # 先封掉恢复流程：关闭过程中 WS 断开会触发 on_bot_disconnect，那不是掉线。
+    if state._adapter.recovery is not None:
+        state._adapter.recovery.close()
     if state._adapter.features.poll_task is not None:
         state._adapter.features.poll_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -406,6 +456,12 @@ async def _shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await state._adapter.attachment_cleanup_task
         state._adapter.attachment_cleanup_task = None
+    if state._adapter.recovery_task is not None:
+        state._adapter.recovery_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await state._adapter.recovery_task
+        state._adapter.recovery_task = None
+    state._adapter.recovery = None
     if state._adapter.sticker_receipt_task is not None:
         state._adapter.sticker_receipt_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

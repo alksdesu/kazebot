@@ -682,18 +682,56 @@ export function useRuntime(): PlatformRuntimeFacts {
   return useConsoleStore((state) => state.live?.state?.runtime || NO_RUNTIME);
 }
 
-/** 各平台 live 状态都有的链路事实：连没连上、当前账号、积压条数。 */
+/** bot 公布的掉线恢复处境。没公布时各项是空值。 */
+export interface RecoveryFacts {
+  state: string;
+  note: string;
+  last_action: string;
+  last_action_at: number;
+  actions_used_24h: number;
+}
+
+const NO_RECOVERY: RecoveryFacts = Object.freeze({
+  state: '', note: '', last_action: '', last_action_at: 0, actions_used_24h: 0,
+});
+
+/** 各平台 live 状态都有的链路事实：连没连上、当前账号、积压条数；连着 OneBot 不等于登录态还在，online 另算。 */
 export interface LinkFacts {
   connected: boolean;
+  /** 平台登录态在线。旧 bot 没公布这一项时按 connected 算。 */
+  online: boolean;
+  offline_reason: string;
+  last_offline_at: number;
+  recovery: RecoveryFacts;
   account: string;
   backlog: number;
+}
+
+function readRecovery(value: unknown): RecoveryFacts {
+  if (!value || typeof value !== 'object') return NO_RECOVERY;
+  const raw = value as Record<string, unknown>;
+  const lastActionAt = Number(raw.last_action_at ?? 0);
+  const used = Number(raw.actions_used_24h ?? 0);
+  return {
+    state: typeof raw.state === 'string' ? raw.state : '',
+    note: typeof raw.note === 'string' ? raw.note : '',
+    last_action: typeof raw.last_action === 'string' ? raw.last_action : '',
+    last_action_at: Number.isFinite(lastActionAt) && lastActionAt > 0 ? lastActionAt : 0,
+    actions_used_24h: Number.isFinite(used) && used > 0 ? used : 0,
+  };
 }
 
 export function readLinkFacts(state: ConsoleState): LinkFacts {
   const published = state.live?.state;
   const backlog = Number(published?.backlog ?? 0);
+  const connected = published?.connected === true;
+  const lastOfflineAt = Number(published?.last_offline_at ?? 0);
   return {
-    connected: published?.connected === true,
+    connected,
+    online: connected && (published?.online === true || published?.online === undefined),
+    offline_reason: typeof published?.offline_reason === 'string' ? published.offline_reason : '',
+    last_offline_at: Number.isFinite(lastOfflineAt) && lastOfflineAt > 0 ? lastOfflineAt : 0,
+    recovery: readRecovery(published?.recovery),
     account: typeof published?.account === 'string' ? published.account : '',
     backlog: Number.isFinite(backlog) && backlog > 0 ? backlog : 0,
   };
@@ -701,9 +739,28 @@ export function readLinkFacts(state: ConsoleState): LinkFacts {
 
 export function useLinkFacts(): LinkFacts {
   const connected = useConsoleStore((state) => readLinkFacts(state).connected);
+  const online = useConsoleStore((state) => readLinkFacts(state).online);
+  const offlineReason = useConsoleStore((state) => readLinkFacts(state).offline_reason);
+  const lastOfflineAt = useConsoleStore((state) => readLinkFacts(state).last_offline_at);
+  const recoveryState = useConsoleStore((state) => readLinkFacts(state).recovery.state);
+  const recoveryNote = useConsoleStore((state) => readLinkFacts(state).recovery.note);
+  const lastAction = useConsoleStore((state) => readLinkFacts(state).recovery.last_action);
+  const lastActionAt = useConsoleStore((state) => readLinkFacts(state).recovery.last_action_at);
+  const actionsUsed = useConsoleStore((state) => readLinkFacts(state).recovery.actions_used_24h);
   const account = useConsoleStore((state) => readLinkFacts(state).account);
   const backlog = useConsoleStore((state) => readLinkFacts(state).backlog);
-  return { connected, account, backlog };
+  return {
+    connected,
+    online,
+    offline_reason: offlineReason,
+    last_offline_at: lastOfflineAt,
+    recovery: {
+      state: recoveryState, note: recoveryNote, last_action: lastAction,
+      last_action_at: lastActionAt, actions_used_24h: actionsUsed,
+    },
+    account,
+    backlog,
+  };
 }
 
 /** 三态开关要能区分「没配」和「配成 false」，所以 null 不能被 fallback 吃掉。

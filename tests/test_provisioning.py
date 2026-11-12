@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "deploy" / "provision_instance.sh"
 WRITABLE_SCRIPT = REPO_ROOT / "deploy" / "enable_instance_writable.sh"
 WRITABLE_UNIT = REPO_ROOT / "deploy" / "systemd" / "kazebot-writable@.service"
+UNIT_DIR = REPO_ROOT / "deploy" / "systemd"
 INSTALLER = REPO_ROOT / "deploy" / "install_provision.sh"
 NEW_INSTANCE = REPO_ROOT / "deploy" / "new_instance.sh"
 CLOUDFLARED = REPO_ROOT / "deploy" / "cloudflared_ingress.py"

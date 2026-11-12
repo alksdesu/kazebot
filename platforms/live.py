@@ -30,6 +30,11 @@ CONFIG_FILE = "file"
 CONFIG_LOADED = "loaded"
 PARSE_ERROR = "parse_error"
 RUNTIME = "runtime"
+# 账号在平台上是否在线（连着 OneBot 不等于登录态还在）、掉线原因与时间、自动恢复的处境。
+ONLINE = "online"
+OFFLINE_REASON = "offline_reason"
+LAST_OFFLINE_AT = "last_offline_at"
+RECOVERY = "recovery"
 
 # 每时每刻都在动，判断内容变没变时不算，否则每个对齐周期都要重写一次。
 VOLATILE_FIELDS: frozenset[str] = frozenset({PUBLISHED_AT, BACKLOG})
@@ -106,6 +111,11 @@ class LiveStatus:
     # 排除不了还在跑：时间戳在将来说明时钟被拨过，写它的 bot 可能刚写完。要求 bot 停着的操作按它判。
     may_be_running: bool
     connected: bool
+    # 平台登录态在线。没公布这一项的旧 bot 按 connected 算。
+    online: bool
+    offline_reason: str
+    last_offline_at: float | None
+    recovery: Mapping[str, Any] | None
     account: str
     backlog: int
     config_path: str
@@ -149,12 +159,19 @@ def live_status(state: Mapping[str, Any], *, now: float | None = None) -> LiveSt
     fresh = age is not None and 0 <= age <= STALE_AFTER_SEC
     account = source.get(ACCOUNT)
     loaded = source.get(CONFIG_LOADED)
+    connected = fresh and source.get(CONNECTED) is True
+    published_online = source.get(ONLINE)
+    recovery = source.get(RECOVERY)
     return LiveStatus(
         published=published,
         age_sec=None if age is None else round(age, 3),
         fresh=fresh,
         may_be_running=age is not None and age <= STALE_AFTER_SEC,
-        connected=fresh and source.get(CONNECTED) is True,
+        connected=connected,
+        online=connected and (published_online is True or published_online is None),
+        offline_reason=_text(source.get(OFFLINE_REASON)),
+        last_offline_at=_timestamp(source.get(LAST_OFFLINE_AT)),
+        recovery=recovery if isinstance(recovery, Mapping) else None,
         account=str(account).strip() if isinstance(account, (str, int)) and not isinstance(account, bool) else "",
         backlog=_count(source.get(BACKLOG)),
         config_path=_text(source.get(CONFIG_PATH)),

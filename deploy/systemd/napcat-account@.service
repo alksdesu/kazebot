@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply a NapCat account action requested by instance %i
+After=docker.service
+
+[Service]
+Type=oneshot
+# 以 root 跑：要改 root 的 webui.json、重启容器。脚本是 /usr/local/lib 里的副本、解释器是系统的，
+# 拿 /opt/kazebot 那边的代码以 root 跑就是把机器交给 agent。
+ExecStart=/usr/bin/python3 -I /usr/local/lib/kazebot/napcat_account_runner.py %i
+TimeoutStartSec=180

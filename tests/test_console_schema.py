@@ -433,7 +433,7 @@ class TestQQPage:
         """这些块由前端按「qq:分区」登记的组件画，改名要两边一起改。"""
         assert _custom_names(console_layout.SECTIONS) == {
             "groupWarning", "audition", "adminWarning", "capabilities",
-            "queueFacts", "historyFacts", "bridgeFacts", "environment", "restartEngine",
+            "queueFacts", "historyFacts", "bridgeFacts", "linkFacts", "environment", "restartEngine",
         }
 
 

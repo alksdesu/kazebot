@@ -297,7 +297,7 @@ def create_app(
     # 全量重启的 stop_all 夹进 engine 重启的停和起之间，新起的 engine 没人停，supervisor 退出后成了孤儿。
     app.state.restart_gate = RestartGate()
     app.state.config_store = config_store
-    app.state.platform_accounts = PlatformAccounts(state.workspace_root)
+    app.state.platform_accounts = PlatformAccounts(state.workspace_root, state=state)
 
     @app.get("/v1/health", response_model=HealthOut, response_model_exclude_none=True)
     async def health(request: Request) -> HealthOut:

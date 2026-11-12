@@ -139,8 +139,10 @@ PY
 
   say "装 systemd 单元"
   [ -d "$UNITS" ] || fail "$UNITS 不存在，先跑 install_provision.sh"
+  [ -f "$UNITS/napcat-account@.path" ] || fail "$UNITS 里没有 napcat-account@.path，重跑一遍 install_provision.sh"
   install -m 0644 -o root -g root "$UNITS"/kazebot@.service "$UNITS"/kazebot-qq@.service \
-    "$UNITS"/kazebot-cleanup@.service "$UNITS"/kazebot-cleanup@.timer /etc/systemd/system/
+    "$UNITS"/kazebot-cleanup@.service "$UNITS"/kazebot-cleanup@.timer \
+    "$UNITS"/napcat-account@.path "$UNITS"/napcat-account@.service /etc/systemd/system/
   systemctl daemon-reload
 
   say "接入 cloudflared"
@@ -148,7 +150,8 @@ PY
 
   say "启动服务"
   chown -R "$OWNER:$OWNER" "$WS"
-  systemctl enable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer"
+  systemctl enable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer" \
+    "napcat-account@$INSTANCE.path"
 
   say "等 supervisor 应答 127.0.0.1:$sup_port/i/$INSTANCE …"
   waited=0
@@ -172,7 +175,8 @@ do_remove() {
 
   # 每一步都能重跑：上次停在半路的话，控制台里那条还在，再点一次删除就接着做，做完的步骤自己跳过。
   say "停服务"
-  systemctl disable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer" 2>&1 | tee -a "$LOG" || true
+  systemctl disable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer" \
+    "napcat-account@$INSTANCE.path" 2>&1 | tee -a "$LOG" || true
 
   # 名字是 napcat- 加实例名，永远撞不上序号 0 的 napcat，也撞不上 gitea。
   if docker inspect "napcat-$INSTANCE" >/dev/null 2>&1; then

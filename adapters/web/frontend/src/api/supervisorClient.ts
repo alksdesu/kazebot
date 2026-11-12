@@ -2419,6 +2419,12 @@ export interface ConfigLiveState {
     account?: string;
     /** 等着处理的消息条数。 */
     backlog?: number;
+    /** 平台登录态在线。连着 OneBot 不等于登录态还在；旧 bot 不公布这一项。 */
+    online?: boolean;
+    offline_reason?: string;
+    last_offline_at?: number;
+    /** 掉线恢复的处境：state / note / last_action / last_action_at / actions_used_24h。 */
+    recovery?: Record<string, unknown>;
     config_path?: string;
     /** 磁盘上这份文件的指纹。 */
     file?: ConfigFileFingerprint;
@@ -2767,6 +2773,10 @@ const LIVE_SNAPSHOT = {
   connected: optional(BOOLEAN),
   account: optional(TEXT),
   backlog: optional(NUMBER),
+  online: optional(BOOLEAN),
+  offline_reason: optional(TEXT),
+  last_offline_at: optional(NUMBER),
+  recovery: optional(OBJECT),
   config_path: optional(TEXT),
   parse_error: optional(TEXT),
   layer: optional(TEXT),

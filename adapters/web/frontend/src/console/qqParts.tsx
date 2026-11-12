@@ -2,7 +2,7 @@
 // 分区本身、字段和说明都来自后端的 schema，这里只放编不成字段的东西。
 import { Audition } from './Audition';
 import { Capabilities } from './CapabilityGrants';
-import { BridgeFacts, Environment, HistoryFacts, QueueFacts, RestartEngine } from './LinkFacts';
+import { BridgeFacts, Environment, HistoryFacts, QueueFacts, RecoveryFacts, RestartEngine } from './LinkFacts';
 import { AdminListWarning, GroupListWarning } from './listWarnings';
 import type { PageParts } from './sectionParts';
 import {
@@ -33,6 +33,7 @@ export const QQ_PARTS: PageParts = Object.freeze({
       queueFacts: QueueFacts,
       historyFacts: HistoryFacts,
       bridgeFacts: BridgeFacts,
+      linkFacts: RecoveryFacts,
       environment: Environment,
       restartEngine: RestartEngine,
     },

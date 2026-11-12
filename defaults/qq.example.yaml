@@ -113,3 +113,19 @@ forward_bridge:
   # 令牌写在 data/platform_secrets.yaml 的 qq.forward_bridge_token 或 .env 的 ONEBOT_FORWARD_BRIDGE_TOKEN；
   # 都没配时 bot 自签一份写到 ONEBOT_FORWARD_BRIDGE_TOKEN_FILE
   # （默认 ${CLONOTH_WORKSPACE}/data/onebot_forward_bridge_token），仍强制校验；文件不可写则 Bridge 不启动。
+
+# ── 掉线恢复 ──────────────────────────────────
+# QQ 服务端会不定期注销 PC 登录态（提示「登录已失效」），NapCat 本地的快速登录凭据多半还能用一次。
+# bot 收到 bot_offline 通知、OneBot 断开或心跳停了之后，按文案判断原因：登录态失效 / 原因不明的在预算内
+# 自动快速登录；手机踢下线、改密码、版本过低这类人为或必须升级的情况只记录、不自动顶回去。
+# 每次动作写进 data/qq_offline_events.jsonl，控制台「链路」页能看到当前处境。
+recovery:
+  enabled: true
+  # 24 小时滚动窗口内的自动登录动作上限。登录太频繁本身就是风控信号，宁可停下来等人。
+  daily_limit: 3
+  min_interval_sec: 600
+  # 快速登录被拒（凭据已作废、要求验证设备）时重启 NapCat 进扫码态，控制台能直接出码；也算一次动作。
+  # 默认关：被拒说明本地凭据已经作废，自动重启只省一次点击，却多一次容器重启；关着就只通知。
+  login_mode_on_failure: false
+  # 恢复成功或放弃时私聊管理员名单一句话。掉线期间发不出去的，链路回来再补。
+  notify_admins: true

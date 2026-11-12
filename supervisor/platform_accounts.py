@@ -5,10 +5,13 @@
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib.util
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping
@@ -23,7 +26,7 @@ from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import HOOK_ACCOUNT_OPS, PlatformDescriptor
 from platforms.ids import normalize_id
 from platforms.live import read_live_status
-from platforms.registry import MissingPlatformHook, platform_hook
+from platforms.registry import MissingPlatformHook, all_platforms, platform_hook
 from platforms.wording import name_with
 
 from .admin_api import verify_admin_token
@@ -38,14 +41,67 @@ _log = logging.getLogger(__name__)
 _MIGRATION_MODULE = "_supervisor_scope_migration"
 _MIGRATION_SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "migrate_qq_bot_scope.py"
 
+# 兜底轮询的节律。bot 进程自己接掉线信号；这里只在它没在跑或没报的情况下让人知道号掉了。
+WATCH_INTERVAL_SEC = 60.0
+# 连续两轮不在线才记一笔：一次查询撞上重启窗口不算掉线。
+WATCH_CONFIRM_ROUNDS = 2
+
+
+class AccountWatch:
+    """一个平台的登录态观察记录：最近一次查到什么、从什么时候起不在线。"""
+
+    def __init__(self) -> None:
+        self.last_checked_at: float = 0.0
+        self.last_error: str = ""
+        self.online: bool | None = None
+        self.offline_since: float = 0.0
+        self.offline_rounds: int = 0
+        self.reported: bool = False
+
+    def observe(self, *, online: bool | None, error: str, now: float) -> str:
+        """记一次观察，返回要写审计的事件名；空串 = 没有变化值得记。"""
+        self.last_checked_at = now
+        self.last_error = error
+        if online is None:
+            return ""
+        self.online = online
+        if online:
+            self.offline_rounds = 0
+            self.offline_since = 0.0
+            if self.reported:
+                self.reported = False
+                return "platform_account_online"
+            return ""
+        self.offline_rounds += 1
+        if not self.offline_since:
+            self.offline_since = now
+        if not self.reported and self.offline_rounds >= WATCH_CONFIRM_ROUNDS:
+            self.reported = True
+            return "platform_account_offline"
+        return ""
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "last_checked_at": self.last_checked_at,
+            "online": self.online,
+            "offline_since": self.offline_since,
+            "error": self.last_error,
+        }
+
 
 class PlatformAccounts:
-    """各平台的账号运维对象，每个平台只建一个：平台模块缓存着登录凭证，每次新建就每次重登。"""
+    """各平台的账号运维对象，每个平台只建一个：平台模块缓存着登录凭证，每次新建就每次重登。
 
-    def __init__(self, workspace_root: Path) -> None:
+    带 state 时还能起一个兜底轮询：bot 进程不在、或它的掉线信号没发出来时，这里仍能把号不在线记进审计。
+    """
+
+    def __init__(self, workspace_root: Path, *, state: SupervisorState | None = None) -> None:
         self._root = Path(workspace_root)
         self._ops: dict[str, AccountOps] = {}
         self._lock = threading.Lock()
+        self._state = state
+        self._watches: dict[str, AccountWatch] = {}
+        self._watch_task: asyncio.Task | None = None
 
     def ops(self, platform: PlatformDescriptor) -> AccountOps:
         with self._lock:
@@ -57,6 +113,75 @@ class PlatformAccounts:
                     raise HTTPException(status_code=404, detail=name_with(platform.display_name, "没有账号运维")) from None
                 found = self._ops[platform.id] = module.account_ops(self._root)
             return found
+
+    def watch(self, platform: PlatformDescriptor) -> AccountWatch:
+        with self._lock:
+            found = self._watches.get(platform.id)
+            if found is None:
+                found = self._watches[platform.id] = AccountWatch()
+            return found
+
+    def watched_platforms(self) -> tuple[PlatformDescriptor, ...]:
+        """有账号运维钩子的平台。目前只有 QQ 声明了，别的平台加了钩子就自动进来。"""
+        found = []
+        for platform in all_platforms():
+            try:
+                platform_hook(platform, HOOK_ACCOUNT_OPS)
+            except MissingPlatformHook:
+                continue
+            found.append(platform)
+        return tuple(found)
+
+    async def check_once(self, platform: PlatformDescriptor, *, now: float | None = None) -> str:
+        """查一轮并记审计。返回写了的事件名，便于测试和日志。"""
+        stamp = time.time() if now is None else now
+        watch = self.watch(platform)
+        try:
+            ops = self.ops(platform)
+        except HTTPException:
+            return ""
+        if not ops.configured:
+            return ""
+        try:
+            status = await ops.status()
+            online: bool | None = bool(status.get("online"))
+            error = ""
+        except AccountUnreachable as exc:
+            online, error = None, str(exc)
+        except AccountOpsError as exc:
+            online, error = None, str(exc)
+        event = watch.observe(online=online, error=error, now=stamp)
+        if event and self._state is not None:
+            _audit(
+                self._state, event, platform,
+                offline_since=watch.offline_since, error=error,
+                offline_reason=str(status.get("offline_reason") or "") if online is not None else "",
+            )
+            _log.warning("%s 账号%s", platform.display_name, "恢复在线" if online else "不在线")
+        return event
+
+    async def _watch_forever(self) -> None:
+        while True:
+            for platform in self.watched_platforms():
+                try:
+                    await self.check_once(platform)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.debug("账号兜底轮询失败：%s", platform.id, exc_info=True)
+            await asyncio.sleep(WATCH_INTERVAL_SEC)
+
+    def start(self) -> None:
+        if self._state is None or (self._watch_task is not None and not self._watch_task.done()):
+            return
+        self._watch_task = asyncio.get_running_loop().create_task(self._watch_forever())
+
+    async def stop(self) -> None:
+        task, self._watch_task = self._watch_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 def _refusal(exc: AccountOpsError) -> HTTPException:
@@ -73,15 +198,16 @@ def _audit(state: SupervisorState, type_: str, platform: PlatformDescriptor, **p
     )
 
 
-async def account_status(ops: AccountOps) -> dict[str, Any]:
+async def account_status(ops: AccountOps, watch: AccountWatch | None = None) -> dict[str, Any]:
+    extra = {"watch": watch.payload()} if watch is not None else {}
     if not ops.configured:
-        return {"configured": False}
+        return {"configured": False, **extra}
     try:
-        return {"configured": True, "reachable": True, **await ops.status()}
+        return {"configured": True, "reachable": True, **await ops.status(), **extra}
     except AccountUnreachable as exc:
         # 换号重启和首次部署都会经过这里。判成 502 的话，页面上什么都渲染不出来，
         # 连「正在重启」都说不了 —— 而这恰恰是最需要告诉人的时候。
-        return {"configured": True, "reachable": False, "reason": str(exc)}
+        return {"configured": True, "reachable": False, "reason": str(exc), **extra}
     except AccountOpsError as exc:
         raise _refusal(exc) from exc
 
@@ -326,8 +452,8 @@ def create_platform_account_router(state: SupervisorState, accounts: PlatformAcc
 
     @router.get("/{platform_id}/account")
     async def get_account(platform_id: str) -> dict[str, Any]:
-        _, ops = resolve(platform_id)
-        return await account_status(ops)
+        platform, ops = resolve(platform_id)
+        return await account_status(ops, accounts.watch(platform))
 
     @router.post("/{platform_id}/account/switch")
     async def post_switch(platform_id: str, body: AccountSwitchIn) -> dict[str, Any]:
@@ -380,7 +506,7 @@ def create_legacy_qq_account_router(state: SupervisorState, accounts: PlatformAc
 
     @router.get("/v1/qq/account")
     async def get_account() -> dict[str, Any]:
-        return _named_uin(await account_status(accounts.ops(QQ_NAPCAT)))
+        return _named_uin(await account_status(accounts.ops(QQ_NAPCAT), accounts.watch(QQ_NAPCAT)))
 
     @router.post("/v1/qq/account/quick-login")
     async def post_quick_login(body: QqQuickLoginIn) -> dict[str, Any]:

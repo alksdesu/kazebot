@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for NapCat account action requests from instance %i
+
+[Path]
+PathExists=/opt/kazebot-data/%i/data/napcat-account.request
+Unit=napcat-account@%i.service
+
+[Install]
+WantedBy=multi-user.target

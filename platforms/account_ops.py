@@ -43,6 +43,10 @@ class AccountStatus(TypedDict, total=False):
     # 等扫码时一并带出，控制台不必再单发一次请求去撞重启窗口。
     qrcode: str
     quick_login: list[QuickLoginTarget]
+    # bot 进程公布的掉线原因与自动恢复处境；bot 没在跑或没公布时缺省。
+    offline_reason: str
+    last_offline_at: float
+    recovery: dict[str, object]
 
 
 class SwitchResult(TypedDict):
